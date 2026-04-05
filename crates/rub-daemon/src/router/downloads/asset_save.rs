@@ -925,7 +925,7 @@ fn reserve_reconciled_output_path(
     let reconciled = reconcile_output_path_with_bytes(planned_path, content_type, first_chunk);
     let mut reserved_paths = reserved_output_paths
         .lock()
-        .expect("reserved output paths mutex should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     reserved_paths.remove(planned_path);
     if !reserved_paths.contains(&reconciled) {
         reserved_paths.insert(reconciled.clone());
@@ -1119,12 +1119,14 @@ fn temporary_path(path: &Path) -> PathBuf {
 }
 
 fn set_tracked_temp_path(slot: &Arc<Mutex<Option<PathBuf>>>, value: Option<PathBuf>) {
-    *slot.lock().expect("temp path slot poisoned") = value;
+    if let Ok(mut guard) = slot.lock() {
+        *guard = value;
+    }
 }
 
 async fn cleanup_tracked_temp_path(slot: &Arc<Mutex<Option<PathBuf>>>) {
     let path = {
-        let mut guard = slot.lock().expect("temp path slot poisoned");
+        let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.take()
     };
     if let Some(path) = path {

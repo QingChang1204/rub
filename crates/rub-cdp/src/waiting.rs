@@ -117,7 +117,7 @@ fn frame_context_error_is_deterministic(error: &RubError) -> bool {
 fn wait_check_script(condition: &WaitCondition) -> Result<String, RubError> {
     match &condition.kind {
         WaitKind::Locator { locator, state } => locator_wait_script(locator, *state),
-        WaitKind::Text { text } => Ok(text_wait_script(text)),
+        WaitKind::Text { text } => text_wait_script(text),
     }
 }
 
@@ -284,9 +284,14 @@ fn locator_wait_script(locator: &CanonicalLocator, state: WaitState) -> Result<S
     ))
 }
 
-fn text_wait_script(text: &str) -> String {
-    let text_literal = serde_json::to_string(text).expect("json string serialization");
-    format!(
+fn text_wait_script(text: &str) -> Result<String, RubError> {
+    let text_literal = serde_json::to_string(text).map_err(|error| {
+        RubError::domain(
+            ErrorCode::InvalidInput,
+            format!("Failed to serialize wait text: {error}"),
+        )
+    })?;
+    Ok(format!(
         r#"(() => {{
             const normalize = (value) => String(value || '')
                 .replace(/\s+/g, ' ')
@@ -304,7 +309,7 @@ fn text_wait_script(text: &str) -> String {
             const needle = normalize({text_literal});
             return JSON.stringify(needle.length > 0 && haystack.includes(needle));
         }})()"#
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -319,7 +324,8 @@ mod tests {
 
     #[test]
     fn text_wait_script_normalizes_whitespace_and_case() {
-        let script = text_wait_script("Enter   Account Information");
+        let script = text_wait_script("Enter   Account Information")
+            .expect("text serialization should succeed");
         assert!(script.contains(".replace(/\\s+/g, ' ')"));
         assert!(script.contains(".toLocaleLowerCase()"));
         assert!(script.contains("Enter   Account Information"));
@@ -327,7 +333,7 @@ mod tests {
 
     #[test]
     fn text_wait_script_escapes_newlines_via_json_string_literal() {
-        let script = text_wait_script("Line 1\nLine 2");
+        let script = text_wait_script("Line 1\nLine 2").expect("text serialization should succeed");
         assert!(script.contains("Line 1\\nLine 2"), "{script}");
         assert!(!script.contains("Line 1\nLine 2"), "{script}");
     }

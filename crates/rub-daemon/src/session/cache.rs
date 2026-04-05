@@ -69,7 +69,7 @@ impl SessionState {
         let mut queue = self
             .post_commit_projections
             .lock()
-            .expect("post-commit projection mutex should not be poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let projection = PostCommitProjection {
             request: request.clone(),
             response: response.clone(),
@@ -83,7 +83,7 @@ impl SessionState {
     pub fn pending_post_commit_projection_count(&self) -> usize {
         self.post_commit_projections
             .lock()
-            .expect("post-commit projection mutex should not be poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entries
             .len()
     }
@@ -91,7 +91,7 @@ impl SessionState {
     pub fn post_commit_projection_drop_count(&self) -> u64 {
         self.post_commit_projections
             .lock()
-            .expect("post-commit projection mutex should not be poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .dropped_before_projection
     }
 

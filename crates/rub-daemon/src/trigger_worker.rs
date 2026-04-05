@@ -685,7 +685,12 @@ async fn fire_browser_command_trigger(
                     trigger_action_timeout_ms(command, &args),
                 )
                 .with_command_id(command_id)
-                .expect("trigger action command_id must remain protocol-valid")
+                .map_err(|reason| {
+                    ErrorEnvelope::new(
+                        rub_core::error::ErrorCode::IpcProtocolError,
+                        format!("trigger action command_id is not protocol-valid: {reason}"),
+                    )
+                })?
             },
             state,
         )
@@ -746,7 +751,12 @@ async fn fire_workflow_trigger(
                 trigger_action_timeout_ms("pipe", &args),
             )
             .with_command_id(command_id)
-            .expect("trigger action command_id must remain protocol-valid"),
+            .map_err(|reason| {
+                ErrorEnvelope::new(
+                    rub_core::error::ErrorCode::IpcProtocolError,
+                    format!("trigger action command_id is not protocol-valid: {reason}"),
+                )
+            })?,
             state,
         )
         .await;

@@ -589,7 +589,12 @@ async fn build_orchestration_action_request(
                 orchestration_action_timeout_ms(command, &args),
             )
             .with_command_id(command_id)
-            .expect("orchestration step command_id must remain protocol-valid"))
+            .map_err(|reason| {
+                ErrorEnvelope::new(
+                    ErrorCode::IpcProtocolError,
+                    format!("orchestration step command_id is not protocol-valid: {reason}"),
+                )
+            })?)
         }
         TriggerActionKind::Workflow => {
             let payload = action.payload.as_ref().ok_or_else(|| {
@@ -643,7 +648,12 @@ async fn build_orchestration_action_request(
                 orchestration_action_timeout_ms("pipe", &args),
             )
             .with_command_id(command_id)
-            .expect("orchestration step command_id must remain protocol-valid"))
+            .map_err(|reason| {
+                ErrorEnvelope::new(
+                    ErrorCode::IpcProtocolError,
+                    format!("orchestration step command_id is not protocol-valid: {reason}"),
+                )
+            })?)
         }
         TriggerActionKind::Provider | TriggerActionKind::Script | TriggerActionKind::Webhook => {
             Err(ErrorEnvelope::new(

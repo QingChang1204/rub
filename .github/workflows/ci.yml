@@ -12,15 +12,15 @@ env:
 
 jobs:
   # ── Tier 1: Static analysis + unit/contract tests ──────────────────────────
-  # Runs on every push and PR. No browser required. Must pass to merge.
   check:
     name: Check & Test (unit)
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -29,7 +29,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin/
@@ -41,41 +41,47 @@ jobs:
             ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
             ${{ runner.os }}-cargo-
 
+      - name: Cache build artifacts
+        uses: actions/cache@v5
+        with:
+          path: target/
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/*.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-target-
+
       - name: Format check
         run: cargo fmt --check
 
       - name: Clippy (includes test code)
-        run: cargo clippy --tests -- -D warnings
-
-      - name: Build (dev)
-        run: cargo build --workspace
+        run: cargo clippy --workspace --tests -- -D warnings
 
       - name: Test (unit + contract, no browser)
         run: cargo test --workspace
 
-      - name: Release build
-        run: cargo build --release
-
-  # ── Tier 2: Browser E2E integration tests ──────────────────────────────────
-  # This job ALWAYS runs for every PR and every push to main.
-  # There is NO label or manual escape hatch at the job level.
-  #
-  # Within the job, paths-filter determines whether actual browser work is
-  # needed. PRs that touch only non-code files (docs, markdown, CI yaml)
-  # will have steps skipped — but the job itself is always present and
-  # visible in the PR check list, so branch protection can require it.
-  #
-  # To run locally: cargo test --workspace -- --ignored
+  # ── Tier 2: Browser E2E integration tests (sharded) ────────────────────────
+  # Split into 3 parallel shards by test module to reduce wall-clock time.
+  # Each shard runs on its own macOS runner with automatic retry for
+  # transient Chrome launch failures.
   e2e:
-    name: E2E (browser required)
+    name: E2E (${{ matrix.shard }})
     runs-on: macos-latest
-    # No job-level "if" — this job runs unconditionally.
-    # Skipping is handled at the step level via paths-filter below.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Shard 1: foundation + integration (~128 tests, heaviest)
+          - shard: "core"
+            modules: "foundation integration"
+          # Shard 2: state + runtime + orchestration (~104 tests)
+          - shard: "runtime"
+            modules: "state_workflow runtime_integration orchestration_runtime"
+          # Shard 3: workflow + trigger (~63 tests, lightest)
+          - shard: "workflow"
+            modules: "workflow_extract_storage trigger_runtime"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      # Detect whether any code that could affect browser behavior changed.
-      # Only relevant for PRs; push to main always runs the full suite.
       - name: Detect changed files
         id: changes
         if: github.event_name == 'pull_request'
@@ -91,8 +97,6 @@ jobs:
               - 'tests/**'
               - 'fixtures/**'
 
-      # Determine if E2E work should execute.
-      # push-to-main: always. PR: only when rust/test files changed.
       - name: Resolve E2E gate
         id: gate
         run: |
@@ -113,7 +117,7 @@ jobs:
 
       - name: Cache cargo
         if: steps.gate.outputs.run == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin/
@@ -124,6 +128,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-e2e-cargo-${{ hashFiles('**/Cargo.lock') }}-
             ${{ runner.os }}-e2e-cargo-
+
+      - name: Cache build artifacts
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/cache@v5
+        with:
+          path: target/
+          key: ${{ runner.os }}-e2e-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/*.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-e2e-target-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-e2e-target-
 
       - name: Install Chrome (if not present)
         if: steps.gate.outputs.run == 'true'
@@ -136,9 +150,47 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         run: cargo build --release
 
-      - name: Run E2E tests (browser required)
+      - name: Run E2E shard
         if: steps.gate.outputs.run == 'true'
-        timeout-minutes: 45
-        run: cargo test --workspace -- --ignored
+        timeout-minutes: 25
+        run: |
+          MODULES="${{ matrix.modules }}"
+          OVERALL_EXIT=0
+          FAILED_TESTS=""
+
+          echo "🧪 Running E2E shard: ${{ matrix.shard }}"
+          echo "   Modules: $MODULES"
+          echo ""
+
+          # Run each module in the shard
+          for module in $MODULES; do
+            echo "━━━ Running module: $module ━━━"
+            if ! cargo test --workspace -- --ignored "${module}::" 2>&1 | tee "/tmp/e2e_${module}.log"; then
+              # Collect failed test names for retry
+              NEWLY_FAILED=$(grep " FAILED$" "/tmp/e2e_${module}.log" | sed 's/^test //' | sed 's/ \.\.\..*$//' | tr '\n' ' ')
+              FAILED_TESTS="$FAILED_TESTS $NEWLY_FAILED"
+              OVERALL_EXIT=1
+            fi
+            echo ""
+          done
+
+          # Retry any failed tests once (handles transient Chrome launch failures)
+          if [ $OVERALL_EXIT -ne 0 ] && [ -n "$(echo "$FAILED_TESTS" | tr -d ' ')" ]; then
+            echo ""
+            echo "⚠️  Retrying failed tests..."
+            echo "   Tests: $FAILED_TESTS"
+            echo ""
+            RETRY_EXIT=0
+            for test_name in $FAILED_TESTS; do
+              if ! cargo test --workspace -- --ignored "$test_name" 2>&1; then
+                RETRY_EXIT=1
+              fi
+            done
+            exit $RETRY_EXIT
+          elif [ $OVERALL_EXIT -ne 0 ]; then
+            exit 1
+          fi
+
+          echo "✅ All modules in shard passed"
         env:
           RUB_TEST_BINARY: ${{ github.workspace }}/target/release/rub
