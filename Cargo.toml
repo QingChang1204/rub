@@ -65,7 +65,27 @@ toml = "0.8"
 # Timestamps / RFC3339 formatting + canonical parsing
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 
+# Config for 'cargo dist'
+[workspace.metadata.dist]
+# The preferred cargo-dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.22.1"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# A GitHub repo to push Homebrew formulas to
+tap = "QingChang1204/homebrew-tap"
+# Publish jobs to run in CI
+publish-jobs = ["homebrew"]
+
 [profile.release]
 lto = true
 strip = true
 codegen-units = 1
+
+# The profile that 'cargo dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
