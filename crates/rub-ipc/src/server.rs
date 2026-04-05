@@ -235,11 +235,15 @@ mod tests {
         let root = std::env::temp_dir().join(format!("ri-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&root).expect("create temp root");
         let socket_path = root.join("d.sock");
-        // Bind a second socket at a *different* path to obtain a guaranteed
-        // distinct inode, then use that identity as the "stale" reference.
-        // This avoids relying on inode recycling behaviour after remove+rebind
-        // on the same path, which Linux tmpfs does not guarantee.
         let other_path = root.join("other.sock");
+
+        // Bind both sockets simultaneously. While both files exist at the same
+        // time the OS cannot assign the same inode to both, so the identities
+        // are guaranteed to differ. We capture other.sock's identity as the
+        // "stale" reference, then close it — leaving d.sock as the "live"
+        // replacement. The fence must reject cleaning up d.sock when given
+        // other.sock's stale identity.
+        let live_listener = UnixListener::bind(&socket_path).expect("bind live socket");
         let other_listener = UnixListener::bind(&other_path).expect("bind other socket");
         let stale_identity = {
             let metadata = std::fs::symlink_metadata(&other_path).expect("other metadata");
@@ -248,9 +252,6 @@ mod tests {
         drop(other_listener);
         let _ = std::fs::remove_file(&other_path);
 
-        let live_listener = UnixListener::bind(&socket_path).expect("bind live socket");
-        // The live socket has a different inode from `stale_identity`, so the
-        // fence must reject the replacement attempt.
         let error = stale_socket_replacement_fence(&socket_path, stale_identity)
             .expect_err("replacement socket with different identity must block stale unlink");
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
