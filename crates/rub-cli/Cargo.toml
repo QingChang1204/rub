@@ -1,0 +1,35 @@
+[package]
+name = "rub-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "rub"
+path = "src/main.rs"
+
+[dependencies]
+rub-core = { version = "0.1.0", path = "../rub-core" }
+rub-ipc = { version = "0.1.0", path = "../rub-ipc" }
+rub-daemon = { version = "0.1.0", path = "../rub-daemon" }
+rub-cdp = { version = "0.1.0", path = "../rub-cdp" }
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+libc.workspace = true
+toml.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+serial_test = "3.2.0"
+rub-test-harness = { path = "../rub-test-harness" }

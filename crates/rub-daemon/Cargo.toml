@@ -1,0 +1,27 @@
+[package]
+name = "rub-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rub-core = { version = "0.1.0", path = "../rub-core" }
+rub-cdp = { version = "0.1.0", path = "../rub-cdp" }
+rub-ipc = { version = "0.1.0", path = "../rub-ipc" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+base64.workspace = true
+time.workspace = true
+libc.workspace = true
+futures.workspace = true
+reqwest.workspace = true

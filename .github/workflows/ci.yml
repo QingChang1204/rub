@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Tier 1: Static analysis + unit/contract tests ──────────────────────────
+  # Runs on every push and PR. No browser required. Must pass to merge.
+  check:
+    name: Check & Test (unit)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy (includes test code)
+        run: cargo clippy --tests -- -D warnings
+
+      - name: Build (dev)
+        run: cargo build --workspace
+
+      - name: Test (unit + contract, no browser)
+        run: cargo test --workspace
+
+      - name: Release build
+        run: cargo build --release
+
+  # ── Tier 2: Browser E2E integration tests ──────────────────────────────────
+  # This job ALWAYS runs for every PR and every push to main.
+  # There is NO label or manual escape hatch at the job level.
+  #
+  # Within the job, paths-filter determines whether actual browser work is
+  # needed. PRs that touch only non-code files (docs, markdown, CI yaml)
+  # will have steps skipped — but the job itself is always present and
+  # visible in the PR check list, so branch protection can require it.
+  #
+  # To run locally: cargo test --workspace -- --ignored
+  e2e:
+    name: E2E (browser required)
+    runs-on: macos-latest
+    # No job-level "if" — this job runs unconditionally.
+    # Skipping is handled at the step level via paths-filter below.
+    steps:
+      - uses: actions/checkout@v4
+
+      # Detect whether any code that could affect browser behavior changed.
+      # Only relevant for PRs; push to main always runs the full suite.
+      - name: Detect changed files
+        id: changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust:
+              - 'crates/**/*.rs'
+              - 'crates/**/Cargo.toml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '**/build.rs'
+              - 'tests/**'
+              - 'fixtures/**'
+
+      # Determine if E2E work should execute.
+      # push-to-main: always. PR: only when rust/test files changed.
+      - name: Resolve E2E gate
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.changes.outputs.rust }}" = "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No browser-affecting files changed — E2E skipped."
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.gate.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+
+      - name: Cache cargo
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-e2e-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Chrome (if not present)
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          if ! command -v google-chrome &>/dev/null && ! command -v chromium-browser &>/dev/null; then
+            brew install --cask google-chrome || true
+          fi
+
+      - name: Build rub binary
+        if: steps.gate.outputs.run == 'true'
+        run: cargo build --release
+
+      - name: Run E2E tests (browser required)
+        if: steps.gate.outputs.run == 'true'
+        timeout-minutes: 15
+        run: cargo test --workspace -- --ignored
+        env:
+          RUB_TEST_BINARY: ${{ github.workspace }}/target/release/rub
