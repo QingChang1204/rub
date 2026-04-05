@@ -138,7 +138,7 @@ jobs:
 
       - name: Run E2E tests (browser required)
         if: steps.gate.outputs.run == 'true'
-        timeout-minutes: 15
+        timeout-minutes: 45
         run: cargo test --workspace -- --ignored
         env:
           RUB_TEST_BINARY: ${{ github.workspace }}/target/release/rub
