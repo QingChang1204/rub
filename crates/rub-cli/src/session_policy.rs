@@ -568,7 +568,71 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn parse_connection_request_allows_profile_when_user_data_dir_only_comes_from_config_default() {
+        let mock_home =
+            std::env::temp_dir().join(format!("rub-mock-profile-{}", std::process::id()));
+        std::fs::create_dir_all(mock_home.join("google-chrome/Default")).unwrap();
+        std::fs::create_dir_all(
+            mock_home.join("Library/Application Support/Google/Chrome/Default"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(mock_home.join("Google/Chrome/User Data/Default")).unwrap();
+        let local_state = r#"{"profile":{"info_cache":{"Default":{"name":"Default"}}}}"#;
+        std::fs::write(mock_home.join("google-chrome/Local State"), local_state).unwrap();
+        std::fs::write(
+            mock_home.join("Library/Application Support/Google/Chrome/Local State"),
+            local_state,
+        )
+        .unwrap();
+        std::fs::write(
+            mock_home.join("Google/Chrome/User Data/Local State"),
+            local_state,
+        )
+        .unwrap();
+
+        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let old_home = std::env::var("HOME").ok();
+        let old_localappdata = std::env::var("LOCALAPPDATA").ok();
+
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &mock_home);
+            std::env::set_var("HOME", &mock_home);
+            std::env::set_var("LOCALAPPDATA", &mock_home);
+        }
+
+        struct EnvGuard {
+            old_xdg: Option<String>,
+            old_home: Option<String>,
+            old_localappdata: Option<String>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    if let Some(v) = &self.old_xdg {
+                        std::env::set_var("XDG_CONFIG_HOME", v);
+                    } else {
+                        std::env::remove_var("XDG_CONFIG_HOME");
+                    }
+                    if let Some(v) = &self.old_home {
+                        std::env::set_var("HOME", v);
+                    } else {
+                        std::env::remove_var("HOME");
+                    }
+                    if let Some(v) = &self.old_localappdata {
+                        std::env::set_var("LOCALAPPDATA", v);
+                    } else {
+                        std::env::remove_var("LOCALAPPDATA");
+                    }
+                }
+            }
+        }
+        let _guard = EnvGuard {
+            old_xdg,
+            old_home,
+            old_localappdata,
+        };
+
         let mut cli = cli_with(Commands::Doctor);
         cli.profile = Some("Default".to_string());
         cli.user_data_dir = Some("/tmp/config-default-root".to_string());
@@ -577,6 +641,8 @@ mod tests {
 
         let request = parse_connection_request(&cli).expect("config default should not conflict");
         assert!(matches!(request, ConnectionRequest::Profile { .. }));
+
+        let _ = std::fs::remove_dir_all(mock_home);
     }
 
     #[test]

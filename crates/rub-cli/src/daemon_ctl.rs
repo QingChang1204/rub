@@ -2133,6 +2133,7 @@ mod tests {
         std::fs::write(runtime.pid_path(), std::process::id().to_string()).unwrap();
         std::fs::write(runtime.startup_committed_path(), "sess-default").unwrap();
         let stale_socket = runtime.socket_path();
+        std::fs::create_dir_all(stale_socket.parent().unwrap()).unwrap();
         std::fs::write(&stale_socket, b"").unwrap();
         write_registry(
             &home,
@@ -2196,6 +2197,7 @@ mod tests {
         std::fs::write(runtime.startup_committed_path(), "sess-default").unwrap();
 
         let socket_path = runtime.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).unwrap();
         write_registry(
@@ -2314,8 +2316,9 @@ mod tests {
         std::fs::write(live_runtime.pid_path(), std::process::id().to_string()).unwrap();
         std::fs::write(pending_runtime.pid_path(), std::process::id().to_string()).unwrap();
         std::fs::write(projection.startup_committed_path(), "sess-live").unwrap();
+        std::fs::create_dir_all(pending_runtime.socket_path().parent().unwrap()).unwrap();
         std::fs::write(pending_runtime.socket_path(), b"pending").unwrap();
-
+        std::fs::create_dir_all(live_runtime.socket_path().parent().unwrap()).unwrap();
         let listener = StdUnixListener::bind(live_runtime.socket_path()).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -2533,7 +2536,9 @@ mod tests {
                 std::fs::create_dir_all(parent).unwrap();
             }
         }
+        std::fs::create_dir_all(session_paths.canonical_socket_path().parent().unwrap()).unwrap();
         std::fs::write(session_paths.canonical_socket_path(), b"").unwrap();
+        std::fs::create_dir_all(session_paths.socket_path().parent().unwrap()).unwrap();
         std::fs::write(session_paths.socket_path(), b"").unwrap();
 
         assert_eq!(

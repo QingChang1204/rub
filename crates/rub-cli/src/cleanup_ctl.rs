@@ -857,6 +857,7 @@ mod tests {
         let session_paths = RubPaths::new(&home).session_runtime("default", "sess-pending");
         std::fs::create_dir_all(session_paths.session_dir()).unwrap();
         std::fs::write(session_paths.pid_path(), std::process::id().to_string()).unwrap();
+        std::fs::create_dir_all(session_paths.socket_path().parent().unwrap()).unwrap();
         std::fs::write(session_paths.socket_path(), b"socket").unwrap();
         write_registry(
             &home,
