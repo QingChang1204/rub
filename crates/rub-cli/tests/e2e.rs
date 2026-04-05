@@ -170,6 +170,14 @@ fn parse_json(output: &std::process::Output) -> serde_json::Value {
     })
 }
 
+fn doctor_result(json: &serde_json::Value) -> &serde_json::Value {
+    &json["data"]["result"]
+}
+
+fn doctor_runtime(json: &serde_json::Value) -> &serde_json::Value {
+    &json["data"]["runtime"]
+}
+
 fn wait_for_pending_dialog(home: &str) -> serde_json::Value {
     for _ in 0..40 {
         let out = rub_cmd(home).arg("dialog").output().unwrap();

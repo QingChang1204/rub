@@ -3576,9 +3576,10 @@ fn t433_runtime_downloads_projects_registry() {
     );
 
     let doctor = parse_json(&rub_cmd(&home).arg("doctor").output().unwrap());
+    let doctor_runtime = doctor_runtime(&doctor);
     assert_eq!(doctor["success"], true, "{doctor}");
     assert_eq!(
-        doctor["data"]["runtime"]["last_download"]["guid"],
+        doctor_runtime["download_runtime"]["last_download"]["guid"],
         runtime["data"]["result"]["last_download"]["guid"],
         "{doctor}"
     );

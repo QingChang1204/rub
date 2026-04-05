@@ -160,7 +160,7 @@ pub async fn execute_js_in_context(
         builder = builder.context_id(context_id);
     }
     let result = page
-        .execute(
+        .evaluate(
             builder
                 .build()
                 .map_err(|e| RubError::Internal(format!("Build evaluate params failed: {e}")))?,
@@ -169,11 +169,7 @@ pub async fn execute_js_in_context(
         .map_err(|e| {
             RubError::domain(ErrorCode::JsEvalError, format!("JS evaluation failed: {e}"))
         })?;
-    Ok(result
-        .result
-        .result
-        .value
-        .unwrap_or(serde_json::Value::Null))
+    Ok(result.value().cloned().unwrap_or(serde_json::Value::Null))
 }
 
 #[cfg(test)]

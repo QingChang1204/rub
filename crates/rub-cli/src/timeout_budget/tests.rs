@@ -1423,6 +1423,25 @@ fn type_request_rejects_ambiguous_locator_before_bootstrap() {
 }
 
 #[test]
+fn type_request_allows_focused_text_target_without_locator_before_bootstrap() {
+    let cli = cli_with(Commands::Type {
+        index: None,
+        target: ElementAddressArgs::default(),
+        clear: false,
+        text: "hello".to_string(),
+        wait_after: WaitAfterArgs::default(),
+    });
+
+    let request = build_request(&cli).expect("focused target typing should build");
+    assert_eq!(request.command, "type");
+    assert_eq!(request.args["text"], "hello");
+    assert_eq!(request.args["clear"], false);
+    assert!(request.args["index"].is_null());
+    assert!(request.args["selector"].is_null());
+    assert!(request.args["target_text"].is_null());
+}
+
+#[test]
 fn hover_request_rejects_match_selection_with_index_before_bootstrap() {
     let cli = cli_with(Commands::Hover {
         index: Some(0),

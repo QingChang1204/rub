@@ -134,21 +134,19 @@ fn t386_doctor_runtime_observatory_captures_console_and_request_signals() {
 
     let out = rub_cmd(&home).arg("doctor").output().unwrap();
     let json = parse_json(&out);
+    let runtime = doctor_runtime(&json);
     assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["runtime_observatory"]["status"], "active");
-    assert_eq!(
-        json["data"]["integration_runtime"]["observatory_ready"],
-        true
-    );
+    assert_eq!(runtime["runtime_observatory"]["status"], "active");
+    assert_eq!(runtime["integration_runtime"]["observatory_ready"], true);
     assert!(
-        json["data"]["runtime_observatory"]["recent_console_errors"]
+        runtime["runtime_observatory"]["recent_console_errors"]
             .as_array()
             .unwrap()
             .iter()
             .any(|event| event["message"].as_str() == Some("rub observatory"))
     );
     assert!(
-        json["data"]["runtime_observatory"]["recent_requests"]
+        runtime["runtime_observatory"]["recent_requests"]
             .as_array()
             .unwrap()
             .iter()
@@ -193,20 +191,21 @@ fn t387_doctor_state_inspector_and_readiness_capture_live_page_state() {
 
     let out = rub_cmd(&home).arg("doctor").output().unwrap();
     let json = parse_json(&out);
+    let runtime = doctor_runtime(&json);
     assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["state_inspector"]["status"], "active");
-    assert_eq!(json["data"]["state_inspector"]["auth_state"], "unknown");
-    assert_eq!(json["data"]["state_inspector"]["cookie_count"], 0);
+    assert_eq!(runtime["state_inspector"]["status"], "active");
+    assert_eq!(runtime["state_inspector"]["auth_state"], "unknown");
+    assert_eq!(runtime["state_inspector"]["cookie_count"], 0);
     assert_eq!(
-        json["data"]["state_inspector"]["local_storage_keys"],
+        runtime["state_inspector"]["local_storage_keys"],
         json!(["token"])
     );
     assert_eq!(
-        json["data"]["state_inspector"]["session_storage_keys"],
+        runtime["state_inspector"]["session_storage_keys"],
         json!(["csrf"])
     );
     assert_eq!(
-        json["data"]["state_inspector"]["auth_signals"],
+        runtime["state_inspector"]["auth_signals"],
         json!([
             "local_storage_present",
             "session_storage_present",
@@ -214,41 +213,38 @@ fn t387_doctor_state_inspector_and_readiness_capture_live_page_state() {
         ])
     );
     assert_eq!(
-        json["data"]["integration_runtime"]["state_inspector_ready"],
+        runtime["integration_runtime"]["state_inspector_ready"],
         true
     );
 
-    assert_eq!(json["data"]["readiness_state"]["status"], "active");
-    assert_eq!(json["data"]["readiness_state"]["route_stability"], "stable");
-    assert_eq!(json["data"]["readiness_state"]["loading_present"], false);
-    assert_eq!(json["data"]["readiness_state"]["skeleton_present"], false);
-    assert_eq!(json["data"]["readiness_state"]["overlay_state"], "none");
+    assert_eq!(runtime["readiness_state"]["status"], "active");
+    assert_eq!(runtime["readiness_state"]["route_stability"], "stable");
+    assert_eq!(runtime["readiness_state"]["loading_present"], false);
+    assert_eq!(runtime["readiness_state"]["skeleton_present"], false);
+    assert_eq!(runtime["readiness_state"]["overlay_state"], "none");
     assert_eq!(
-        json["data"]["readiness_state"]["document_ready_state"],
+        runtime["readiness_state"]["document_ready_state"],
         "complete"
     );
+    assert_eq!(runtime["readiness_state"]["blocking_signals"], json!([]));
+    assert_eq!(runtime["integration_runtime"]["readiness_ready"], true);
     assert_eq!(
-        json["data"]["readiness_state"]["blocking_signals"],
-        json!([])
-    );
-    assert_eq!(json["data"]["integration_runtime"]["readiness_ready"], true);
-    assert_eq!(
-        json["data"]["human_verification_handoff"]["status"],
+        runtime["human_verification_handoff"]["status"],
         "unavailable"
     );
     assert_eq!(
-        json["data"]["human_verification_handoff"]["automation_paused"],
+        runtime["human_verification_handoff"]["automation_paused"],
         false
     );
     assert_eq!(
-        json["data"]["human_verification_handoff"]["resume_supported"],
+        runtime["human_verification_handoff"]["resume_supported"],
         false
     );
     assert_eq!(
-        json["data"]["human_verification_handoff"]["unavailable_reason"],
+        runtime["human_verification_handoff"]["unavailable_reason"],
         "session_not_user_accessible"
     );
-    assert_eq!(json["data"]["integration_runtime"]["handoff_ready"], false);
+    assert_eq!(runtime["integration_runtime"]["handoff_ready"], false);
 
     cleanup(&home);
 }
@@ -272,20 +268,18 @@ fn t388_doctor_reports_handoff_available_for_external_session() {
         .output()
         .unwrap();
     let json = parse_json(&out);
+    let runtime = doctor_runtime(&json);
     assert_eq!(json["success"], true, "{json}");
+    assert_eq!(runtime["human_verification_handoff"]["status"], "available");
     assert_eq!(
-        json["data"]["human_verification_handoff"]["status"],
-        "available"
-    );
-    assert_eq!(
-        json["data"]["human_verification_handoff"]["automation_paused"],
+        runtime["human_verification_handoff"]["automation_paused"],
         false
     );
     assert_eq!(
-        json["data"]["human_verification_handoff"]["resume_supported"],
+        runtime["human_verification_handoff"]["resume_supported"],
         true
     );
-    assert_eq!(json["data"]["integration_runtime"]["handoff_ready"], true);
+    assert_eq!(runtime["integration_runtime"]["handoff_ready"], true);
 
     let _ = rub_cmd(&home).arg("close").output();
     terminate_external_chrome(&mut chrome);
@@ -740,12 +734,10 @@ fn t390_intercept_rewrite_round_trip() {
     assert_eq!(added["data"]["runtime"]["request_rule_count"], 1, "{added}");
 
     let doctor = parse_json(&rub_cmd(&home).arg("doctor").output().unwrap());
+    let runtime = doctor_runtime(&doctor);
     assert_eq!(doctor["success"], true, "{doctor}");
-    assert_eq!(doctor["data"]["integration_runtime"]["status"], "active");
-    assert_eq!(
-        doctor["data"]["integration_runtime"]["request_rule_count"],
-        1
-    );
+    assert_eq!(runtime["integration_runtime"]["status"], "active");
+    assert_eq!(runtime["integration_runtime"]["request_rule_count"], 1);
 
     let listed = parse_json(&rub_cmd(&home).args(["intercept", "list"]).output().unwrap());
     assert_eq!(listed["success"], true, "{listed}");
@@ -786,9 +778,10 @@ fn t390_intercept_rewrite_round_trip() {
     assert_eq!(mocked["data"]["result"], "mock");
 
     let doctor = parse_json(&rub_cmd(&home).arg("doctor").output().unwrap());
+    let runtime = doctor_runtime(&doctor);
     assert_eq!(doctor["success"], true, "{doctor}");
     assert!(
-        doctor["data"]["runtime_observatory"]["recent_requests"]
+        runtime["runtime_observatory"]["recent_requests"]
             .as_array()
             .unwrap()
             .iter()
@@ -904,9 +897,10 @@ fn t391_intercept_block_correlates_network_failure() {
     assert_eq!(waited["success"], true, "{waited}");
 
     let doctor = parse_json(&rub_cmd(&home).arg("doctor").output().unwrap());
+    let runtime = doctor_runtime(&doctor);
     assert_eq!(doctor["success"], true, "{doctor}");
     assert!(
-        doctor["data"]["runtime_observatory"]["recent_network_failures"]
+        runtime["runtime_observatory"]["recent_network_failures"]
             .as_array()
             .unwrap()
             .iter()
@@ -991,9 +985,10 @@ fn t392_intercept_header_override_round_trip() {
     );
 
     let doctor = parse_json(&rub_cmd(&home).arg("doctor").output().unwrap());
+    let runtime = doctor_runtime(&doctor);
     assert_eq!(doctor["success"], true, "{doctor}");
     assert!(
-        doctor["data"]["runtime_observatory"]["recent_requests"]
+        runtime["runtime_observatory"]["recent_requests"]
             .as_array()
             .unwrap()
             .iter()

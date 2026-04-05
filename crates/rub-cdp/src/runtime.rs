@@ -8,19 +8,16 @@ use tokio::time::{Duration, Instant, sleep};
 
 use crate::browser::BrowserLaunchOptions;
 use crate::identity_policy::IdentityPolicy;
-use crate::managed_browser::resolve_managed_profile_dir;
+use crate::managed_browser::{is_profile_in_use, resolve_managed_profile_dir};
 
 pub(crate) async fn launch_managed_browser(
     options: &BrowserLaunchOptions,
     identity_policy: &IdentityPolicy,
 ) -> Result<(Arc<Browser>, Arc<Page>), RubError> {
     let config = build_managed_config(options, identity_policy)?;
-    let (mut browser, handler) = Browser::launch(config).await.map_err(|e| {
-        RubError::domain(
-            ErrorCode::BrowserLaunchFailed,
-            format!("Failed to launch browser: {e}"),
-        )
-    })?;
+    let (mut browser, handler) = Browser::launch(config)
+        .await
+        .map_err(|e| classify_managed_launch_error(options, &e.to_string()))?;
     spawn_handler_loop(handler);
 
     let page = crate::tab_projection::wait_for_startup_page(&mut browser).await?;
@@ -214,15 +211,57 @@ pub(crate) fn select_attached_page_index(
     select_attached_external_page_index(page_target_ids, attached_target_ids)
 }
 
+fn classify_managed_launch_error(options: &BrowserLaunchOptions, error: &str) -> RubError {
+    let profile = resolve_managed_profile_dir(options.user_data_dir.clone());
+    let context = serde_json::json!({
+        "user_data_dir": profile.path.display().to_string(),
+    });
+    if browser_launch_error_is_profile_in_use(error)
+        || is_profile_in_use(&profile.path).unwrap_or(false)
+    {
+        return RubError::domain_with_context(
+            ErrorCode::ProfileInUse,
+            format!(
+                "Browser profile {} is already in use by another browser process",
+                profile.path.display()
+            ),
+            context,
+        );
+    }
+
+    RubError::domain_with_context(
+        ErrorCode::BrowserLaunchFailed,
+        format!("Failed to launch browser: {error}"),
+        context,
+    )
+}
+
+fn browser_launch_error_is_profile_in_use(error: &str) -> bool {
+    error.contains("Failed to create a ProcessSingleton")
+        || error.contains("SingletonLock")
+        || error.contains("profile appears to be in use")
+}
+
 fn build_managed_config(
     options: &BrowserLaunchOptions,
     identity_policy: &IdentityPolicy,
+) -> Result<BrowserConfig, RubError> {
+    build_managed_config_with_executable(options, identity_policy, None)
+}
+
+fn build_managed_config_with_executable(
+    options: &BrowserLaunchOptions,
+    identity_policy: &IdentityPolicy,
+    executable_override: Option<&std::path::Path>,
 ) -> Result<BrowserConfig, RubError> {
     let mut config_builder = if options.headless {
         BrowserConfig::builder().new_headless_mode()
     } else {
         BrowserConfig::builder().with_head()
     };
+    if let Some(executable) = executable_override {
+        config_builder = config_builder.chrome_executable(executable);
+    }
     if options.ignore_cert_errors {
         config_builder = config_builder.arg("--ignore-certificate-errors");
     }
@@ -275,7 +314,8 @@ fn spawn_handler_loop(mut handler: chromiumoxide::handler::Handler) {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_managed_config, select_attached_external_page_index, select_attached_page_index,
+        browser_launch_error_is_profile_in_use, build_managed_config_with_executable,
+        select_attached_external_page_index, select_attached_page_index,
     };
     use crate::browser::BrowserLaunchOptions;
     use crate::identity_policy::IdentityPolicy;
@@ -331,7 +371,13 @@ mod tests {
     fn headed_launch_config_explicitly_disables_headless_mode() {
         let options = options(false);
         let identity_policy = IdentityPolicy::from_options(&options);
-        let config = build_managed_config(&options, &identity_policy).expect("config should build");
+        let executable = std::env::current_exe().expect("current test binary should exist");
+        let config = build_managed_config_with_executable(
+            &options,
+            &identity_policy,
+            Some(executable.as_path()),
+        )
+        .expect("config should build");
         let debug = format!("{config:?}");
 
         assert!(debug.contains("headless: False"), "{debug}");
@@ -341,9 +387,28 @@ mod tests {
     fn headless_launch_config_uses_new_headless_mode() {
         let options = options(true);
         let identity_policy = IdentityPolicy::from_options(&options);
-        let config = build_managed_config(&options, &identity_policy).expect("config should build");
+        let executable = std::env::current_exe().expect("current test binary should exist");
+        let config = build_managed_config_with_executable(
+            &options,
+            &identity_policy,
+            Some(executable.as_path()),
+        )
+        .expect("config should build");
         let debug = format!("{config:?}");
 
         assert!(debug.contains("headless: New"), "{debug}");
+    }
+
+    #[test]
+    fn process_singleton_launch_error_is_classified_as_profile_in_use() {
+        assert!(browser_launch_error_is_profile_in_use(
+            "Failed to create a ProcessSingleton for your profile directory",
+        ));
+        assert!(browser_launch_error_is_profile_in_use(
+            "Failed to create /tmp/profile/SingletonLock: File exists",
+        ));
+        assert!(!browser_launch_error_is_profile_in_use(
+            "Could not auto detect a chrome executable",
+        ));
     }
 }

@@ -11,9 +11,9 @@ pub(crate) use self::budget::WAIT_IPC_BUFFER_MS;
 use self::budget::{command_timeout_ms, humanize_budget_ms_for_command_args};
 use self::helpers::{
     WaitProbeArgs, element_address_args, merge_json_objects, mutating_request,
-    observation_projection_args, observation_scope_args, parse_indexed_operand, resolve_cli_path,
-    resolve_inspect_list_spec_source, resolve_json_spec_source, resolve_pipe_spec,
-    wait_command_args, with_wait_after,
+    observation_projection_args, observation_scope_args, optional_element_address_args,
+    parse_indexed_operand, resolve_cli_path, resolve_inspect_list_spec_source,
+    resolve_json_spec_source, resolve_pipe_spec, wait_command_args, with_wait_after,
 };
 use self::subcommands::{
     build_cookies_request, build_dialog_request, build_download_request, build_get_request,
@@ -331,7 +331,7 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
             "type",
             with_wait_after(
                 merge_json_objects(
-                    element_address_args(*index, target)?,
+                    optional_element_address_args(*index, target)?,
                     serde_json::json!({
                         "text": text,
                         "clear": clear,

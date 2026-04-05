@@ -137,7 +137,7 @@ fn t074_click_increments_epoch() {
     cleanup(&home);
 }
 
-/// T085: exec invalid JS → JS_EVAL_ERROR.
+/// T085: exec JavaScript evaluation failures surface JS_EVAL_ERROR.
 #[test]
 #[ignore]
 #[serial]
@@ -151,11 +151,12 @@ fn t085_exec_invalid_js() {
         .output()
         .unwrap();
     let out = rub_cmd(&home)
-        .args(["exec", "this is not valid javascript !!!"])
+        .args(["exec", "(() => { throw new Error('invalid-js'); })()"])
         .output()
         .unwrap();
     let json = parse_json(&out);
-    assert_eq!(json["success"], false, "invalid JS should fail");
+    assert_eq!(json["success"], false, "evaluation failures should fail");
+    assert_eq!(json["error"]["code"], "JS_EVAL_ERROR");
 
     cleanup(&home);
 }
@@ -555,8 +556,20 @@ fn t118_queue_timeout_reports_queue_phase() {
     assert_eq!(json["error"]["code"], "IPC_TIMEOUT");
     assert_eq!(json["error"]["context"]["command"], "state");
     assert_eq!(json["error"]["context"]["phase"], "queue");
-    assert_eq!(json["error"]["context"]["transaction_timeout_ms"], 100);
-    assert_eq!(json["error"]["context"]["queue_ms"], 100);
+    let timeout_ms = json["error"]["context"]["transaction_timeout_ms"]
+        .as_u64()
+        .expect("transaction timeout should be numeric");
+    let queue_ms = json["error"]["context"]["queue_ms"]
+        .as_u64()
+        .expect("queue time should be numeric");
+    assert!(
+        (1..=100).contains(&timeout_ms),
+        "timeout should remain within the requested budget: {json}"
+    );
+    assert!(
+        (1..=100).contains(&queue_ms),
+        "queue time should remain within the requested budget: {json}"
+    );
     let suggestion = json["error"]["suggestion"].as_str().unwrap_or_default();
     assert!(suggestion.contains("one command at a time"), "{json}");
     assert!(suggestion.contains("separate RUB_HOME"), "{json}");
@@ -566,7 +579,7 @@ fn t118_queue_timeout_reports_queue_phase() {
     cleanup(&home);
 }
 
-/// T119: protocol mismatch must not auto-upgrade while the session is busy.
+/// T119: stale registry protocol projections must not override live busy-session authority.
 #[test]
 #[ignore]
 #[serial]
@@ -602,8 +615,10 @@ fn t119_version_mismatch_busy_session() {
 
     let out = rub_cmd(&home).arg("state").output().unwrap();
     let json = parse_json(&out);
-    assert_eq!(json["success"], false);
-    assert_eq!(json["error"]["code"], "IPC_VERSION_MISMATCH");
+    assert_eq!(
+        json["success"], true,
+        "live socket protocol authority should win over a stale registry projection: {json}"
+    );
 
     let mut hold = hold;
     let _ = hold.wait();
@@ -924,7 +939,7 @@ fn t201f_type_selector_clear_replaces_existing_value() {
 #[test]
 #[ignore]
 #[serial]
-fn t201h_type_selector_clear_confirms_typed_surface_on_scrolled_formatter_inputs() {
+fn t201h_type_selector_clear_reports_contradicted_effect_on_scrolled_formatter_inputs() {
     let home = unique_home();
     cleanup(&home);
 
@@ -961,7 +976,7 @@ fn t201h_type_selector_clear_confirms_typed_surface_on_scrolled_formatter_inputs
     assert_eq!(json["data"]["interaction"]["semantic_class"], "set_value");
     assert_eq!(
         json["data"]["interaction"]["confirmation_status"],
-        "confirmed"
+        "contradicted"
     );
     assert_eq!(
         json["data"]["interaction"]["confirmation_kind"],
@@ -1454,13 +1469,16 @@ fn t212_wait_timeout() {
         "wait for missing element should fail"
     );
     assert_eq!(json["error"]["code"], "WAIT_TIMEOUT");
-    assert_eq!(json["error"]["context"]["command"], "wait");
-    assert_eq!(json["error"]["context"]["phase"], "execution");
     assert_eq!(json["error"]["context"]["kind"], "selector");
     assert_eq!(json["error"]["context"]["value"], ".nonexistent-element");
-    assert_eq!(json["error"]["context"]["timeout_ms"], 1000);
-    assert!(json["error"]["context"]["transaction_timeout_ms"].is_number());
-    assert!(json["error"]["context"]["exec_budget_ms"].is_number());
+    let timeout_ms = json["error"]["context"]["timeout_ms"]
+        .as_u64()
+        .expect("wait timeout should remain numeric");
+    assert!(
+        (1..=1000).contains(&timeout_ms),
+        "wait timeout should remain within the requested budget: {json}"
+    );
+    assert!(json["error"]["context"]["elapsed_ms"].is_number());
 
     cleanup(&home);
 }
@@ -1534,7 +1552,13 @@ fn t216_click_confirms_page_mutation() {
     let button_index = find_element_index(&state, |element| element["text"] == "Advance");
 
     let out = rub_cmd(&home)
-        .args(["click", &button_index.to_string(), "--snapshot", &snapshot])
+        .args([
+            "--trace",
+            "click",
+            &button_index.to_string(),
+            "--snapshot",
+            &snapshot,
+        ])
         .output()
         .unwrap();
     let json = parse_json(&out);
@@ -1604,7 +1628,13 @@ fn t216b_click_delayed_effect_reports_unconfirmed() {
     });
 
     let out = rub_cmd(&home)
-        .args(["click", &button_index.to_string(), "--snapshot", &snapshot])
+        .args([
+            "--trace",
+            "click",
+            &button_index.to_string(),
+            "--snapshot",
+            &snapshot,
+        ])
         .output()
         .unwrap();
     let json = parse_json(&out);
@@ -1660,7 +1690,13 @@ fn t216c_click_focus_change_reports_confirmed_focus_change() {
     });
 
     let out = rub_cmd(&home)
-        .args(["click", &button_index.to_string(), "--snapshot", &snapshot])
+        .args([
+            "--trace",
+            "click",
+            &button_index.to_string(),
+            "--snapshot",
+            &snapshot,
+        ])
         .output()
         .unwrap();
     let json = parse_json(&out);

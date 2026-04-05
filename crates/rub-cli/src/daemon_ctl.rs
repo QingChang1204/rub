@@ -1419,19 +1419,29 @@ async fn hard_cut_outdated_daemon(
     Ok(())
 }
 
+async fn probe_upgrade_check(client: &mut IpcClient, session_name: &str) -> Result<(), RubError> {
+    client
+        .send(&IpcRequest::new(
+            "_upgrade_check",
+            serde_json::json!({}),
+            3_000,
+        ))
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            RubError::domain(
+                ErrorCode::IpcProtocolError,
+                format!("Failed to fetch upgrade status for session '{session_name}': {error}"),
+            )
+        })
+}
+
 async fn detect_or_connect_hardened(
     rub_home: &Path,
     session_name: &str,
     transient_socket_policy: TransientSocketPolicy,
 ) -> Result<DaemonConnection, RubError> {
     let authority_entry = registry_entry_by_name(rub_home, session_name)?;
-    if let Some(entry) = authority_entry.as_ref()
-        && entry.ipc_protocol_version != rub_ipc::protocol::IPC_PROTOCOL_VERSION
-    {
-        hard_cut_outdated_daemon(rub_home, session_name, entry).await?;
-        return Ok(DaemonConnection::NeedStart);
-    }
-
     let socket_paths = socket_candidates_for_session(authority_entry.as_ref())?;
 
     if socket_paths.is_empty() {
@@ -1448,6 +1458,38 @@ async fn detect_or_connect_hardened(
         .await
         {
             Ok((mut handshake_client, _attribution)) => {
+                let mut requires_handshake_reconnect = false;
+                if let Some(entry) = authority_entry.as_ref()
+                    && entry.ipc_protocol_version != rub_ipc::protocol::IPC_PROTOCOL_VERSION
+                {
+                    match probe_upgrade_check(&mut handshake_client, session_name).await {
+                        Ok(()) => requires_handshake_reconnect = true,
+                        Err(_) => {
+                            // Only a successful live probe can override a stale registry
+                            // protocol projection. Otherwise we fall back to the restart path.
+                            // The probe consumes a single-use IPC client, so the handshake must
+                            // reconnect on success.
+                            //
+                            // This keeps protocol authority with the live daemon while honoring
+                            // the one-request-per-connection transport contract.
+                            //
+                            // When the probe fails, we preserve the prior hard-cut/start
+                            // behavior for unreachable or outdated daemons.
+                            hard_cut_outdated_daemon(rub_home, session_name, entry).await?;
+                            return Ok(DaemonConnection::NeedStart);
+                        }
+                    }
+                }
+                if requires_handshake_reconnect {
+                    let (reconnected_client, _attribution) = connect_ipc_with_retry(
+                        &socket_path,
+                        ErrorCode::IpcProtocolError,
+                        "Failed to reconnect to daemon socket after upgrade probe",
+                    )
+                    .await
+                    .map_err(|failure| failure.into_error())?;
+                    handshake_client = reconnected_client;
+                }
                 let handshake = fetch_handshake_info(&mut handshake_client).await?;
                 return maybe_upgrade_if_needed(
                     rub_home,

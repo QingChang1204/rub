@@ -2130,13 +2130,14 @@ fn t311_cdp_url_close_preserves_browser() {
     assert_eq!(parse_json(&out)["success"], true);
 
     let doctor = parse_json(&rub_cmd(&home).arg("doctor").output().unwrap());
+    let report = doctor_result(&doctor);
     assert_eq!(doctor["success"], true, "{doctor}");
     assert_eq!(
-        doctor["data"]["launch_policy"]["connection_target"]["source"],
+        report["launch_policy"]["connection_target"]["source"],
         "cdp_url"
     );
     assert_eq!(
-        doctor["data"]["launch_policy"]["connection_target"]["url"],
+        report["launch_policy"]["connection_target"]["url"],
         cdp_origin
     );
 
@@ -2178,17 +2179,18 @@ fn t320_profile_resolve() {
 
     let out = rub_cmd_env(&home, &envs).arg("doctor").output().unwrap();
     let json = parse_json(&out);
+    let report = doctor_result(&json);
     assert_eq!(json["success"], true);
     assert_eq!(
-        json["data"]["launch_policy"]["connection_target"]["source"],
+        report["launch_policy"]["connection_target"]["source"],
         "profile"
     );
     assert_eq!(
-        json["data"]["launch_policy"]["connection_target"]["name"],
+        report["launch_policy"]["connection_target"]["name"],
         "Default"
     );
     assert_eq!(
-        json["data"]["launch_policy"]["connection_target"]["resolved_path"],
+        report["launch_policy"]["connection_target"]["resolved_path"],
         resolved_profile.display().to_string()
     );
 

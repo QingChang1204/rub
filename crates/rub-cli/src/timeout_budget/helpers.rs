@@ -232,12 +232,28 @@ pub(crate) fn element_address_args(
     index: Option<u32>,
     target: &ElementAddressArgs,
 ) -> Result<serde_json::Value, RubError> {
+    element_address_args_with_requirement(index, target, true)
+}
+
+pub(crate) fn optional_element_address_args(
+    index: Option<u32>,
+    target: &ElementAddressArgs,
+) -> Result<serde_json::Value, RubError> {
+    element_address_args_with_requirement(index, target, false)
+}
+
+fn element_address_args_with_requirement(
+    index: Option<u32>,
+    target: &ElementAddressArgs,
+    require_target: bool,
+) -> Result<serde_json::Value, RubError> {
     let element_ref = non_empty_arg(target.element_ref.as_deref());
     let selector = non_empty_arg(target.selector.as_deref());
     let target_text = non_empty_arg(target.target_text.as_deref());
     let role = non_empty_arg(target.role.as_deref());
     let label = non_empty_arg(target.label.as_deref());
     let testid = non_empty_arg(target.testid.as_deref());
+    let snapshot = non_empty_arg(target.snapshot.as_deref());
     validate_selection_flags(
         target.first,
         target.last,
@@ -253,10 +269,24 @@ pub(crate) fn element_address_args(
         + label.is_some() as u8
         + testid.is_some() as u8;
     if configured == 0 {
-        return Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            "Missing required target: provide <index>, --ref, --selector, --target-text, --role, --label, or --testid",
-        ));
+        if snapshot.is_some() {
+            return Err(RubError::domain(
+                ErrorCode::InvalidInput,
+                "Snapshot targeting requires <index>, --ref, --selector, --target-text, --role, --label, or --testid",
+            ));
+        }
+        if selection_requested(target.first, target.last, target.nth) {
+            return Err(RubError::domain(
+                ErrorCode::InvalidInput,
+                "Match selection requires --selector, --target-text, --role, --label, or --testid",
+            ));
+        }
+        if require_target {
+            return Err(RubError::domain(
+                ErrorCode::InvalidInput,
+                "Missing required target: provide <index>, --ref, --selector, --target-text, --role, --label, or --testid",
+            ));
+        }
     }
     if configured > 1 {
         return Err(RubError::domain(
@@ -279,7 +309,7 @@ pub(crate) fn element_address_args(
 
     Ok(serde_json::json!({
         "index": index,
-        "snapshot_id": target.snapshot,
+        "snapshot_id": snapshot,
         "element_ref": element_ref,
         "selector": selector,
         "target_text": target_text,
