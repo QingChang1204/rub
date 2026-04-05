@@ -225,11 +225,13 @@ mod tests {
         acquire_socket_bind_guard, prepare_socket_path_for_bind, socket_identity,
         stale_socket_replacement_fence,
     };
+    use serial_test::serial;
     use std::os::unix::net::UnixListener;
     use std::sync::mpsc;
     use std::time::Duration;
 
     #[test]
+    #[serial]
     fn stale_socket_fence_rejects_identity_change_before_unlink() {
         let root = std::env::temp_dir().join(format!("ri-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&root).expect("create temp root");
@@ -254,6 +256,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn stale_socket_fence_accepts_same_socket_identity() {
         let root = std::env::temp_dir().join(format!("ri-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&root).expect("create temp root");
