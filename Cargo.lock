@@ -1292,6 +1292,7 @@ dependencies = [
  "rub-core",
  "serde",
  "serde_json",
+ "serial_test",
  "tokio",
  "uuid",
 ]

@@ -231,23 +231,28 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    #[serial]
     fn stale_socket_fence_rejects_identity_change_before_unlink() {
         let root = std::env::temp_dir().join(format!("ri-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&root).expect("create temp root");
         let socket_path = root.join("d.sock");
-
-        let stale_listener = UnixListener::bind(&socket_path).expect("bind stale socket");
-        let identity = {
-            let metadata = std::fs::symlink_metadata(&socket_path).expect("stale metadata");
+        // Bind a second socket at a *different* path to obtain a guaranteed
+        // distinct inode, then use that identity as the "stale" reference.
+        // This avoids relying on inode recycling behaviour after remove+rebind
+        // on the same path, which Linux tmpfs does not guarantee.
+        let other_path = root.join("other.sock");
+        let other_listener = UnixListener::bind(&other_path).expect("bind other socket");
+        let stale_identity = {
+            let metadata = std::fs::symlink_metadata(&other_path).expect("other metadata");
             socket_identity(&metadata)
         };
-        drop(stale_listener);
-        std::fs::remove_file(&socket_path).expect("remove stale socket path");
+        drop(other_listener);
+        let _ = std::fs::remove_file(&other_path);
 
-        let live_listener = UnixListener::bind(&socket_path).expect("bind replacement socket");
-        let error = stale_socket_replacement_fence(&socket_path, identity)
-            .expect_err("replacement socket must block stale unlink");
+        let live_listener = UnixListener::bind(&socket_path).expect("bind live socket");
+        // The live socket has a different inode from `stale_identity`, so the
+        // fence must reject the replacement attempt.
+        let error = stale_socket_replacement_fence(&socket_path, stale_identity)
+            .expect_err("replacement socket with different identity must block stale unlink");
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
 
         drop(live_listener);
