@@ -14,6 +14,53 @@
 
 **rub** is a Rust CLI + persistent daemon for headless browser automation over Chrome DevTools Protocol (CDP). It produces deterministic JSON output, maintains persistent browser sessions, and targets DOM elements through snapshot-based addressing — all designed for reliable AI agent integration without the overhead of Node.js or Python runtimes.
 
+## Why rub?
+
+The following observations come from running rub as an AI agent on real tasks: navigating authenticated Chinese social media sites (Weibo, Baidu, Zhihu) across 7 simultaneous sessions, querying live network traffic, extracting structured page data, and inspecting runtime state between turns. These are measurements and experiences, not claims.
+
+### The core friction with existing tools
+
+When a language model drives a browser through Playwright or Puppeteer, it runs into the same three problems on every task:
+
+**Raw output requires interpretation.** These tools return DOM or screenshots. The agent has to decide what is relevant, parse it, and convert it into something it can act on. On a complex page this can cost thousands of tokens per step, and the interpretation is lossy — the model may focus on the wrong part of the page.
+
+**Every invocation is stateless.** Each tool call typically starts a fresh browser process or reconnects. A task requiring 15 sequential steps pays the browser launch cost 15 times. More importantly, there is no persistent state: cookies, session tokens, and any prior browser context must be reconstructed from scratch.
+
+**Retry is unsafe.** If the model retries a form submit because the response was slow, the form submits twice. There is no built-in deduplication. The agent has to solve this externally, which is complex and error-prone.
+
+### What using rub actually looks like
+
+**State is pre-digested, not raw.** When I call `rub state` on a live Weibo session, the response contains 83 typed elements — each with its tag, visible text, ARIA role, bounding box, a stable `element_ref` handle, and a depth in the DOM tree. The snapshot was taken in 116ms against a session that had been open and authenticated for hours. There is nothing to parse. The agent reads the JSON and acts.
+
+```json
+{
+  "index": 2,
+  "tag": "input",
+  "attributes": {"placeholder": "搜索微博", "type": "text"},
+  "bounding_box": {"x": 194.0, "y": 14.5, "width": 153.0, "height": 32.0},
+  "element_ref": "6F448F458A1D33EFF8F20E8E5E500C10:25"
+}
+```
+
+**`dom_epoch` tells me if the world changed.** Every snapshot carries a monotonic `dom_epoch` counter that increments on navigation. When I ran two consecutive `exec` calls on the Weibo session, I watched it go from `6` to `7` in real time — meaning a navigation event happened between the calls. If my agent holds a stale `element_ref` and the DOM has been replaced, rub rejects the reference with `StaleSnapshot`. This is enforced at the structural level; I don't implement it.
+
+**Sessions persist across every agent turn.** I had 7 browser sessions running simultaneously: `weibo`, `baidu`, `zhihu`, `mytest`, `wiki-test`, `ssq`, `default`. They showed up in a single `rub sessions` call with their PIDs, socket paths, and protocol versions. Switching context is one environment variable: `RUB_SESSION=baidu rub state`. The sessions keep their cookies, their authenticated state, their network history — across as many agent turns as the task requires.
+
+**The network log is always there.** Without setting up any interceptors, the Weibo session had captured **1,024 network requests** in its observatory buffer — GET calls to `rm.api.weibo.com`, XHR polling, resource loads. I can query this at any time with `rub inspect network --match "api/" --method POST`. If the agent needs to extract a bearer token from a request, or verify that a form submission fired a specific API call, the log is already there.
+
+**Errors tell the agent exactly what to do next.** Every error response has a `code` (machine-readable), a `message` (human-readable), a `suggestion` (actionable), and a `context` object (structured data for the failure). When `inspect text` matched 51 elements instead of one, the error said: `"suggestion": "use --first, --last, or --nth to select a single match"`. When `open` timed out, it said: `"suggestion": "use --load-strategy domcontentloaded"`. This is the contract: errors never just fail — they tell the agent what to try next.
+
+**Retry is structurally safe.** A mutating command (click, type, fill, submit) that carries a `command_id` is deduplicated inside the daemon. If the network drops between the command dispatch and the response, the agent can retry with the same `command_id`. The daemon returns the cached original response. The action never runs twice. This works without any coordination logic on the agent side.
+
+**One call gives a health dashboard.** `rub runtime summary` returns the status of every subsystem in one round trip: dialog state (is a JS alert blocking?), frame context (am I in an iframe?), download progress, handoff state, interference mode, network observatory health, orchestration connectivity. When something is wrong and I don't know why, this is the first call I make.
+
+### Who this is for
+
+- **AI agents** that need structured browser output without building a parser around raw DOM or screenshots
+- **LLM pipelines** where authentication state and browser context must survive across multiple tool calls within a conversation turn
+- **Multi-session automation** where separate browser workers need to coordinate — one session monitors, a trigger bridges the condition to an action on a different browser
+- **Production agent infrastructure** that needs at-most-once execution, safe retry, structured error codes, and passive network observability without configuration overhead
+
 ## Features
 
 ### 🤖 Agent-Native Interface
@@ -99,28 +146,74 @@ rub inspect list '{"container": ".product-list", "item": ".product-card", "field
 
 ### 🍪 State Management
 
-**Cookies**
-- `cookies get` (with optional `--url` filter), `cookies set`, `cookies clear`
-- `cookies export` / `cookies import` for session portability
+**Cookies** — full browser cookie jar access:
+```bash
+rub cookies get                       # All cookies for the session
+rub cookies get --url https://api.example.com   # Filter to cookies sent to a URL
+rub cookies set SESSION_ID abc123 --domain example.com --secure --http-only --same-site Strict --expires 1735689600
+rub cookies clear                     # Clear all cookies
+rub cookies clear --url https://example.com     # Clear cookies scoped to a URL
+rub cookies export cookies.json       # Dump all cookies to JSON
+rub cookies import cookies.json       # Restore cookies (session portability)
+```
 
-**Web Storage**
-- `storage get`, `storage set`, `storage remove`, `storage clear` (per-area: `local` / `session`)
-- `storage export` / `storage import` for state snapshots
+**Web Storage** — localStorage and sessionStorage, scoped to the current origin:
+```bash
+rub storage get my_key                # Search both areas
+rub storage get my_key --area local   # Explicit localStorage
+rub storage get my_key --area session # Explicit sessionStorage
+rub storage set token abc123          # Set in both areas (defaults to local)
+rub storage remove token              # Remove from both areas
+rub storage clear --area local        # Clear only localStorage
+rub storage clear                     # Clear both areas
+rub storage export                    # Print snapshot JSON to stdout
+rub storage export --path snap.json   # Write snapshot to a file
+rub storage import snap.json          # Restore all storage keys into the current origin
+```
 
-**Downloads**
-- `downloads` — list download state
-- `download wait` — block until download reaches target state (`completed`, `failed`, etc.)
-- `download cancel` — abort in-progress downloads
+**Downloads** — browser download management:
+```bash
+rub downloads                                 # List all in-flight and completed downloads
+rub download wait                             # Block until any download reaches `completed`
+rub download wait --id <GUID> --state in_progress   # Wait for specific download state
+rub download cancel <GUID>                    # Abort an in-progress download
+```
+
+**Batch Asset Download** (`download save`) — authenticated bulk file fetcher using session cookies:
+```bash
+rub download save \
+  --file urls.txt \
+  --output-dir ./assets
+
+# JSON source with nested path and URL/name fields
+rub download save \
+  --file api_response.json \
+  --input-field data.items \
+  --url-field download_url \
+  --name-field filename \
+  --output-dir ./media \
+  --concurrency 12 \
+  --base-url https://cdn.example.com \
+  --cookie-url https://example.com \
+  --limit 100 \
+  --overwrite
+```
+Reads session cookies from the live browser, sends them as `Cookie` headers during fetch.
 
 **JavaScript Execution**
-- `exec <code>` — evaluate JavaScript and return the result as JSON
-- `exec <code> --raw` — print the raw JS result without the JSON envelope
+```bash
+rub exec "document.title"                   # Returns JSON-encoded result
+rub exec "window.scrollTo(0, 500)" --raw    # Raw JS return value (no JSON wrapper)
+rub exec "JSON.stringify(window.__APP_STATE__)"  # Extract embedded data
+```
 
 **Session Management**
-- `sessions` — list all active named sessions with PID, socket, and metadata
-- `close` — close the current session's browser
-- `close --all` — close every active session across all names
-- `cleanup` — remove stale sockets, orphaned daemon state, and temporary browser artifacts
+```bash
+rub sessions            # List all active sessions (name, PID, socket, protocol version)
+rub close               # Close current session's browser
+rub close --all         # Terminate every active session
+rub cleanup             # Remove stale sockets, orphaned daemon state, temp artifacts
+```
 
 ### 🛡️ Anti-Detection & Stealth
 
@@ -161,53 +254,90 @@ rub history --export-script --output replay.sh
 
 ### 🌍 Network Controls
 
-**Request Interception** (`intercept`)
-- `intercept rewrite` — redirect matching requests to a different base URL
-- `intercept block` — block requests by URL pattern
-- `intercept allow` — explicitly allow requests
-- `intercept header` — override request headers per URL pattern
-- `intercept list` / `intercept remove` / `intercept clear`
+**Request Interception** (`intercept`) — session-scoped CDP `Fetch.enable` rules:
+```bash
+# Rewrite: redirect matching requests to a different base URL
+# Supports exact match or trailing-* prefix patterns
+rub intercept rewrite "https://api.prod.example.com/*" "https://api.staging.example.com"
 
-**Public-Web Interference** (`interference`)
-- Mode-based interference handling: `normal`, `public_web_stable`, `strict`
-- Automatic classification of popups, navigation drift, consent walls
-- `interference recover` for safe automated recovery
+# Block: drop matching requests before they reach the network
+rub intercept block "https://analytics.example.com/*"
+
+# Allow: explicitly pass through requests (takes precedence over block rules)
+rub intercept allow "https://api.example.com/health"
+
+# Header override: inject or replace request headers
+rub intercept header "https://api.example.com/*" Authorization "Bearer my-token"
+rub intercept header "https://api.example.com/*" --header "X-Debug=1" --header "X-Env=staging"
+
+# Manage rules
+rub intercept list              # List all active rules with stable IDs
+rub intercept remove 2          # Remove rule by ID from `list`
+rub intercept clear             # Remove all interception rules
+```
+
+**Public-Web Interference** (`interference`) — automatic popup/overlay detection and recovery:
+```bash
+# Set session interference tolerance mode
+rub interference mode normal          # Default: fail on unexpected navigation
+rub interference mode public_web_stable  # Tolerate popups and consent walls
+rub interference mode strict          # Reject any deviation from expected flow
+
+# Trigger safe automated recovery for the current classified interference
+rub interference recover
+```
+The interference classifier runs on every command cycle and categorizes: cookie consent dialogs, email capture modals, geo-redirect drift, CAPTCHA presence, and login-wall detection.
 
 ### 🤝 Human-in-the-Loop
 
-**Handoff** — pause automation for human verification:
+**Handoff** — pause automation and wait for a human to complete a verification step:
 ```bash
-rub handoff start     # Pause automation
-# ... human takes action ...
-rub handoff complete  # Resume
+rub handoff start     # Pause all automation commands (returns AutomationPaused to callers)
+rub handoff status    # Check current handoff state and who initiated it
+rub handoff complete  # Mark verification done and unblock automation
 ```
+While handoff is active, all automation commands are rejected with `AutomationPaused`. Only `handoff status` and `handoff complete` are allowed through.
 
-**Takeover** — full session accessibility control:
+**Takeover** — full human control of the browser session, designed for supervised automation:
 ```bash
-rub takeover start    # Pause for human control
-rub takeover elevate  # Relaunch headless → headed browser
-rub takeover resume   # Hand back to automation
+rub takeover start    # Pause automation; marks session as human-controlled
+rub takeover status   # Show current takeover state and accessibility binding
+rub takeover elevate  # Re-launch a headless browser into a visible headed window (when supported)
+rub takeover resume   # Hand browser back to automation and unblock commands
 ```
+`elevate` is distinct from `start` — it physically makes the browser window visible for direct interaction, useful when the session was originally launched headless.
 
 ### 🎭 Cross-Session Orchestration
 
-Event-driven rules that survive session restarts and span multiple sessions:
-```bash
-# Register an orchestration rule from a JSON spec file
-rub orchestration add --file rule.json
-rub orchestration add --file rule.json --paused   # Add in paused state
+Event-driven multi-step automation rules that span **multiple named sessions**. A rule has a `source` session (condition evaluation) and a `target` session (action execution). Each rule is a sequenced list of actions executed in order — partial failures report exactly which step failed.
 
-# Manage rules
-rub orchestration list
-rub orchestration execute --id 3   # Run a rule immediately by id
+```bash
+# Register from a JSON spec file or a named asset under RUB_HOME/orchestrations/
+rub orchestration add --file rule.json
+rub orchestration add --asset my-rule          # Load from ~/.rub/orchestrations/my-rule.json
+rub orchestration add --file rule.json --paused  # Register but keep paused
+
+# Manage active rules
+rub orchestration list                          # Show all rules, status, and last result
+rub orchestration execute --id 3               # Execute rule 3 immediately (bypass condition)
 rub orchestration pause 3
 rub orchestration resume 3
 rub orchestration remove 3
-rub orchestration clear
+rub orchestration trace --last 20              # Recent lifecycle/outcome events
 
-# List saved orchestration assets
-rub orchestration list-assets
+# Persist and share rules as named assets
+rub orchestration export 3 --save-as my-rule   # Save to ~/.rub/orchestrations/my-rule.json
+rub orchestration export 3 --output ./rule.json # Export to explicit path
+rub orchestration list-assets                  # List all saved orchestration assets
 ```
+
+**Rule structure** (JSON spec):
+- `mode`: `once` (fires then becomes `fired`) or `repeat` (re-arms after cooldown)
+- `source`: `{session_name, tab_target_id, frame_id}` — where conditions are evaluated
+- `target`: `{session_name}` — where actions are dispatched
+- `actions[]`: ordered list of `{kind: "browser_command"|"workflow", command, payload}`
+- `execution_policy`: `{cooldown_ms, retry_limit}` — up to 3 transient retries with 100ms delay
+- Workflow actions support `vars` (static bindings) and `source_vars` (live bindings read from source tab at dispatch time)
 
 ### 💬 Dialog Handling
 
@@ -219,18 +349,41 @@ rub dialog dismiss                         # Dismiss
 
 ### 🔄 Cross-Tab Triggers
 
-Event-driven automation across browser tabs:
-```bash
-# Register a trigger from a JSON spec file
-rub trigger add --file trigger-spec.json
+Event-driven automation that monitors a **source tab** for a condition and executes an action on a **target tab** when the condition fires. Evaluated every 500ms in a background worker independent of CLI activity.
 
-# Manage triggers
-rub trigger list
+```bash
+rub trigger add --file trigger-spec.json        # Register and arm immediately
+rub trigger add --file trigger-spec.json --paused  # Register but keep paused
+rub trigger list                                # Show all triggers, status, last evidence
 rub trigger pause 1
 rub trigger resume 1
 rub trigger remove 1
-rub trigger trace --last 20
+rub trigger trace --last 20                     # Recent fire/block/degraded events with evidence
 ```
+
+**Condition types** (field `condition.kind` in spec):
+
+| Kind | What is evaluated on the source tab |
+|------|-------------------------------------|
+| `url_match` | Current tab URL contains `condition.url_pattern` |
+| `text_present` | Page contains `condition.text` |
+| `locator_present` | A CSS / role / label / testid locator resolves to ≥1 element |
+| `readiness` | Page readiness matches `condition.readiness_state` (`domcontentloaded`, `networkidle`, etc.) |
+| `network_request` | A recorded network request matches `condition.method` + `condition.status_code` + URL pattern |
+| `storage_value` | `condition.area` storage at `condition.key` equals `condition.value` |
+
+**Action types** (field `action.kind` in spec):
+
+| Kind | What executes on the target tab |
+|------|--------------------------------|
+| `browser_command` | Any rub command (`click`, `type`, `fill`, `navigate`, …) with a JSON payload |
+| `workflow` | A named workflow or inline `steps` array, with optional `source_vars` bindings from the source tab |
+
+**Reliability guarantees**:
+- **Double-fire prevention**: evidence fingerprint (`consumed_evidence_fingerprint`) gates each fire cycle — same network request or storage value cannot trigger twice
+- **Post-queue re-validation**: condition is re-checked after acquiring the FIFO lock, preventing stale fires if the condition cleared while queued
+- **Tab reconciliation**: if source or target tab closes/reopens, the trigger degrades to `unavailable` and auto-recovers when tabs reappear
+- **Mode**: `once` (trigger fires once then stops) or `repeat` (re-arms after each fire)
 
 ### 📡 Runtime Observability
 
