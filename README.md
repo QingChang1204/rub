@@ -112,6 +112,16 @@ rub inspect list '{"container": ".product-list", "item": ".product-card", "field
 - `download wait` — block until download reaches target state (`completed`, `failed`, etc.)
 - `download cancel` — abort in-progress downloads
 
+**JavaScript Execution**
+- `exec <code>` — evaluate JavaScript and return the result as JSON
+- `exec <code> --raw` — print the raw JS result without the JSON envelope
+
+**Session Management**
+- `sessions` — list all active named sessions with PID, socket, and metadata
+- `close` — close the current session's browser
+- `close --all` — close every active session across all names
+- `cleanup` — remove stale sockets, orphaned daemon state, and temporary browser artifacts
+
 ### 🛡️ Anti-Detection & Stealth
 
 **L1: Stealth Baseline** (enabled by default)
@@ -179,6 +189,26 @@ rub takeover elevate  # Relaunch headless → headed browser
 rub takeover resume   # Hand back to automation
 ```
 
+### 🎭 Cross-Session Orchestration
+
+Event-driven rules that survive session restarts and span multiple sessions:
+```bash
+# Register an orchestration rule from a JSON spec file
+rub orchestration add --file rule.json
+rub orchestration add --file rule.json --paused   # Add in paused state
+
+# Manage rules
+rub orchestration list
+rub orchestration execute --id 3   # Run a rule immediately by id
+rub orchestration pause 3
+rub orchestration resume 3
+rub orchestration remove 3
+rub orchestration clear
+
+# List saved orchestration assets
+rub orchestration list-assets
+```
+
 ### 💬 Dialog Handling
 
 ```bash
@@ -235,14 +265,24 @@ rub --profile "Work" open https://example.com
 
 ## Installation
 
+### Homebrew (macOS / Linux)
+
 ```bash
-# Build from source
+brew tap QingChang1204/tap
+brew install rub
+```
+
+### Build from Source
+
+```bash
 cargo build --release
 cp target/release/rub /usr/local/bin/
 
 # Verify
 rub --version
 ```
+
+> **Requirements**: Chrome, Chromium, or Edge must be installed separately. rub connects to the browser via CDP and does not bundle a browser.
 
 ## Quick Start
 
@@ -259,8 +299,13 @@ rub keys Enter
 # Wait for results
 rub wait --text "Results" --timeout 5000
 
-# Screenshot
+# Screenshot (plain or with element index overlays)
 rub screenshot --path result.png --full
+rub screenshot --path result.png --highlight
+
+# Execute JavaScript
+rub exec "document.title"
+rub exec "window.scrollTo(0, 500)" --raw
 
 # Inspect network traffic
 rub inspect network --match "api/" --method GET
@@ -268,8 +313,14 @@ rub inspect network --match "api/" --method GET
 # Extract structured data
 rub extract '{"title": "text:h1", "links": "text:a"}'
 
-# Close when done
-rub close
+# Session management
+rub sessions            # list all active sessions
+rub close               # close current session browser
+rub close --all         # close every active session
+rub cleanup             # purge stale sockets and orphaned state
+
+# Pretty-print output (--json is an alias for --json-pretty)
+rub --json state
 ```
 
 ## Global Options
@@ -282,17 +333,17 @@ rub close
 | `--headed` | Launch browser with visible window | `false` |
 | `--ignore-cert-errors` | Ignore TLS certificate errors | `false` |
 | `--user-data-dir <path>` | Reuse a browser profile | — |
-| `--json-pretty` | Pretty-print JSON output | `false` |
+| `--json-pretty` / `--json` | Pretty-print JSON output | `false` |
 | `--verbose` | Include interaction trace summary | `false` |
 | `--trace` | Include full interaction trace | `false` |
 | `--cdp-url <url>` | Connect to external Chrome via CDP | — |
-| `--connect` | Auto-discover local Chrome | `false` |
+| `--connect` | Auto-discover local Chrome (ports 9222–9229) | `false` |
 | `--profile <name>` | Connect using a Chrome profile | — |
 | `--no-stealth` | Disable L1 stealth patches | `false` |
 | `--humanize` | Enable L2 humanized interaction | `false` |
-| `--humanize-speed <preset>` | Humanize speed: fast, normal, slow | `normal` |
+| `--humanize-speed <preset>` | Humanize speed: `fast`, `normal`, `slow` | `normal` |
 
-**Environment variables**: `RUB_HOME`, `RUB_SESSION`, `RUB_IGNORE_CERT_ERRORS`, `RUB_USER_DATA_DIR`, `RUB_SHOW_INFOBARS`, `RUB_HUMANIZE`, `RUB_HUMANIZE_SPEED`, `RUB_STEALTH`
+**Environment variables**: `RUB_HOME`, `RUB_SESSION`, `RUB_IGNORE_CERT_ERRORS`, `RUB_USER_DATA_DIR`, `RUB_SHOW_INFOBARS`, `RUB_HUMANIZE`, `RUB_HUMANIZE_SPEED`, `RUB_STEALTH` (`0` to disable stealth)
 
 ## Configuration
 
@@ -310,45 +361,121 @@ CLI flags override file configuration.
 
 ## Architecture
 
-```
-                                ┌──────────────────────────────┐
-                                │         Chrome / CDP          │
-                                └───────────────▲──────────────┘
-                                                │
-┌──────────┐    Unix Socket    ┌────────────────┴──────────────┐
-│  CLI     │◄──── NDJSON ─────►│  Per-Session Daemon (tokio)   │
-│  (clap)  │                   │                               │
-└──────────┘                   │  ┌─────────┐  ┌────────────┐  │
-                               │  │ Router  │  │ BrowserPort│  │
-                               │  │ (FIFO)  │  │ (CDP)      │  │
-                               │  └─────────┘  └────────────┘  │
-                               └───────────────────────────────┘
-```
+### Overview
 
 ```
-crates/
-  rub-core/           # Shared types, models, errors (zero internal deps)
-  rub-cdp/            # Chrome DevTools Protocol adapter layer
-  rub-ipc/            # IPC protocol and transport
-  rub-daemon/         # Persistent daemon runtime, command router
-  rub-cli/            # CLI entry point, command definitions, output formatting
-  rub-test-harness/   # Shared test utilities
+┌─────────────────────────────────────────────────────────────────┐
+│  rub CLI (clap)                                                  │
+│  Parses args → builds IpcRequest → sends over Unix socket       │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │ NDJSON over Unix domain socket
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Per-Session Daemon  (tokio async runtime)                       │
+│                                                                  │
+│  ┌──────────────┐    ┌───────────────────────────────────────┐  │
+│  │ IPC Server   │    │  DaemonRouter  (FIFO Semaphore = 1)   │  │
+│  │ Unix Socket  ├───►│  · Replay fence (at-most-once)        │  │
+│  │ NDJSON codec │    │  · Handoff gate                       │  │
+│  └──────────────┘    │  · Timeout budget tracking            │  │
+│                      │  · Command dispatch (40+ handlers)    │  │
+│                      └──────────────┬────────────────────────┘  │
+│                                     │                            │
+│  ┌──────────────────────────────────▼────────────────────────┐  │
+│  │  BrowserPort (CDP / chromiumoxide)                        │  │
+│  │  · Snapshot engine + dom_epoch guard                      │  │
+│  │  · Stealth injection (9 evaluateOnNewDocument patches)    │  │
+│  │  · Humanized Bézier mouse + typing                        │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  Background Workers                                              │
+│  · trigger_worker   — cross-tab event rules                     │
+│  · orchestration_worker — cross-session automation rules        │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-**Design properties**:
+### IPC Transport
 
-- **Persistent sessions** — daemon auto-starts on first command, reuses browser across commands
-- **Snapshot authority** — `click` and `type` validate against a cached `snapshot_id` guarded by `dom_epoch`
-- **At-most-once semantics** — `command_id` deduplication for mutating commands
-- **Profile safety** — `--user-data-dir` conflicts are rejected before browser launch
-- **Stealth layer** — L1 JS injection patches + L2 humanized Bézier mouse paths and timing
-- **Structured logging** — `tracing`-based JSON logs to `~/.rub/daemon.log`
+The CLI and daemon communicate over **Unix domain sockets** using an **NDJSON (newline-delimited JSON) codec**. Each CLI invocation opens one connection, writes exactly one `IpcRequest`, reads one `IpcResponse`, and exits. The protocol is framed by newline as the commit fence — a partial write without a trailing newline is classified as `partial_ndjson_frame` and rejected cleanly.
+
+The socket bind path is guarded by a `.bind.lock` file (acquired via `flock(LOCK_EX)`) to serialize concurrent startup races. Before binding, the server probes the existing socket file: if it accepts connections it belongs to a live daemon and the new process backs off; if it refuses (`ConnectionRefused`) the stale file is unlinked — but only after verifying the socket's `(dev, inode)` identity matches, preventing a TOCTOU race where a new daemon creates a fresh socket between the probe and the unlink.
+
+### FIFO Command Queue
+
+`DaemonRouter` owns a `tokio::sync::Semaphore` initialized to **1 permit**. Every incoming request must acquire this permit before executing, which means commands are serialized FIFO — there is no concurrent execution within a session. This is the foundational invariant that makes snapshot-based element addressing correct: no DOM mutation can race with a read.
+
+The queue enforces a **timeout budget** split into two phases:
+1. **Queue wait** — time spent waiting for the Semaphore permit
+2. **Execution** — time spent in the actual CDP command
+
+Both are measured independently and returned in every response as `timing.queue_ms`, `timing.exec_ms`, `timing.total_ms`.
+
+### At-Most-Once Semantics (Replay Fence)
+
+Mutating commands that carry a `command_id` field participate in the **replay fence**:
+
+1. First arrival: daemon claims `command_id` ownership via a `watch` channel, executes the command, caches the exact response.
+2. Concurrent duplicate: waits on the same `watch` channel until the first execution completes, then returns the cached response directly — no double execution.
+3. Conflicting fingerprint: same `command_id` but different command/args — rejected with `IpcVersionMismatch`.
+
+The cached response stored is the **post-commit** shaped response (after frame-limit enforcement and timing injection), ensuring any replay observes exactly the same wire format as the original caller.
+
+### Snapshot Authority & DOM Epoch
+
+The `state` command captures a DOM snapshot and assigns it a `snapshot_id`. Interaction commands (`click`, `type`, etc.) default to an **implicit live snapshot** (taken atomically before dispatch) or can reference an explicit `--snapshot <id>`, validated by a `dom_epoch` counter that increments on every navigation event. If the epoch has advanced since the snapshot was taken, the snapshot is rejected as stale — preventing automation from targeting elements that no longer exist post-navigation.
+
+### Daemon Startup Commit Protocol
+
+Startup uses a **two-phase commit** to prevent split-brain discovery:
+
+1. Daemon binds the Unix socket and writes a PID file.
+2. Daemon publishes a **pending** registry entry (not yet authoritative).
+3. Daemon writes canonical socket and PID **projections** (symlinks + plain files) using `atomic_write` + `fdatasync` for durability.
+4. Daemon writes a **startup committed marker** — only after this file exists can discovery treat the daemon as canonical.
+5. `promote_session_authority` atomically makes the entry the authoritative record for the session name.
+
+If any step fails, `StartupCommitGuard` (a drop-guard) rolls back the registry entry, removes all projections, and restores the previous authority — so a crash during startup never leaves a permanently broken session.
+
+### Daemon Idle Shutdown
+
+The daemon evaluates idle shutdown each 60-second tick. It exits only when **all** of the following hold:
+- No connected CLI clients (`connected_client_count == 0`)
+- No in-flight command transactions (`in_flight_count == 0`)
+- No active cross-tab triggers
+- No active cross-session orchestration rules
+- No active human-control handoff/takeover
+- Last activity was > 30 minutes ago
+
+Shutdown first drains pending background projections (history, workflow assets), then waits for all workers to exit, then closes the browser — in strict order to avoid cutting an in-flight transaction.
+
+### Crate Dependency Graph
+
+```
+rub-cli
+  └─ rub-daemon   ← orchestration, triggers, session, router
+  └─ rub-cdp      ← CDP adapter, stealth, snapshot engine
+  └─ rub-ipc      ← Unix socket server/client, NDJSON codec
+  └─ rub-core     ← shared models, errors, port traits (no internal deps)
+```
+
+`rub-core` has **zero internal dependencies** and defines the `BrowserPort` trait that allows `rub-cdp` to be swapped or mocked in tests.
+
+### Key Design Invariants
+
+| Invariant | Enforcement Point |
+|-----------|------------------|
+| Commands execute FIFO, one at a time | `DaemonRouter::exec_semaphore` (capacity = 1) |
+| Mutating commands are at-most-once | Replay fence in `prepare_command_dispatch` |
+| Stale element addresses are rejected | `dom_epoch` guard in snapshot validation |
+| Daemon startup is atomic or rolled back | `StartupCommitGuard` drop impl |
+| Socket bind excludes concurrent starters | `flock(LOCK_EX)` on `.bind.lock` |
+| IPC frames are bounded | `MAX_FRAME_BYTES` enforced in `finalize_response` |
 
 ## Requirements
 
-- Rust 1.94.1+
-- Chrome, Chromium, or Edge (any CDP-compatible browser)
-- macOS or Linux (Unix domain sockets)
+- Chrome, Chromium, or Edge installed separately (any version supporting CDP)
+- macOS or Linux (Unix domain sockets required for daemon IPC)
+- **Build from source only**: Rust 1.94.1+
 
 ## Contributing
 
