@@ -422,8 +422,10 @@ rub --profile "Work" open https://example.com
 
 ```bash
 brew tap QingChang1204/tap
-brew install rub
+brew install rub-cli
 ```
+
+The Homebrew formula is published as `rub-cli`, and it installs the `rub` binary.
 
 ### Build from Source
 
