@@ -56,7 +56,21 @@ pub enum Commands {
         projection: ObservationProjectionArgs,
     },
 
-    /// Atomically capture a token-friendly page summary plus screenshot
+    /// Atomically capture a token-friendly page summary plus screenshot.
+    ///
+    /// Produces an element index map and screenshot in one round trip.
+    /// The `element_map` in the result lists all visible interactive elements
+    /// with their numeric index — use that index with `click`, `type`, `hover`,
+    /// and `fill` to interact with the page.
+    ///
+    /// After `observe`, interact using the index numbers in element_map:
+    ///   rub observe --path /tmp/page.png
+    ///   rub click 3                    # click element #3 from element_map
+    ///   rub type --index 5 "hello"     # type into element #5
+    ///   rub fill '[{"index":3,"value":"hello"},{"index":5,"value":"world"}]'
+    ///
+    /// Screenshot is base64 in JSON by default; use --path to save to disk.
+    /// Use --compact for a token-efficient text summary instead of full a11y tree.
     Observe {
         /// Save the screenshot to a file path (otherwise base64 in JSON)
         #[arg(long)]
@@ -113,15 +127,23 @@ pub enum Commands {
         raw: bool,
     },
 
-    /// Scroll the viewport
+    /// Scroll the viewport.
+    ///
+    /// Examples:
+    ///   rub scroll                   # scroll down 600px (default)
+    ///   rub scroll up --amount 300   # scroll up 300px
+    ///   rub scroll --y -300          # scroll up 300px (signed delta syntax)
+    ///   rub scroll --y 500           # scroll down 500px
     Scroll {
-        /// Direction: up or down
+        /// Direction: up or down (default: down). Ignored when --y is set.
         #[arg(default_value = "down")]
         direction: String,
-        /// Pixels to scroll
+        /// Pixels to scroll as a positive integer (default: 600).
+        /// Mutually exclusive with --y.
         #[arg(long)]
         amount: Option<u32>,
-        /// Signed Y delta shorthand (`--y -300` = scroll up 300)
+        /// Signed pixel delta: negative = scroll up, positive = scroll down.
+        /// (e.g. --y -300 scrolls up 300px). Mutually exclusive with --amount.
         #[arg(long, conflicts_with = "amount", allow_hyphen_values = true)]
         y: Option<i32>,
     },
@@ -408,9 +430,27 @@ pub enum Commands {
         wait_after: WaitAfterArgs,
     },
 
-    /// Fill multiple form fields through the canonical interaction runtime
+    /// Fill multiple form fields through the canonical interaction runtime.
+    ///
+    /// SPEC is a JSON array where each entry targets a field and sets its value.
+    /// Fields can be targeted by snapshot index (from `observe`/`state`), by
+    /// label, by CSS selector, or by semantic locator.
+    ///
+    /// Spec formats:
+    ///
+    ///   By index:    '[{"index":3,"value":"alice@example.com"},{"index":5,"value":"secret"}]'
+    ///   By label:    '[{"label":"Email","value":"alice@example.com"},{"label":"Password","value":"secret"}]'
+    ///   By selector: '[{"selector":"#email","value":"alice@example.com"}]'
+    ///   By text:     '[{"target_text":"Email address","value":"alice@example.com"}]'
+    ///
+    /// Mixed locators are allowed in the same spec array.
+    /// Add --submit-label "Sign in" (or --submit-index N) to click submit after filling.
+    ///
+    /// Examples:
+    ///   rub fill '[{"label":"Email","value":"user@example.com"},{"label":"Password","value":"pass"}]' --submit-label "Log in"
+    ///   rub fill --file form.json --submit-label "Submit"
     Fill {
-        /// Inline JSON fill specification
+        /// Inline JSON fill specification (array of field descriptors)
         #[arg(conflicts_with = "file")]
         spec: Option<String>,
         /// Load the fill specification from a JSON file
@@ -450,7 +490,21 @@ pub enum Commands {
         wait_after: WaitAfterArgs,
     },
 
-    /// Extract structured data through the canonical query surface
+    /// Extract structured data through the canonical query surface.
+    ///
+    /// SPEC is a JSON object mapping output field names to CSS selectors or
+    /// extraction descriptors. Each key becomes a field in the returned data.
+    ///
+    /// Simple field extraction:
+    ///   rub extract '{"title":"h1","price":".price","description":".desc"}'
+    ///
+    /// With explicit attribute (default is text content):
+    ///   rub extract '{"link":{"selector":"a.main","attr":"href"}}'
+    ///
+    /// Multiple items (list extraction — returns an array):
+    ///   rub extract '{"items":{"selector":".item","fields":{"name":".name","price":".price"}}}'
+    ///
+    /// Output is always JSON: {"result": {"data": {"title": "...", ...}}}
     Extract {
         /// Inline JSON extract specification
         #[arg(conflicts_with = "file")]
@@ -463,9 +517,25 @@ pub enum Commands {
         snapshot: Option<String>,
     },
 
-    /// Execute a workflow pipeline over existing canonical commands
+    /// Execute a workflow pipeline over existing canonical commands.
+    ///
+    /// SPEC is a JSON array of step objects, each with a `command` key and optional
+    /// `args` object. Steps run sequentially; output from each step is available
+    /// to subsequent steps via `{{prev.*}}` references (coming soon).
+    ///
+    /// Minimal example (open and take screenshot):
+    ///   rub pipe '[{"command":"open","args":{"url":"https://example.com"}},{"command":"screenshot"}]'
+    ///
+    /// Form automation:
+    ///   rub pipe '[{"command":"open","args":{"url":"https://login.example.com"}},{"command":"fill","args":{"spec":[{"label":"Email","value":"user@example.com"},{"label":"Password","value":"pass"}],"submit_label":"Log in"}}]'
+    ///
+    /// Named workflow (saved under RUB_HOME/workflows/<name>.json):
+    ///   rub pipe --workflow login --var email=user@example.com --var password=secret
+    ///
+    /// Allowed commands in pipe: open, state, click, type, exec, scroll, back,
+    ///   keys, wait, tabs, switch, close-tab, get, hover, upload, select, fill, extract
     Pipe {
-        /// JSON pipeline specification
+        /// JSON pipeline specification (array of {command, args} step objects)
         #[arg(conflicts_with_all = ["file", "workflow", "list_workflows"])]
         spec: Option<String>,
         /// Load the pipeline specification from a JSON file
@@ -574,6 +644,21 @@ impl Commands {
 #[cfg(test)]
 mod tests {
     use super::Commands;
+    use crate::commands::Cli;
+    use clap::CommandFactory;
+
+    fn render_subcommand_long_help(name: &str) -> String {
+        let mut root = Cli::command();
+        let mut subcommand = root
+            .find_subcommand_mut(name)
+            .unwrap_or_else(|| panic!("missing subcommand {name}"))
+            .clone();
+        let mut buffer = Vec::new();
+        subcommand
+            .write_long_help(&mut buffer)
+            .expect("help should render");
+        String::from_utf8(buffer).expect("help should be valid utf-8")
+    }
 
     #[test]
     fn canonical_name_single_sources_public_command_strings() {
@@ -604,5 +689,21 @@ mod tests {
             Some("internal daemon")
         );
         assert_eq!(Commands::Downloads.local_projection_surface(), None);
+    }
+
+    #[test]
+    fn observe_help_uses_index_flag_in_type_example() {
+        let help = render_subcommand_long_help("observe");
+        assert!(help.contains("rub type --index 5 \"hello\""), "{help}");
+        assert!(!help.contains("rub type 5 \"hello\""), "{help}");
+    }
+
+    #[test]
+    fn pipe_help_examples_use_command_step_key() {
+        let help = render_subcommand_long_help("pipe");
+        assert!(help.contains("\"command\":\"open\""), "{help}");
+        assert!(help.contains("{command, args} step objects"), "{help}");
+        assert!(!help.contains("\"cmd\":\"open\""), "{help}");
+        assert!(!help.contains("`cmd` key"), "{help}");
     }
 }

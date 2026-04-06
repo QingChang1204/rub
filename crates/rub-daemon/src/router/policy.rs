@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use super::PendingExternalDomCommit;
 use crate::session::SessionState;
 
 pub(super) fn command_allowed_during_handoff(command: &str) -> bool {
@@ -34,9 +35,12 @@ pub(super) fn response_dom_epoch(
     command: &str,
     args: &serde_json::Value,
     state: &Arc<SessionState>,
+    pending_external_dom_commit: PendingExternalDomCommit,
 ) -> Option<u64> {
     if command_increments_epoch(command) || dialog_action_commits_epoch(command, args) {
-        state.clear_pending_external_dom_change();
+        if matches!(pending_external_dom_commit, PendingExternalDomCommit::Clear) {
+            state.clear_pending_external_dom_change();
+        }
         Some(state.increment_epoch())
     } else if matches!(command, "scroll" | "fill" | "pipe") {
         Some(state.current_epoch())

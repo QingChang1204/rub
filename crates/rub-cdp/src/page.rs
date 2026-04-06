@@ -3,7 +3,10 @@
 use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::{
     network::{EventResponseReceived, ResourceType},
-    page::{EventLifecycleEvent, GetNavigationHistoryParams, NavigateToHistoryEntryParams},
+    page::{
+        EventLifecycleEvent, EventNavigatedWithinDocument, GetNavigationHistoryParams,
+        NavigateParams, NavigateToHistoryEntryParams, ReloadParams, StopLoadingParams,
+    },
 };
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
@@ -19,6 +22,13 @@ enum HistoryDirection {
     Forward,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum NavigateCommitKind {
+    Download { warning: String },
+    SameDocument,
+    Lifecycle,
+}
+
 /// Navigate to URL with the specified load strategy.
 pub async fn navigate(
     page: &Arc<Page>,
@@ -28,23 +38,18 @@ pub async fn navigate(
 ) -> Result<RubPage, RubError> {
     let mut response_listener = page.event_listener::<EventResponseReceived>().await.ok();
     let main_frame = resolve_navigation_main_frame(page, timeout).await?;
-    match strategy {
+    let navigation_warning = match strategy {
         LoadStrategy::Load => {
-            page.goto(url).await.map_err(|e| {
-                RubError::domain(
-                    ErrorCode::NavigationFailed,
-                    format!("Navigation to {url} failed: {e}"),
-                )
-            })?;
+            navigate_with_lifecycle(page, url, "load", main_frame.clone(), timeout).await?
         }
         LoadStrategy::DomContentLoaded => {
             navigate_with_lifecycle(page, url, "DOMContentLoaded", main_frame.clone(), timeout)
-                .await?;
+                .await?
         }
         LoadStrategy::NetworkIdle => {
-            navigate_with_lifecycle(page, url, "networkIdle", main_frame.clone(), timeout).await?;
+            navigate_with_lifecycle(page, url, "networkIdle", main_frame.clone(), timeout).await?
         }
-    }
+    };
 
     // Get final URL and title
     let final_url = page
@@ -71,7 +76,7 @@ pub async fn navigate(
         title,
         http_status,
         final_url,
-        navigation_warning: None,
+        navigation_warning,
     })
 }
 
@@ -267,31 +272,11 @@ pub async fn reload(
     timeout: std::time::Duration,
 ) -> Result<RubPage, RubError> {
     let lifecycle_name = match strategy {
-        LoadStrategy::Load => None,
-        LoadStrategy::DomContentLoaded => Some("DOMContentLoaded"),
-        LoadStrategy::NetworkIdle => Some("networkIdle"),
+        LoadStrategy::Load => "load",
+        LoadStrategy::DomContentLoaded => "DOMContentLoaded",
+        LoadStrategy::NetworkIdle => "networkIdle",
     };
-    let mut lifecycle_listener = if lifecycle_name.is_some() {
-        Some(prepare_lifecycle_listener(page, timeout).await?)
-    } else {
-        None
-    };
-
-    page.reload().await.map_err(|e| {
-        RubError::domain(ErrorCode::NavigationFailed, format!("Reload failed: {e}"))
-    })?;
-
-    if let Some((main_frame, listener)) = lifecycle_listener.as_mut()
-        && let Some(lifecycle_name) = lifecycle_name
-    {
-        wait_for_lifecycle_event_from_listener(
-            main_frame.clone(),
-            listener,
-            lifecycle_name,
-            timeout,
-        )
-        .await?;
-    }
+    reload_with_lifecycle(page, lifecycle_name, timeout).await?;
 
     current_page_summary(page).await
 }
@@ -302,19 +287,88 @@ async fn navigate_with_lifecycle(
     lifecycle_name: &str,
     main_frame: FrameId,
     timeout: std::time::Duration,
-) -> Result<(), RubError> {
-    let mut listener = prepare_lifecycle_listener_stream(page).await?;
-    let encoded_url = serde_json::to_string(url)
-        .map_err(|e| RubError::Internal(format!("Failed to encode navigation URL: {e}")))?;
-    page.evaluate(format!("window.location.assign({encoded_url})"))
-        .await
-        .map_err(|e| {
-            RubError::domain(
-                ErrorCode::NavigationFailed,
-                format!("Navigation to {url} failed: {e}"),
+) -> Result<Option<String>, RubError> {
+    let mut lifecycle_listener = prepare_lifecycle_listener_stream(page).await?;
+    let mut same_document_listener = prepare_same_document_listener_stream(page).await?;
+    let navigate = page.execute(NavigateParams::new(url)).await.map_err(|e| {
+        RubError::domain(
+            ErrorCode::NavigationFailed,
+            format!("Navigation to {url} failed: {e}"),
+        )
+    })?;
+    match classify_navigate_commit(
+        navigate.error_text.as_deref(),
+        navigate.is_download.unwrap_or(false),
+        navigate.loader_id.is_some(),
+        url,
+    )? {
+        NavigateCommitKind::Download { warning } => Ok(Some(warning)),
+        NavigateCommitKind::SameDocument => {
+            wait_for_same_document_navigation_from_listener(
+                main_frame,
+                &mut same_document_listener,
+                timeout,
             )
-        })?;
-    wait_for_lifecycle_event_from_listener(main_frame, &mut listener, lifecycle_name, timeout).await
+            .await?;
+            Ok(None)
+        }
+        NavigateCommitKind::Lifecycle => {
+            wait_for_navigation_lifecycle_or_stop_loading(
+                page,
+                main_frame,
+                &mut lifecycle_listener,
+                lifecycle_name,
+                timeout,
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+}
+
+fn classify_navigate_commit(
+    error_text: Option<&str>,
+    is_download: bool,
+    has_loader_id: bool,
+    url: &str,
+) -> Result<NavigateCommitKind, RubError> {
+    if let Some(error_text) = error_text {
+        return Err(RubError::domain(
+            ErrorCode::NavigationFailed,
+            format!("Navigation to {url} failed: {error_text}"),
+        ));
+    }
+    if is_download {
+        return Ok(NavigateCommitKind::Download {
+            warning: format!(
+                "Navigation to {url} triggered a browser download; the active page remained on the current document"
+            ),
+        });
+    }
+    if has_loader_id {
+        Ok(NavigateCommitKind::Lifecycle)
+    } else {
+        Ok(NavigateCommitKind::SameDocument)
+    }
+}
+
+async fn reload_with_lifecycle(
+    page: &Arc<Page>,
+    lifecycle_name: &str,
+    timeout: std::time::Duration,
+) -> Result<(), RubError> {
+    let (main_frame, mut listener) = prepare_lifecycle_listener(page, timeout).await?;
+    page.execute(ReloadParams::default()).await.map_err(|e| {
+        RubError::domain(ErrorCode::NavigationFailed, format!("Reload failed: {e}"))
+    })?;
+    wait_for_navigation_lifecycle_or_stop_loading(
+        page,
+        main_frame,
+        &mut listener,
+        lifecycle_name,
+        timeout,
+    )
+    .await
 }
 
 async fn wait_for_history_entry_commit(
@@ -458,6 +512,18 @@ async fn prepare_lifecycle_listener_stream(
         .map_err(|e| RubError::Internal(format!("Failed to subscribe to lifecycle events: {e}")))
 }
 
+async fn prepare_same_document_listener_stream(
+    page: &Arc<Page>,
+) -> Result<impl Stream<Item = Arc<EventNavigatedWithinDocument>> + Unpin, RubError> {
+    page.event_listener::<EventNavigatedWithinDocument>()
+        .await
+        .map_err(|e| {
+            RubError::Internal(format!(
+                "Failed to subscribe to same-document navigation events: {e}"
+            ))
+        })
+}
+
 async fn resolve_navigation_main_frame(
     page: &Arc<Page>,
     timeout: std::time::Duration,
@@ -525,6 +591,64 @@ where
     })?
 }
 
+async fn wait_for_same_document_navigation_from_listener<S>(
+    main_frame: FrameId,
+    listener: &mut S,
+    timeout: std::time::Duration,
+) -> Result<(), RubError>
+where
+    S: Stream<Item = Arc<EventNavigatedWithinDocument>> + Unpin,
+{
+    if timeout.is_zero() {
+        return Err(RubError::domain(
+            ErrorCode::PageLoadTimeout,
+            "Timed out waiting for same-document navigation commit",
+        ));
+    }
+    tokio::time::timeout(timeout, async {
+        while let Some(event) = listener.next().await {
+            if event.frame_id == main_frame {
+                return Ok(());
+            }
+        }
+        Err(RubError::domain(
+            ErrorCode::NavigationFailed,
+            "Same-document navigation listener ended before the navigation commit fence",
+        ))
+    })
+    .await
+    .map_err(|_| {
+        RubError::domain(
+            ErrorCode::PageLoadTimeout,
+            "Timed out waiting for same-document navigation commit",
+        )
+    })?
+}
+
+async fn wait_for_navigation_lifecycle_or_stop_loading<S>(
+    page: &Arc<Page>,
+    main_frame: FrameId,
+    listener: &mut S,
+    lifecycle_name: &str,
+    timeout: std::time::Duration,
+) -> Result<(), RubError>
+where
+    S: Stream<Item = Arc<EventLifecycleEvent>> + Unpin,
+{
+    match wait_for_lifecycle_event_from_listener(main_frame, listener, lifecycle_name, timeout)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if matches!(&error, RubError::Domain(envelope) if envelope.code == ErrorCode::PageLoadTimeout)
+            {
+                let _ = page.execute(StopLoadingParams::default()).await;
+            }
+            Err(error)
+        }
+    }
+}
+
 pub async fn viewport_dimensions(page: &Arc<Page>) -> Result<(f64, f64), RubError> {
     #[derive(Deserialize)]
     struct Viewport {
@@ -562,8 +686,15 @@ pub async fn cleanup_highlights(page: &Arc<Page>) -> Result<(), RubError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameId, parse_scroll_position_json, wait_for_lifecycle_event_from_listener};
+    use super::{
+        FrameId, NavigateCommitKind, classify_navigate_commit, parse_scroll_position_json,
+        wait_for_lifecycle_event_from_listener, wait_for_same_document_navigation_from_listener,
+    };
+    use chromiumoxide::cdp::browser_protocol::page::{
+        EventNavigatedWithinDocument, NavigatedWithinDocumentNavigationType,
+    };
     use rub_core::error::ErrorCode;
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn frame_id(value: &str) -> FrameId {
@@ -602,6 +733,70 @@ mod tests {
         .expect("the wait fence should honor the caller timeout instead of sleeping on a hidden multi-second budget")
         .expect_err("pending listener should time out at the caller budget");
         assert_eq!(error.into_envelope().code, ErrorCode::PageLoadTimeout);
+    }
+
+    #[tokio::test]
+    async fn same_document_navigation_wait_succeeds_for_main_frame_commit() {
+        let mut listener = futures::stream::iter(vec![Arc::new(EventNavigatedWithinDocument {
+            frame_id: frame_id("main"),
+            url: "https://example.com/page#section".to_string(),
+            navigation_type: NavigatedWithinDocumentNavigationType::Fragment,
+        })]);
+
+        wait_for_same_document_navigation_from_listener(
+            frame_id("main"),
+            &mut listener,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("same-document commit should satisfy the fence");
+    }
+
+    #[tokio::test]
+    async fn same_document_navigation_wait_honors_caller_timeout_budget() {
+        let mut listener = futures::stream::pending();
+        let error = tokio::time::timeout(
+            Duration::from_millis(150),
+            wait_for_same_document_navigation_from_listener(
+                frame_id("main"),
+                &mut listener,
+                Duration::from_millis(30),
+            ),
+        )
+        .await
+        .expect("the same-document fence should honor the caller timeout")
+        .expect_err("pending same-document listener should time out at the caller budget");
+        assert_eq!(error.into_envelope().code, ErrorCode::PageLoadTimeout);
+    }
+
+    #[test]
+    fn navigate_commit_classifies_protocol_result_exhaustively() {
+        assert_eq!(
+            classify_navigate_commit(None, true, true, "https://example.com/file.csv")
+                .expect("download navigation should classify"),
+            NavigateCommitKind::Download {
+                warning: "Navigation to https://example.com/file.csv triggered a browser download; the active page remained on the current document".to_string(),
+            }
+        );
+        assert_eq!(
+            classify_navigate_commit(None, false, false, "https://example.com/page#section")
+                .expect("same-document navigation should classify"),
+            NavigateCommitKind::SameDocument
+        );
+        assert_eq!(
+            classify_navigate_commit(None, false, true, "https://example.com")
+                .expect("cross-document navigation should classify"),
+            NavigateCommitKind::Lifecycle
+        );
+
+        let error = classify_navigate_commit(
+            Some("net::ERR_NAME_NOT_RESOLVED"),
+            false,
+            true,
+            "https://missing.invalid",
+        )
+        .expect_err("protocol error text should fail immediately");
+        assert_eq!(error.into_envelope().code, ErrorCode::NavigationFailed);
     }
 
     #[test]

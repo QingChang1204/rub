@@ -120,6 +120,46 @@ impl TransactionDeadline {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub(super) enum PendingExternalDomCommit {
+    #[default]
+    Clear,
+    Preserve,
+}
+
+#[derive(Debug)]
+pub(super) struct CommandDispatchOutcome {
+    data: serde_json::Value,
+    pending_external_dom_commit: PendingExternalDomCommit,
+}
+
+impl CommandDispatchOutcome {
+    pub(super) fn new(data: serde_json::Value) -> Self {
+        Self {
+            data,
+            pending_external_dom_commit: PendingExternalDomCommit::Clear,
+        }
+    }
+
+    pub(super) fn with_pending_external_dom_commit(
+        mut self,
+        pending_external_dom_commit: PendingExternalDomCommit,
+    ) -> Self {
+        self.pending_external_dom_commit = pending_external_dom_commit;
+        self
+    }
+
+    pub(super) fn into_parts(self) -> (serde_json::Value, PendingExternalDomCommit) {
+        (self.data, self.pending_external_dom_commit)
+    }
+}
+
+impl From<serde_json::Value> for CommandDispatchOutcome {
+    fn from(data: serde_json::Value) -> Self {
+        Self::new(data)
+    }
+}
+
 /// The central command router. Owns the FIFO dispatch queue.
 pub struct DaemonRouter {
     browser: Arc<dyn BrowserPort>,
@@ -967,9 +1007,9 @@ fn attach_response_metadata(
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonRouter, TimeoutPhase, TransactionDeadline, attach_interaction_projection,
-        attach_select_projection, augment_wait_timeout_error, command_allowed_during_handoff,
-        detection_risks, finalize_response, prepare_replay_fence,
+        DaemonRouter, PendingExternalDomCommit, TimeoutPhase, TransactionDeadline,
+        attach_interaction_projection, attach_select_projection, augment_wait_timeout_error,
+        command_allowed_during_handoff, detection_risks, finalize_response, prepare_replay_fence,
         protocol_version_mismatch_response, replay_request_fingerprint,
         request_owns_authoritative_timeout, timeout_context, wait_timeout_error,
     };
@@ -1061,13 +1101,23 @@ mod tests {
         let current_epoch = state.increment_epoch();
 
         assert_eq!(
-            super::policy::response_dom_epoch("fill", &serde_json::json!({}), &state),
+            super::policy::response_dom_epoch(
+                "fill",
+                &serde_json::json!({}),
+                &state,
+                PendingExternalDomCommit::Clear,
+            ),
             Some(current_epoch)
         );
         assert_eq!(state.current_epoch(), current_epoch);
 
         assert_eq!(
-            super::policy::response_dom_epoch("pipe", &serde_json::json!({}), &state),
+            super::policy::response_dom_epoch(
+                "pipe",
+                &serde_json::json!({}),
+                &state,
+                PendingExternalDomCommit::Clear,
+            ),
             Some(current_epoch)
         );
         assert_eq!(state.current_epoch(), current_epoch);
@@ -1087,6 +1137,7 @@ mod tests {
                 "dialog",
                 &serde_json::json!({ "sub": "accept" }),
                 &state,
+                PendingExternalDomCommit::Clear,
             ),
             Some(base_epoch + 1)
         );
@@ -1097,6 +1148,7 @@ mod tests {
                 "dialog",
                 &serde_json::json!({ "sub": "dismiss" }),
                 &state,
+                PendingExternalDomCommit::Clear,
             ),
             Some(base_epoch + 2)
         );
@@ -1107,10 +1159,32 @@ mod tests {
                 "dialog",
                 &serde_json::json!({ "sub": "status" }),
                 &state,
+                PendingExternalDomCommit::Clear,
             ),
             None
         );
         assert_eq!(state.current_epoch(), base_epoch + 2);
+    }
+
+    #[test]
+    fn incrementing_epoch_can_preserve_pending_external_dom_marker() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-router-preserve-pending"),
+            None,
+        ));
+        state.mark_pending_external_dom_change();
+
+        let epoch = super::policy::response_dom_epoch(
+            "open",
+            &serde_json::json!({}),
+            &state,
+            PendingExternalDomCommit::Preserve,
+        );
+
+        assert_eq!(epoch, Some(1));
+        assert_eq!(state.current_epoch(), 1);
+        assert!(state.has_pending_external_dom_change());
     }
 
     #[test]

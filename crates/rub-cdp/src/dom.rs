@@ -448,15 +448,36 @@ pub fn highlight_overlay_js(snapshot: &Snapshot) -> Result<String, RubError> {
         r#"
         (() => {{
             const overlays = {overlays_json};
-            // Use a shadow DOM host to isolate overlays from main DOM
+            // Use an open shadow DOM host to isolate overlays from main DOM.
+            // mode:'open' is required so host.shadowRoot can be read back on
+            // subsequent calls; mode:'closed' causes shadowRoot to always return
+            // null, making the second invocation call null.attachShadow() and
+            // throw a TypeError.
             let host = document.getElementById('__rub_overlay_host__');
+            let shadow;
             if (!host) {{
                 host = document.createElement('div');
                 host.id = '__rub_overlay_host__';
                 host.style.cssText = 'position:absolute;top:0;left:0;width:0;height:0;overflow:visible;z-index:2147483647;pointer-events:none';
-                document.body.appendChild(host);
+                // document.body may be null in SPAs during early render or on about:blank.
+                const mountPoint = document.body || document.documentElement;
+                if (!mountPoint) return 0;
+                mountPoint.appendChild(host);
+                shadow = host.attachShadow({{ mode: 'open' }});
+            }} else {{
+                shadow = host.shadowRoot;
+                if (!shadow) {{
+                    // Defensive: host exists but shadow root is inaccessible — rebuild.
+                    host.remove();
+                    host = document.createElement('div');
+                    host.id = '__rub_overlay_host__';
+                    host.style.cssText = 'position:absolute;top:0;left:0;width:0;height:0;overflow:visible;z-index:2147483647;pointer-events:none';
+                    const mountPoint = document.body || document.documentElement;
+                    if (!mountPoint) return 0;
+                    mountPoint.appendChild(host);
+                    shadow = host.attachShadow({{ mode: 'open' }});
+                }}
             }}
-            const shadow = host.shadowRoot || host.attachShadow({{ mode: 'closed' }});
             while (shadow.firstChild) {{
                 shadow.removeChild(shadow.firstChild);
             }}

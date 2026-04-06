@@ -412,6 +412,23 @@ mod tests {
     }
 
     #[test]
+    fn type_index_example_requires_explicit_index_flag() {
+        let cli = Cli::try_parse_from(["rub", "type", "--index", "5", "hello"])
+            .expect("cli should parse");
+        match cli.command {
+            Commands::Type { index, text, .. } => {
+                assert_eq!(index, Some(5));
+                assert_eq!(text, "hello");
+            }
+            other => panic!("expected type command, got {other:?}"),
+        }
+
+        let error = Cli::try_parse_from(["rub", "type", "5", "hello"]).unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("unexpected argument"), "{rendered}");
+    }
+
+    #[test]
     fn invalid_humanize_speed_is_rejected_at_parse_time() {
         let error = Cli::try_parse_from(["rub", "--humanize-speed", "warp", "doctor"]).unwrap_err();
         let rendered = error.to_string();

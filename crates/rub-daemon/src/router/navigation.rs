@@ -10,7 +10,10 @@ use super::projection::{
     viewport_subject,
 };
 use super::request_args::parse_json_args;
-use super::snapshot::{build_stable_snapshot, settle_external_dom_fence};
+use super::snapshot::{
+    ExternalDomFenceOutcome, build_stable_snapshot, settle_external_dom_fence,
+    sleep_full_settle_window,
+};
 use super::state_format::{StateFormat, project_snapshot};
 use super::url_normalization::normalize_open_url;
 use super::*;
@@ -151,27 +154,52 @@ async fn settle_navigation_projection(
     router: &DaemonRouter,
     state: &Arc<SessionState>,
     reason: &str,
-) {
+    deadline: TransactionDeadline,
+) -> PendingExternalDomCommit {
     state.clear_all_snapshots().await;
     state.select_frame(None).await;
-    settle_external_dom_fence(state, reason).await;
+    let pending_external_dom_commit =
+        match settle_external_dom_fence(state, reason, Some(deadline)).await {
+            ExternalDomFenceOutcome::Settled => PendingExternalDomCommit::Clear,
+            ExternalDomFenceOutcome::IncompleteDueToDeadline
+            | ExternalDomFenceOutcome::Unstable => PendingExternalDomCommit::Preserve,
+        };
 
     for attempt in 0..NAVIGATION_PROJECTION_SETTLE_RETRIES {
+        if deadline.remaining_duration().is_none() {
+            tracing::debug!(
+                reason,
+                attempt,
+                "settle_navigation_projection: deadline exhausted, stopping early"
+            );
+            return pending_external_dom_commit;
+        }
         let tabs = router.browser.list_tabs().await.ok();
         if let Some(tabs) = tabs.as_ref() {
             state.adopt_interference_primary_context(tabs).await;
         }
         crate::runtime_refresh::refresh_live_frame_runtime(&router.browser, state).await;
         if active_tab_and_frame_runtime_converged(state, tabs.as_deref()).await {
-            return;
+            return pending_external_dom_commit;
         }
-        if attempt + 1 < NAVIGATION_PROJECTION_SETTLE_RETRIES {
-            tokio::time::sleep(std::time::Duration::from_millis(
-                NAVIGATION_PROJECTION_SETTLE_DELAY_MS,
-            ))
-            .await;
+        if attempt + 1 < NAVIGATION_PROJECTION_SETTLE_RETRIES
+            && !sleep_full_settle_window(Some(deadline), NAVIGATION_PROJECTION_SETTLE_DELAY_MS)
+                .await
+        {
+            tracing::debug!(
+                reason,
+                attempt,
+                "settle_navigation_projection: deadline too close for another full settle window, stopping early"
+            );
+            return pending_external_dom_commit;
         }
     }
+
+    pending_external_dom_commit
+}
+
+fn is_page_load_timeout(error: &RubError) -> bool {
+    matches!(error, RubError::Domain(envelope) if envelope.code == ErrorCode::PageLoadTimeout)
 }
 
 async fn active_tab_and_frame_runtime_converged(
@@ -196,17 +224,28 @@ pub(super) async fn cmd_open(
     args: &serde_json::Value,
     deadline: TransactionDeadline,
     state: &Arc<SessionState>,
-) -> Result<serde_json::Value, RubError> {
+) -> Result<CommandDispatchOutcome, RubError> {
     let parsed: OpenArgs = parse_json_args(args, "open")?;
     let requested_url = parsed.url;
     let url = normalize_open_url(&requested_url);
     let strategy = parse_optional_load_strategy(parsed.load_strategy.as_deref(), "load_strategy")?;
 
-    let page = router
+    let page = match router
         .browser
         .navigate(&url, strategy, deadline.remaining_ms())
-        .await?;
-    settle_navigation_projection(router, state, "open").await;
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => {
+            if is_page_load_timeout(&error) {
+                settle_navigation_projection(router, state, "open", deadline).await;
+                state.mark_pending_external_dom_change();
+            }
+            return Err(error);
+        }
+    };
+    let pending_external_dom_commit =
+        settle_navigation_projection(router, state, "open", deadline).await;
     let active_tab = active_tab_entity(router).await?;
     let mut data = serde_json::json!({});
     attach_subject(
@@ -225,7 +264,8 @@ pub(super) async fn cmd_open(
             "active_tab": active_tab,
         }),
     );
-    Ok(data)
+    Ok(CommandDispatchOutcome::new(data)
+        .with_pending_external_dom_commit(pending_external_dom_commit))
 }
 
 pub(super) async fn cmd_state(
@@ -403,9 +443,19 @@ pub(super) async fn cmd_back(
     router: &DaemonRouter,
     deadline: TransactionDeadline,
     state: &Arc<SessionState>,
-) -> Result<serde_json::Value, RubError> {
-    let page = router.browser.back(deadline.remaining_ms()).await?;
-    settle_navigation_projection(router, state, "back").await;
+) -> Result<CommandDispatchOutcome, RubError> {
+    let page = match router.browser.back(deadline.remaining_ms()).await {
+        Ok(page) => page,
+        Err(error) => {
+            if is_page_load_timeout(&error) {
+                settle_navigation_projection(router, state, "back", deadline).await;
+                state.mark_pending_external_dom_change();
+            }
+            return Err(error);
+        }
+    };
+    let pending_external_dom_commit =
+        settle_navigation_projection(router, state, "back", deadline).await;
     let at_start = router
         .browser
         .execute_js(
@@ -426,16 +476,27 @@ pub(super) async fn cmd_back(
             "at_start": at_start,
         }),
     );
-    Ok(data)
+    Ok(CommandDispatchOutcome::new(data)
+        .with_pending_external_dom_commit(pending_external_dom_commit))
 }
 
 pub(super) async fn cmd_forward(
     router: &DaemonRouter,
     deadline: TransactionDeadline,
     state: &Arc<SessionState>,
-) -> Result<serde_json::Value, RubError> {
-    let page = router.browser.forward(deadline.remaining_ms()).await?;
-    settle_navigation_projection(router, state, "forward").await;
+) -> Result<CommandDispatchOutcome, RubError> {
+    let page = match router.browser.forward(deadline.remaining_ms()).await {
+        Ok(page) => page,
+        Err(error) => {
+            if is_page_load_timeout(&error) {
+                settle_navigation_projection(router, state, "forward", deadline).await;
+                state.mark_pending_external_dom_change();
+            }
+            return Err(error);
+        }
+    };
+    let pending_external_dom_commit =
+        settle_navigation_projection(router, state, "forward", deadline).await;
     let at_end = router
         .browser
         .execute_js(
@@ -456,7 +517,8 @@ pub(super) async fn cmd_forward(
             "at_end": at_end,
         }),
     );
-    Ok(data)
+    Ok(CommandDispatchOutcome::new(data)
+        .with_pending_external_dom_commit(pending_external_dom_commit))
 }
 
 pub(super) async fn cmd_reload(
@@ -464,15 +526,26 @@ pub(super) async fn cmd_reload(
     args: &serde_json::Value,
     deadline: TransactionDeadline,
     state: &Arc<SessionState>,
-) -> Result<serde_json::Value, RubError> {
+) -> Result<CommandDispatchOutcome, RubError> {
     let parsed: ReloadArgs = parse_json_args(args, "reload")?;
     let strategy = parse_optional_load_strategy(parsed.load_strategy.as_deref(), "load_strategy")?;
 
-    let page = router
+    let page = match router
         .browser
         .reload(strategy, deadline.remaining_ms())
-        .await?;
-    settle_navigation_projection(router, state, "reload").await;
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => {
+            if is_page_load_timeout(&error) {
+                settle_navigation_projection(router, state, "reload", deadline).await;
+                state.mark_pending_external_dom_change();
+            }
+            return Err(error);
+        }
+    };
+    let pending_external_dom_commit =
+        settle_navigation_projection(router, state, "reload", deadline).await;
     let active_tab = active_tab_entity(router).await?;
     let mut data = serde_json::json!({});
     attach_subject(&mut data, navigation_subject("reload"));
@@ -484,7 +557,8 @@ pub(super) async fn cmd_reload(
             "load_strategy": strategy,
         }),
     );
-    Ok(data)
+    Ok(CommandDispatchOutcome::new(data)
+        .with_pending_external_dom_commit(pending_external_dom_commit))
 }
 
 pub(super) async fn cmd_screenshot(
@@ -606,11 +680,13 @@ pub(super) async fn cmd_tabs(router: &DaemonRouter) -> Result<serde_json::Value,
 pub(super) async fn cmd_switch(
     router: &DaemonRouter,
     args: &serde_json::Value,
+    deadline: TransactionDeadline,
     state: &Arc<SessionState>,
-) -> Result<serde_json::Value, RubError> {
+) -> Result<CommandDispatchOutcome, RubError> {
     let parsed: SwitchArgs = parse_json_args(args, "switch")?;
     let tab = router.browser.switch_tab(parsed.index).await?;
-    settle_navigation_projection(router, state, "switch").await;
+    let pending_external_dom_commit =
+        settle_navigation_projection(router, state, "switch", deadline).await;
     let mut data = serde_json::json!({});
     attach_subject(&mut data, tab_subject(parsed.index));
     attach_result(
@@ -619,14 +695,16 @@ pub(super) async fn cmd_switch(
             "active_tab": tab_entity(&tab),
         }),
     );
-    Ok(data)
+    Ok(CommandDispatchOutcome::new(data)
+        .with_pending_external_dom_commit(pending_external_dom_commit))
 }
 
 pub(super) async fn cmd_close_tab(
     router: &DaemonRouter,
     args: &serde_json::Value,
+    deadline: TransactionDeadline,
     state: &Arc<SessionState>,
-) -> Result<serde_json::Value, RubError> {
+) -> Result<CommandDispatchOutcome, RubError> {
     let parsed: CloseTabArgs = parse_json_args(args, "close-tab")?;
     let index = parsed.index;
     let before_tabs = router.browser.list_tabs().await?;
@@ -638,7 +716,8 @@ pub(super) async fn cmd_close_tab(
             .unwrap_or(0)
     });
     let tabs = router.browser.close_tab(index).await?;
-    settle_navigation_projection(router, state, "close-tab").await;
+    let pending_external_dom_commit =
+        settle_navigation_projection(router, state, "close-tab", deadline).await;
     let active_tab = tabs.iter().find(|tab| tab.active).ok_or_else(|| {
         RubError::Internal("close-tab completed without an active tab".to_string())
     })?;
@@ -651,7 +730,8 @@ pub(super) async fn cmd_close_tab(
             "active_tab": tab_entity(active_tab),
         }),
     );
-    Ok(data)
+    Ok(CommandDispatchOutcome::new(data)
+        .with_pending_external_dom_commit(pending_external_dom_commit))
 }
 
 async fn active_tab_entity(router: &DaemonRouter) -> Result<serde_json::Value, RubError> {

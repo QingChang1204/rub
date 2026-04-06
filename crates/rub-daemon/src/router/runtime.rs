@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::request_args::{parse_json_args, required_string_arg, subcommand_arg};
+use super::request_args::{parse_json_args, subcommand_arg};
 use super::*;
 use crate::runtime_refresh::{
     refresh_live_dialog_runtime, refresh_live_frame_runtime, refresh_live_interference_state,
@@ -209,7 +209,13 @@ enum CookieAction {
 
 impl CookieAction {
     fn parse(args: &serde_json::Value) -> Result<Self, RubError> {
-        match required_string_arg(args, "sub")?.as_str() {
+        let sub = args.get("sub").and_then(|v| v.as_str()).ok_or_else(|| {
+            RubError::domain(
+                ErrorCode::InvalidInput,
+                "cookies requires a subcommand: get, set, clear, export, import",
+            )
+        })?;
+        match sub {
             "get" => Ok(Self::Get),
             "set" => Ok(Self::Set),
             "clear" => Ok(Self::Clear),
@@ -217,7 +223,9 @@ impl CookieAction {
             "import" => Ok(Self::Import),
             other => Err(RubError::domain(
                 ErrorCode::InvalidInput,
-                format!("Unknown cookies subcommand: '{other}'"),
+                format!(
+                    "Unknown cookies subcommand '{other}'. Valid: get, set, clear, export, import"
+                ),
             )),
         }
     }
