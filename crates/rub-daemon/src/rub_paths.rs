@@ -3,6 +3,23 @@ use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::{fs, io};
 
+/// Returns a stable, per-OS-user identity string used to scope the runtime
+/// socket directory so that multiple accounts on the same machine never
+/// share a socket directory (which would cause `Permission denied` for
+/// whichever account didn't create it first).
+///
+/// `$USER` is set by the OS for every login session on macOS and Linux and
+/// is the idiomatic way to obtain the current username in safe Rust without
+/// an `unsafe` block or an additional dependency.
+fn current_user_tag() -> String {
+    std::env::var("USER").unwrap_or_else(|_| {
+        // Fallback: if USER is somehow unset (e.g. bare daemon spawn without
+        // a login shell), use the effective UID so we always produce a valid,
+        // non-colliding directory name.
+        std::env::var("UID").unwrap_or_else(|_| "unknown".to_string())
+    })
+}
+
 /// Canonical `RUB_HOME` path authority for the current baseline layout.
 #[derive(Debug, Clone)]
 pub struct RubPaths {
@@ -35,7 +52,13 @@ impl RubPaths {
     }
 
     pub fn socket_runtime_dir(&self) -> PathBuf {
-        PathBuf::from("/tmp/rub-sock")
+        // Scope the runtime socket directory to the current OS user so that
+        // multiple accounts on the same machine (e.g. liuqingchang and
+        // qingchang) each own their own directory.  Without this, whichever
+        // account runs `rub` first creates /tmp/rub-sock with mode 755, and
+        // all other accounts get `Permission denied` when they try to create
+        // their own sockets inside it.
+        PathBuf::from(format!("/tmp/rub-sock-{}", current_user_tag()))
     }
 
     pub fn workflows_dir(&self) -> PathBuf {
@@ -370,7 +393,15 @@ mod tests {
             paths.sessions_dir(),
             PathBuf::from("/tmp/rub-home/sessions")
         );
-        assert_eq!(paths.socket_runtime_dir(), PathBuf::from("/tmp/rub-sock"));
+        // Socket runtime dir is now user-scoped; verify it contains the
+        // current username (or UID fallback) rather than a hardcoded string.
+        let tag = std::env::var("USER")
+            .or_else(|_| std::env::var("UID"))
+            .unwrap_or_else(|_| "unknown".to_string());
+        assert_eq!(
+            paths.socket_runtime_dir(),
+            PathBuf::from(format!("/tmp/rub-sock-{tag}"))
+        );
         assert_eq!(
             paths.workflows_dir(),
             PathBuf::from("/tmp/rub-home/workflows")
@@ -476,7 +507,10 @@ mod tests {
             session.canonical_socket_path(),
             PathBuf::from("/tmp/rub-home/sessions/default/daemon.sock")
         );
-        assert!(session.socket_path().starts_with("/tmp/rub-sock"));
+        let tag = std::env::var("USER")
+            .or_else(|_| std::env::var("UID"))
+            .unwrap_or_else(|_| "unknown".to_string());
+        assert!(session.socket_path().starts_with(format!("/tmp/rub-sock-{tag}")));
         assert_eq!(
             session.pid_path(),
             PathBuf::from("/tmp/rub-home/sessions/by-id/sess-123/daemon.pid")
@@ -512,7 +546,10 @@ mod tests {
             .join("overflow");
         let session = RubPaths::new(&deep_home).session_runtime("default", "sess-123");
         let socket = session.socket_path();
-        assert!(socket.starts_with("/tmp/rub-sock"));
+        let tag = std::env::var("USER")
+            .or_else(|_| std::env::var("UID"))
+            .unwrap_or_else(|_| "unknown".to_string());
+        assert!(socket.starts_with(format!("/tmp/rub-sock-{tag}")));
         assert!(
             socket.as_os_str().len() < 100,
             "actual socket authority should stay below Unix socket path limits: {}",
