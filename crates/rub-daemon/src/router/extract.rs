@@ -282,12 +282,20 @@ enum ExtractCommand {
 }
 
 impl ExtractCommand {
-    fn parse(args: &serde_json::Value) -> Result<Self, RubError> {
+    fn parse(args: &serde_json::Value, sub_override: Option<&str>) -> Result<Self, RubError> {
         let mut normalized = args.clone();
         if let Some(object) = normalized.as_object_mut() {
-            object
-                .entry("sub".to_string())
-                .or_insert_with(|| serde_json::json!("extract"));
+            if let Some(sub) = sub_override {
+                // Caller (inspect dispatch) provides the sub explicitly after stripping
+                // the routing key; use it directly so the right variant is selected.
+                object.insert("sub".to_string(), serde_json::json!(sub));
+            } else {
+                // Top-level use: sub may already be in args (CLI-provided), or defaults
+                // to "extract" when the extract command is invoked without a sub-command.
+                object
+                    .entry("sub".to_string())
+                    .or_insert_with(|| serde_json::json!("extract"));
+            }
         }
 
         #[derive(Debug, serde::Deserialize)]
@@ -336,9 +344,10 @@ impl ExtractCommand {
 pub(super) async fn cmd_extract(
     router: &DaemonRouter,
     args: &serde_json::Value,
+    sub_override: Option<&str>,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
-    let parsed_args = ExtractCommand::parse(args)?;
+    let parsed_args = ExtractCommand::parse(args, sub_override)?;
     let parsed = parse_extract_fields(parsed_args.spec(), &state.rub_home)?;
     let fields = parsed.value;
     let metadata = parsed.metadata;
@@ -1263,10 +1272,13 @@ mod tests {
 
     #[test]
     fn extract_command_defaults_to_query_mode() {
-        let parsed = ExtractCommand::parse(&json!({
-            "spec": "{\"title\":{\"kind\":\"text\",\"selector\":\"h1\"}}",
-            "snapshot_id": "snap-1",
-        }))
+        let parsed = ExtractCommand::parse(
+            &json!({
+                "spec": "{\"title\":{\"kind\":\"text\",\"selector\":\"h1\"}}",
+                "snapshot_id": "snap-1",
+            }),
+            None,
+        )
         .expect("plain extract payload should parse");
 
         match parsed {
@@ -1279,16 +1291,19 @@ mod tests {
 
     #[test]
     fn extract_command_parses_list_scan_payload() {
-        let parsed = ExtractCommand::parse(&json!({
-            "sub": "list",
-            "spec": "{\"rows\":{\"collection\":{\"selector\":\"li\",\"fields\":{\"title\":{\"kind\":\"text\",\"selector\":\".title\"}}}}}",
-            "scan_until": 25,
-            "scan_key": "id",
-            "max_scrolls": 4,
-            "scroll_amount": 900,
-            "settle_ms": 300,
-            "stall_limit": 2,
-        }))
+        let parsed = ExtractCommand::parse(
+            &json!({
+                "sub": "list",
+                "spec": "{\"rows\":{\"collection\":{\"selector\":\"li\",\"fields\":{\"title\":{\"kind\":\"text\",\"selector\":\".title\"}}}}}",
+                "scan_until": 25,
+                "scan_key": "id",
+                "max_scrolls": 4,
+                "scroll_amount": 900,
+                "settle_ms": 300,
+                "stall_limit": 2,
+            }),
+            None,
+        )
         .expect("inspect list payload should parse");
 
         let scan = parsed

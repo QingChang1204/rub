@@ -510,7 +510,11 @@ mod tests {
         let tag = std::env::var("USER")
             .or_else(|_| std::env::var("UID"))
             .unwrap_or_else(|_| "unknown".to_string());
-        assert!(session.socket_path().starts_with(format!("/tmp/rub-sock-{tag}")));
+        assert!(
+            session
+                .socket_path()
+                .starts_with(format!("/tmp/rub-sock-{tag}"))
+        );
         assert_eq!(
             session.pid_path(),
             PathBuf::from("/tmp/rub-home/sessions/by-id/sess-123/daemon.pid")

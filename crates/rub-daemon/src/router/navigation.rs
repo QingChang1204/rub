@@ -840,4 +840,29 @@ mod tests {
         assert!(!inline_screenshot_payload_exceeds_limit(1024));
         assert!(inline_screenshot_payload_exceeds_limit(7 * 1024 * 1024));
     }
+
+    #[test]
+    fn inspect_page_routing_sub_field_is_stripped_by_cmd_inspect_before_reaching_state_args() {
+        // Documentation test: confirm that StateArgs correctly rejects "sub" when it
+        // appears directly. This verifies that cmd_inspect's strip_inspect_routing_key
+        // is required — if it were removed, inspect page would fail with INVALID_INPUT.
+        let error = parse_json_args::<StateArgs>(
+            &serde_json::json!({ "sub": "page", "format": "compact" }),
+            "state",
+        )
+        .expect_err("StateArgs must reject 'sub' — stripping is cmd_inspect's responsibility");
+        assert_eq!(error.into_envelope().code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn state_args_still_rejects_genuinely_unknown_fields() {
+        // Guard: ensure the schema stays strict for all unknown fields.
+        let error = parse_json_args::<StateArgs>(
+            &serde_json::json!({ "limit": 10, "mystery": true }),
+            "state",
+        )
+        .expect_err("unknown state fields must still be rejected")
+        .into_envelope();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+    }
 }

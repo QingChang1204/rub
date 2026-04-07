@@ -19,16 +19,6 @@ enum GetCommand {
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[serde(tag = "sub", rename_all = "lowercase")]
-enum InspectReadCommand {
-    Text(InspectReadArgs),
-    Html(InspectReadArgs),
-    Value(InspectReadArgs),
-    Attributes(InspectReadArgs),
-    Bbox(InspectReadArgs),
-}
-
-#[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExecArgs {
     code: String,
@@ -172,22 +162,23 @@ async fn cmd_get_html(
 pub(super) async fn cmd_inspect_read(
     router: &DaemonRouter,
     args: &serde_json::Value,
+    inspect_sub: &str,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
-    match parse_json_args::<InspectReadCommand>(args, "inspect")? {
-        InspectReadCommand::Text(parsed) => {
-            cmd_inspect_text_like(router, args, parsed, state, InspectReadKind::Text).await
-        }
-        InspectReadCommand::Html(parsed) => cmd_inspect_html(router, args, parsed, state).await,
-        InspectReadCommand::Value(parsed) => {
-            cmd_inspect_text_like(router, args, parsed, state, InspectReadKind::Value).await
-        }
-        InspectReadCommand::Attributes(parsed) => {
+    // "sub" has already been stripped by cmd_inspect; dispatch using the explicit
+    // inspect_sub parameter instead of re-reading it from args via a serde tag enum.
+    let parsed: InspectReadArgs = parse_json_args(args, "inspect")?;
+    match inspect_sub {
+        "text" => cmd_inspect_text_like(router, args, parsed, state, InspectReadKind::Text).await,
+        "html" => cmd_inspect_html(router, args, parsed, state).await,
+        "value" => cmd_inspect_text_like(router, args, parsed, state, InspectReadKind::Value).await,
+        "attributes" => {
             cmd_inspect_text_like(router, args, parsed, state, InspectReadKind::Attributes).await
         }
-        InspectReadCommand::Bbox(parsed) => {
-            cmd_inspect_text_like(router, args, parsed, state, InspectReadKind::Bbox).await
-        }
+        "bbox" => cmd_inspect_text_like(router, args, parsed, state, InspectReadKind::Bbox).await,
+        other => Err(RubError::Internal(format!(
+            "Unexpected inspect read sub-command reached handler: '{other}'"
+        ))),
     }
 }
 
@@ -632,8 +623,8 @@ impl IntoCanonicalLocatorRef for LiveLocator {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecArgs, GetCommand, InspectReadCommand, live_read_subject, multi_read_result,
-        page_subject, read_payload, scalar_read_result,
+        ExecArgs, GetCommand, InspectReadArgs, live_read_subject, multi_read_result, page_subject,
+        read_payload, scalar_read_result,
     };
     use crate::router::request_args::parse_json_args;
     use rub_core::error::ErrorCode;
@@ -690,10 +681,11 @@ mod tests {
     }
 
     #[test]
-    fn typed_inspect_payload_rejects_unknown_fields() {
-        let error = parse_json_args::<InspectReadCommand>(
+    fn inspect_payload_rejects_unknown_fields_in_stripped_args() {
+        // After cmd_inspect strips "sub", InspectReadArgs is parsed directly.
+        // Verify that unknown fields are still rejected.
+        let error = parse_json_args::<InspectReadArgs>(
             &json!({
-                "sub": "text",
                 "selector": ".cta",
                 "mystery": true,
             }),

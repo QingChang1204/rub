@@ -158,7 +158,7 @@ pub(super) async fn dispatch_named_command(
         Some(CommandName::Fill) => workflow::cmd_fill(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
-        Some(CommandName::Extract) => extract::cmd_extract(router, args, state)
+        Some(CommandName::Extract) => extract::cmd_extract(router, args, None, state)
             .await
             .map(CommandDispatchOutcome::new),
         Some(CommandName::Pipe) => workflow::cmd_pipe(router, args, deadline, state)

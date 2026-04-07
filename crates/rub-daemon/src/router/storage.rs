@@ -703,4 +703,31 @@ mod tests {
         .expect("hidden orchestration payload should remain accepted");
         assert_eq!(parsed.area.as_deref(), Some("local"));
     }
+
+    #[test]
+    fn inspect_storage_routing_sub_field_is_stripped_before_reaching_inspect_storage_args() {
+        // Documentation test: confirm that InspectStorageArgs correctly rejects "sub".
+        // This verifies that cmd_inspect's strip_inspect_routing_key is required —
+        // if it were removed, inspect storage would fail with INVALID_INPUT.
+        let error = parse_json_args::<InspectStorageArgs>(
+            &json!({ "sub": "storage", "area": "local" }),
+            "inspect storage",
+        )
+        .expect_err(
+            "InspectStorageArgs must reject 'sub' — stripping is cmd_inspect's responsibility",
+        );
+        assert_eq!(error.into_envelope().code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn inspect_storage_still_rejects_genuinely_unknown_fields() {
+        // Guard: ensure the schema stays strict for all unknown fields.
+        let error = parse_json_args::<InspectStorageArgs>(
+            &json!({ "area": "local", "mystery": true }),
+            "inspect storage",
+        )
+        .expect_err("unknown inspect storage fields must still be rejected")
+        .into_envelope();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+    }
 }

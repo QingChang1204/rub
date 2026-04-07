@@ -287,24 +287,36 @@ async fn hit_test_matches(
         object_id,
         &format!(
             "function() {{
-                let x = {:.3};
-                let y = {:.3};
+                // GetContentQuads returns top-level viewport coordinates regardless
+                // of whether the element lives in an iframe. Use the top-level
+                // document for hit-testing to avoid execution-context /
+                // coordinate-space mismatches that arise when the remote_object_id
+                // is resolved via the top-level page context (making `window` in
+                // this function refer to the top window even for iframe elements).
+                const x = {:.3};
+                const y = {:.3};
                 try {{
-                    let currentWindow = window;
-                    while (currentWindow && currentWindow !== currentWindow.top) {{
-                        const frameEl = currentWindow.frameElement;
-                        if (!(frameEl instanceof Element)) return false;
-                        const rect = frameEl.getBoundingClientRect();
-                        x -= rect.left;
-                        y -= rect.top;
-                        currentWindow = currentWindow.parent;
+                    const topDoc = window.top.document;
+                    const hit = topDoc.elementFromPoint(x, y);
+                    if (!hit) return false;
+                    // Fast path: hit is the element or an ancestor/descendant.
+                    if (hit === this || this.contains(hit) || hit.contains(this)) return true;
+                    // Cross-iframe path: if the top-level hit is an <iframe>,
+                    // descend into its contentDocument and re-test using
+                    // frame-local coordinates.
+                    if (hit.contentDocument) {{
+                        try {{
+                            const fr = hit.getBoundingClientRect();
+                            const inner = hit.contentDocument.elementFromPoint(
+                                x - fr.left, y - fr.top
+                            );
+                            if (inner && (inner === this || this.contains(inner) || inner.contains(this))) return true;
+                        }} catch (_inner) {{}}
                     }}
+                    return false;
                 }} catch (_error) {{
                     return false;
                 }}
-                const top = document.elementFromPoint(x, y);
-                if (!top) return false;
-                return top === this || this.contains(top) || top.contains(this);
             }}",
             point.x, point.y
         ),

@@ -24,12 +24,12 @@ enum InspectNetworkCommand {
 }
 
 impl InspectNetworkCommand {
-    fn parse(args: &serde_json::Value) -> Result<Self, RubError> {
+    fn parse(args: &serde_json::Value, sub: &str) -> Result<Self, RubError> {
         let mut normalized = args.clone();
         if let Some(object) = normalized.as_object_mut() {
-            object
-                .entry("sub".to_string())
-                .or_insert_with(|| serde_json::json!("network"));
+            // Use the sub provided explicitly by cmd_inspect dispatch (already matched
+            // from the routing key before it was stripped from forwarded args).
+            object.insert("sub".to_string(), serde_json::json!(sub));
         }
         #[derive(Debug, serde::Deserialize)]
         #[serde(tag = "sub", rename_all = "lowercase")]
@@ -74,9 +74,10 @@ struct NetworkCurlArgs {
 
 pub(super) async fn cmd_inspect_network(
     args: &serde_json::Value,
+    inspect_sub: &str,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
-    match InspectNetworkCommand::parse(args)? {
+    match InspectNetworkCommand::parse(args, inspect_sub)? {
         InspectNetworkCommand::Timeline(parsed) => cmd_network_timeline(parsed, state).await,
         InspectNetworkCommand::Curl(parsed) => cmd_network_curl(parsed, state).await,
     }
@@ -565,11 +566,15 @@ mod tests {
 
     #[test]
     fn typed_inspect_network_payload_defaults_to_timeline() {
-        let parsed = InspectNetworkCommand::parse(&serde_json::json!({
-            "wait": true,
-            "timeout_ms": 10,
-        }))
-        .expect("network inspect should default to timeline");
+        // "sub" is now provided explicitly by cmd_inspect dispatch; pass "network" directly.
+        let parsed = InspectNetworkCommand::parse(
+            &serde_json::json!({
+                "wait": true,
+                "timeout_ms": 10,
+            }),
+            "network",
+        )
+        .expect("network inspect should parse as timeline");
         assert!(matches!(
             parsed,
             InspectNetworkCommand::Timeline(NetworkTimelineArgs {
