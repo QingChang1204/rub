@@ -370,7 +370,7 @@ async fn cmd_storage_import(
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     let path = args.path;
-    let data = std::fs::read_to_string(&path).map_err(|error| {
+    let data = tokio::fs::read_to_string(&path).await.map_err(|error| {
         RubError::domain(
             ErrorCode::FileNotFound,
             format!("Cannot read storage snapshot file: {error}"),
