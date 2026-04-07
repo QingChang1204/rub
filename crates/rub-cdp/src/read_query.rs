@@ -42,21 +42,19 @@ struct ReadQueryPayload {
 fn read_query_invalid_locator_suggestion(locator: &LiveLocator) -> &'static str {
     match locator.as_canonical() {
         CanonicalLocator::Selector { .. } => {
-            "Check the CSS selector syntax, or switch to --role/--label/--testid. Run 'rub inspect page --format compact' to inspect nearby content"
+            "Check the CSS selector syntax, or switch to --role/--label/--testid. Run 'rub observe' to see available elements"
         }
-        _ => {
-            "Check the locator value, or run 'rub inspect page --format compact' to inspect the current content root"
-        }
+        _ => "Check the locator value, or run 'rub observe' to see available elements",
     }
 }
 
 fn read_query_not_found_suggestion(locator: &LiveLocator) -> &'static str {
     match locator.as_canonical() {
         CanonicalLocator::Selector { .. } => {
-            "Verify the selector in the current frame, or switch to --role/--label/--testid for a more stable locator. Run 'rub inspect page --format compact' to inspect nearby content"
+            "Verify the selector in the current frame, or switch to --role/--label/--testid for a more stable locator. Run 'rub observe' to see available elements"
         }
         _ => {
-            "Run 'rub inspect page --format compact' to inspect the current content root, then refine the locator or add --first/--last/--nth if multiple matches are expected"
+            "Run 'rub observe' to see available elements, then refine the locator or add --first/--last/--nth if multiple matches are expected"
         }
     }
 }
