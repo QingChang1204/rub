@@ -137,15 +137,14 @@ pub(crate) async fn find_snapshot_elements_in_observation_scope(
     }
 
     if payload.selected_root_count == 0 {
-        return Err(RubError::domain_with_context(
+        return Err(RubError::domain_with_context_and_suggestion(
             ErrorCode::ElementNotFound,
             "Observation scope did not resolve to any content root",
             serde_json::json!({
                 "scope": scope,
                 "root_match_count": payload.root_match_count,
-                "frame_id": snapshot.frame_context.frame_id,
-                "snapshot_id": snapshot.snapshot_id,
             }),
+            "Verify the scope locator matches a visible element on the current page. Run 'rub observe' without --scope to see all available elements",
         ));
     }
 
@@ -164,14 +163,14 @@ pub(crate) async fn find_snapshot_elements_in_observation_scope(
     }
 
     if resolved.is_empty() {
-        return Err(RubError::domain_with_context(
+        return Err(RubError::domain_with_context_and_suggestion(
             ErrorCode::ElementNotFound,
             "Observation scope resolved no interactive snapshot descendants",
             serde_json::json!({
                 "scope": scope,
                 "root_match_count": payload.root_match_count,
-                "snapshot_id": snapshot.snapshot_id,
             }),
+            "The scope root was found but contains no interactive elements. Try a broader scope or run 'rub observe' to see the full page",
         ));
     }
 

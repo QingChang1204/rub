@@ -106,7 +106,23 @@ pub(crate) fn parse_json_spec_with_secret_resolution<T>(
 where
     T: DeserializeOwned,
 {
-    let mut spec = parse_json_value(raw, command)?;
+    let spec = parse_json_value(raw, command)?;
+    resolve_json_value_with_secret_resolution(spec, command, rub_home)
+}
+
+/// Resolve secret placeholders in an already-parsed JSON `Value` and
+/// deserialize into the target type.  Use this when the caller needs to
+/// pre-process the parsed JSON (e.g. shorthand normalization) before
+/// secret resolution and typed deserialization — avoids a redundant
+/// string → parse → string round-trip.
+pub(crate) fn resolve_json_value_with_secret_resolution<T>(
+    mut spec: Value,
+    command: &str,
+    rub_home: &Path,
+) -> Result<ResolvedJsonSpec<T>, RubError>
+where
+    T: DeserializeOwned,
+{
     let sources = SecretSources::load(rub_home)?;
     let mut metadata = SecretResolutionMetadata::default();
     resolve_placeholders(&mut spec, command, &sources, &mut metadata)?;

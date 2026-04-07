@@ -148,7 +148,7 @@ async fn cmd_find_content(
                 "content": true,
                 "locator": locator,
             }),
-            "Run 'rub inspect page --format compact' to inspect nearby content anchors, then refine the locator or add --first/--last/--nth if multiple matches are expected",
+            "Run 'rub observe' to see all interactive elements on the page, or broaden the locator. Add --first/--last/--nth if multiple matches are expected",
         ));
     }
 
