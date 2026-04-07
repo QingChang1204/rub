@@ -535,6 +535,11 @@ pub enum Commands {
     /// Named workflow (saved under RUB_HOME/workflows/<name>.json):
     ///   rub pipe --workflow login --var email=user@example.com --var password=secret
     ///
+    /// Step result references: Use {{prev.result.PATH}} to inject the previous step's
+    /// result, or {{steps[N].result.PATH}} / {{steps[LABEL].result.PATH}} to reference
+    /// any completed prior step by index or label:
+    ///   rub pipe '[{"command":"extract","args":{"spec":"{\"title\":\"h1\"}"},"label":"get_title"},{"command":"exec","args":{"code":"document.title = \"{{prev.result.fields.title}}\""}}]'
+    ///
     /// Allowed commands in pipe: open, state, click, type, exec, scroll, back,
     ///   keys, wait, tabs, switch, close-tab, get, hover, upload, select, fill, extract
     Pipe {
