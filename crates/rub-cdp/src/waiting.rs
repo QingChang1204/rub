@@ -5,6 +5,8 @@ use rub_core::model::{WaitCondition, WaitKind, WaitState};
 use std::sync::Arc;
 use tokio::time::{Duration, Instant};
 
+use crate::live_dom_locator::LOCATOR_JS_HELPERS;
+
 const POLL_INTERVAL_MS: u64 = 100;
 const INVALID_SELECTOR_SENTINEL: &str = "__rub_invalid_selector__";
 
@@ -141,66 +143,11 @@ fn locator_wait_script(locator: &CanonicalLocator, state: WaitState) -> Result<S
         )
     })?;
     Ok(format!(
-        r#"(() => {{
+        r#"(() =>{{
             const locator = {locator};
             const state = {state};
-            const normalize = (value) => String(value ?? '')
-                .replace(/\s+/g, ' ')
-                .trim()
-                .toLocaleLowerCase();
-            const visibleText = (el) => normalize(el.innerText || el.textContent || '');
-            const textish = (...values) => values
-                .map((value) => normalize(value))
-                .find((value) => value.length > 0) || '';
-            const fallbackRole = (el) => {{
-                const tag = String(el.tagName || '').toLowerCase();
-                if (tag === 'button') return 'button';
-                if (tag === 'a' && el.hasAttribute('href')) return 'link';
-                if (tag === 'textarea') return 'textbox';
-                if (tag === 'select') return 'combobox';
-                if (tag === 'option') return 'option';
-                if (tag === 'input') {{
-                    const type = String(el.getAttribute('type') || '').toLowerCase();
-                    if (type === 'checkbox') return 'checkbox';
-                    if (type === 'radio') return 'radio';
-                    if (type === 'button' || type === 'submit' || type === 'reset') return 'button';
-                    return 'textbox';
-                }}
-                return '';
-            }};
-            const semanticRole = (el) => textish(el.getAttribute && el.getAttribute('role'), fallbackRole(el));
-            const accessibleLabel = (el) => {{
-                const labels = [];
-                if (el.getAttribute) {{
-                    labels.push(el.getAttribute('aria-label'));
-                    labels.push(el.getAttribute('placeholder'));
-                    labels.push(el.getAttribute('title'));
-                    labels.push(el.getAttribute('alt'));
-                    labels.push(el.getAttribute('value'));
-                    labels.push(el.getAttribute('name'));
-                }}
-                const id = el.getAttribute && el.getAttribute('id');
-                if (id) {{
-                    const viaFor = document.querySelector(`label[for="${{CSS.escape(id)}}"]`);
-                    if (viaFor) labels.push(viaFor.innerText || viaFor.textContent);
-                }}
-                if (typeof el.closest === 'function') {{
-                    const viaClosest = el.closest('label');
-                    if (viaClosest) labels.push(viaClosest.innerText || viaClosest.textContent);
-                }}
-                labels.push(el.innerText || el.textContent);
-                return textish(...labels);
-            }};
-            const testingId = (el) => {{
-                if (!el.getAttribute) return '';
-                return textish(
-                    el.getAttribute('data-testid'),
-                    el.getAttribute('data-test-id'),
-                    el.getAttribute('data-test')
-                );
-            }};
-            const allElements = () => Array.from(document.querySelectorAll('*'));
-            const pickSelection = (elements, selection) => {{
+            {LOCATOR_JS_HELPERS}
+            const pickSelection = (elements, selection) =>{{
                 if (!selection) return elements[0] || null;
                 switch (selection) {{
                     case 'first':
@@ -214,7 +161,7 @@ fn locator_wait_script(locator: &CanonicalLocator, state: WaitState) -> Result<S
                         return elements[0] || null;
                 }}
             }};
-            const isVisible = (el) => {{
+            const isVisible = (el) =>{{
                 if (!el) return false;
                 const style = getComputedStyle(el);
                 if (style.display === 'none' || style.visibility === 'hidden') return false;
@@ -223,50 +170,16 @@ fn locator_wait_script(locator: &CanonicalLocator, state: WaitState) -> Result<S
                 const rect = el.getBoundingClientRect();
                 return rect.width > 0 && rect.height > 0;
             }};
-            const matches = (() => {{
-                switch (locator.kind) {{
-                    case 'selector':
-                        try {{
-                            return Array.from(document.querySelectorAll(locator.css));
-                        }} catch (_error) {{
-                            return {invalid_selector};
-                        }}
-                    case 'target_text': {{
-                        const needle = normalize(locator.text);
-                        if (!needle) return [];
-                        return allElements().filter((el) => {{
-                            const candidate = textish(
-                                el.innerText,
-                                el.textContent,
-                                el.getAttribute && el.getAttribute('aria-label'),
-                                el.getAttribute && el.getAttribute('title'),
-                                el.getAttribute && el.getAttribute('placeholder')
-                            );
-                            return candidate.includes(needle);
-                        }});
-                    }}
-                    case 'role': {{
-                        const needle = normalize(locator.role);
-                        if (!needle) return [];
-                        return allElements().filter((el) => semanticRole(el) === needle);
-                    }}
-                    case 'label': {{
-                        const needle = normalize(locator.label);
-                        if (!needle) return [];
-                        return allElements().filter((el) => {{
-                            const candidate = accessibleLabel(el);
-                            return candidate.length > 0 && candidate.includes(needle);
-                        }});
-                    }}
-                    case 'test_id': {{
-                        const needle = normalize(locator.testid);
-                        if (!needle) return [];
-                        return allElements().filter((el) => testingId(el) === needle);
-                    }}
-                    default:
-                        return [];
+            const matches = (() =>{{
+                try {{
+                    return resolveLocatorMatches(locator);
+                }} catch (_error) {{
+                    return {invalid_selector};
                 }}
             }})();
+            if (typeof matches === 'string' && matches === {invalid_selector}) {{
+                return JSON.stringify(matches);
+            }}
             const selected = pickSelection(matches, locator.selection);
             switch (state) {{
                 case 'attached':

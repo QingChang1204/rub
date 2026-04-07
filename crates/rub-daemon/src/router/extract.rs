@@ -13,7 +13,7 @@ use super::extract_postprocess::{
 };
 use super::projection::snapshot_entity;
 use super::request_args::{LocatorRequestArgs, locator_json, parse_json_args};
-use super::secret_resolution::{parse_json_spec_with_secret_resolution, redact_json_value};
+use super::secret_resolution::redact_json_value;
 use super::snapshot::build_stable_snapshot;
 use super::*;
 use collection::{ExtractEntrySpec, extract_collection};
@@ -65,6 +65,7 @@ struct RawExtractFieldSpec {
     kind: Option<ExtractKind>,
     #[serde(rename = "type")]
     type_hint: Option<ExtractTypeHint>,
+    #[serde(alias = "attr")]
     attribute: Option<String>,
     #[serde(default)]
     many: bool,
@@ -128,9 +129,13 @@ impl<'de> Deserialize<'de> for ExtractFieldSpec {
                 )));
             }
             (None, None) => {
-                return Err(serde::de::Error::custom(
-                    "extract field is missing 'kind'; use kind:'text'/'value'/... or the shorthand type:'text'/'value'/...",
-                ));
+                // Infer kind from context: attribute field present → Attribute, else → Text
+                let inferred = if raw.attribute.is_some() {
+                    ExtractKind::Attribute
+                } else {
+                    ExtractKind::Text
+                };
+                (inferred, None)
             }
         };
 
@@ -1143,7 +1148,33 @@ fn parse_extract_fields(
     rub_home: &std::path::Path,
 ) -> Result<super::secret_resolution::ResolvedJsonSpec<BTreeMap<String, ExtractEntrySpec>>, RubError>
 {
-    parse_json_spec_with_secret_resolution(raw, "extract", rub_home)
+    // Parse once, normalize string shorthands in-place, then resolve
+    // secrets and deserialize — avoids a redundant string round-trip.
+    let mut spec = super::request_args::parse_json_spec::<serde_json::Value>(raw, "extract")?;
+    normalize_extract_spec_shorthands_in_place(&mut spec);
+    super::secret_resolution::resolve_json_value_with_secret_resolution(spec, "extract", rub_home)
+}
+
+/// Normalize string-shorthand extract specs into full field objects in-place.
+///
+/// Converts `{"title": "h1"}` entries to `{"title": {"selector": "h1", "kind": "text"}}`.
+/// Object entries and non-object roots pass through unchanged.
+fn normalize_extract_spec_shorthands_in_place(spec: &mut serde_json::Value) {
+    let Some(object) = spec.as_object_mut() else {
+        return;
+    };
+    // Fast-path: if no string values exist, nothing to normalize.
+    if !object.values().any(|v| v.is_string()) {
+        return;
+    }
+    for value in object.values_mut() {
+        if let serde_json::Value::String(selector) = value {
+            *value = serde_json::json!({
+                "selector": *selector,
+                "kind": "text"
+            });
+        }
+    }
 }
 
 impl ExtractKind {
@@ -1270,5 +1301,60 @@ mod tests {
         assert_eq!(scan.scroll_amount, 900);
         assert_eq!(scan.settle_ms, 300);
         assert_eq!(scan.stall_limit, 2);
+    }
+
+    #[test]
+    fn normalize_shorthand_converts_string_values_to_selector_objects() {
+        let mut value: serde_json::Value = serde_json::from_str(
+            r#"{"title":"h1","price":".price","link":{"selector":"a","attr":"href"}}"#,
+        )
+        .expect("test JSON should parse");
+        super::normalize_extract_spec_shorthands_in_place(&mut value);
+
+        // String values should be expanded to full objects
+        assert_eq!(value["title"]["selector"], "h1");
+        assert_eq!(value["title"]["kind"], "text");
+        assert_eq!(value["price"]["selector"], ".price");
+        assert_eq!(value["price"]["kind"], "text");
+
+        // Object values should pass through unchanged
+        assert_eq!(value["link"]["selector"], "a");
+        assert_eq!(value["link"]["attr"], "href");
+    }
+
+    #[test]
+    fn extract_field_defaults_to_text_kind_when_omitted() {
+        let field: ExtractFieldSpec = serde_json::from_value(json!({
+            "selector": "#headline"
+        }))
+        .expect("extract field without kind should default to text");
+
+        assert_eq!(field.selector.as_deref(), Some("#headline"));
+        assert!(matches!(field.kind, ExtractKind::Text));
+    }
+
+    #[test]
+    fn extract_field_infers_attribute_kind_when_attr_present() {
+        let field: ExtractFieldSpec = serde_json::from_value(json!({
+            "selector": "a.main",
+            "attr": "href"
+        }))
+        .expect("extract field with attr alias should infer attribute kind");
+
+        assert!(matches!(field.kind, ExtractKind::Attribute));
+        assert_eq!(field.attribute.as_deref(), Some("href"));
+    }
+
+    #[test]
+    fn extract_field_accepts_attr_as_alias_for_attribute() {
+        let field: ExtractFieldSpec = serde_json::from_value(json!({
+            "selector": "img",
+            "kind": "attribute",
+            "attr": "src"
+        }))
+        .expect("attr alias should be accepted");
+
+        assert_eq!(field.attribute.as_deref(), Some("src"));
+        assert!(matches!(field.kind, ExtractKind::Attribute));
     }
 }

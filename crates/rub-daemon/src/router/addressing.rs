@@ -435,13 +435,13 @@ fn resolve_elements_by_text(snapshot: &Snapshot, query: &str) -> Result<Vec<Elem
 
     let contains = text_matches(snapshot, &normalized_query, false);
     if contains.is_empty() {
-        return Err(RubError::domain_with_context(
+        return Err(RubError::domain_with_context_and_suggestion(
             ErrorCode::ElementNotFound,
             format!("No interactive snapshot element matched text '{query}'"),
             serde_json::json!({
                 "target_text": query,
-                "snapshot_id": snapshot.snapshot_id,
             }),
+            "Run 'rub observe' to see all interactive elements, or use --selector for content-level matching",
         ));
     }
 
@@ -458,13 +458,13 @@ fn resolve_elements_by_role(snapshot: &Snapshot, query: &str) -> Result<Vec<Elem
         .collect::<Vec<_>>();
     matches.sort_by_key(|element| element.index);
     if matches.is_empty() {
-        return Err(RubError::domain_with_context(
+        return Err(RubError::domain_with_context_and_suggestion(
             ErrorCode::ElementNotFound,
             format!("No interactive snapshot element matched role '{query}'"),
             serde_json::json!({
                 "role": query,
-                "snapshot_id": snapshot.snapshot_id,
             }),
+            "Run 'rub observe' to see all interactive elements and their roles",
         ));
     }
     Ok(matches)
@@ -494,13 +494,13 @@ fn resolve_elements_by_label(snapshot: &Snapshot, query: &str) -> Result<Vec<Ele
         .collect::<Vec<_>>();
     contains.sort_by_key(|element| element.index);
     if contains.is_empty() {
-        return Err(RubError::domain_with_context(
+        return Err(RubError::domain_with_context_and_suggestion(
             ErrorCode::ElementNotFound,
             format!("No interactive snapshot element matched label '{query}'"),
             serde_json::json!({
                 "label": query,
-                "snapshot_id": snapshot.snapshot_id,
             }),
+            "Run 'rub observe' to see all interactive elements and their labels",
         ));
     }
     Ok(contains)
@@ -520,13 +520,13 @@ fn resolve_elements_by_testid(snapshot: &Snapshot, query: &str) -> Result<Vec<El
         .collect::<Vec<_>>();
     matches.sort_by_key(|element| element.index);
     if matches.is_empty() {
-        return Err(RubError::domain_with_context(
+        return Err(RubError::domain_with_context_and_suggestion(
             ErrorCode::ElementNotFound,
             format!("No interactive snapshot element matched test id '{query}'"),
             serde_json::json!({
                 "testid": query,
-                "snapshot_id": snapshot.snapshot_id,
             }),
+            "Run 'rub observe' to see all interactive elements and their test IDs",
         ));
     }
     Ok(matches)

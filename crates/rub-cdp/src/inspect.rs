@@ -71,11 +71,11 @@ struct HtmlQueryPayload {
 }
 
 fn selector_recovery_suggestion() -> &'static str {
-    "Check the CSS selector syntax, or switch to --role/--label/--testid. Run 'rub inspect page --format compact' to inspect nearby content"
+    "Check the CSS selector syntax, or switch to --role/--label/--testid. Run 'rub observe' to see available elements"
 }
 
 fn selector_not_found_suggestion() -> &'static str {
-    "Verify the selector in the current frame, or switch to --role/--label/--testid for a more stable locator. Run 'rub inspect page --format compact' to inspect nearby content"
+    "Verify the selector in the current frame, or switch to --role/--label/--testid for a more stable locator. Run 'rub observe' to see available elements"
 }
 
 pub(crate) async fn get_title(page: &Arc<Page>) -> Result<String, RubError> {
@@ -254,7 +254,6 @@ async fn resolve_selector_matches(
             serde_json::json!({
                 "selector": selector,
                 "kind": error_label,
-                "frame_id": snapshot.frame_context.frame_id,
             }),
             selector_recovery_suggestion(),
         ));
@@ -281,7 +280,6 @@ async fn resolve_selector_matches(
             serde_json::json!({
                 "selector": selector,
                 "kind": error_label,
-                "snapshot_id": snapshot.snapshot_id,
             }),
             selector_not_found_suggestion(),
         ));

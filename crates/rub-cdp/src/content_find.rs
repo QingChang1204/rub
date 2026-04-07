@@ -38,7 +38,7 @@ pub(crate) async fn find_content_matches(
                 "locator": locator,
                 "frame_id": frame_context.frame.frame_id,
             }),
-            "Check the locator syntax, or run 'rub inspect page --format compact' to inspect nearby content anchors",
+            "Check the locator syntax, or run 'rub observe' to inspect nearby content anchors",
         ));
     }
 

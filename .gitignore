@@ -21,3 +21,6 @@ Thumbs.db
 
 # rub runtime (never commit user data)
 ~/.rub/
+
+# Agent config (local only)
+GEMINI.md

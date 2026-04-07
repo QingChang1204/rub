@@ -492,19 +492,22 @@ pub enum Commands {
 
     /// Extract structured data through the canonical query surface.
     ///
-    /// SPEC is a JSON object mapping output field names to CSS selectors or
-    /// extraction descriptors. Each key becomes a field in the returned data.
+    /// SPEC is a JSON object mapping output field names to extraction descriptors.
+    /// Each key becomes a field in the returned JSON.
     ///
-    /// Simple field extraction:
-    ///   rub extract '{"title":"h1","price":".price","description":".desc"}'
+    /// Shorthand — field name to CSS selector (defaults to text content):
+    ///   rub extract '{"title":"h1","price":".price","desc":".desc"}'
     ///
-    /// With explicit attribute (default is text content):
+    /// Explicit kind (text, value, html, bbox, attributes, attribute):
+    ///   rub extract '{"title":{"selector":"h1","kind":"text"}}'
+    ///
+    /// Attribute extraction (use "attr" or "attribute" + "kind":"attribute"):
     ///   rub extract '{"link":{"selector":"a.main","attr":"href"}}'
     ///
-    /// Multiple items (list extraction — returns an array):
-    ///   rub extract '{"items":{"selector":".item","fields":{"name":".name","price":".price"}}}'
+    /// Collection extraction (returns an array of row objects):
+    ///   rub extract '{"items":{"collection":"li.item","fields":{"name":{"kind":"text"},"price":{"selector":".price"}}}}'
     ///
-    /// Output is always JSON: {"result": {"data": {"title": "...", ...}}}
+    /// Output shape: {"result": {"fields": {"title": "...", ...}, "field_count": N}}
     Extract {
         /// Inline JSON extract specification
         #[arg(conflicts_with = "file")]
@@ -520,8 +523,8 @@ pub enum Commands {
     /// Execute a workflow pipeline over existing canonical commands.
     ///
     /// SPEC is a JSON array of step objects, each with a `command` key and optional
-    /// `args` object. Steps run sequentially; output from each step is available
-    /// to subsequent steps via `{{prev.*}}` references (coming soon).
+    /// `args` object. Steps run sequentially; each step result is included in the
+    /// final response under `steps[n].result`.
     ///
     /// Minimal example (open and take screenshot):
     ///   rub pipe '[{"command":"open","args":{"url":"https://example.com"}},{"command":"screenshot"}]'
@@ -531,6 +534,11 @@ pub enum Commands {
     ///
     /// Named workflow (saved under RUB_HOME/workflows/<name>.json):
     ///   rub pipe --workflow login --var email=user@example.com --var password=secret
+    ///
+    /// Step result references: Use {{prev.result.PATH}} to inject the previous step's
+    /// result, or {{steps[N].result.PATH}} / {{steps[LABEL].result.PATH}} to reference
+    /// any completed prior step by index or label:
+    ///   rub pipe '[{"command":"extract","args":{"spec":"{\"title\":\"h1\"}"},"label":"get_title"},{"command":"exec","args":{"code":"document.title = \"{{prev.result.fields.title}}\""}}]'
     ///
     /// Allowed commands in pipe: open, state, click, type, exec, scroll, back,
     ///   keys, wait, tabs, switch, close-tab, get, hover, upload, select, fill, extract

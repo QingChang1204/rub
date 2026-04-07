@@ -22,7 +22,7 @@ pub mod js;
 pub mod keyboard;
 pub mod keys;
 pub(crate) mod listener_generation;
-mod live_dom_locator;
+pub mod live_dom_locator;
 pub(crate) mod managed_browser;
 pub mod network_rules;
 pub mod observation_scope;
