@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use rub_cdp::live_dom_locator::LOCATOR_JS_HELPERS;
 use rub_core::error::{ErrorCode, RubError};
 
 use super::{
@@ -382,11 +383,9 @@ fn build_collection_extract_script(collection: &ExtractCollectionSpec) -> Result
             const collectionRoot = {collection_root};
             const fields = {fields};
             try {{
-                const normalizeText = (value) =>
-                    String(value || '')
-                        .replace(/\s+/g, ' ')
-                        .trim()
-                        .toLowerCase();
+                {LOCATOR_JS_HELPERS}
+                const normalizeText = normalize;
+                const testId = testingId;
 
                 const candidateValues = (el) => {{
                     const values = [];
@@ -397,56 +396,6 @@ fn build_collection_extract_script(collection: &ExtractCollectionSpec) -> Result
                         if (value) values.push(value);
                     }}
                     return values;
-                }};
-
-                const fallbackRole = (el) => {{
-                    const tag = (el.tagName || '').toLowerCase();
-                    if (tag === 'input') {{
-                        const inputType = normalizeText(el.getAttribute('type') || '');
-                        if (inputType === 'checkbox') return 'checkbox';
-                        if (inputType === 'radio') return 'radio';
-                        return 'textbox';
-                    }}
-                    switch (tag) {{
-                        case 'button':
-                            return 'button';
-                        case 'a':
-                            return 'link';
-                        case 'textarea':
-                            return 'textbox';
-                        case 'select':
-                            return 'combobox';
-                        case 'option':
-                            return 'option';
-                        default:
-                            return 'generic';
-                    }}
-                }};
-
-                const semanticRole = (el) =>
-                    normalizeText(el.getAttribute('role') || '') || fallbackRole(el);
-
-                const accessibleLabel = (el) => {{
-                    for (const value of [
-                        normalizeText(el.textContent || ''),
-                        normalizeText(el.getAttribute('aria-label') || ''),
-                        normalizeText(el.getAttribute('placeholder') || ''),
-                        normalizeText(el.getAttribute('name') || ''),
-                        normalizeText(el.getAttribute('value') || ''),
-                        normalizeText(el.getAttribute('title') || ''),
-                        normalizeText(el.getAttribute('alt') || ''),
-                    ]) {{
-                        if (value) return value;
-                    }}
-                    return '';
-                }};
-
-                const testId = (el) => {{
-                    for (const name of ['data-testid', 'data-test-id', 'data-test']) {{
-                        const value = normalizeText(el.getAttribute(name) || '');
-                        if (value) return value;
-                    }}
-                    return '';
                 }};
 
                 const elementsInScope = (root) => {{

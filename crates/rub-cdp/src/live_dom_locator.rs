@@ -1,4 +1,4 @@
-pub(crate) const LOCATOR_JS_HELPERS: &str = r#"
+pub const LOCATOR_JS_HELPERS: &str = r#"
 const normalize = (value) => String(value ?? '')
     .replace(/\s+/g, ' ')
     .trim()
