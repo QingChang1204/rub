@@ -522,6 +522,23 @@ fn parse_pipe_spec(
         ));
     }
 
+    // Enforce label uniqueness to prevent ambiguous steps[LABEL] references.
+    let mut seen_labels = std::collections::HashSet::new();
+    for (index, step) in parsed.value.steps.iter().enumerate() {
+        if let Some(label) = step.label.as_deref()
+            && !seen_labels.insert(label.to_string())
+        {
+            return Err(RubError::domain_with_context(
+                ErrorCode::InvalidInput,
+                format!("Duplicate step label '{label}' at step index {index}"),
+                serde_json::json!({
+                    "label": label,
+                    "step_index": index,
+                }),
+            ));
+        }
+    }
+
     Ok(parsed)
 }
 
@@ -556,7 +573,13 @@ fn resolve_step_references(
 ) -> Result<(), RubError> {
     match args {
         serde_json::Value::String(s) => {
-            *s = resolve_template_string(s, completed, step_index)?;
+            // When the entire string is a single {{...}} placeholder, preserve
+            // the original JSON type instead of stringifying it.
+            if let Some(json_value) = try_resolve_whole_placeholder(s, completed, step_index)? {
+                *args = json_value;
+            } else {
+                *s = resolve_template_string(s, completed, step_index)?;
+            }
         }
         serde_json::Value::Object(map) => {
             for value in map.values_mut() {
@@ -571,6 +594,29 @@ fn resolve_step_references(
         _ => {}
     }
     Ok(())
+}
+
+/// When a string is exactly `{{reference}}` with no surrounding text,
+/// resolve it to the original JSON value (preserving type).
+/// Returns None if the string contains additional text or multiple placeholders.
+fn try_resolve_whole_placeholder(
+    input: &str,
+    completed: &[serde_json::Value],
+    step_index: usize,
+) -> Result<Option<serde_json::Value>, RubError> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with("{{") || !trimmed.ends_with("}}") {
+        return Ok(None);
+    }
+    // Ensure there's exactly one placeholder (no nested {{ or second {{ after the first }}).
+    let inner = &trimmed[2..trimmed.len() - 2];
+    if inner.contains("{{") || inner.contains("}}") {
+        return Ok(None);
+    }
+    let reference = inner.trim();
+    let (step_value, path) = resolve_reference_target(reference, completed, step_index)?;
+    let resolved = navigate_json_path(step_value, path)?;
+    Ok(Some(resolved.clone()))
 }
 
 fn resolve_template_string(
@@ -610,8 +656,27 @@ fn resolve_single_reference(
     completed: &[serde_json::Value],
     step_index: usize,
 ) -> Result<String, RubError> {
-    // Parse "prev.PATH" or "steps[N].PATH" or "steps[LABEL].PATH"
-    let (step_value, path) = if let Some(path) = reference.strip_prefix("prev.") {
+    let (step_value, path) = resolve_reference_target(reference, completed, step_index)?;
+    let resolved = navigate_json_path(step_value, path)?;
+
+    // Convert to string representation (used when embedded in a larger template string)
+    match resolved {
+        serde_json::Value::String(s) => Ok(s.clone()),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        serde_json::Value::Bool(b) => Ok(b.to_string()),
+        serde_json::Value::Null => Ok("null".to_string()),
+        other => Ok(other.to_string()),
+    }
+}
+
+/// Parse a reference string like "prev.PATH" or "steps[N].PATH" and return
+/// the target step JSON value + the remaining path suffix.
+fn resolve_reference_target<'a>(
+    reference: &'a str,
+    completed: &'a [serde_json::Value],
+    step_index: usize,
+) -> Result<(&'a serde_json::Value, &'a str), RubError> {
+    if let Some(path) = reference.strip_prefix("prev.") {
         if step_index == 0 {
             return Err(RubError::domain_with_context(
                 ErrorCode::InvalidInput,
@@ -622,7 +687,7 @@ fn resolve_single_reference(
                 }),
             ));
         }
-        (&completed[step_index - 1], path)
+        Ok((&completed[step_index - 1], path))
     } else if let Some(rest) = reference.strip_prefix("steps[") {
         let Some(bracket_end) = rest.find(']') else {
             return Err(RubError::domain(
@@ -670,24 +735,12 @@ fn resolve_single_reference(
                     )
                 })?
         };
-        (&completed[target_index], path)
+        Ok((&completed[target_index], path))
     } else {
-        return Err(RubError::domain(
+        Err(RubError::domain(
             ErrorCode::InvalidInput,
             format!("Unknown reference '{{{{{reference}}}}}': must start with 'prev.' or 'steps['"),
-        ));
-    };
-
-    // Navigate the JSON path
-    let resolved = navigate_json_path(step_value, path)?;
-
-    // Convert to string representation
-    match resolved {
-        serde_json::Value::String(s) => Ok(s.clone()),
-        serde_json::Value::Number(n) => Ok(n.to_string()),
-        serde_json::Value::Bool(b) => Ok(b.to_string()),
-        serde_json::Value::Null => Ok("null".to_string()),
-        other => Ok(other.to_string()),
+        ))
     }
 }
 
@@ -946,11 +999,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_number_as_string() {
+    fn resolve_whole_placeholder_preserves_json_type() {
         let completed = mock_completed_steps();
         let mut args = json!({ "count": "{{steps[0].result.fields.count}}" });
         resolve_step_references(&mut args, &completed, 2).unwrap();
-        assert_eq!(args["count"], "42");
+        // Whole-placeholder resolution preserves the original JSON type (number, not string).
+        assert_eq!(args["count"], 42);
+    }
+
+    #[test]
+    fn resolve_number_embedded_in_string_stringifies() {
+        let completed = mock_completed_steps();
+        let mut args = json!({ "msg": "Count is {{steps[0].result.fields.count}}" });
+        resolve_step_references(&mut args, &completed, 2).unwrap();
+        assert_eq!(args["msg"], "Count is 42");
     }
 
     #[test]
@@ -1020,5 +1082,38 @@ mod tests {
         let mut args = json!([{"value": "{{prev.result.value}}"}]);
         resolve_step_references(&mut args, &completed, 2).unwrap();
         assert_eq!(args[0]["value"], "computed");
+    }
+
+    #[test]
+    fn resolve_whole_placeholder_preserves_bool() {
+        let completed =
+            vec![json!({ "action": { "command": "exec" }, "result": { "done": true } })];
+        let mut args = json!({ "flag": "{{prev.result.done}}" });
+        resolve_step_references(&mut args, &completed, 1).unwrap();
+        assert_eq!(args["flag"], true);
+    }
+
+    #[test]
+    fn resolve_whole_placeholder_preserves_object() {
+        let completed = vec![
+            json!({ "action": { "command": "state" }, "result": { "snapshot": { "url": "https://example.com", "elements": [] } } }),
+        ];
+        let mut args = json!({ "snap": "{{prev.result.snapshot}}" });
+        resolve_step_references(&mut args, &completed, 1).unwrap();
+        assert!(args["snap"].is_object());
+        assert_eq!(args["snap"]["url"], "https://example.com");
+    }
+
+    #[test]
+    fn parse_pipe_spec_rejects_duplicate_labels() {
+        let spec = r#"[
+            {"command": "state", "label": "fetch"},
+            {"command": "observe", "label": "fetch"}
+        ]"#;
+        let rub_home = std::path::PathBuf::from("/tmp");
+        let err = parse_pipe_spec(spec, &rub_home).unwrap_err();
+        let envelope = err.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::InvalidInput);
+        assert!(envelope.message.contains("Duplicate step label"));
     }
 }
