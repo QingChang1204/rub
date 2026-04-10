@@ -1,76 +1,19 @@
+mod args;
+mod projection;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rub_core::error::{ErrorCode, RubError};
-use rub_core::model::{NetworkRequestLifecycle, NetworkRequestRecord};
-
-use crate::router::request_args::parse_json_args;
+use self::args::{
+    InspectNetworkCommand, NetworkCurlArgs, NetworkRequestWaitState, NetworkTimelineArgs,
+    NetworkWaitErrorContext, filter_requests_by_wait_state, parse_lifecycle_filter,
+};
+use self::projection::{
+    build_curl_export, network_payload, network_registry_subject, network_request_subject,
+    network_wait_subject, summarize_request_record,
+};
 use crate::session::SessionState;
-
-#[derive(Clone, Copy)]
-struct NetworkWaitErrorContext<'a> {
-    request_id: Option<&'a str>,
-    url_match: Option<&'a str>,
-    method: Option<&'a str>,
-    status: Option<u16>,
-    desired_state: NetworkRequestWaitState,
-    started: Instant,
-}
-
-#[derive(Debug)]
-enum InspectNetworkCommand {
-    Timeline(NetworkTimelineArgs),
-    Curl(NetworkCurlArgs),
-}
-
-impl InspectNetworkCommand {
-    fn parse(args: &serde_json::Value, sub: &str) -> Result<Self, RubError> {
-        let mut normalized = args.clone();
-        if let Some(object) = normalized.as_object_mut() {
-            // Use the sub provided explicitly by cmd_inspect dispatch (already matched
-            // from the routing key before it was stripped from forwarded args).
-            object.insert("sub".to_string(), serde_json::json!(sub));
-        }
-        #[derive(Debug, serde::Deserialize)]
-        #[serde(tag = "sub", rename_all = "lowercase")]
-        enum TaggedInspectNetworkCommand {
-            Network(NetworkTimelineArgs),
-            Curl(NetworkCurlArgs),
-        }
-
-        match parse_json_args::<TaggedInspectNetworkCommand>(&normalized, "inspect network")? {
-            TaggedInspectNetworkCommand::Network(args) => Ok(Self::Timeline(args)),
-            TaggedInspectNetworkCommand::Curl(args) => Ok(Self::Curl(args)),
-        }
-    }
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkTimelineArgs {
-    #[serde(default)]
-    wait: bool,
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    last: Option<u64>,
-    #[serde(default)]
-    url_match: Option<String>,
-    #[serde(default)]
-    method: Option<String>,
-    #[serde(default)]
-    status: Option<u64>,
-    #[serde(default)]
-    lifecycle: Option<String>,
-    #[serde(default)]
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkCurlArgs {
-    id: String,
-}
+use rub_core::error::{ErrorCode, RubError};
 
 pub(super) async fn cmd_inspect_network(
     args: &serde_json::Value,
@@ -297,225 +240,13 @@ async fn cmd_network_curl(
     ))
 }
 
-#[derive(Debug)]
-struct CurlExport {
-    command: String,
-    body_complete: bool,
-    body_omitted_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NetworkRequestWaitState {
-    Pending,
-    Responded,
-    Completed,
-    Failed,
-    Terminal,
-}
-
-impl NetworkRequestWaitState {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Responded => "responded",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Terminal => "terminal",
-        }
-    }
-
-    fn actual_filter(self) -> Option<NetworkRequestLifecycle> {
-        match self {
-            Self::Pending => Some(NetworkRequestLifecycle::Pending),
-            Self::Responded => Some(NetworkRequestLifecycle::Responded),
-            Self::Completed => Some(NetworkRequestLifecycle::Completed),
-            Self::Failed => Some(NetworkRequestLifecycle::Failed),
-            Self::Terminal => None,
-        }
-    }
-
-    fn matches(self, lifecycle: NetworkRequestLifecycle) -> bool {
-        match self {
-            Self::Pending => lifecycle == NetworkRequestLifecycle::Pending,
-            Self::Responded => lifecycle == NetworkRequestLifecycle::Responded,
-            Self::Completed => lifecycle == NetworkRequestLifecycle::Completed,
-            Self::Failed => lifecycle == NetworkRequestLifecycle::Failed,
-            Self::Terminal => matches!(
-                lifecycle,
-                NetworkRequestLifecycle::Completed | NetworkRequestLifecycle::Failed
-            ),
-        }
-    }
-}
-
-fn parse_lifecycle_filter(
-    value: Option<&str>,
-) -> Result<Option<NetworkRequestWaitState>, RubError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match value {
-        "pending" => Ok(Some(NetworkRequestWaitState::Pending)),
-        "responded" => Ok(Some(NetworkRequestWaitState::Responded)),
-        "completed" => Ok(Some(NetworkRequestWaitState::Completed)),
-        "failed" => Ok(Some(NetworkRequestWaitState::Failed)),
-        "terminal" => Ok(Some(NetworkRequestWaitState::Terminal)),
-        other => Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            format!(
-                "Unknown network lifecycle '{other}'. Valid: pending, responded, completed, failed, terminal"
-            ),
-        )),
-    }
-}
-
-fn filter_requests_by_wait_state(
-    requests: Vec<NetworkRequestRecord>,
-    state: Option<NetworkRequestWaitState>,
-) -> Vec<NetworkRequestRecord> {
-    let Some(state) = state else {
-        return requests;
-    };
-    requests
-        .into_iter()
-        .filter(|record| state.matches(record.lifecycle))
-        .collect()
-}
-
-fn summarize_request_record(mut request: NetworkRequestRecord) -> NetworkRequestRecord {
-    request.request_body = None;
-    request.response_body = None;
-    request
-}
-
-fn build_curl_export(
-    request: &rub_core::model::NetworkRequestRecord,
-) -> Result<CurlExport, RubError> {
-    if request.method.trim().is_empty() {
-        return Err(RubError::domain_with_context(
-            ErrorCode::BrowserCrashed,
-            "inspect curl requires an authoritative recorded request method",
-            serde_json::json!({
-                "kind": "network_request",
-                "id": request.request_id,
-                "reason": "request_method_missing",
-            }),
-        ));
-    }
-
-    let mut parts = vec!["curl".to_string()];
-    parts.push("-X".to_string());
-    parts.push(shell_quote(&request.method));
-
-    for (name, value) in &request.request_headers {
-        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("host") {
-            continue;
-        }
-        parts.push("-H".to_string());
-        parts.push(shell_quote(&format!("{name}: {value}")));
-    }
-
-    let mut body_complete = true;
-    let mut body_omitted_reason = None;
-    if let Some(body) = &request.request_body {
-        if body.available {
-            let is_truncated = body.truncated.unwrap_or(false);
-            match body.encoding.as_deref() {
-                Some("text") if !is_truncated => {
-                    parts.push("--data-raw".to_string());
-                    parts.push(shell_quote(body.preview.as_deref().unwrap_or("")));
-                }
-                Some("base64") => {
-                    body_complete = false;
-                    body_omitted_reason = Some("request_body_base64".to_string());
-                }
-                _ if is_truncated => {
-                    body_complete = false;
-                    body_omitted_reason = Some("request_body_truncated".to_string());
-                }
-                _ => {}
-            }
-        } else {
-            body_complete = false;
-            body_omitted_reason = body.omitted_reason.clone();
-        }
-    }
-
-    parts.push(shell_quote(&request.url));
-    Ok(CurlExport {
-        command: parts.join(" "),
-        body_complete,
-        body_omitted_reason,
-    })
-}
-
-fn shell_quote(input: &str) -> String {
-    if input.is_empty() {
-        return "''".to_string();
-    }
-    if input
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || "-._~/:?&=%@".contains(ch))
-    {
-        return input.to_string();
-    }
-    format!("'{}'", input.replace('\'', "'\"'\"'"))
-}
-
-fn network_payload(subject: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "subject": subject,
-        "result": result,
-    })
-}
-
-fn network_registry_subject(
-    last: Option<usize>,
-    url_match: Option<&str>,
-    method: Option<&str>,
-    status: Option<u16>,
-    lifecycle: Option<NetworkRequestWaitState>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "kind": "network_request_registry",
-        "last": last,
-        "url_match": url_match,
-        "method": method,
-        "status": status,
-        "lifecycle": lifecycle.map(NetworkRequestWaitState::as_str),
-    })
-}
-
-fn network_request_subject(request_id: &str) -> serde_json::Value {
-    serde_json::json!({
-        "kind": "network_request",
-        "request_id": request_id,
-    })
-}
-
-fn network_wait_subject(
-    request_id: Option<&str>,
-    url_match: Option<&str>,
-    method: Option<&str>,
-    status: Option<u16>,
-    lifecycle: NetworkRequestWaitState,
-) -> serde_json::Value {
-    serde_json::json!({
-        "kind": "network_request_wait",
-        "request_id": request_id,
-        "url_match": url_match,
-        "method": method,
-        "status": status,
-        "lifecycle": lifecycle.as_str(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use super::projection::shell_quote;
     use super::{
         InspectNetworkCommand, NetworkRequestWaitState, NetworkTimelineArgs, build_curl_export,
         cmd_network_wait, filter_requests_by_wait_state, network_payload, network_registry_subject,
-        network_request_subject, network_wait_subject, parse_lifecycle_filter, shell_quote,
+        network_request_subject, network_wait_subject, parse_lifecycle_filter,
     };
     use rub_core::error::ErrorCode;
     use rub_core::model::{NetworkBodyPreview, NetworkRequestLifecycle, NetworkRequestRecord};

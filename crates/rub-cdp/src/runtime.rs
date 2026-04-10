@@ -199,8 +199,7 @@ fn select_attached_external_page_index(
 
     match attached_matches.as_slice() {
         [index] => Some(*index),
-        [index, ..] => Some(*index),
-        [] => Some(0),
+        _ => None,
     }
 }
 
@@ -348,23 +347,22 @@ mod tests {
     }
 
     #[test]
-    fn attached_external_page_selection_falls_back_to_first_attached_page_when_ambiguous() {
+    fn attached_external_page_selection_fails_closed_when_ambiguous() {
         let pages = vec![
             "tab-1".to_string(),
             "tab-2".to_string(),
             "tab-3".to_string(),
         ];
         let attached = vec!["tab-1".to_string(), "tab-3".to_string()];
-        assert_eq!(
-            select_attached_external_page_index(&pages, &attached),
-            Some(0)
-        );
+        assert_eq!(select_attached_external_page_index(&pages, &attached), None);
+        assert_eq!(select_attached_page_index(&pages, &attached), None);
     }
 
     #[test]
-    fn attached_external_page_selection_falls_back_to_first_page_without_attached_targets() {
+    fn attached_external_page_selection_fails_closed_without_attached_targets() {
         let pages = vec!["tab-1".to_string(), "tab-2".to_string()];
-        assert_eq!(select_attached_external_page_index(&pages, &[]), Some(0));
+        assert_eq!(select_attached_external_page_index(&pages, &[]), None);
+        assert_eq!(select_attached_page_index(&pages, &[]), None);
     }
 
     #[test]

@@ -5,6 +5,8 @@ use rub_core::model::CommandResult;
 use rub_ipc::protocol::IpcResponse;
 use serde_json::{Map, Value};
 
+const POST_COMMIT_LOCAL_FAILURE_STATE: &str = "daemon_committed_local_followup_failed";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionTraceMode {
     Compact,
@@ -18,7 +20,6 @@ pub fn format_response(
     command: &str,
     session: &str,
     pretty: bool,
-    raw_exec: bool,
     trace_mode: InteractionTraceMode,
 ) -> String {
     if let Some(envelope) = response.contract_error_envelope() {
@@ -41,13 +42,6 @@ pub fn format_response(
         };
     }
 
-    if raw_exec
-        && response.status == rub_ipc::protocol::ResponseStatus::Success
-        && let Some(result) = response.data.as_ref().and_then(|data| data.get("result"))
-    {
-        return format_raw_value(result, pretty);
-    }
-
     let mut result = CommandResult {
         success: response.status == rub_ipc::protocol::ResponseStatus::Success,
         command: command.to_string(),
@@ -66,6 +60,19 @@ pub fn format_response(
     } else {
         serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
     }
+}
+
+/// Format the explicit raw stdout surface for `exec --raw`.
+///
+/// This surface is intentionally separate from the standard JSON envelope.
+/// Callers must opt into it explicitly instead of routing through
+/// `format_response()`.
+pub fn format_exec_raw_response(response: &IpcResponse, pretty: bool) -> Option<String> {
+    if response.status != rub_ipc::protocol::ResponseStatus::Success {
+        return None;
+    }
+    let result = response.data.as_ref().and_then(|data| data.get("result"))?;
+    Some(format_raw_value(result, pretty))
 }
 
 fn format_raw_value(value: &Value, pretty: bool) -> String {
@@ -102,6 +109,10 @@ pub fn format_post_commit_cli_error(
     envelope: ErrorEnvelope,
     pretty: bool,
 ) -> String {
+    let data = response
+        .data
+        .as_ref()
+        .map(annotate_post_commit_local_failure_data);
     let result = CommandResult {
         success: false,
         command: command.to_string(),
@@ -110,7 +121,7 @@ pub fn format_post_commit_cli_error(
         command_id: response.command_id.clone(),
         session: session.to_string(),
         timing: response.timing,
-        data: response.data.clone(),
+        data,
         error: Some(envelope),
     };
 
@@ -118,6 +129,23 @@ pub fn format_post_commit_cli_error(
         serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
     } else {
         serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+    }
+}
+
+fn annotate_post_commit_local_failure_data(data: &Value) -> Value {
+    match data {
+        Value::Object(object) => {
+            let mut annotated = object.clone();
+            annotated.insert(
+                "commit_state".to_string(),
+                Value::String(POST_COMMIT_LOCAL_FAILURE_STATE.to_string()),
+            );
+            Value::Object(annotated)
+        }
+        other => serde_json::json!({
+            "commit_state": POST_COMMIT_LOCAL_FAILURE_STATE,
+            "daemon_response": other,
+        }),
     }
 }
 
@@ -195,7 +223,10 @@ fn summarize_observed_effects(interaction: &Map<String, Value>) -> Option<Value>
 
 #[cfg(test)]
 mod tests {
-    use super::{InteractionTraceMode, format_post_commit_cli_error, format_response};
+    use super::{
+        InteractionTraceMode, POST_COMMIT_LOCAL_FAILURE_STATE, format_exec_raw_response,
+        format_post_commit_cli_error, format_response,
+    };
     use rub_core::error::ErrorEnvelope;
     use rub_core::model::Timing;
     use rub_ipc::protocol::{IpcResponse, ResponseStatus};
@@ -447,7 +478,6 @@ mod tests {
             "select",
             "default",
             false,
-            false,
             InteractionTraceMode::Trace,
         );
         let json: Value = serde_json::from_str(&output).unwrap();
@@ -509,6 +539,10 @@ mod tests {
         assert_eq!(value["request_id"], "req-42");
         assert_eq!(value["command_id"], "cmd-42");
         assert_eq!(value["success"], false);
+        assert_eq!(
+            value["data"]["commit_state"],
+            POST_COMMIT_LOCAL_FAILURE_STATE
+        );
         assert_eq!(value["data"]["result"]["ok"], true);
         assert_eq!(
             value["error"]["message"],
@@ -517,7 +551,38 @@ mod tests {
     }
 
     #[test]
-    fn format_response_supports_exec_raw_output() {
+    fn post_commit_cli_error_wraps_non_object_daemon_payload_with_commit_state() {
+        let response = IpcResponse {
+            ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+            request_id: "req-99".to_string(),
+            command_id: Some("cmd-99".to_string()),
+            status: ResponseStatus::Success,
+            timing: Timing::default(),
+            data: Some(serde_json::json!("done")),
+            error: None,
+        };
+
+        let formatted = format_post_commit_cli_error(
+            &response,
+            "history",
+            "default",
+            ErrorEnvelope::new(
+                rub_core::error::ErrorCode::InvalidInput,
+                "local export failed after daemon success",
+            ),
+            false,
+        );
+        let value: Value = serde_json::from_str(&formatted).expect("valid output JSON");
+
+        assert_eq!(
+            value["data"]["commit_state"],
+            POST_COMMIT_LOCAL_FAILURE_STATE
+        );
+        assert_eq!(value["data"]["daemon_response"], "done");
+    }
+
+    #[test]
+    fn format_exec_raw_response_returns_explicit_raw_surface() {
         let response = IpcResponse {
             ipc_protocol_version: "1.0".to_string(),
             command_id: Some("019-raw".to_string()),
@@ -539,10 +604,78 @@ mod tests {
             "exec",
             "default",
             false,
-            true,
             InteractionTraceMode::Compact,
         );
-        assert_eq!(output, "The Page Title");
+        let value: Value = serde_json::from_str(&output).expect("valid JSON output");
+        assert_eq!(value["success"], true);
+        let raw = format_exec_raw_response(&response, false).expect("raw output should exist");
+        assert_eq!(raw, "The Page Title");
+    }
+
+    #[test]
+    fn format_exec_raw_response_requires_success_with_result_payload() {
+        let error_response = IpcResponse {
+            ipc_protocol_version: "1.0".to_string(),
+            command_id: Some("019-raw".to_string()),
+            request_id: "019-request".to_string(),
+            status: ResponseStatus::Error,
+            data: None,
+            error: Some(ErrorEnvelope::new(
+                rub_core::error::ErrorCode::InvalidInput,
+                "boom",
+            )),
+            timing: Timing {
+                queue_ms: 0,
+                exec_ms: 5,
+                total_ms: 5,
+            },
+        };
+        assert!(format_exec_raw_response(&error_response, false).is_none());
+
+        let missing_result = IpcResponse {
+            ipc_protocol_version: "1.0".to_string(),
+            command_id: Some("019-raw".to_string()),
+            request_id: "019-request".to_string(),
+            status: ResponseStatus::Success,
+            data: Some(serde_json::json!({ "ok": true })),
+            error: None,
+            timing: Timing {
+                queue_ms: 0,
+                exec_ms: 5,
+                total_ms: 5,
+            },
+        };
+        assert!(format_exec_raw_response(&missing_result, false).is_none());
+    }
+
+    #[test]
+    fn format_response_keeps_exec_success_in_json_envelope_by_default() {
+        let response = IpcResponse {
+            ipc_protocol_version: "1.0".to_string(),
+            command_id: Some("019-raw".to_string()),
+            request_id: "019-request".to_string(),
+            status: ResponseStatus::Success,
+            data: Some(serde_json::json!({
+                "result": "The Page Title"
+            })),
+            error: None,
+            timing: Timing {
+                queue_ms: 0,
+                exec_ms: 5,
+                total_ms: 5,
+            },
+        };
+
+        let output = format_response(
+            &response,
+            "exec",
+            "default",
+            false,
+            InteractionTraceMode::Compact,
+        );
+        let value: Value = serde_json::from_str(&output).expect("valid JSON output");
+        assert_eq!(value["success"], true);
+        assert_eq!(value["data"]["result"], "The Page Title");
     }
 
     #[test]
@@ -569,7 +702,6 @@ mod tests {
             &response,
             "hover",
             "default",
-            false,
             false,
             InteractionTraceMode::Compact,
         );
@@ -604,7 +736,6 @@ mod tests {
             &response,
             "hover",
             "default",
-            false,
             false,
             InteractionTraceMode::Verbose,
         );
@@ -641,7 +772,6 @@ mod tests {
             "hover",
             "default",
             false,
-            false,
             InteractionTraceMode::Verbose,
         );
         let json: Value = serde_json::from_str(&output).unwrap();
@@ -668,7 +798,6 @@ mod tests {
             "doctor",
             "default",
             false,
-            false,
             InteractionTraceMode::Compact,
         );
         let json: Value = serde_json::from_str(&output).unwrap();
@@ -693,7 +822,6 @@ mod tests {
             &response,
             "doctor",
             "default",
-            false,
             false,
             InteractionTraceMode::Compact,
         );
@@ -722,7 +850,6 @@ mod tests {
             &response,
             "doctor",
             "default",
-            false,
             false,
             InteractionTraceMode::Compact,
         );

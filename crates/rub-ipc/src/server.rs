@@ -13,7 +13,7 @@ use tokio::net::{
 };
 
 use crate::codec::NdJsonCodec;
-use crate::protocol::{IpcRequest, IpcResponse};
+use crate::protocol::{IpcProtocolDecodeError, IpcRequest, IpcResponse};
 
 /// Daemon-side IPC server. Listens on a Unix socket.
 pub struct IpcServer {
@@ -207,7 +207,14 @@ impl IpcConnection {
     pub async fn read_request(
         &mut self,
     ) -> Result<Option<IpcRequest>, Box<dyn std::error::Error + Send + Sync>> {
-        NdJsonCodec::read(&mut self.reader).await
+        let Some(value) = NdJsonCodec::read::<serde_json::Value, _>(&mut self.reader).await? else {
+            return Ok(None);
+        };
+        let request = IpcRequest::from_value_strict(value).map_err(|envelope| {
+            Box::new(IpcProtocolDecodeError::new(envelope))
+                as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        Ok(Some(request))
     }
 
     /// Send a response to the client.

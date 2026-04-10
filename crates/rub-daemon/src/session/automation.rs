@@ -96,6 +96,17 @@ impl SessionState {
             .record_outcome(id, evidence, result)
     }
 
+    pub async fn set_orchestration_condition_evidence(
+        &self,
+        id: u32,
+        evidence: Option<rub_core::model::TriggerEvidenceInfo>,
+    ) -> Option<rub_core::model::OrchestrationRuleInfo> {
+        self.orchestration_runtime
+            .write()
+            .await
+            .set_condition_evidence(id, evidence)
+    }
+
     pub async fn record_orchestration_outcome_with_fallback(
         &self,
         rule_snapshot: &rub_core::model::OrchestrationRuleInfo,

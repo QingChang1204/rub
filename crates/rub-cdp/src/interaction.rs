@@ -8,7 +8,8 @@ pub(crate) use confirmation::{
 };
 pub(crate) use observation::{
     capture_active_interaction_baseline, capture_active_interaction_baseline_in_context,
-    capture_interaction_baseline, capture_page_baseline, observe_element,
+    capture_interaction_baseline, capture_page_baseline, capture_related_page_baseline,
+    observe_element,
 };
 pub(crate) use preflight::{
     clear_text_input, ensure_activation_target_enabled, ensure_active_text_target_editable,

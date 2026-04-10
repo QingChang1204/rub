@@ -12,6 +12,8 @@ use crate::observation::ObservationScope;
 use crate::storage::{StorageArea, StorageSnapshot};
 use std::collections::HashMap;
 
+pub const DEFAULT_SNAPSHOT_LIMIT: u32 = 500;
+
 /// Infrastructure boundary for browser control.
 /// Implemented by `rub-cdp::ChromiumAdapter`.
 /// Defined in `rub-core` so the daemon can depend on the trait
@@ -27,7 +29,8 @@ pub trait BrowserPort: Send + Sync {
     ) -> Result<Page, RubError>;
 
     /// Capture a DOM snapshot with interactive elements.
-    /// `limit`: max elements to return. `None` = use default (500). `Some(0)` = no limit.
+    /// `limit`: max elements to return. `None` = use default (`DEFAULT_SNAPSHOT_LIMIT`).
+    /// `Some(0)` = no limit.
     async fn snapshot(&self, limit: Option<u32>) -> Result<Snapshot, RubError>;
 
     /// Capture a DOM snapshot for an explicit frame context (`None` = top/primary frame).

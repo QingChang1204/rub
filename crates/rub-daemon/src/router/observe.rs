@@ -1,4 +1,8 @@
-use super::element_semantics::semantic_role;
+mod args;
+mod projection;
+
+use self::args::{ObserveArgs, parse_observe_limit};
+use self::projection::{build_element_map, capture_screenshot_payload, count_summary_lines};
 use super::observation_filter::{
     ObservationProjectionMode, apply_observation_projection,
     attach_observation_projection_metadata, parse_observation_projection,
@@ -8,56 +12,13 @@ use super::observation_scope::{
 };
 use super::projection::{attach_result, attach_subject, snapshot_entity};
 use super::snapshot::build_stable_snapshot;
-use super::state_format::{
-    summarize_element_label, summarize_snapshot_a11y, summarize_snapshot_compact,
-};
+use super::state_format::{summarize_snapshot_a11y, summarize_snapshot_compact};
 use super::*;
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ObserveArgs {
-    #[serde(default)]
-    full: bool,
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    limit: Option<u64>,
-    #[serde(default, rename = "compact")]
-    _compact: bool,
-    #[serde(default, rename = "depth")]
-    _depth: Option<u64>,
-    #[serde(default, rename = "scope")]
-    _scope: Option<serde_json::Value>,
-    #[serde(default, rename = "scope_selector")]
-    _scope_selector: Option<String>,
-    #[serde(default, rename = "scope_role")]
-    _scope_role: Option<String>,
-    #[serde(default, rename = "scope_label")]
-    _scope_label: Option<String>,
-    #[serde(default, rename = "scope_testid")]
-    _scope_testid: Option<String>,
-    #[serde(default, rename = "scope_first")]
-    _scope_first: bool,
-    #[serde(default, rename = "scope_last")]
-    _scope_last: bool,
-    #[serde(default, rename = "scope_nth")]
-    _scope_nth: Option<u64>,
-    #[serde(default, rename = "_orchestration")]
-    _orchestration: Option<serde_json::Value>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct ObserveElementMapEntry {
-    index: u32,
-    depth: u32,
-    role: String,
-    label: String,
-    bbox: rub_core::model::BoundingBox,
-}
 
 pub(super) async fn cmd_observe(
     router: &DaemonRouter,
     args: &serde_json::Value,
+    deadline: TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     let parsed: ObserveArgs = super::request_args::parse_json_args(args, "observe")?;
@@ -74,7 +35,7 @@ pub(super) async fn cmd_observe(
             limit
         };
     let mut snapshot =
-        build_stable_snapshot(router, args, state, capture_limit, true, false).await?;
+        build_stable_snapshot(router, args, state, deadline, capture_limit, true, false).await?;
     let mut scope_metadata = None::<(rub_core::observation::ObservationScope, u32, u32)>;
     if let Some(scope) = observation_scope.as_ref() {
         let scoped = apply_observation_scope(router, snapshot, scope).await?;
@@ -202,84 +163,9 @@ pub(super) async fn cmd_observe(
     Ok(response)
 }
 
-fn parse_observe_limit(limit: Option<u64>) -> Result<Option<u32>, RubError> {
-    let Some(raw_limit) = limit else {
-        return Ok(None);
-    };
-    let limit = u32::try_from(raw_limit).map_err(|_| {
-        RubError::domain(
-            ErrorCode::InvalidInput,
-            format!(
-                "observe limit {raw_limit} exceeds the supported maximum {}",
-                u32::MAX
-            ),
-        )
-    })?;
-    Ok(Some(limit))
-}
-
-fn count_summary_lines(summary: &str) -> usize {
-    summary
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count()
-}
-
-fn build_element_map(snapshot: &rub_core::model::Snapshot) -> Vec<ObserveElementMapEntry> {
-    snapshot
-        .elements
-        .iter()
-        .filter_map(|element| {
-            element.bounding_box.map(|bbox| ObserveElementMapEntry {
-                index: element.index,
-                depth: element.depth.unwrap_or(0),
-                role: semantic_role(element),
-                label: summarize_element_label(element),
-                bbox,
-            })
-        })
-        .collect()
-}
-
-async fn capture_screenshot_payload(
-    router: &DaemonRouter,
-    full: bool,
-    path: Option<&str>,
-) -> Result<serde_json::Value, RubError> {
-    let png_bytes = router.browser.screenshot(full).await?;
-    if let Some(path) = path {
-        std::fs::write(path, &png_bytes)?;
-        return Ok(serde_json::json!({
-            "kind": "screenshot",
-            "format": "png",
-            "output_path": path,
-            "size_bytes": png_bytes.len(),
-        }));
-    }
-
-    if super::navigation::inline_screenshot_payload_exceeds_limit(png_bytes.len()) {
-        return Ok(serde_json::json!({
-            "kind": "screenshot",
-            "format": "png",
-            "available": false,
-            "omitted_reason": "inline_frame_limit_exceeded",
-            "size_bytes": png_bytes.len(),
-            "suggestion": "Use --path to save the screenshot to disk",
-        }));
-    }
-
-    use base64::Engine;
-    Ok(serde_json::json!({
-        "kind": "screenshot",
-        "format": "png",
-        "base64": base64::engine::general_purpose::STANDARD.encode(&png_bytes),
-        "size_bytes": png_bytes.len(),
-    }))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ObserveArgs, parse_observe_limit};
+    use super::args::{ObserveArgs, parse_observe_limit};
     use crate::router::request_args::parse_json_args;
     use rub_core::error::ErrorCode;
 
@@ -304,5 +190,20 @@ mod tests {
         )
         .expect_err("unknown observe fields should fail closed");
         assert_eq!(error.into_envelope().code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn typed_observe_payload_accepts_path_state_metadata() {
+        let parsed = parse_json_args::<ObserveArgs>(
+            &serde_json::json!({
+                "path": "/tmp/observe.png",
+                "path_state": {
+                    "path_authority": "cli.observe.path"
+                }
+            }),
+            "observe",
+        )
+        .expect("observe payload should accept display-only path metadata");
+        assert_eq!(parsed.path.as_deref(), Some("/tmp/observe.png"));
     }
 }

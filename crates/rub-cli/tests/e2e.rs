@@ -8,8 +8,10 @@ use rub_daemon::rub_paths::RubPaths;
 use rub_test_harness::server::TestServer;
 use serde_json::{Value, json};
 use serial_test::serial;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -151,13 +153,70 @@ fn rub_cmd_env(rub_home: &str, envs: &[(&str, &str)]) -> Command {
 
 fn unique_home() -> String {
     install_cleanup_hook();
-    let home = format!(
-        "/tmp/rub-e2e-{}-{}",
-        std::process::id(),
-        uuid::Uuid::now_v7()
-    );
+    let temp_root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let home = temp_root
+        .join(format!(
+            "rub-e2e-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ))
+        .to_string_lossy()
+        .to_string();
     register_home(&home);
     home
+}
+
+fn acquire_managed_browser_lock() -> File {
+    let lock_path = std::env::temp_dir().join("rub-e2e-browser.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap_or_else(|error| panic!("failed to open browser lock {:?}: {error}", lock_path));
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(
+        rc,
+        0,
+        "failed to acquire browser lock {:?}: {}",
+        lock_path,
+        std::io::Error::last_os_error()
+    );
+    file
+}
+
+struct ManagedBrowserSession {
+    home: String,
+    _browser_lock: File,
+}
+
+impl ManagedBrowserSession {
+    fn new() -> Self {
+        let browser_lock = acquire_managed_browser_lock();
+        let home = unique_home();
+        cleanup(&home);
+        Self {
+            home,
+            _browser_lock: browser_lock,
+        }
+    }
+
+    fn home(&self) -> &str {
+        &self.home
+    }
+
+    fn cmd(&self) -> Command {
+        rub_cmd(self.home())
+    }
+}
+
+impl Drop for ManagedBrowserSession {
+    fn drop(&mut self) {
+        cleanup_impl(&self.home);
+    }
 }
 
 fn parse_json(output: &std::process::Output) -> serde_json::Value {
@@ -247,39 +306,13 @@ fn wait_for_trigger_unavailable_reason(home: &str, id: u64, expected: &str) -> s
     panic!("Timed out waiting for trigger {id} to publish unavailable_reason '{expected}'");
 }
 
-fn wait_for_orchestration_unavailable_reason(
-    home: &str,
-    id: u64,
-    expected: &str,
-) -> serde_json::Value {
-    for _ in 0..80 {
-        let out = parse_json(
-            &rub_cmd(home)
-                .args(["--session", "source", "orchestration", "list"])
-                .output()
-                .unwrap(),
-        );
-        if out["success"] == true
-            && let Some(rule) = out["data"]["result"]["items"]
-                .as_array()
-                .and_then(|rules| rules.iter().find(|rule| rule["id"].as_u64() == Some(id)))
-            && rule["unavailable_reason"].as_str() == Some(expected)
-        {
-            return out;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!(
-        "Timed out waiting for orchestration rule {id} to publish unavailable_reason '{expected}'"
-    );
-}
-
 fn wait_for_orchestration_status(
     home: &str,
     session: &str,
     id: u64,
     expected: &str,
 ) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
     for _ in 0..80 {
         let out = parse_json(
             &rub_cmd(home)
@@ -287,6 +320,7 @@ fn wait_for_orchestration_status(
                 .output()
                 .unwrap(),
         );
+        last = out.clone();
         if out["success"] == true
             && let Some(rule) = out["data"]["result"]["items"]
                 .as_array()
@@ -298,7 +332,7 @@ fn wait_for_orchestration_status(
         std::thread::sleep(Duration::from_millis(100));
     }
     panic!(
-        "Timed out waiting for orchestration rule {id} in session '{session}' to reach status '{expected}'"
+        "Timed out waiting for orchestration rule {id} in session '{session}' to reach status '{expected}'; last list output: {last}"
     );
 }
 
@@ -612,6 +646,10 @@ fn default_session_pid_path(home: &str) -> PathBuf {
     RubPaths::new(home).session("default").pid_path()
 }
 
+fn session_pid_path(home: &str, session: &str) -> PathBuf {
+    RubPaths::new(home).session(session).pid_path()
+}
+
 fn cleanup_impl(home: &str) {
     unregister_home(home);
     if !std::path::Path::new(home).exists() {
@@ -917,6 +955,8 @@ fn wait_for_cdp_http_ready(origin: &str, timeout: Duration) {
 }
 
 fn probe_cdp_http_ready_once(origin: &str, timeout: Duration) -> bool {
+    use std::io::{ErrorKind, Read};
+
     let request = format!(
         "GET /json/version HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
         origin.trim_start_matches("http://")
@@ -926,9 +966,37 @@ fn probe_cdp_http_ready_once(origin: &str, timeout: Duration) -> bool {
             stream.set_read_timeout(Some(timeout))?;
             stream.set_write_timeout(Some(timeout))?;
             stream.write_all(request.as_bytes())?;
-            let mut response = String::new();
-            stream.read_to_string(&mut response)?;
-            Ok(response)
+            let deadline = std::time::Instant::now() + timeout;
+            let mut response = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        response.extend_from_slice(&chunk[..read]);
+                        let text = String::from_utf8_lossy(&response);
+                        if text.contains(" 200 ")
+                            && text.contains("webSocketDebuggerUrl")
+                            && text.contains("Browser")
+                        {
+                            break;
+                        }
+                    }
+                    Err(error)
+                        if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                    {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
+            Ok(String::from_utf8_lossy(&response).into_owned())
         })
         .ok()
         .is_some_and(|response| {
@@ -1078,8 +1146,8 @@ fn profile_envs_for_test_base(base: &Path) -> Vec<(String, String)> {
     )]
 }
 
-fn spawn_external_chrome(
-    initial_url: Option<&str>,
+fn spawn_external_chrome_with_urls(
+    urls: &[&str],
 ) -> Option<(std::process::Child, String, PathBuf)> {
     let browser_path = browser_binary_for_external_tests()?;
     let port = free_tcp_port();
@@ -1088,20 +1156,25 @@ fn spawn_external_chrome(
         std::process::id(),
         HOME_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    let child = Command::new(browser_path)
-        .args([
-            "--headless=new",
-            "--disable-gpu",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-extensions",
-            "--disable-component-update",
-            "--disable-background-networking",
-            "--remote-debugging-address=127.0.0.1",
-            &format!("--remote-debugging-port={port}"),
-            &format!("--user-data-dir={}", profile_dir.display()),
-            initial_url.unwrap_or("about:blank"),
-        ])
+    let mut command = Command::new(browser_path);
+    command.args([
+        "--headless=new",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions",
+        "--disable-component-update",
+        "--disable-background-networking",
+        "--remote-debugging-address=127.0.0.1",
+        &format!("--remote-debugging-port={port}"),
+        &format!("--user-data-dir={}", profile_dir.display()),
+    ]);
+    if urls.is_empty() {
+        command.arg("about:blank");
+    } else {
+        command.args(urls);
+    }
+    let child = command
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -1112,6 +1185,15 @@ fn spawn_external_chrome(
     wait_for_cdp_http_ready(&cdp_origin, Duration::from_secs(15));
     register_external_chrome(child.id(), &profile_dir);
     Some((child, cdp_origin, profile_dir))
+}
+
+fn spawn_external_chrome(
+    initial_url: Option<&str>,
+) -> Option<(std::process::Child, String, PathBuf)> {
+    match initial_url {
+        Some(url) => spawn_external_chrome_with_urls(&[url]),
+        None => spawn_external_chrome_with_urls(&[]),
+    }
 }
 
 fn terminate_external_chrome(child: &mut std::process::Child) {

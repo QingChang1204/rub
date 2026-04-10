@@ -32,6 +32,7 @@ struct ContentFindMatchEntry<'a> {
 pub(super) async fn cmd_find(
     router: &DaemonRouter,
     args: &serde_json::Value,
+    deadline: TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     let locator = parse_canonical_locator(args, LocatorParseOptions::OPTIONAL_ELEMENT_ADDRESS)?;
@@ -48,7 +49,7 @@ pub(super) async fn cmd_find(
         return cmd_find_content(router, args, state, limit).await;
     }
 
-    let resolved = resolve_elements(router, args, state, "find").await?;
+    let resolved = resolve_elements(router, args, state, deadline, "find").await?;
     let total_matches = resolved.elements.len();
     let matches = resolved
         .elements

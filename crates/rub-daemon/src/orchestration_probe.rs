@@ -1,12 +1,19 @@
 use std::sync::Arc;
 
-use rub_core::error::{ErrorCode, RubError};
+use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
 use rub_core::locator::LiveLocator;
-use rub_core::model::{TabInfo, TriggerConditionKind, TriggerConditionSpec, TriggerEvidenceInfo};
+use rub_core::model::{
+    OrchestrationSessionInfo, TabInfo, TriggerConditionKind, TriggerConditionSpec,
+    TriggerEvidenceInfo,
+};
 use rub_core::port::BrowserPort;
 use rub_core::storage::{StorageArea, StorageSnapshot};
+use rub_ipc::protocol::IpcRequest;
 use serde::{Deserialize, Serialize};
 
+use crate::orchestration_executor::{
+    decode_orchestration_success_payload, dispatch_remote_orchestration_request,
+};
 use crate::session::SessionState;
 
 /// Structured, bounded probe result used by orchestration workers and the
@@ -222,6 +229,45 @@ pub(crate) async fn evaluate_orchestration_probe_for_tab(
             })
         }
     }
+}
+
+pub(crate) async fn dispatch_remote_orchestration_probe(
+    session: &OrchestrationSessionInfo,
+    tab_target_id: &str,
+    frame_id: Option<&str>,
+    condition: &TriggerConditionSpec,
+    after_sequence: u64,
+    last_observed_drop_count: u64,
+) -> Result<OrchestrationProbeResult, ErrorEnvelope> {
+    let response = dispatch_remote_orchestration_request(
+        session,
+        "source",
+        IpcRequest::new(
+            "_orchestration_probe",
+            serde_json::json!({
+                "tab_target_id": tab_target_id,
+                "frame_id": frame_id,
+                "condition": condition,
+                "after_sequence": after_sequence,
+                "last_observed_drop_count": last_observed_drop_count,
+            }),
+            30_000,
+        ),
+        "probe",
+        "orchestration_source_session_unreachable",
+        "orchestration_source_probe_dispatch_failed",
+        "remote orchestration probe returned an error without an envelope",
+    )
+    .await?;
+
+    decode_orchestration_success_payload(
+        response,
+        session,
+        "orchestration_source_probe_payload_missing",
+        "orchestration probe returned success without a payload",
+        "orchestration_source_probe_payload_invalid",
+        "orchestration probe payload",
+    )
 }
 
 fn resolve_tab<'a>(tabs: &'a [TabInfo], tab_target_id: &str) -> Result<&'a TabInfo, RubError> {

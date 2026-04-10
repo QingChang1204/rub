@@ -13,6 +13,7 @@ fn strip_inspect_routing_key(args: &serde_json::Value) -> serde_json::Value {
 pub(super) async fn cmd_inspect(
     router: &DaemonRouter,
     args: &serde_json::Value,
+    deadline: TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     let sub = args
@@ -28,15 +29,15 @@ pub(super) async fn cmd_inspect(
     let forwarded = strip_inspect_routing_key(args);
 
     match sub {
-        "page" => navigation::cmd_state(router, &forwarded, state).await,
+        "page" => navigation::cmd_state(router, &forwarded, deadline, state).await,
         "text" | "html" | "value" | "attributes" | "bbox" => {
             // sub is passed explicitly so cmd_inspect_read doesn't need to re-read it from args.
-            query::cmd_inspect_read(router, &forwarded, sub, state).await
+            query::cmd_inspect_read(router, &forwarded, sub, deadline, state).await
         }
         "list" => {
             // sub_override = Some("list") so ExtractCommand selects list mode even though
             // the routing key has been stripped from forwarded args.
-            extract::cmd_extract(router, &forwarded, Some("list"), state).await
+            extract::cmd_extract(router, &forwarded, Some("list"), deadline, state).await
         }
         "storage" => storage::cmd_inspect_storage(router, &forwarded, state).await,
         "network" | "curl" => {

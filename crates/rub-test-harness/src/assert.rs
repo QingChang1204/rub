@@ -1,5 +1,9 @@
 //! JSON assertion macros for rub test harness.
 
+#[doc(hidden)]
+pub const EXPECTED_STDOUT_SCHEMA_VERSION: &str =
+    rub_core::model::CommandResult::STDOUT_SCHEMA_VERSION;
+
 /// Assert that a JSON value represents a successful command result.
 ///
 /// # Example
@@ -20,8 +24,10 @@ macro_rules! assert_json_success {
         );
         assert!(
             json.get("stdout_schema_version")
-                .is_some_and(|value| value.is_string()),
-            "Missing stdout_schema_version"
+                .is_some_and(|value| value == $crate::assert::EXPECTED_STDOUT_SCHEMA_VERSION),
+            "Expected stdout_schema_version={}, got: {}",
+            $crate::assert::EXPECTED_STDOUT_SCHEMA_VERSION,
+            serde_json::to_string_pretty(json).unwrap_or_default()
         );
         assert!(
             json.get("request_id")
@@ -81,8 +87,10 @@ macro_rules! assert_json_error {
         );
         assert!(
             json.get("stdout_schema_version")
-                .is_some_and(|value| value.is_string()),
-            "Missing stdout_schema_version"
+                .is_some_and(|value| value == $crate::assert::EXPECTED_STDOUT_SCHEMA_VERSION),
+            "Expected stdout_schema_version={}, got: {}",
+            $crate::assert::EXPECTED_STDOUT_SCHEMA_VERSION,
+            serde_json::to_string_pretty(json).unwrap_or_default()
         );
         assert!(
             json.get("request_id")
@@ -150,6 +158,143 @@ macro_rules! assert_element_count {
     }};
 }
 
+/// Assert that a raw stdout surface matches the expected text after trimming
+/// trailing newlines written by the CLI process.
+#[macro_export]
+macro_rules! assert_raw_stdout {
+    ($stdout:expr, $expected:expr) => {{
+        let stdout = &$stdout;
+        let actual = stdout.trim();
+        assert_eq!(
+            actual, $expected,
+            "Expected raw stdout={}, got: {:?}",
+            $expected, stdout
+        );
+    }};
+}
+
+/// Assert that a failed command result preserves the daemon commit truth while
+/// exposing a CLI-local follow-up failure surface.
+#[macro_export]
+macro_rules! assert_post_commit_local_failure {
+    ($json:expr, $error_code:expr) => {{
+        let json = &$json;
+        assert_eq!(
+            json["success"],
+            false,
+            "Expected success=false, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert!(
+            json.get("stdout_schema_version")
+                .is_some_and(|value| value == $crate::assert::EXPECTED_STDOUT_SCHEMA_VERSION),
+            "Expected stdout_schema_version={}, got: {}",
+            $crate::assert::EXPECTED_STDOUT_SCHEMA_VERSION,
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert!(
+            json.get("request_id")
+                .is_some_and(|value| value.is_string()),
+            "Missing request_id"
+        );
+        assert!(
+            json.get("command").is_some_and(|value| value.is_string()),
+            "Missing command"
+        );
+        assert!(
+            json.get("session").is_some_and(|value| value.is_string()),
+            "Missing session"
+        );
+        assert!(
+            json.get("timing").is_some_and(|value| value.is_object()),
+            "Missing timing"
+        );
+        assert_eq!(
+            json["error"]["code"], $error_code,
+            "Expected error code={}, got: {}",
+            $error_code, json["error"]["code"]
+        );
+        assert!(
+            json["error"]
+                .get("message")
+                .is_some_and(|value| value.is_string()),
+            "Missing error message"
+        );
+        assert!(
+            json["error"]
+                .get("suggestion")
+                .is_some_and(|value| value.is_string()),
+            "Missing error suggestion"
+        );
+        assert!(
+            json.get("data").is_some_and(|value| value.is_object()),
+            "Expected post-commit local failure payload to preserve daemon data, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert_eq!(
+            json["data"]["commit_state"],
+            "daemon_committed_local_followup_failed",
+            "Expected explicit post-commit local failure state, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+    }};
+}
+
+/// Assert that a daemon projection/export surface explicitly identifies itself
+/// as a bounded post-commit projection derived from committed daemon truth.
+#[macro_export]
+macro_rules! assert_bounded_projection_surface {
+    ($json:expr, $projection_authority:expr) => {{
+        let json = &$json;
+        assert_eq!(
+            json["projection_state"]["projection_kind"],
+            "bounded_post_commit_projection",
+            "Expected bounded post-commit projection surface, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert_eq!(
+            json["projection_state"]["projection_authority"],
+            $projection_authority,
+            "Expected projection_authority={}, got: {}",
+            $projection_authority,
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert_eq!(
+            json["projection_state"]["upstream_commit_truth"],
+            "daemon_response_committed",
+            "Expected committed daemon truth label, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert!(
+            json["projection_state"]["lossy"].is_boolean(),
+            "Expected boolean lossy flag, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert!(
+            json["projection_state"]["lossy_reasons"].is_array(),
+            "Expected lossy_reasons array, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+    }};
+}
+
+/// Assert that a protocol error exposes a stable structured reason in its
+/// error context rather than collapsing to an opaque string.
+#[macro_export]
+macro_rules! assert_protocol_error_reason {
+    ($json:expr, $error_code:expr, $reason:expr) => {{
+        let json = &$json;
+        $crate::assert_json_error!(json, $error_code);
+        assert_eq!(
+            json["error"]["context"]["reason"],
+            $reason,
+            "Expected protocol error reason={}, got: {}",
+            $reason,
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -185,12 +330,17 @@ mod tests {
         })
     }
 
+    fn counted_raw_stdout(counter: &AtomicUsize) -> String {
+        counter.fetch_add(1, Ordering::SeqCst);
+        "The Page Title\n".to_string()
+    }
+
     #[test]
     fn success_macro_accepts_null_error_and_present_data() {
         let json = serde_json::json!({
             "success": true,
             "command": "open",
-            "stdout_schema_version": "2.0",
+            "stdout_schema_version": "3.0",
             "request_id": "req-1",
             "session": "default",
             "timing": {},
@@ -213,7 +363,7 @@ mod tests {
         let json = serde_json::json!({
             "success": true,
             "command": "open",
-            "stdout_schema_version": "2.0",
+            "stdout_schema_version": "3.0",
             "request_id": "req-1",
             "session": "default",
             "timing": {},
@@ -229,7 +379,7 @@ mod tests {
         let json = serde_json::json!({
             "success": false,
             "command": "open",
-            "stdout_schema_version": "2.0",
+            "stdout_schema_version": "3.0",
             "request_id": "req-1",
             "session": "default",
             "timing": {},
@@ -248,7 +398,7 @@ mod tests {
     fn success_macro_rejects_missing_command_or_session() {
         let json = serde_json::json!({
             "success": true,
-            "stdout_schema_version": "2.0",
+            "stdout_schema_version": "3.0",
             "request_id": "req-1",
             "timing": {},
             "data": {},
@@ -262,7 +412,7 @@ mod tests {
     fn error_macro_rejects_missing_command() {
         let json = serde_json::json!({
             "success": false,
-            "stdout_schema_version": "2.0",
+            "stdout_schema_version": "3.0",
             "request_id": "req-1",
             "session": "default",
             "timing": {},
@@ -280,5 +430,109 @@ mod tests {
         let calls = AtomicUsize::new(0);
         crate::assert_json_error!(counted_error_json(&calls), "INVALID_INPUT");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn success_macro_rejects_wrong_stdout_schema_version() {
+        let json = serde_json::json!({
+            "success": true,
+            "command": "open",
+            "stdout_schema_version": "2.0",
+            "request_id": "req-1",
+            "session": "default",
+            "timing": {},
+            "data": {},
+            "error": null,
+        });
+        crate::assert_json_success!(json);
+    }
+
+    #[test]
+    #[should_panic]
+    fn error_macro_rejects_wrong_stdout_schema_version() {
+        let json = serde_json::json!({
+            "success": false,
+            "command": "open",
+            "stdout_schema_version": "2.0",
+            "request_id": "req-1",
+            "session": "default",
+            "timing": {},
+            "error": {
+                "code": "INVALID_INPUT",
+                "message": "bad input",
+                "suggestion": "fix it"
+            }
+        });
+        crate::assert_json_error!(json, "INVALID_INPUT");
+    }
+
+    #[test]
+    fn raw_stdout_macro_evaluates_input_once_and_trims_newline() {
+        let calls = AtomicUsize::new(0);
+        crate::assert_raw_stdout!(counted_raw_stdout(&calls), "The Page Title");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn post_commit_local_failure_macro_accepts_typed_commit_state() {
+        let json = serde_json::json!({
+            "success": false,
+            "command": "history",
+            "stdout_schema_version": "3.0",
+            "request_id": "req-1",
+            "command_id": "cmd-1",
+            "session": "default",
+            "timing": {},
+            "data": {
+                "commit_state": "daemon_committed_local_followup_failed",
+                "result": { "format": "pipe" }
+            },
+            "error": {
+                "code": "INVALID_INPUT",
+                "message": "local export failed after daemon success",
+                "suggestion": "fix it"
+            }
+        });
+        crate::assert_post_commit_local_failure!(json, "INVALID_INPUT");
+    }
+
+    #[test]
+    fn bounded_projection_surface_macro_accepts_projection_labels() {
+        let json = serde_json::json!({
+            "projection_state": {
+                "projection_kind": "bounded_post_commit_projection",
+                "projection_authority": "session.workflow_capture",
+                "upstream_commit_truth": "daemon_response_committed",
+                "lossy": false,
+                "lossy_reasons": []
+            }
+        });
+        crate::assert_bounded_projection_surface!(json, "session.workflow_capture");
+    }
+
+    #[test]
+    fn protocol_error_reason_macro_accepts_structured_reason() {
+        let json = serde_json::json!({
+            "success": false,
+            "command": "state",
+            "stdout_schema_version": "3.0",
+            "request_id": "req-1",
+            "session": "default",
+            "timing": {},
+            "error": {
+                "code": "IPC_PROTOCOL_ERROR",
+                "message": "IPC response contract error: bad",
+                "suggestion": "fix it",
+                "context": {
+                    "reason": "invalid_ipc_response_contract"
+                }
+            }
+        });
+        crate::assert_protocol_error_reason!(
+            json,
+            "IPC_PROTOCOL_ERROR",
+            "invalid_ipc_response_contract"
+        );
     }
 }

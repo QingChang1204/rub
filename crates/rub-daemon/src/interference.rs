@@ -1,10 +1,11 @@
 use crate::interference_classifier::{InterferenceBaseline, classify};
 use crate::interference_policy::active_policies_for_mode;
 use rub_core::model::{
-    HumanVerificationHandoffInfo, InterferenceMode, InterferenceRecoveryAction,
-    InterferenceRecoveryResult, InterferenceRuntimeInfo, ReadinessInfo, RuntimeObservatoryInfo,
-    TabInfo,
+    InterferenceRecoveryAction, InterferenceRecoveryResult, InterferenceRuntimeInfo,
 };
+
+mod baseline;
+mod recovery;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InterferenceRecoveryContext {
@@ -26,104 +27,6 @@ impl InterferenceRuntimeState {
 
     pub fn replace(&mut self, projection: InterferenceRuntimeInfo) {
         self.projection = projection;
-    }
-
-    pub(crate) fn set_mode(&mut self, mode: InterferenceMode) -> InterferenceRuntimeInfo {
-        self.projection.mode = mode;
-        self.projection.active_policies = active_policies_for_mode(mode);
-        self.projection.clone()
-    }
-
-    pub(crate) fn prime_baseline_from_tabs(&mut self, tabs: &[TabInfo]) {
-        if self.baseline.primary_target_id.is_some() || self.baseline.primary_url.is_some() {
-            return;
-        }
-        let Some(active_tab) = tabs.iter().find(|tab| tab.active) else {
-            return;
-        };
-        self.baseline = InterferenceBaseline {
-            primary_target_id: Some(active_tab.target_id.clone()),
-            primary_url: Some(active_tab.url.clone()),
-            last_tab_count: tabs.len(),
-        };
-    }
-
-    pub(crate) fn adopt_primary_context_from_tabs(&mut self, tabs: &[TabInfo]) {
-        let Some(active_tab) = tabs.iter().find(|tab| tab.active) else {
-            return;
-        };
-        self.baseline = InterferenceBaseline {
-            primary_target_id: Some(active_tab.target_id.clone()),
-            primary_url: Some(active_tab.url.clone()),
-            last_tab_count: tabs.len(),
-        };
-    }
-
-    pub fn classify(
-        &mut self,
-        tabs: &[TabInfo],
-        observatory: &RuntimeObservatoryInfo,
-        readiness: &ReadinessInfo,
-        handoff: &HumanVerificationHandoffInfo,
-    ) -> InterferenceRuntimeInfo {
-        let classified = classify(
-            &self.projection,
-            &self.baseline,
-            tabs,
-            observatory,
-            readiness,
-            handoff,
-        );
-        self.projection = classified.projection;
-        self.baseline = classified.baseline;
-        self.projection.clone()
-    }
-
-    pub(crate) fn recovery_context(&self) -> InterferenceRecoveryContext {
-        InterferenceRecoveryContext {
-            baseline: self.baseline.clone(),
-            projection: self.projection.clone(),
-        }
-    }
-
-    pub(crate) fn begin_recovery(
-        &mut self,
-        action: InterferenceRecoveryAction,
-    ) -> InterferenceRuntimeInfo {
-        self.projection.recovery_in_progress = true;
-        self.projection.last_recovery_action = Some(action);
-        self.projection.last_recovery_result = None;
-        self.projection.degraded_reason = None;
-        self.projection.clone()
-    }
-
-    pub(crate) fn finish_recovery(
-        &mut self,
-        result: InterferenceRecoveryResult,
-    ) -> InterferenceRuntimeInfo {
-        self.projection.recovery_in_progress = false;
-        self.projection.last_recovery_result = Some(result);
-        self.projection.clone()
-    }
-
-    pub(crate) fn record_recovery_outcome(
-        &mut self,
-        action: Option<InterferenceRecoveryAction>,
-        result: InterferenceRecoveryResult,
-    ) -> InterferenceRuntimeInfo {
-        self.projection.recovery_in_progress = false;
-        self.projection.last_recovery_action = action;
-        self.projection.last_recovery_result = Some(result);
-        self.projection.clone()
-    }
-
-    pub fn mark_degraded(&mut self, reason: impl Into<String>) {
-        self.projection = InterferenceRuntimeInfo {
-            status: rub_core::model::InterferenceRuntimeStatus::Degraded,
-            recovery_in_progress: false,
-            degraded_reason: Some(reason.into()),
-            ..self.projection.clone()
-        };
     }
 }
 

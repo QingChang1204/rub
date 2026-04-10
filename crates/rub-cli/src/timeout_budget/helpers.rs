@@ -1,9 +1,10 @@
 use crate::commands::{
     ElementAddressArgs, ObservationProjectionArgs, ObservationScopeArgs, WaitAfterArgs,
 };
-use crate::workflow_assets::resolve_named_workflow_path;
+use crate::workflow_assets::{resolve_named_workflow_path, workflow_asset_path_state};
 use crate::workflow_params::resolve_workflow_parameters;
 use rub_core::error::{ErrorCode, RubError};
+use rub_core::model::PathReferenceState;
 use rub_ipc::protocol::IpcRequest;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +30,20 @@ pub(crate) fn mutating_request(
         .expect("UUID command_id must be valid")
 }
 
+pub(crate) fn input_path_reference_state(
+    path_authority: &str,
+    upstream_truth: &str,
+    path_kind: &str,
+) -> PathReferenceState {
+    PathReferenceState {
+        truth_level: "input_path_reference".to_string(),
+        path_authority: path_authority.to_string(),
+        upstream_truth: upstream_truth.to_string(),
+        path_kind: path_kind.to_string(),
+        control_role: "display_only".to_string(),
+    }
+}
+
 pub(crate) fn resolve_pipe_spec(
     inline_spec: Option<&str>,
     file: Option<&str>,
@@ -49,13 +64,27 @@ pub(crate) fn resolve_pipe_spec(
         }
         (None, Some(path), None) => {
             let contents = std::fs::read_to_string(path).map_err(|error| match error.kind() {
-                std::io::ErrorKind::NotFound => RubError::domain(
+                std::io::ErrorKind::NotFound => input_file_read_error(
                     ErrorCode::FileNotFound,
                     format!("Workflow file not found: {path}"),
+                    path,
+                    input_path_reference_state(
+                        "cli.pipe.spec_source.path",
+                        "cli_pipe_file_option",
+                        "workflow_spec_file",
+                    ),
+                    "pipe_spec_file_not_found",
                 ),
-                _ => RubError::domain(
+                _ => input_file_read_error(
                     ErrorCode::InvalidInput,
                     format!("Failed to read workflow file {path}: {error}"),
+                    path,
+                    input_path_reference_state(
+                        "cli.pipe.spec_source.path",
+                        "cli_pipe_file_option",
+                        "workflow_spec_file",
+                    ),
+                    "pipe_spec_file_read_failed",
                 ),
             })?;
             let parameterized = resolve_workflow_parameters(&contents, vars)?;
@@ -64,6 +93,11 @@ pub(crate) fn resolve_pipe_spec(
                 serde_json::json!({
                     "kind": "file",
                     "path": path,
+                    "path_state": input_path_reference_state(
+                        "cli.pipe.spec_source.path",
+                        "cli_pipe_file_option",
+                        "workflow_spec_file",
+                    ),
                     "vars": parameterized.parameter_keys,
                 }),
             ))
@@ -71,14 +105,22 @@ pub(crate) fn resolve_pipe_spec(
         (None, None, Some(name)) => {
             let path = resolve_named_workflow_path(rub_home, name)?;
             let path_string = path.display().to_string();
+            let path_state =
+                workflow_asset_path_state("cli.pipe.spec_source.path", "cli_pipe_workflow_option");
             let contents = std::fs::read_to_string(&path).map_err(|error| match error.kind() {
-                std::io::ErrorKind::NotFound => RubError::domain(
+                std::io::ErrorKind::NotFound => input_file_read_error(
                     ErrorCode::FileNotFound,
                     format!("Named workflow not found: {name} ({path_string})"),
+                    &path_string,
+                    path_state.clone(),
+                    "named_workflow_asset_not_found",
                 ),
-                _ => RubError::domain(
+                _ => input_file_read_error(
                     ErrorCode::InvalidInput,
                     format!("Failed to read workflow asset {path_string}: {error}"),
+                    &path_string,
+                    path_state.clone(),
+                    "named_workflow_asset_read_failed",
                 ),
             })?;
             let parameterized = resolve_workflow_parameters(&contents, vars)?;
@@ -88,6 +130,7 @@ pub(crate) fn resolve_pipe_spec(
                     "kind": "workflow",
                     "name": name,
                     "path": path_string,
+                    "path_state": path_state,
                     "vars": parameterized.parameter_keys,
                 }),
             ))
@@ -120,14 +163,21 @@ pub(crate) fn resolve_json_spec_source(
         (None, Some(path)) => {
             let path = resolve_cli_path(path);
             let path_string = path.display().to_string();
+            let path_state = json_spec_path_state(command);
             let contents = std::fs::read_to_string(&path).map_err(|error| match error.kind() {
-                std::io::ErrorKind::NotFound => RubError::domain(
+                std::io::ErrorKind::NotFound => input_file_read_error(
                     ErrorCode::FileNotFound,
                     format!("{command} spec file not found: {path_string}"),
+                    &path_string,
+                    path_state.clone(),
+                    "json_spec_file_not_found",
                 ),
-                _ => RubError::domain(
+                _ => input_file_read_error(
                     ErrorCode::InvalidInput,
                     format!("Failed to read {command} spec file {path_string}: {error}"),
+                    &path_string,
+                    path_state.clone(),
+                    "json_spec_file_read_failed",
                 ),
             })?;
             Ok((
@@ -135,6 +185,7 @@ pub(crate) fn resolve_json_spec_source(
                 serde_json::json!({
                     "kind": "file",
                     "path": path_string,
+                    "path_state": path_state,
                 }),
             ))
         }
@@ -147,6 +198,49 @@ pub(crate) fn resolve_json_spec_source(
             format!("Provide an inline {command} JSON spec or --file"),
         )),
     }
+}
+
+fn json_spec_path_state(command: &str) -> PathReferenceState {
+    match command {
+        "fill" => input_path_reference_state(
+            "cli.fill.spec_source.path",
+            "cli_fill_file_option",
+            "json_spec_file",
+        ),
+        "extract" => input_path_reference_state(
+            "cli.extract.spec_source.path",
+            "cli_extract_file_option",
+            "json_spec_file",
+        ),
+        "inspect list" => input_path_reference_state(
+            "cli.inspect_list.spec_source.path",
+            "cli_inspect_list_file_option",
+            "json_spec_file",
+        ),
+        _ => input_path_reference_state(
+            "cli.unknown.spec_source.path",
+            "cli_unknown_file_option",
+            "json_spec_file",
+        ),
+    }
+}
+
+fn input_file_read_error(
+    code: ErrorCode,
+    message: String,
+    path: &str,
+    path_state: PathReferenceState,
+    reason: &str,
+) -> RubError {
+    RubError::domain_with_context(
+        code,
+        message,
+        serde_json::json!({
+            "path": path,
+            "path_state": path_state,
+            "reason": reason,
+        }),
+    )
 }
 
 pub(crate) fn resolve_inspect_list_spec_source(

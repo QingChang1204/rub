@@ -1,3 +1,4 @@
+use super::journal::redacted_post_commit_request;
 use super::*;
 use tracing::trace;
 
@@ -271,19 +272,7 @@ impl SessionState {
         request: &rub_ipc::protocol::IpcRequest,
         response: &rub_ipc::protocol::IpcResponse,
     ) {
-        let mut captured_request = request.clone();
-        match crate::router::secret_resolution::redact_json_value_from_secret_sources(
-            &mut captured_request.args,
-            &self.rub_home,
-        ) {
-            Ok(_) => {}
-            Err(_) => {
-                captured_request.args = serde_json::json!({
-                    "reason": "secret_redaction_unavailable",
-                    "redacted": true,
-                });
-            }
-        }
+        let captured_request = redacted_post_commit_request(request, &self.rub_home);
         self.workflow_capture
             .write()
             .await

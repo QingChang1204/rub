@@ -1,598 +1,29 @@
-use std::collections::BTreeMap;
+mod admin;
+mod cookies;
+mod doctor;
+mod intercept;
+mod intercept_args;
+mod projection;
+mod surface;
+mod takeover;
 
-use super::request_args::{parse_json_args, subcommand_arg};
+pub(super) use self::admin::{cmd_close, cmd_handshake, cmd_upgrade_check};
+pub(super) use self::doctor::cmd_doctor;
+use self::projection::{
+    intercept_payload, intercept_registry_subject, intercept_rule_id_subject,
+    intercept_rule_subject, project_network_rule, project_network_rules,
+};
+use super::artifacts::{INPUT_ARTIFACT_DURABILITY, output_artifact_durability};
+#[cfg(test)]
+use super::request_args::parse_json_args;
 use super::*;
-use crate::runtime_refresh::{
-    refresh_live_dialog_runtime, refresh_live_frame_runtime, refresh_live_interference_state,
-    refresh_live_runtime_and_interference, refresh_live_runtime_state,
-    refresh_live_storage_runtime, refresh_live_trigger_runtime, refresh_orchestration_runtime,
-    refresh_takeover_runtime,
-};
-use rub_core::fs::atomic_write_bytes;
-use rub_core::model::{
-    Cookie, FrameContextStatus, HumanVerificationHandoffStatus, IntegrationRuntimeStatus,
-    IntegrationSurface, ReadinessStatus, TakeoverRuntimeStatus, TakeoverTransitionKind,
-    TakeoverTransitionResult,
-};
-
-#[derive(Clone, Copy, Debug)]
-enum RuntimeSurface {
-    Summary,
-    Integration,
-    Dialog,
-    Downloads,
-    Frame,
-    Interference,
-    Storage,
-    Takeover,
-    Orchestration,
-    Trigger,
-    Observatory,
-    StateInspector,
-    Readiness,
-    Handoff,
-}
-
-impl RuntimeSurface {
-    fn parse(args: &serde_json::Value) -> Result<Self, RubError> {
-        Self::parse_name(subcommand_arg(args, "summary"))
-    }
-
-    fn parse_name(name: &str) -> Result<Self, RubError> {
-        match name {
-            "summary" => Ok(Self::Summary),
-            "integration" => Ok(Self::Integration),
-            "dialog" => Ok(Self::Dialog),
-            "downloads" => Ok(Self::Downloads),
-            "frame" => Ok(Self::Frame),
-            "interference" => Ok(Self::Interference),
-            "storage" => Ok(Self::Storage),
-            "takeover" => Ok(Self::Takeover),
-            "orchestration" => Ok(Self::Orchestration),
-            "trigger" => Ok(Self::Trigger),
-            "observatory" => Ok(Self::Observatory),
-            "state-inspector" => Ok(Self::StateInspector),
-            "readiness" => Ok(Self::Readiness),
-            "handoff" => Ok(Self::Handoff),
-            other => Err(RubError::domain(
-                ErrorCode::InvalidInput,
-                format!("Unknown runtime subcommand: '{other}'"),
-            )),
-        }
-    }
-
-    fn subject(self) -> serde_json::Value {
-        runtime_subject(self.name())
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Summary => "summary",
-            Self::Integration => "integration",
-            Self::Dialog => "dialog",
-            Self::Downloads => "downloads",
-            Self::Frame => "frame",
-            Self::Interference => "interference",
-            Self::Storage => "storage",
-            Self::Takeover => "takeover",
-            Self::Orchestration => "orchestration",
-            Self::Trigger => "trigger",
-            Self::Observatory => "observatory",
-            Self::StateInspector => "state-inspector",
-            Self::Readiness => "readiness",
-            Self::Handoff => "handoff",
-        }
-    }
-
-    async fn refresh(self, router: &DaemonRouter, state: &Arc<SessionState>) {
-        match self {
-            Self::Summary => {
-                refresh_live_runtime_state(&router.browser, state).await;
-                refresh_live_dialog_runtime(&router.browser, state).await;
-                refresh_live_frame_runtime(&router.browser, state).await;
-                refresh_live_storage_runtime(&router.browser, state).await;
-                refresh_takeover_runtime(&router.browser, state).await;
-                refresh_orchestration_runtime(state).await;
-                let _ = refresh_live_trigger_runtime(&router.browser, state).await;
-                let _ = refresh_live_interference_state(&router.browser, state).await;
-            }
-            Self::Integration | Self::StateInspector | Self::Readiness => {
-                refresh_live_runtime_state(&router.browser, state).await;
-            }
-            Self::Dialog => {
-                refresh_live_dialog_runtime(&router.browser, state).await;
-            }
-            Self::Frame => {
-                refresh_live_frame_runtime(&router.browser, state).await;
-            }
-            Self::Interference => {
-                let _ = refresh_live_interference_state(&router.browser, state).await;
-            }
-            Self::Storage => {
-                refresh_live_storage_runtime(&router.browser, state).await;
-            }
-            Self::Takeover => {
-                refresh_takeover_runtime(&router.browser, state).await;
-            }
-            Self::Orchestration => {
-                refresh_orchestration_runtime(state).await;
-            }
-            Self::Trigger => {
-                let _ = refresh_live_trigger_runtime(&router.browser, state).await;
-            }
-            Self::Observatory | Self::Downloads | Self::Handoff => {}
-        }
-    }
-
-    async fn projection(self, state: &Arc<SessionState>) -> Result<serde_json::Value, RubError> {
-        match self {
-            Self::Summary => Ok(runtime_summary(state).await),
-            Self::Integration => {
-                serde_json::to_value(state.integration_runtime().await).map_err(RubError::from)
-            }
-            Self::Dialog => {
-                serde_json::to_value(state.dialog_runtime().await).map_err(RubError::from)
-            }
-            Self::Downloads => {
-                serde_json::to_value(state.download_runtime().await).map_err(RubError::from)
-            }
-            Self::Frame => {
-                serde_json::to_value(state.frame_runtime().await).map_err(RubError::from)
-            }
-            Self::Interference => {
-                serde_json::to_value(state.interference_runtime().await).map_err(RubError::from)
-            }
-            Self::Storage => {
-                serde_json::to_value(state.storage_runtime().await).map_err(RubError::from)
-            }
-            Self::Takeover => {
-                serde_json::to_value(state.takeover_runtime().await).map_err(RubError::from)
-            }
-            Self::Orchestration => {
-                serde_json::to_value(state.orchestration_runtime().await).map_err(RubError::from)
-            }
-            Self::Trigger => {
-                serde_json::to_value(state.trigger_runtime().await).map_err(RubError::from)
-            }
-            Self::Observatory => {
-                serde_json::to_value(state.observatory().await).map_err(RubError::from)
-            }
-            Self::StateInspector => {
-                serde_json::to_value(state.state_inspector().await).map_err(RubError::from)
-            }
-            Self::Readiness => {
-                serde_json::to_value(state.readiness_state().await).map_err(RubError::from)
-            }
-            Self::Handoff => serde_json::to_value(state.human_verification_handoff().await)
-                .map_err(RubError::from),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum InterceptAction {
-    List,
-    Rewrite,
-    Block,
-    Allow,
-    Header,
-    Remove,
-    Clear,
-}
-
-impl InterceptAction {
-    fn parse(args: &serde_json::Value) -> Result<Self, RubError> {
-        match subcommand_arg(args, "list") {
-            "list" => Ok(Self::List),
-            "rewrite" => Ok(Self::Rewrite),
-            "block" => Ok(Self::Block),
-            "allow" => Ok(Self::Allow),
-            "header" => Ok(Self::Header),
-            "remove" => Ok(Self::Remove),
-            "clear" => Ok(Self::Clear),
-            other => Err(RubError::domain(
-                ErrorCode::InvalidInput,
-                format!("Unknown intercept subcommand: '{other}'"),
-            )),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum CookieAction {
-    Get,
-    Set,
-    Clear,
-    Export,
-    Import,
-}
-
-impl CookieAction {
-    fn parse(args: &serde_json::Value) -> Result<Self, RubError> {
-        let sub = args.get("sub").and_then(|v| v.as_str()).ok_or_else(|| {
-            RubError::domain(
-                ErrorCode::InvalidInput,
-                "cookies requires a subcommand: get, set, clear, export, import",
-            )
-        })?;
-        match sub {
-            "get" => Ok(Self::Get),
-            "set" => Ok(Self::Set),
-            "clear" => Ok(Self::Clear),
-            "export" => Ok(Self::Export),
-            "import" => Ok(Self::Import),
-            other => Err(RubError::domain(
-                ErrorCode::InvalidInput,
-                format!(
-                    "Unknown cookies subcommand '{other}'. Valid: get, set, clear, export, import"
-                ),
-            )),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum HandoffAction {
-    Status,
-    Start,
-    Complete,
-}
-
-impl HandoffAction {
-    fn parse(args: &serde_json::Value) -> Result<Self, RubError> {
-        match subcommand_arg(args, "status") {
-            "status" => Ok(Self::Status),
-            "start" => Ok(Self::Start),
-            "complete" => Ok(Self::Complete),
-            other => Err(RubError::domain(
-                ErrorCode::InvalidInput,
-                format!("Unknown handoff subcommand: '{other}'"),
-            )),
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Status => "status",
-            Self::Start => "start",
-            Self::Complete => "complete",
-        }
-    }
-
-    async fn execute(
-        self,
-        router: &DaemonRouter,
-        state: &Arc<SessionState>,
-    ) -> Result<(), RubError> {
-        match self {
-            Self::Status => Ok(()),
-            Self::Start => {
-                ensure_handoff_available(state).await?;
-                state.activate_handoff().await;
-                refresh_takeover_runtime(&router.browser, state).await;
-                Ok(())
-            }
-            Self::Complete => {
-                ensure_handoff_available(state).await?;
-                state.complete_handoff().await;
-                refresh_takeover_runtime(&router.browser, state).await;
-                Ok(())
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum TakeoverAction {
-    Status,
-    Start,
-    Elevate,
-    Resume,
-}
-
-impl TakeoverAction {
-    fn parse(args: &serde_json::Value) -> Result<Self, RubError> {
-        match subcommand_arg(args, "status") {
-            "status" => Ok(Self::Status),
-            "start" => Ok(Self::Start),
-            "elevate" => Ok(Self::Elevate),
-            "resume" => Ok(Self::Resume),
-            other => Err(RubError::domain(
-                ErrorCode::InvalidInput,
-                format!("Unknown takeover subcommand: '{other}'"),
-            )),
-        }
-    }
-
-    fn kind(self) -> TakeoverTransitionKind {
-        match self {
-            Self::Status => TakeoverTransitionKind::Start,
-            Self::Start => TakeoverTransitionKind::Start,
-            Self::Elevate => TakeoverTransitionKind::Elevate,
-            Self::Resume => TakeoverTransitionKind::Resume,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Status => "status",
-            Self::Start => "start",
-            Self::Elevate => "elevate",
-            Self::Resume => "resume",
-        }
-    }
-
-    async fn execute(
-        self,
-        router: &DaemonRouter,
-        state: &Arc<SessionState>,
-    ) -> Result<(), RubError> {
-        match self {
-            Self::Status => Ok(()),
-            Self::Start => self.execute_start(router, state).await,
-            Self::Elevate => self.execute_elevate(router, state).await,
-            Self::Resume => self.execute_resume(router, state).await,
-        }
-    }
-
-    async fn execute_start(
-        self,
-        router: &DaemonRouter,
-        state: &Arc<SessionState>,
-    ) -> Result<(), RubError> {
-        let current = state.takeover_runtime().await;
-        if !matches!(
-            current.status,
-            TakeoverRuntimeStatus::Available | TakeoverRuntimeStatus::Active
-        ) {
-            return Err(self
-                .reject(
-                    state,
-                    current.unavailable_reason.clone(),
-                    "Session takeover is unavailable for this session",
-                    serde_json::json!({ "takeover_runtime": state.takeover_runtime().await }),
-                )
-                .await);
-        }
-        state.activate_handoff().await;
-        refresh_takeover_runtime(&router.browser, state).await;
-        self.record_success(state).await;
-        Ok(())
-    }
-
-    async fn execute_elevate(
-        self,
-        router: &DaemonRouter,
-        state: &Arc<SessionState>,
-    ) -> Result<(), RubError> {
-        let current = state.takeover_runtime().await;
-        if !current.elevate_supported {
-            let reason = current
-                .unavailable_reason
-                .clone()
-                .or_else(|| Some("elevation_not_supported".to_string()));
-            return Err(self
-                .reject(
-                    state,
-                    reason.clone(),
-                    "Session takeover elevation is unavailable for this session",
-                    serde_json::json!({
-                        "takeover_runtime": state.takeover_runtime().await,
-                        "reason": reason,
-                    }),
-                )
-                .await);
-        }
-        router.browser.elevate_to_visible().await?;
-        state.set_handoff_available(true).await;
-        refresh_takeover_runtime(&router.browser, state).await;
-        if let Err(error) = verify_takeover_continuity(router, state).await {
-            self.record_rejection(state, Some("continuity_fence_failed".to_string()))
-                .await;
-            return Err(error);
-        }
-        self.record_success(state).await;
-        Ok(())
-    }
-
-    async fn execute_resume(
-        self,
-        router: &DaemonRouter,
-        state: &Arc<SessionState>,
-    ) -> Result<(), RubError> {
-        let current = state.takeover_runtime().await;
-        if !current.automation_paused || !current.resume_supported {
-            let reason = if !current.resume_supported {
-                current
-                    .unavailable_reason
-                    .clone()
-                    .or_else(|| Some("resume_not_supported".to_string()))
-            } else {
-                Some("takeover_not_active".to_string())
-            };
-            return Err(self
-                .reject(
-                    state,
-                    reason.clone(),
-                    "Session takeover resume is unavailable for this session",
-                    serde_json::json!({
-                        "takeover_runtime": state.takeover_runtime().await,
-                        "reason": reason,
-                    }),
-                )
-                .await);
-        }
-        state.complete_handoff().await;
-        refresh_takeover_runtime(&router.browser, state).await;
-        if let Err(error) = verify_takeover_continuity(router, state).await {
-            state.activate_handoff().await;
-            refresh_takeover_runtime(&router.browser, state).await;
-            self.record_rejection(state, Some("continuity_fence_failed".to_string()))
-                .await;
-            return Err(error);
-        }
-        let resumed_runtime = state.takeover_runtime().await;
-        let handoff = state.human_verification_handoff().await;
-        if let Some(error) = takeover_resume_repaused_error(&resumed_runtime, &handoff) {
-            self.record_rejection(state, Some("automation_repaused_by_policy".to_string()))
-                .await;
-            return Err(error);
-        }
-        self.record_success(state).await;
-        Ok(())
-    }
-
-    async fn reject(
-        self,
-        state: &Arc<SessionState>,
-        reason: Option<String>,
-        message: &'static str,
-        context: serde_json::Value,
-    ) -> RubError {
-        self.record_rejection(state, reason).await;
-        RubError::domain_with_context(ErrorCode::InvalidInput, message, context)
-    }
-
-    async fn record_rejection(self, state: &Arc<SessionState>, reason: Option<String>) {
-        state
-            .record_takeover_transition(self.kind(), TakeoverTransitionResult::Rejected, reason)
-            .await;
-    }
-
-    async fn record_success(self, state: &Arc<SessionState>) {
-        state
-            .record_takeover_transition(self.kind(), TakeoverTransitionResult::Succeeded, None)
-            .await;
-    }
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InterceptRewriteArgs {
-    #[serde(rename = "sub")]
-    _sub: String,
-    source_pattern: String,
-    target_base: String,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InterceptUrlPatternArgs {
-    #[serde(rename = "sub")]
-    _sub: String,
-    url_pattern: String,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InterceptHeaderArgs {
-    #[serde(rename = "sub")]
-    _sub: String,
-    url_pattern: String,
-    headers: Vec<String>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InterceptRemoveArgs {
-    #[serde(rename = "sub")]
-    _sub: String,
-    id: u32,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CookiesUrlArgs {
-    #[serde(rename = "sub")]
-    _sub: String,
-    #[serde(default)]
-    url: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CookiesPathArgs {
-    #[serde(rename = "sub")]
-    _sub: String,
-    path: String,
-}
-
-pub(super) async fn cmd_doctor(
-    router: &DaemonRouter,
-    state: &Arc<SessionState>,
-) -> Result<serde_json::Value, RubError> {
-    let browser_healthy = router.browser.health_check().await.is_ok();
-    refresh_live_runtime_state(&router.browser, state).await;
-    refresh_live_dialog_runtime(&router.browser, state).await;
-    refresh_live_frame_runtime(&router.browser, state).await;
-    refresh_live_storage_runtime(&router.browser, state).await;
-    refresh_takeover_runtime(&router.browser, state).await;
-    refresh_orchestration_runtime(state).await;
-    let _ = refresh_live_trigger_runtime(&router.browser, state).await;
-    let _ = refresh_live_interference_state(&router.browser, state).await;
-    let launch_policy = router.browser.launch_policy();
-    let report = crate::health::build_report(
-        &state.session_id,
-        &state.session_name,
-        &state.rub_home,
-        true,
-    );
-    let detection_risks = detection_risks(&launch_policy);
-
-    Ok(serde_json::json!({
-        "subject": {
-            "kind": "session_diagnostics",
-            "session_id": report.session_id,
-            "session_name": report.session_name,
-        },
-        "result": {
-            "browser": {
-                "found": report.browser_found,
-                "path": report.browser_path,
-                "version": report.browser_version,
-                "healthy": browser_healthy,
-            },
-            "daemon": {
-                "running": true,
-                "pid": std::process::id(),
-                "session_id": report.session_id,
-                "session_name": report.session_name,
-                "uptime_seconds": state.uptime_seconds(),
-                "in_flight": state.in_flight_count.load(std::sync::atomic::Ordering::SeqCst),
-            },
-            "socket": {
-                "path": state.socket_path(),
-                "healthy": true,
-            },
-            "disk": {
-                "rub_home": report.rub_home,
-                "log_size_mb": report.daemon_log_size_mb,
-            },
-            "versions": {
-                "rub": report.rub_version,
-                "ipc_protocol_version": report.ipc_protocol_version,
-            },
-            "launch_policy": launch_policy,
-            "capabilities": agent_capabilities(),
-            "dom_epoch": state.current_epoch(),
-            "detection_risks": detection_risks,
-        },
-        "runtime": runtime_summary(state).await,
-    }))
-}
 
 pub(super) async fn cmd_runtime(
     router: &DaemonRouter,
     state: &Arc<SessionState>,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, RubError> {
-    super::request_args::reject_unknown_fields(args, &["sub"], "runtime")?;
-    let surface = RuntimeSurface::parse(args)?;
-    surface.refresh(router, state).await;
-    Ok(runtime_surface_payload(
-        surface.subject(),
-        surface.projection(state).await?,
-    ))
+    surface::cmd_runtime(router, state, args).await
 }
 
 pub(super) async fn cmd_handoff(
@@ -600,16 +31,7 @@ pub(super) async fn cmd_handoff(
     args: &serde_json::Value,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
-    let action = HandoffAction::parse(args)?;
-    action.execute(router, state).await?;
-
-    Ok(runtime_surface_payload(
-        serde_json::json!({
-            "kind": "human_verification_handoff",
-            "action": action.name(),
-        }),
-        serde_json::to_value(state.human_verification_handoff().await).map_err(RubError::from)?,
-    ))
+    takeover::cmd_handoff(router, args, state).await
 }
 
 pub(super) async fn cmd_takeover(
@@ -617,133 +39,14 @@ pub(super) async fn cmd_takeover(
     args: &serde_json::Value,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
-    refresh_takeover_runtime(&router.browser, state).await;
-
-    let action = TakeoverAction::parse(args)?;
-    action.execute(router, state).await?;
-
-    Ok(runtime_surface_payload(
-        serde_json::json!({
-            "kind": "takeover",
-            "action": action.name(),
-        }),
-        serde_json::to_value(state.takeover_runtime().await).map_err(RubError::from)?,
-    ))
+    takeover::cmd_takeover(router, args, state).await
 }
 
-async fn ensure_handoff_available(state: &Arc<SessionState>) -> Result<(), RubError> {
-    let current = state.human_verification_handoff().await;
-    if matches!(current.status, HumanVerificationHandoffStatus::Unavailable) {
-        return Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            "Human verification handoff is unavailable for this session",
-        ));
-    }
-    Ok(())
-}
-
-async fn verify_takeover_continuity(
+pub(super) async fn cmd_cookies(
     router: &DaemonRouter,
-    state: &Arc<SessionState>,
-) -> Result<(), RubError> {
-    let tabs = refresh_live_runtime_and_interference(&router.browser, state)
-        .await
-        .map_err(|error| {
-            RubError::domain_with_context(
-                ErrorCode::BrowserCrashed,
-                format!("Takeover continuity fence failed while refreshing runtime: {error}"),
-                serde_json::json!({ "phase": "runtime_refresh" }),
-            )
-        })?;
-
-    let active_tab = tabs.iter().any(|tab| tab.active);
-    let frame_runtime = state.frame_runtime().await;
-    let readiness = state.readiness_state().await;
-    let integration = state.integration_runtime().await;
-
-    let failure = takeover_continuity_failure(active_tab, &frame_runtime, &readiness, &integration);
-
-    if let Some((reason, message)) = failure {
-        state.mark_takeover_runtime_degraded(reason).await;
-        return Err(RubError::domain_with_context(
-            ErrorCode::BrowserCrashed,
-            message,
-            serde_json::json!({
-                "reason": reason,
-                "frame_runtime": frame_runtime,
-                "readiness_state": readiness,
-                "integration_runtime": integration,
-                "takeover_runtime": state.takeover_runtime().await,
-            }),
-        ));
-    }
-
-    state.clear_takeover_runtime_degraded().await;
-    refresh_takeover_runtime(&router.browser, state).await;
-    Ok(())
-}
-
-fn takeover_continuity_failure(
-    active_tab: bool,
-    frame_runtime: &rub_core::model::FrameRuntimeInfo,
-    readiness: &rub_core::model::ReadinessInfo,
-    integration: &rub_core::model::IntegrationRuntimeInfo,
-) -> Option<(&'static str, &'static str)> {
-    if !active_tab {
-        return Some((
-            "continuity_no_active_tab",
-            "No active tab remained after takeover transition",
-        ));
-    }
-    if matches!(
-        frame_runtime.status,
-        FrameContextStatus::Unknown | FrameContextStatus::Stale | FrameContextStatus::Degraded
-    ) || frame_runtime.current_frame.is_none()
-    {
-        return Some((
-            "continuity_frame_unavailable",
-            "Frame context became unavailable after takeover transition",
-        ));
-    }
-    if matches!(readiness.status, ReadinessStatus::Degraded) {
-        return Some((
-            "continuity_readiness_degraded",
-            "Readiness surface degraded after takeover transition",
-        ));
-    }
-    let takeover_required_surface_degraded = integration.degraded_surfaces.iter().any(|surface| {
-        matches!(
-            surface,
-            IntegrationSurface::RequestRules | IntegrationSurface::RuntimeObservatory
-        )
-    });
-    if matches!(integration.status, IntegrationRuntimeStatus::Degraded)
-        && takeover_required_surface_degraded
-    {
-        return Some((
-            "continuity_runtime_degraded",
-            "Integration runtime degraded after takeover transition",
-        ));
-    }
-    None
-}
-
-fn takeover_resume_repaused_error(
-    takeover: &rub_core::model::TakeoverRuntimeInfo,
-    handoff: &rub_core::model::HumanVerificationHandoffInfo,
-) -> Option<RubError> {
-    if !takeover.automation_paused && !handoff.automation_paused {
-        return None;
-    }
-
-    Some(RubError::domain_with_context(
-        ErrorCode::AutomationPaused,
-        "Session takeover resumed briefly but policy-driven handoff immediately re-paused automation",
-        serde_json::json!({
-            "takeover_runtime": takeover,
-            "handoff": handoff,
-        }),
-    ))
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, RubError> {
+    cookies::cmd_cookies(router, args).await
 }
 
 pub(super) async fn cmd_intercept(
@@ -751,603 +54,24 @@ pub(super) async fn cmd_intercept(
     args: &serde_json::Value,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
-    match InterceptAction::parse(args)? {
-        InterceptAction::List => {
-            let rules = state.network_rules().await;
-            Ok(intercept_payload(
-                intercept_registry_subject(),
-                serde_json::json!({
-                    "rules": project_network_rules(&rules),
-                }),
-                serde_json::json!(state.integration_runtime().await),
-            ))
-        }
-        InterceptAction::Rewrite => {
-            let parsed = parse_json_args::<InterceptRewriteArgs>(args, "intercept rewrite")?;
-            validate_rewrite_pattern(&parsed.source_pattern)?;
-            create_intercept_rule(
-                router,
-                state,
-                NetworkRuleSpec::Rewrite {
-                    url_pattern: parsed.source_pattern,
-                    target_base: parsed.target_base,
-                },
-            )
-            .await
-        }
-        InterceptAction::Block => {
-            let parsed = parse_json_args::<InterceptUrlPatternArgs>(args, "intercept block")?;
-            create_intercept_rule(
-                router,
-                state,
-                NetworkRuleSpec::Block {
-                    url_pattern: parsed.url_pattern,
-                },
-            )
-            .await
-        }
-        InterceptAction::Allow => {
-            let parsed = parse_json_args::<InterceptUrlPatternArgs>(args, "intercept allow")?;
-            create_intercept_rule(
-                router,
-                state,
-                NetworkRuleSpec::Allow {
-                    url_pattern: parsed.url_pattern,
-                },
-            )
-            .await
-        }
-        InterceptAction::Header => {
-            let parsed = parse_json_args::<InterceptHeaderArgs>(args, "intercept header")?;
-            let headers = parse_header_overrides(&parsed.headers)?;
-            create_intercept_rule(
-                router,
-                state,
-                NetworkRuleSpec::HeaderOverride {
-                    url_pattern: parsed.url_pattern,
-                    headers,
-                },
-            )
-            .await
-        }
-        InterceptAction::Remove => {
-            let parsed = parse_json_args::<InterceptRemoveArgs>(args, "intercept remove")?;
-            remove_intercept_rule(router, state, parsed.id).await
-        }
-        InterceptAction::Clear => clear_intercept_rules(router, state).await,
-    }
-}
-
-async fn create_intercept_rule(
-    router: &DaemonRouter,
-    state: &Arc<SessionState>,
-    spec: NetworkRuleSpec,
-) -> Result<serde_json::Value, RubError> {
-    let mut rules = state.network_rules().await;
-    let rule = NetworkRule {
-        id: state.next_network_rule_id(),
-        status: NetworkRuleStatus::Active,
-        spec,
-    };
-    rules.push(rule.clone());
-    commit_intercept_registry_change(
-        router,
-        state,
-        intercept_rule_subject(&rule),
-        serde_json::json!({
-            "rule": project_network_rule(&rule),
-            "rules": project_network_rules(&rules),
-        }),
-        rules,
-    )
-    .await
-}
-
-async fn remove_intercept_rule(
-    router: &DaemonRouter,
-    state: &Arc<SessionState>,
-    id: u32,
-) -> Result<serde_json::Value, RubError> {
-    let current = state.network_rules().await;
-    if !current.iter().any(|rule| rule.id == id) {
-        return Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            format!("Intercept rule {id} does not exist"),
-        ));
-    }
-
-    let rules = current
-        .into_iter()
-        .filter(|rule| rule.id != id)
-        .collect::<Vec<_>>();
-    commit_intercept_registry_change(
-        router,
-        state,
-        intercept_rule_id_subject(id),
-        serde_json::json!({
-            "removed_id": id,
-            "rules": project_network_rules(&rules),
-        }),
-        rules,
-    )
-    .await
-}
-
-async fn clear_intercept_rules(
-    router: &DaemonRouter,
-    state: &Arc<SessionState>,
-) -> Result<serde_json::Value, RubError> {
-    commit_intercept_registry_change(
-        router,
-        state,
-        intercept_registry_subject(),
-        serde_json::json!({
-            "cleared": true,
-            "rules": [],
-        }),
-        Vec::new(),
-    )
-    .await
-}
-
-async fn commit_intercept_registry_change(
-    router: &DaemonRouter,
-    state: &Arc<SessionState>,
-    subject: serde_json::Value,
-    result: serde_json::Value,
-    rules: Vec<NetworkRule>,
-) -> Result<serde_json::Value, RubError> {
-    router.browser.sync_network_rules(&rules).await?;
-    state.replace_network_rules(rules).await;
-    Ok(intercept_payload(
-        subject,
-        result,
-        serde_json::json!(state.integration_runtime().await),
-    ))
-}
-
-pub(super) async fn cmd_close(router: &DaemonRouter) -> Result<serde_json::Value, RubError> {
-    router.browser.close().await?;
-    Ok(serde_json::json!({
-        "subject": {
-            "kind": "session_browser",
-        },
-        "result": {
-            "closed": true,
-            "daemon_stopped": false,
-            "daemon_exit_policy": "idle_timeout_or_shutdown_signal",
-        }
-    }))
-}
-
-pub(super) async fn cmd_handshake(
-    router: &DaemonRouter,
-    state: &Arc<SessionState>,
-) -> Result<serde_json::Value, RubError> {
-    let runtime_state = state.runtime_state_snapshot().await;
-    Ok(serde_json::json!({
-        "daemon_session_id": state.session_id,
-        "ipc_protocol_version": IPC_PROTOCOL_VERSION,
-        "in_flight_count": state.in_flight_count.load(std::sync::atomic::Ordering::SeqCst),
-        "connected_client_count": state.connected_client_count.load(std::sync::atomic::Ordering::SeqCst),
-        "launch_policy": router.browser.launch_policy(),
-        "integration_runtime": state.integration_runtime().await,
-        "dialog_runtime": state.dialog_runtime().await,
-        "download_runtime": state.download_runtime().await,
-        "frame_runtime": state.frame_runtime().await,
-        "interference_runtime": state.interference_runtime().await,
-        "storage_runtime": state.storage_runtime().await,
-        "takeover_runtime": state.takeover_runtime().await,
-        "orchestration_runtime": state.orchestration_runtime().await,
-        "trigger_runtime": state.trigger_runtime().await,
-        "runtime_observatory": state.observatory().await,
-        "state_inspector": runtime_state.state_inspector,
-        "readiness_state": runtime_state.readiness_state,
-        "human_verification_handoff": state.human_verification_handoff().await,
-        "capabilities": agent_capabilities(),
-    }))
-}
-
-pub(super) async fn cmd_upgrade_check(
-    state: &Arc<SessionState>,
-) -> Result<serde_json::Value, RubError> {
-    let active_trigger_count = state.active_trigger_count().await;
-    let active_orchestration_count = state.active_orchestration_count().await;
-    let human_control_active = state.has_active_human_control().await;
-    Ok(serde_json::json!({
-        "idle": state.is_idle_for_upgrade().await && active_trigger_count == 0 && active_orchestration_count == 0,
-        "in_flight_count": state.in_flight_count.load(std::sync::atomic::Ordering::SeqCst),
-        "connected_client_count": state.connected_client_count.load(std::sync::atomic::Ordering::SeqCst),
-        "active_trigger_count": active_trigger_count,
-        "active_orchestration_count": active_orchestration_count,
-        "human_control_active": human_control_active,
-    }))
-}
-
-pub(super) async fn cmd_cookies(
-    router: &DaemonRouter,
-    args: &serde_json::Value,
-) -> Result<serde_json::Value, RubError> {
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct CookieSetArgs {
-        #[serde(rename = "sub")]
-        _sub: String,
-        name: String,
-        value: String,
-        domain: String,
-        #[serde(default = "default_cookie_path")]
-        path: String,
-        #[serde(default)]
-        secure: bool,
-        #[serde(default)]
-        http_only: bool,
-        #[serde(default = "default_cookie_same_site")]
-        same_site: String,
-        #[serde(default)]
-        expires: Option<f64>,
-    }
-
-    match CookieAction::parse(args)? {
-        CookieAction::Get => {
-            let parsed = parse_json_args::<CookiesUrlArgs>(args, "cookies get")?;
-            let cookies = router.browser.get_cookies(parsed.url.as_deref()).await?;
-            Ok(cookie_payload(
-                cookies_subject(parsed.url.as_deref()),
-                serde_json::json!({
-                    "cookies": cookies,
-                }),
-                None,
-            ))
-        }
-        CookieAction::Set => {
-            let parsed = parse_json_args::<CookieSetArgs>(args, "cookies set")?;
-            if !matches!(
-                parsed.same_site.as_str(),
-                "Strict" | "strict" | "Lax" | "lax" | "None" | "none"
-            ) {
-                return Err(RubError::domain(
-                    ErrorCode::InvalidInput,
-                    format!(
-                        "Invalid sameSite value '{}'. Valid: Strict, Lax, None",
-                        parsed.same_site
-                    ),
-                ));
-            }
-            let cookie = Cookie {
-                name: parsed.name,
-                value: parsed.value,
-                domain: parsed.domain,
-                path: parsed.path,
-                secure: parsed.secure,
-                http_only: parsed.http_only,
-                same_site: parsed.same_site,
-                expires: parsed.expires,
-            };
-            router.browser.set_cookie(&cookie).await?;
-            Ok(cookie_payload(
-                cookie_subject(&cookie),
-                serde_json::json!({
-                    "cookie": cookie,
-                }),
-                None,
-            ))
-        }
-        CookieAction::Clear => {
-            let parsed = parse_json_args::<CookiesUrlArgs>(args, "cookies clear")?;
-            router.browser.delete_cookies(parsed.url.as_deref()).await?;
-            Ok(cookie_payload(
-                cookies_subject(parsed.url.as_deref()),
-                serde_json::json!({
-                    "cleared": true,
-                }),
-                None,
-            ))
-        }
-        CookieAction::Export => {
-            let parsed = parse_json_args::<CookiesPathArgs>(args, "cookies export")?;
-            let cookies = router.browser.get_cookies(None).await?;
-            let json = serde_json::to_string_pretty(&cookies)
-                .map_err(|e| RubError::Internal(format!("Serialize cookies failed: {e}")))?;
-            atomic_write_bytes(std::path::Path::new(&parsed.path), json.as_bytes(), 0o600)
-                .map(|_| ())
-                .map_err(|e| RubError::Internal(format!("Cannot write file: {e}")))?;
-
-            Ok(cookie_payload(
-                cookies_subject(None),
-                serde_json::json!({
-                    "count": cookies.len(),
-                }),
-                Some(cookie_artifact(&parsed.path, "output")),
-            ))
-        }
-        CookieAction::Import => {
-            let parsed = parse_json_args::<CookiesPathArgs>(args, "cookies import")?;
-            let data = std::fs::read_to_string(&parsed.path).map_err(|e| {
-                RubError::domain(ErrorCode::FileNotFound, format!("Cannot read file: {e}"))
-            })?;
-            let cookies: Vec<Cookie> = serde_json::from_str(&data).map_err(|e| {
-                RubError::domain(ErrorCode::InvalidInput, format!("Invalid JSON: {e}"))
-            })?;
-            let previous_cookies = router.browser.get_cookies(None).await?;
-            let count = cookies.len();
-            for (index, cookie) in cookies.iter().enumerate() {
-                if let Err(error) = router.browser.set_cookie(cookie).await {
-                    let rollback = restore_cookie_batch(router, &previous_cookies).await;
-                    return Err(cookie_import_error(
-                        &parsed.path,
-                        index,
-                        error,
-                        rollback.err(),
-                    ));
-                }
-            }
-            Ok(cookie_payload(
-                cookies_subject(None),
-                serde_json::json!({
-                    "imported": count,
-                }),
-                Some(cookie_artifact(&parsed.path, "input")),
-            ))
-        }
-    }
-}
-
-fn default_cookie_path() -> String {
-    "/".to_string()
-}
-
-fn default_cookie_same_site() -> String {
-    "Lax".to_string()
-}
-
-fn validate_rewrite_pattern(pattern: &str) -> Result<(), RubError> {
-    let wildcard_count = pattern.matches('*').count();
-    if wildcard_count > 1 || (wildcard_count == 1 && !pattern.ends_with('*')) {
-        return Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            "Rewrite patterns must be exact URLs or a single trailing-* prefix pattern",
-        ));
-    }
-    Ok(())
-}
-
-fn project_network_rules(rules: &[NetworkRule]) -> Vec<serde_json::Value> {
-    rules.iter().map(project_network_rule).collect()
-}
-
-fn project_network_rule(rule: &NetworkRule) -> serde_json::Value {
-    let (action, pattern, extra) = match &rule.spec {
-        NetworkRuleSpec::Rewrite {
-            url_pattern,
-            target_base,
-        } => (
-            "rewrite",
-            url_pattern.as_str(),
-            serde_json::json!({ "target_base": target_base }),
-        ),
-        NetworkRuleSpec::Block { url_pattern } => {
-            ("block", url_pattern.as_str(), serde_json::json!({}))
-        }
-        NetworkRuleSpec::Allow { url_pattern } => {
-            ("allow", url_pattern.as_str(), serde_json::json!({}))
-        }
-        NetworkRuleSpec::HeaderOverride {
-            url_pattern,
-            headers,
-        } => (
-            "header_override",
-            url_pattern.as_str(),
-            serde_json::json!({ "headers": headers }),
-        ),
-    };
-
-    let mut value = serde_json::json!({
-        "id": rule.id,
-        "status": rule.status,
-        "action": action,
-        "pattern": pattern,
-    });
-    if let Some(object) = value.as_object_mut()
-        && let Some(extra_object) = extra.as_object()
-    {
-        object.extend(extra_object.clone());
-    }
-    value
-}
-
-fn intercept_payload(
-    subject: serde_json::Value,
-    result: serde_json::Value,
-    runtime: serde_json::Value,
-) -> serde_json::Value {
-    serde_json::json!({
-        "subject": subject,
-        "result": result,
-        "runtime": runtime,
-    })
-}
-
-fn intercept_registry_subject() -> serde_json::Value {
-    serde_json::json!({
-        "kind": "intercept_rule_registry",
-    })
-}
-
-fn intercept_rule_subject(rule: &NetworkRule) -> serde_json::Value {
-    let (action, pattern) = match &rule.spec {
-        NetworkRuleSpec::Rewrite { url_pattern, .. } => ("rewrite", url_pattern.as_str()),
-        NetworkRuleSpec::Block { url_pattern } => ("block", url_pattern.as_str()),
-        NetworkRuleSpec::Allow { url_pattern } => ("allow", url_pattern.as_str()),
-        NetworkRuleSpec::HeaderOverride { url_pattern, .. } => {
-            ("header_override", url_pattern.as_str())
-        }
-    };
-    serde_json::json!({
-        "kind": "intercept_rule",
-        "action": action,
-        "pattern": pattern,
-    })
-}
-
-fn intercept_rule_id_subject(id: u32) -> serde_json::Value {
-    serde_json::json!({
-        "kind": "intercept_rule",
-        "id": id,
-    })
-}
-
-fn cookie_payload(
-    subject: serde_json::Value,
-    result: serde_json::Value,
-    artifact: Option<serde_json::Value>,
-) -> serde_json::Value {
-    let mut payload = serde_json::json!({
-        "subject": subject,
-        "result": result,
-    });
-    if let Some(object) = payload.as_object_mut()
-        && let Some(artifact) = artifact
-    {
-        object.insert("artifact".to_string(), artifact);
-    }
-    payload
-}
-
-fn cookies_subject(url: Option<&str>) -> serde_json::Value {
-    serde_json::json!({
-        "kind": "cookies",
-        "url": url,
-    })
-}
-
-fn cookie_subject(cookie: &Cookie) -> serde_json::Value {
-    serde_json::json!({
-        "kind": "cookie",
-        "name": cookie.name,
-        "domain": cookie.domain,
-        "path": cookie.path,
-    })
-}
-
-fn cookie_artifact(path: &str, direction: &str) -> serde_json::Value {
-    serde_json::json!({
-        "kind": "cookies_archive",
-        "format": "json",
-        "path": path,
-        "direction": direction,
-    })
-}
-
-async fn restore_cookie_batch(router: &DaemonRouter, cookies: &[Cookie]) -> Result<(), RubError> {
-    router.browser.delete_cookies(None).await?;
-    for cookie in cookies {
-        router.browser.set_cookie(cookie).await?;
-    }
-    Ok(())
-}
-
-fn cookie_import_error(
-    path: &str,
-    index: usize,
-    import_error: RubError,
-    rollback_error: Option<RubError>,
-) -> RubError {
-    match rollback_error {
-        Some(rollback_error) => RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            format!("Cookie import failed at index {index}: {import_error}"),
-            serde_json::json!({
-                "path": path,
-                "cookie_index": index,
-                "rollback_failed": true,
-                "rollback_error": rollback_error.into_envelope(),
-            }),
-        ),
-        None => RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            format!("Cookie import failed at index {index}: {import_error}"),
-            serde_json::json!({
-                "path": path,
-                "cookie_index": index,
-                "rollback_failed": false,
-            }),
-        ),
-    }
-}
-
-fn runtime_surface_payload(
-    subject: serde_json::Value,
-    runtime: serde_json::Value,
-) -> serde_json::Value {
-    serde_json::json!({
-        "subject": subject,
-        "runtime": runtime,
-    })
-}
-
-fn runtime_subject(surface: &str) -> serde_json::Value {
-    serde_json::json!({
-        "kind": "runtime_surface",
-        "surface": surface,
-    })
-}
-
-async fn runtime_summary(state: &Arc<SessionState>) -> serde_json::Value {
-    let runtime_state = state.runtime_state_snapshot().await;
-    serde_json::json!({
-        "integration_runtime": state.integration_runtime().await,
-        "dialog_runtime": state.dialog_runtime().await,
-        "download_runtime": state.download_runtime().await,
-        "frame_runtime": state.frame_runtime().await,
-        "interference_runtime": state.interference_runtime().await,
-        "storage_runtime": state.storage_runtime().await,
-        "takeover_runtime": state.takeover_runtime().await,
-        "orchestration_runtime": state.orchestration_runtime().await,
-        "trigger_runtime": state.trigger_runtime().await,
-        "runtime_observatory": state.observatory().await,
-        "state_inspector": runtime_state.state_inspector,
-        "readiness_state": runtime_state.readiness_state,
-        "human_verification_handoff": state.human_verification_handoff().await,
-    })
-}
-
-fn parse_header_overrides(raw_headers: &[String]) -> Result<BTreeMap<String, String>, RubError> {
-    if raw_headers.is_empty() {
-        return Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            "Intercept header requires at least one --header NAME=VALUE entry",
-        ));
-    }
-
-    let mut headers = BTreeMap::new();
-    for entry in raw_headers {
-        let Some((name, value)) = entry.split_once('=') else {
-            return Err(RubError::domain(
-                ErrorCode::InvalidInput,
-                format!("Invalid header override '{entry}'. Use NAME=VALUE"),
-            ));
-        };
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(RubError::domain(
-                ErrorCode::InvalidInput,
-                format!("Invalid header override '{entry}'. Header name cannot be empty"),
-            ));
-        }
-        headers.insert(name.to_string(), value.to_string());
-    }
-
-    Ok(headers)
+    intercept::cmd_intercept(router, args, state).await
 }
 
 #[cfg(test)]
 mod tests {
+    use super::cookies::CookiesPathArgs;
+    use super::projection::{
+        cookie_artifact, cookie_payload, cookie_subject, cookies_subject, runtime_subject,
+        runtime_surface_payload,
+    };
+    use super::takeover::{takeover_continuity_failure, takeover_resume_repaused_error};
     use super::{
-        cmd_cookies, cmd_handoff, cookie_artifact, cookie_payload, cookie_subject, cookies_subject,
-        intercept_payload, intercept_registry_subject, intercept_rule_id_subject,
-        intercept_rule_subject, project_network_rule, takeover_continuity_failure,
-        takeover_resume_repaused_error,
+        cmd_cookies, cmd_doctor, cmd_handoff, cmd_runtime, intercept_payload,
+        intercept_registry_subject, intercept_rule_id_subject, intercept_rule_subject,
+        parse_json_args, project_network_rule,
+    };
+    use crate::router::runtime::projection::{
+        annotate_doctor_operator_path_states, runtime_projection_state,
     };
     use crate::session::SessionState;
     use rub_core::error::{ErrorCode, RubError};
@@ -1472,6 +196,173 @@ mod tests {
         assert_eq!(payload["runtime"]["status"], "active");
     }
 
+    #[test]
+    fn runtime_surface_payload_marks_runtime_as_display_only_operator_projection() {
+        let payload = runtime_surface_payload(
+            runtime_subject("integration"),
+            runtime_projection_state("integration", "session.integration_runtime"),
+            serde_json::json!({ "status": "active" }),
+        );
+        assert_eq!(payload["subject"]["kind"], "runtime_surface");
+        assert_eq!(payload["subject"]["surface"], "integration");
+        assert_eq!(
+            payload["runtime_projection_state"]["projection_kind"],
+            "live_runtime_projection"
+        );
+        assert_eq!(
+            payload["runtime_projection_state"]["projection_authority"],
+            "session.integration_runtime"
+        );
+        assert_eq!(
+            payload["runtime_projection_state"]["truth_level"],
+            "operator_projection"
+        );
+        assert_eq!(
+            payload["runtime_projection_state"]["control_role"],
+            "display_only"
+        );
+        assert_eq!(payload["runtime"]["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn doctor_marks_runtime_summary_as_operator_projection() {
+        let router = test_router();
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-test"),
+            None,
+        ));
+
+        let payload = cmd_doctor(&router, &state)
+            .await
+            .expect("doctor should succeed");
+        assert_eq!(
+            payload["runtime_projection_state"]["projection_kind"],
+            "live_runtime_projection"
+        );
+        assert_eq!(
+            payload["runtime_projection_state"]["projection_authority"],
+            "session.runtime_summary"
+        );
+        assert_eq!(
+            payload["runtime_projection_state"]["upstream_truth"],
+            "session_live_runtime_state"
+        );
+        assert_eq!(
+            payload["runtime_projection_state"]["truth_level"],
+            "operator_projection"
+        );
+    }
+
+    #[test]
+    fn annotate_doctor_operator_path_states_marks_display_only_path_references() {
+        let mut result = serde_json::json!({
+            "browser": {
+                "path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            },
+            "socket": {
+                "path": "/tmp/rub.sock",
+            },
+            "disk": {
+                "rub_home": "/tmp/rub-home",
+            },
+            "launch_policy": {
+                "user_data_dir": "/tmp/rub-home/profile-root",
+                "connection_target": {
+                    "source": "profile",
+                    "name": "Default",
+                    "resolved_path": "/tmp/rub-home/profile-root/Default",
+                }
+            },
+        });
+
+        annotate_doctor_operator_path_states(&mut result);
+
+        assert_eq!(
+            result["browser"]["path_state"]["truth_level"],
+            "operator_path_reference"
+        );
+        assert_eq!(
+            result["browser"]["path_state"]["path_authority"],
+            "router.doctor.browser_path"
+        );
+        assert_eq!(
+            result["browser"]["path_state"]["path_kind"],
+            "browser_binary_reference"
+        );
+        assert_eq!(
+            result["socket"]["path_state"]["path_authority"],
+            "router.doctor.socket_path"
+        );
+        assert_eq!(
+            result["socket"]["path_state"]["path_kind"],
+            "daemon_socket_reference"
+        );
+        assert_eq!(
+            result["disk"]["rub_home_state"]["path_authority"],
+            "router.doctor.rub_home"
+        );
+        assert_eq!(
+            result["disk"]["rub_home_state"]["path_kind"],
+            "daemon_home_directory"
+        );
+        assert_eq!(
+            result["disk"]["rub_home_state"]["control_role"],
+            "display_only"
+        );
+        assert_eq!(
+            result["launch_policy"]["user_data_dir_state"]["path_authority"],
+            "router.doctor.launch_policy.user_data_dir"
+        );
+        assert_eq!(
+            result["launch_policy"]["user_data_dir_state"]["path_kind"],
+            "managed_user_data_directory"
+        );
+        assert_eq!(
+            result["launch_policy"]["connection_target"]["resolved_path_state"]["path_authority"],
+            "router.doctor.launch_policy.connection_target.resolved_path"
+        );
+        assert_eq!(
+            result["launch_policy"]["connection_target"]["resolved_path_state"]["path_kind"],
+            "profile_directory_reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_command_marks_surface_as_operator_projection() {
+        let router = test_router();
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-test"),
+            None,
+        ));
+
+        let payload = cmd_runtime(
+            &router,
+            &state,
+            &serde_json::json!({ "sub": "integration" }),
+        )
+        .await
+        .expect("runtime command should succeed");
+        assert_eq!(
+            payload["runtime_projection_state"]["projection_kind"],
+            "live_runtime_projection"
+        );
+        assert_eq!(
+            payload["runtime_projection_state"]["projection_authority"],
+            "session.integration_runtime"
+        );
+        assert_eq!(
+            payload["runtime_projection_state"]["durability"],
+            "best_effort"
+        );
+        assert_eq!(
+            payload["runtime_projection_state"]["control_role"],
+            "display_only"
+        );
+        assert_eq!(payload["subject"]["surface"], "integration");
+    }
+
     #[tokio::test]
     async fn cookies_set_rejects_unknown_or_mistyped_fields() {
         let router = test_router();
@@ -1492,6 +383,32 @@ mod tests {
         let envelope = error.into_envelope();
         assert_eq!(envelope.code, ErrorCode::InvalidInput);
         assert!(envelope.message.contains("Invalid cookies set payload"));
+    }
+
+    #[tokio::test]
+    async fn cookies_set_accepts_missing_optional_domain() {
+        let router = test_router();
+        let error = cmd_cookies(
+            &router,
+            &serde_json::json!({
+                "sub": "set",
+                "name": "session",
+                "value": "abc",
+                "path": "/",
+                "same_site": "Lax"
+            }),
+        )
+        .await
+        .expect_err(
+            "test router still fails later without a real page, but parsing should succeed",
+        );
+
+        let envelope = error.into_envelope();
+        assert_ne!(envelope.code, ErrorCode::InvalidInput);
+        assert!(
+            !envelope.message.contains("Invalid cookies set payload"),
+            "{envelope:?}"
+        );
     }
 
     #[test]
@@ -1529,12 +446,28 @@ mod tests {
         let payload = cookie_payload(
             cookie_subject(&cookie),
             serde_json::json!({ "cookie": cookie }),
-            Some(cookie_artifact("/tmp/cookies.json", "output")),
+            Some(cookie_artifact("/tmp/cookies.json", "output", "durable")),
         );
         assert_eq!(payload["subject"]["kind"], "cookie");
         assert_eq!(payload["result"]["cookie"]["name"], "sid");
         assert_eq!(payload["artifact"]["kind"], "cookies_archive");
         assert_eq!(payload["artifact"]["direction"], "output");
+        assert_eq!(
+            payload["artifact"]["artifact_state"]["truth_level"],
+            "command_artifact"
+        );
+        assert_eq!(
+            payload["artifact"]["artifact_state"]["artifact_authority"],
+            "router.cookies_export_artifact"
+        );
+        assert_eq!(
+            payload["artifact"]["artifact_state"]["upstream_truth"],
+            "cookies_export_result"
+        );
+        assert_eq!(
+            payload["artifact"]["artifact_state"]["durability"],
+            "durable"
+        );
     }
 
     #[test]
@@ -1664,5 +597,21 @@ mod tests {
         .expect("repaused runtime should reject resume");
 
         assert_eq!(error.into_envelope().code, ErrorCode::AutomationPaused);
+    }
+
+    #[test]
+    fn cookies_path_payload_accepts_path_state_metadata() {
+        let parsed = parse_json_args::<CookiesPathArgs>(
+            &serde_json::json!({
+                "sub": "export",
+                "path": "/tmp/cookies.json",
+                "path_state": {
+                    "path_authority": "cli.cookies.export.path"
+                }
+            }),
+            "cookies export",
+        )
+        .expect("cookies path payload should accept display-only path metadata");
+        assert_eq!(parsed.path, "/tmp/cookies.json");
     }
 }

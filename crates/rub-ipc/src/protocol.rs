@@ -1,5 +1,6 @@
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use rub_core::error::ErrorEnvelope;
 use rub_core::model::Timing;
@@ -57,6 +58,18 @@ impl IpcRequest {
     pub fn with_daemon_session_id(mut self, id: impl Into<String>) -> Result<Self, String> {
         self.daemon_session_id = validate_optional_daemon_session_id(Some(id.into()))?;
         Ok(self)
+    }
+
+    pub fn from_value_strict(value: serde_json::Value) -> Result<Self, ErrorEnvelope> {
+        serde_json::from_value(value).map_err(|error| {
+            ErrorEnvelope::new(
+                rub_core::error::ErrorCode::IpcProtocolError,
+                format!("IPC request contract error: {error}"),
+            )
+            .with_context(serde_json::json!({
+                "reason": "invalid_ipc_request_contract",
+            }))
+        })
     }
 }
 
@@ -168,7 +181,57 @@ impl IpcResponse {
     pub fn validate_contract(&self) -> Result<(), ErrorEnvelope> {
         self.contract_error_envelope().map_or(Ok(()), Err)
     }
+
+    pub fn from_value_strict(value: serde_json::Value) -> Result<Self, ErrorEnvelope> {
+        let raw: RawIpcResponse = serde_json::from_value(value).map_err(|error| {
+            ErrorEnvelope::new(
+                rub_core::error::ErrorCode::IpcProtocolError,
+                format!("IPC response schema error: {error}"),
+            )
+            .with_context(serde_json::json!({
+                "reason": "invalid_ipc_response_schema",
+            }))
+        })?;
+        let response = IpcResponse {
+            ipc_protocol_version: raw.ipc_protocol_version,
+            command_id: raw.command_id,
+            request_id: raw.request_id,
+            status: raw.status,
+            data: raw.data,
+            error: raw.error,
+            timing: raw.timing,
+        };
+        response.validate_contract()?;
+        Ok(response)
+    }
 }
+
+#[derive(Debug, Clone)]
+pub struct IpcProtocolDecodeError {
+    envelope: ErrorEnvelope,
+}
+
+impl IpcProtocolDecodeError {
+    pub fn new(envelope: ErrorEnvelope) -> Self {
+        Self { envelope }
+    }
+
+    pub fn envelope(&self) -> &ErrorEnvelope {
+        &self.envelope
+    }
+
+    pub fn into_envelope(self) -> ErrorEnvelope {
+        self.envelope
+    }
+}
+
+impl fmt::Display for IpcProtocolDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.envelope.message)
+    }
+}
+
+impl std::error::Error for IpcProtocolDecodeError {}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -190,20 +253,9 @@ impl<'de> Deserialize<'de> for IpcResponse {
     where
         D: Deserializer<'de>,
     {
-        let raw = RawIpcResponse::deserialize(deserializer)?;
-        let response = IpcResponse {
-            ipc_protocol_version: raw.ipc_protocol_version,
-            command_id: raw.command_id,
-            request_id: raw.request_id,
-            status: raw.status,
-            data: raw.data,
-            error: raw.error,
-            timing: raw.timing,
-        };
-        response
-            .validate_contract()
-            .map_err(|envelope| de::Error::custom(envelope.message))?;
-        Ok(response)
+        let value = serde_json::Value::deserialize(deserializer)?;
+        IpcResponse::from_value_strict(value)
+            .map_err(|envelope| de::Error::custom(envelope.message))
     }
 }
 

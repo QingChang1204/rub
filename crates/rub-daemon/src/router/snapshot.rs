@@ -69,6 +69,7 @@ pub(super) async fn build_stable_snapshot(
     router: &DaemonRouter,
     args: &serde_json::Value,
     state: &Arc<SessionState>,
+    deadline: TransactionDeadline,
     limit: Option<u32>,
     a11y: bool,
     listeners: bool,
@@ -130,7 +131,20 @@ pub(super) async fn build_stable_snapshot(
                 .await?
         };
 
-        tokio::time::sleep(std::time::Duration::from_millis(SNAPSHOT_SETTLE_DELAY_MS)).await;
+        if !sleep_full_settle_window(Some(deadline), SNAPSHOT_SETTLE_DELAY_MS).await {
+            state.mark_pending_external_dom_change();
+            return Err(RubError::domain_with_context(
+                ErrorCode::StaleSnapshot,
+                "Snapshot could not stabilize before the authoritative deadline expired",
+                serde_json::json!({
+                    "reason": "snapshot_deadline_exhausted",
+                    "attempts": attempt + 1,
+                    "selected_frame_id": selected_frame_id,
+                    "timeout_ms": deadline.timeout_ms,
+                    "elapsed_ms": deadline.elapsed_ms(),
+                }),
+            ));
+        }
 
         if !state.take_pending_external_dom_change() {
             return Ok(snapshot);
@@ -194,6 +208,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settle_window_rejects_exact_boundary_without_partial_sleep() {
+        let waited = tokio::time::timeout(
+            Duration::from_millis(30),
+            sleep_full_settle_window(Some(TransactionDeadline::new(100)), 100),
+        )
+        .await
+        .expect("exact-boundary settle wait should return immediately");
+        assert!(
+            !waited,
+            "deadline equal to the settle window must fail closed instead of partially sleeping"
+        );
+    }
+
+    #[tokio::test]
     async fn settle_external_dom_fence_preserves_marker_when_deadline_is_too_close() {
         let state = Arc::new(SessionState::new(
             "default",
@@ -243,5 +271,32 @@ mod tests {
         let outcome = fence.await.expect("settle fence task should complete");
         assert_eq!(outcome, ExternalDomFenceOutcome::Settled);
         assert!(!state.has_pending_external_dom_change());
+    }
+
+    #[tokio::test]
+    async fn settle_external_dom_fence_stops_before_partial_second_window() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-router-snapshot-fence-near-timeout"),
+            None,
+        ));
+        let task_state = state.clone();
+        let fence = tokio::spawn(async move {
+            settle_external_dom_fence(&task_state, "observe", Some(TransactionDeadline::new(150)))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        state.mark_pending_external_dom_change();
+
+        let outcome = tokio::time::timeout(Duration::from_millis(250), fence)
+            .await
+            .expect("settle fence should complete before test timeout")
+            .expect("settle fence task should complete");
+        assert_eq!(outcome, ExternalDomFenceOutcome::IncompleteDueToDeadline);
+        assert!(
+            state.has_pending_external_dom_change(),
+            "near-timeout settle must preserve the pending marker instead of pretending stability"
+        );
     }
 }

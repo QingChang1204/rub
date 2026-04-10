@@ -14,8 +14,9 @@ use crate::router::DaemonRouter;
 use crate::session::SessionState;
 
 use super::{
-    ORCHESTRATION_ACTION_BASE_TIMEOUT_MS, decode_orchestration_success_payload,
-    dispatch_remote_orchestration_request, ensure_orchestration_success_response,
+    ORCHESTRATION_ACTION_BASE_TIMEOUT_MS, decode_orchestration_success_payload_field,
+    decode_orchestration_success_result_items, dispatch_remote_orchestration_request,
+    ensure_orchestration_success_response,
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,31 +116,14 @@ async fn list_target_tabs(
         ORCHESTRATION_ACTION_BASE_TIMEOUT_MS,
     );
     let response = dispatch_to_target_session(router, state, session, request).await?;
-    let tabs = response
-        .data
-        .and_then(|data| data.get("tabs").cloned())
-        .ok_or_else(|| {
-            ErrorEnvelope::new(
-                ErrorCode::IpcProtocolError,
-                "Orchestration target tabs response did not include a tabs payload",
-            )
-            .with_context(serde_json::json!({
-                "reason": "orchestration_target_tabs_payload_missing",
-                "target_session_id": session.session_id,
-                "target_session_name": session.session_name,
-            }))
-        })?;
-    serde_json::from_value::<Vec<TabInfo>>(tabs).map_err(|error| {
-        ErrorEnvelope::new(
-            ErrorCode::IpcProtocolError,
-            format!("Failed to decode orchestration target tabs payload: {error}"),
-        )
-        .with_context(serde_json::json!({
-            "reason": "orchestration_target_tabs_payload_invalid",
-            "target_session_id": session.session_id,
-            "target_session_name": session.session_name,
-        }))
-    })
+    decode_orchestration_success_result_items(
+        response,
+        session,
+        "orchestration_target_tabs_payload_missing",
+        "Orchestration target tabs response did not include a result.items payload",
+        "orchestration_target_tabs_payload_invalid",
+        "orchestration target tabs payload",
+    )
 }
 
 async fn list_target_frames(
@@ -153,31 +137,14 @@ async fn list_target_frames(
         ORCHESTRATION_ACTION_BASE_TIMEOUT_MS,
     );
     let response = dispatch_to_target_session(router, state, session, request).await?;
-    let frames = response
-        .data
-        .and_then(|data| data.get("frames").cloned())
-        .ok_or_else(|| {
-            ErrorEnvelope::new(
-                ErrorCode::IpcProtocolError,
-                "Orchestration target frames response did not include a frames payload",
-            )
-            .with_context(serde_json::json!({
-                "reason": "orchestration_target_frames_payload_missing",
-                "target_session_id": session.session_id,
-                "target_session_name": session.session_name,
-            }))
-        })?;
-    serde_json::from_value::<Vec<FrameInventoryEntry>>(frames).map_err(|error| {
-        ErrorEnvelope::new(
-            ErrorCode::IpcProtocolError,
-            format!("Failed to decode orchestration target frames payload: {error}"),
-        )
-        .with_context(serde_json::json!({
-            "reason": "orchestration_target_frames_payload_invalid",
-            "target_session_id": session.session_id,
-            "target_session_name": session.session_name,
-        }))
-    })
+    decode_orchestration_success_result_items(
+        response,
+        session,
+        "orchestration_target_frames_payload_missing",
+        "Orchestration target frames response did not include a result.items payload",
+        "orchestration_target_frames_payload_invalid",
+        "orchestration target frames payload",
+    )
 }
 
 async fn ensure_orchestration_target_frame_continuity(
@@ -239,11 +206,12 @@ async fn fetch_orchestration_target_runtime_summary(
         ORCHESTRATION_ACTION_BASE_TIMEOUT_MS,
     );
     let response = dispatch_to_target_session(router, state, session, request).await?;
-    decode_orchestration_success_payload(
+    decode_orchestration_success_payload_field(
         response,
         session,
+        "runtime",
         "orchestration_target_runtime_summary_payload_missing",
-        "Orchestration target runtime summary returned success without a payload",
+        "Orchestration target runtime summary returned success without a runtime payload",
         "orchestration_target_runtime_summary_payload_invalid",
         "orchestration target runtime summary",
     )

@@ -4,8 +4,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rub_core::model::{
     OrchestrationEventInfo, OrchestrationEventKind, OrchestrationGroupInfo,
     OrchestrationResultInfo, OrchestrationRuleInfo, OrchestrationRuleStatus,
-    OrchestrationRuntimeInfo, OrchestrationRuntimeStatus, OrchestrationSessionInfo,
-    OrchestrationTraceProjection, TriggerEvidenceInfo,
+    OrchestrationRuntimeInfo, OrchestrationRuntimeStatus, OrchestrationTraceProjection,
+    TriggerEvidenceInfo,
+};
+
+mod events;
+mod mutation;
+mod projection;
+mod sessions;
+
+use events::orchestration_outcome_event_kind;
+pub(crate) use sessions::{
+    extend_orchestration_session_path_context, projected_orchestration_session,
 };
 
 const ORCHESTRATION_EVENT_LIMIT: usize = 64;
@@ -40,444 +50,15 @@ impl OrchestrationRuntimeState {
     pub fn rules(&self) -> Vec<OrchestrationRuleInfo> {
         self.projection.rules.clone()
     }
-
-    pub fn register(&mut self, rule: OrchestrationRuleInfo) -> Result<OrchestrationRuleInfo, u32> {
-        if let Some(existing) = self
-            .projection
-            .rules
-            .iter()
-            .find(|existing| existing.idempotency_key == rule.idempotency_key)
-        {
-            return Err(existing.id);
-        }
-        self.projection.last_rule_id = Some(rule.id);
-        self.projection.rules.push(rule.clone());
-        self.push_event(OrchestrationEventInfo {
-            sequence: 0,
-            kind: OrchestrationEventKind::Registered,
-            rule_id: Some(rule.id),
-            summary: format!("orchestration rule {} registered", rule.id),
-            unavailable_reason: rule.unavailable_reason.clone(),
-            evidence: rule.last_condition_evidence.clone(),
-            correlation_key: Some(rule.correlation_key.clone()),
-            idempotency_key: Some(rule.idempotency_key.clone()),
-            error_code: None,
-            reason: None,
-            committed_steps: None,
-            total_steps: None,
-        });
-        self.refresh_counts();
-        self.refresh_status();
-        Ok(rule)
-    }
-
-    pub fn update_status(
-        &mut self,
-        id: u32,
-        status: OrchestrationRuleStatus,
-    ) -> Option<OrchestrationRuleInfo> {
-        let rule = {
-            let rule = self
-                .projection
-                .rules
-                .iter_mut()
-                .find(|rule| rule.id == id)?;
-            rule.status = status;
-            rule.clone()
-        };
-        let kind = match status {
-            OrchestrationRuleStatus::Paused => Some(OrchestrationEventKind::Paused),
-            OrchestrationRuleStatus::Armed => Some(OrchestrationEventKind::Resumed),
-            _ => None,
-        };
-        if let Some(kind) = kind {
-            self.push_event(OrchestrationEventInfo {
-                sequence: 0,
-                kind,
-                rule_id: Some(rule.id),
-                summary: format!(
-                    "orchestration rule {} {}",
-                    rule.id,
-                    match kind {
-                        OrchestrationEventKind::Paused => "paused",
-                        OrchestrationEventKind::Resumed => "resumed",
-                        _ => "updated",
-                    }
-                ),
-                unavailable_reason: rule.unavailable_reason.clone(),
-                evidence: rule.last_condition_evidence.clone(),
-                correlation_key: Some(rule.correlation_key.clone()),
-                idempotency_key: Some(rule.idempotency_key.clone()),
-                error_code: None,
-                reason: None,
-                committed_steps: None,
-                total_steps: None,
-            });
-        }
-        self.refresh_counts();
-        self.refresh_status();
-        Some(rule)
-    }
-
-    pub fn remove(&mut self, id: u32) -> Option<OrchestrationRuleInfo> {
-        let index = self
-            .projection
-            .rules
-            .iter()
-            .position(|rule| rule.id == id)?;
-        let removed = self.projection.rules.remove(index);
-        self.push_event(OrchestrationEventInfo {
-            sequence: 0,
-            kind: OrchestrationEventKind::Removed,
-            rule_id: Some(removed.id),
-            summary: format!("orchestration rule {} removed", removed.id),
-            unavailable_reason: removed.unavailable_reason.clone(),
-            evidence: removed.last_condition_evidence.clone(),
-            correlation_key: Some(removed.correlation_key.clone()),
-            idempotency_key: Some(removed.idempotency_key.clone()),
-            error_code: None,
-            reason: None,
-            committed_steps: None,
-            total_steps: None,
-        });
-        self.refresh_counts();
-        self.refresh_status();
-        Some(removed)
-    }
-
-    pub fn record_outcome(
-        &mut self,
-        id: u32,
-        evidence: Option<TriggerEvidenceInfo>,
-        result: OrchestrationResultInfo,
-    ) -> Option<OrchestrationRuleInfo> {
-        let rule = {
-            let rule = self
-                .projection
-                .rules
-                .iter_mut()
-                .find(|rule| rule.id == id)?;
-            rule.status = result.next_status;
-            rule.execution_policy.cooldown_until_ms = result.cooldown_until_ms;
-            rule.last_condition_evidence = evidence.clone();
-            rule.last_result = Some(result.clone());
-            rule.clone()
-        };
-        self.projection.last_rule_id = Some(id);
-        self.projection.last_rule_result = Some(result.clone());
-        if let Some(kind) = orchestration_outcome_event_kind(result.status) {
-            self.push_event(OrchestrationEventInfo {
-                sequence: 0,
-                kind,
-                rule_id: Some(rule.id),
-                summary: result.summary.clone(),
-                unavailable_reason: rule.unavailable_reason.clone(),
-                evidence,
-                correlation_key: Some(rule.correlation_key.clone()),
-                idempotency_key: Some(rule.idempotency_key.clone()),
-                error_code: result.error_code,
-                reason: result.reason.clone(),
-                committed_steps: Some(result.committed_steps),
-                total_steps: Some(result.total_steps),
-            });
-        }
-        self.refresh_counts();
-        self.refresh_status();
-        Some(rule)
-    }
-
-    pub fn record_outcome_with_fallback(
-        &mut self,
-        rule_snapshot: &OrchestrationRuleInfo,
-        evidence: Option<TriggerEvidenceInfo>,
-        result: OrchestrationResultInfo,
-    ) -> Option<OrchestrationRuleInfo> {
-        if self
-            .projection
-            .rules
-            .iter()
-            .any(|rule| rule.id == rule_snapshot.id)
-        {
-            return self.record_outcome(rule_snapshot.id, evidence, result);
-        }
-
-        self.projection.last_rule_id = Some(rule_snapshot.id);
-        self.projection.last_rule_result = Some(result.clone());
-        if let Some(kind) = orchestration_outcome_event_kind(result.status) {
-            self.push_event(OrchestrationEventInfo {
-                sequence: 0,
-                kind,
-                rule_id: Some(rule_snapshot.id),
-                summary: result.summary.clone(),
-                unavailable_reason: rule_snapshot.unavailable_reason.clone(),
-                evidence,
-                correlation_key: Some(rule_snapshot.correlation_key.clone()),
-                idempotency_key: Some(rule_snapshot.idempotency_key.clone()),
-                error_code: result.error_code,
-                reason: result.reason.clone(),
-                committed_steps: Some(result.committed_steps),
-                total_steps: Some(result.total_steps),
-            });
-        }
-        self.refresh_counts();
-        self.refresh_status();
-        None
-    }
-
-    pub fn replace(
-        &mut self,
-        sequence: u64,
-        current_session_id: String,
-        current_session_name: String,
-        known_sessions: Vec<OrchestrationSessionInfo>,
-        degraded_reason: Option<String>,
-    ) -> OrchestrationRuntimeInfo {
-        if sequence < self.last_refresh_sequence {
-            return self.projection();
-        }
-        self.last_refresh_sequence = sequence;
-        self.projection.current_session_id = Some(current_session_id);
-        self.projection.current_session_name = Some(current_session_name);
-        self.projection.known_sessions = known_sessions;
-        self.projection.session_count = self.projection.known_sessions.len();
-        let supported = degraded_reason.is_none();
-        self.projection.addressing_supported = supported;
-        self.projection.execution_supported = supported;
-        self.projection.degraded_reason = degraded_reason;
-        self.reconcile_sessions();
-        self.refresh_counts();
-        self.refresh_status();
-        self.projection()
-    }
-
-    pub fn mark_degraded(
-        &mut self,
-        sequence: u64,
-        reason: impl Into<String>,
-    ) -> OrchestrationRuntimeInfo {
-        if sequence < self.last_refresh_sequence {
-            return self.projection();
-        }
-        self.last_refresh_sequence = sequence;
-        self.projection.addressing_supported = false;
-        self.projection.execution_supported = false;
-        self.projection.degraded_reason = Some(reason.into());
-        self.refresh_counts();
-        self.refresh_status();
-        self.projection()
-    }
-
-    fn reconcile_sessions(&mut self) {
-        let mut pending_events = Vec::new();
-        for rule in &mut self.projection.rules {
-            let previous_unavailable_reason = rule.unavailable_reason.clone();
-            let source = self
-                .projection
-                .known_sessions
-                .iter()
-                .find(|session| session.session_id == rule.source.session_id);
-            let target = self
-                .projection
-                .known_sessions
-                .iter()
-                .find(|session| session.session_id == rule.target.session_id);
-
-            if let Some(session) = source {
-                rule.source.session_name = session.session_name.clone();
-            }
-            if let Some(session) = target {
-                rule.target.session_name = session.session_name.clone();
-            }
-
-            rule.unavailable_reason = match (source.is_some(), target.is_some()) {
-                (true, true) => None,
-                (false, false) => Some("source_and_target_sessions_missing".to_string()),
-                (false, true) => Some("source_session_missing".to_string()),
-                (true, false) => Some("target_session_missing".to_string()),
-            };
-
-            if previous_unavailable_reason != rule.unavailable_reason {
-                match (&previous_unavailable_reason, &rule.unavailable_reason) {
-                    (_, Some(reason)) => pending_events.push(OrchestrationEventInfo {
-                        sequence: 0,
-                        kind: OrchestrationEventKind::Unavailable,
-                        rule_id: Some(rule.id),
-                        summary: format!(
-                            "orchestration rule {} became unavailable: {reason}",
-                            rule.id
-                        ),
-                        unavailable_reason: Some(reason.clone()),
-                        evidence: rule.last_condition_evidence.clone(),
-                        correlation_key: Some(rule.correlation_key.clone()),
-                        idempotency_key: Some(rule.idempotency_key.clone()),
-                        error_code: None,
-                        reason: None,
-                        committed_steps: None,
-                        total_steps: None,
-                    }),
-                    (Some(_), None) => pending_events.push(OrchestrationEventInfo {
-                        sequence: 0,
-                        kind: OrchestrationEventKind::Recovered,
-                        rule_id: Some(rule.id),
-                        summary: format!(
-                            "orchestration rule {} recovered source/target session availability",
-                            rule.id
-                        ),
-                        unavailable_reason: None,
-                        evidence: rule.last_condition_evidence.clone(),
-                        correlation_key: Some(rule.correlation_key.clone()),
-                        idempotency_key: Some(rule.idempotency_key.clone()),
-                        error_code: None,
-                        reason: None,
-                        committed_steps: None,
-                        total_steps: None,
-                    }),
-                    (None, None) => {}
-                }
-            }
-        }
-
-        for event in pending_events {
-            self.push_event(event);
-        }
-    }
-
-    fn refresh_counts(&mut self) {
-        let now_ms = current_time_ms();
-        self.projection.groups = build_groups(&self.projection.rules);
-        self.projection.group_count = self.projection.groups.len();
-        self.projection.active_rule_count = self
-            .projection
-            .rules
-            .iter()
-            .filter(|rule| {
-                matches!(rule.status, OrchestrationRuleStatus::Armed)
-                    && rule.unavailable_reason.is_none()
-                    && !rule_in_cooldown(rule, now_ms)
-            })
-            .count();
-        self.projection.cooldown_rule_count = self
-            .projection
-            .rules
-            .iter()
-            .filter(|rule| {
-                matches!(rule.status, OrchestrationRuleStatus::Armed)
-                    && rule.unavailable_reason.is_none()
-                    && rule_in_cooldown(rule, now_ms)
-            })
-            .count();
-        self.projection.paused_rule_count = self
-            .projection
-            .rules
-            .iter()
-            .filter(|rule| matches!(rule.status, OrchestrationRuleStatus::Paused))
-            .count();
-        self.projection.unavailable_rule_count = self
-            .projection
-            .rules
-            .iter()
-            .filter(|rule| rule.unavailable_reason.is_some())
-            .count();
-    }
-
-    fn refresh_status(&mut self) {
-        self.projection.status = if self.projection.degraded_reason.is_some()
-            || self.projection.rules.iter().any(|rule| {
-                rule.last_result.as_ref().is_some_and(|result| {
-                    matches!(
-                        result.status,
-                        OrchestrationRuleStatus::Blocked | OrchestrationRuleStatus::Degraded
-                    )
-                })
-            }) {
-            OrchestrationRuntimeStatus::Degraded
-        } else if self.projection.session_count > 0 || !self.projection.rules.is_empty() {
-            OrchestrationRuntimeStatus::Active
-        } else {
-            OrchestrationRuntimeStatus::Inactive
-        };
-    }
-
-    fn push_event(&mut self, mut event: OrchestrationEventInfo) {
-        let sequence = self.next_event_sequence.max(1);
-        self.next_event_sequence = sequence + 1;
-        event.sequence = sequence;
-        self.recent_events.push_back(event);
-        while self.recent_events.len() > ORCHESTRATION_EVENT_LIMIT {
-            self.recent_events.pop_front();
-        }
-    }
-}
-
-fn orchestration_outcome_event_kind(
-    status: OrchestrationRuleStatus,
-) -> Option<OrchestrationEventKind> {
-    match status {
-        OrchestrationRuleStatus::Fired => Some(OrchestrationEventKind::Fired),
-        OrchestrationRuleStatus::Blocked => Some(OrchestrationEventKind::Blocked),
-        OrchestrationRuleStatus::Degraded => Some(OrchestrationEventKind::Degraded),
-        OrchestrationRuleStatus::Armed
-        | OrchestrationRuleStatus::Paused
-        | OrchestrationRuleStatus::Expired => None,
-    }
-}
-
-fn build_groups(rules: &[OrchestrationRuleInfo]) -> Vec<OrchestrationGroupInfo> {
-    let now_ms = current_time_ms();
-    let mut grouped = BTreeMap::<String, OrchestrationGroupInfo>::new();
-    for rule in rules {
-        let entry = grouped
-            .entry(rule.correlation_key.clone())
-            .or_insert_with(|| OrchestrationGroupInfo {
-                correlation_key: rule.correlation_key.clone(),
-                rule_ids: Vec::new(),
-                active_rule_count: 0,
-                cooldown_rule_count: 0,
-                paused_rule_count: 0,
-                unavailable_rule_count: 0,
-            });
-        entry.rule_ids.push(rule.id);
-        if matches!(rule.status, OrchestrationRuleStatus::Armed)
-            && rule.unavailable_reason.is_none()
-        {
-            if rule_in_cooldown(rule, now_ms) {
-                entry.cooldown_rule_count += 1;
-            } else {
-                entry.active_rule_count += 1;
-            }
-        }
-        if matches!(rule.status, OrchestrationRuleStatus::Paused) {
-            entry.paused_rule_count += 1;
-        }
-        if rule.unavailable_reason.is_some() {
-            entry.unavailable_rule_count += 1;
-        }
-    }
-
-    let mut groups = grouped.into_values().collect::<Vec<_>>();
-    for group in &mut groups {
-        group.rule_ids.sort_unstable();
-    }
-    groups
-}
-
-fn rule_in_cooldown(rule: &OrchestrationRuleInfo, now_ms: u64) -> bool {
-    rule.execution_policy
-        .cooldown_until_ms
-        .map(|until| until > now_ms)
-        .unwrap_or(false)
-}
-
-fn current_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::OrchestrationRuntimeState;
+    use super::projection::current_time_ms;
+    use super::{
+        OrchestrationRuntimeState, extend_orchestration_session_path_context,
+        projected_orchestration_session,
+    };
     use rub_core::model::{
         OrchestrationAddressInfo, OrchestrationEventKind, OrchestrationExecutionPolicyInfo,
         OrchestrationMode, OrchestrationResultInfo, OrchestrationRuleInfo, OrchestrationRuleStatus,
@@ -486,15 +67,15 @@ mod tests {
     };
 
     fn session(id: &str, name: &str, current: bool) -> OrchestrationSessionInfo {
-        OrchestrationSessionInfo {
-            session_id: id.to_string(),
-            session_name: name.to_string(),
-            pid: 1234,
-            socket_path: format!("/tmp/{name}.sock"),
+        projected_orchestration_session(
+            id.to_string(),
+            name.to_string(),
+            1234,
+            format!("/tmp/{name}.sock"),
             current,
-            ipc_protocol_version: "1.0".to_string(),
-            user_data_dir: None,
-        }
+            "1.0".to_string(),
+            None,
+        )
     }
 
     fn rule(source_session_id: &str, target_session_id: &str) -> OrchestrationRuleInfo {
@@ -569,6 +150,77 @@ mod tests {
         assert!(runtime.execution_supported);
         assert_eq!(runtime.session_count, 1);
         assert_eq!(runtime.current_session_id.as_deref(), Some("sess-current"));
+        assert_eq!(
+            runtime.known_sessions[0]
+                .socket_path_state
+                .as_ref()
+                .map(|state| state.path_kind.as_str()),
+            Some("session_socket_reference")
+        );
+    }
+
+    #[test]
+    fn projected_orchestration_session_marks_registry_backed_path_references() {
+        let session = projected_orchestration_session(
+            "sess-current".to_string(),
+            "default".to_string(),
+            42,
+            "/tmp/rub.sock".to_string(),
+            true,
+            "1.0".to_string(),
+            Some("/tmp/rub-profile".to_string()),
+        );
+
+        assert_eq!(
+            session
+                .socket_path_state
+                .as_ref()
+                .map(|state| state.truth_level.as_str()),
+            Some("operator_path_reference")
+        );
+        assert_eq!(
+            session
+                .socket_path_state
+                .as_ref()
+                .map(|state| state.path_authority.as_str()),
+            Some("session.orchestration_runtime.known_sessions.socket_path")
+        );
+        assert_eq!(
+            session
+                .user_data_dir_state
+                .as_ref()
+                .map(|state| state.path_kind.as_str()),
+            Some("managed_user_data_directory")
+        );
+    }
+
+    #[test]
+    fn extend_orchestration_session_path_context_projects_transport_references() {
+        let session = projected_orchestration_session(
+            "sess-current".to_string(),
+            "default".to_string(),
+            42,
+            "/tmp/rub.sock".to_string(),
+            true,
+            "1.0".to_string(),
+            Some("/tmp/rub-profile".to_string()),
+        );
+        let mut context = serde_json::json!({
+            "reason": "orchestration_target_session_unreachable",
+        });
+
+        extend_orchestration_session_path_context(&mut context, &session);
+
+        assert_eq!(context["socket_path"], "/tmp/rub.sock");
+        assert_eq!(
+            context["socket_path_state"]["path_kind"],
+            "session_socket_reference"
+        );
+        assert_eq!(context["user_data_dir"], "/tmp/rub-profile");
+        assert_eq!(
+            context["user_data_dir_state"]["path_kind"],
+            "managed_user_data_directory"
+        );
     }
 
     #[test]
@@ -813,7 +465,7 @@ mod tests {
             .register(repeat_rule)
             .expect("repeat orchestration rule should register");
 
-        let cooldown_until_ms = super::current_time_ms() + 5_000;
+        let cooldown_until_ms = current_time_ms() + 5_000;
         let rule = state
             .record_outcome(
                 1,

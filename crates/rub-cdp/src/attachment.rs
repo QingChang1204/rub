@@ -190,7 +190,7 @@ async fn http_get_text_until(
     url: &str,
     deadline: Instant,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    use std::io;
+    use std::io::{self, ErrorKind};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -213,12 +213,30 @@ async fn http_get_text_until(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP request write timed out"))??;
 
     let mut response = Vec::new();
-    tokio::time::timeout(
-        remaining_budget(deadline)?,
-        stream.read_to_end(&mut response),
-    )
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP response read timed out"))??;
+    let mut chunk = [0_u8; 2048];
+    loop {
+        let read = tokio::time::timeout(remaining_budget(deadline)?, stream.read(&mut chunk))
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "HTTP response read timed out")
+            })??;
+
+        if read == 0 {
+            break;
+        }
+
+        response.extend_from_slice(&chunk[..read]);
+        match parse_http_response_body(&response) {
+            Ok(body) => return String::from_utf8(body).map_err(Into::into),
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<io::Error>().map(io::Error::kind),
+                    Some(ErrorKind::UnexpectedEof | ErrorKind::InvalidData)
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
     let body = parse_http_response_body(&response)?;
     String::from_utf8(body).map_err(Into::into)
 }
@@ -397,10 +415,12 @@ fn decode_chunked_body(
 mod tests {
     use super::{
         canonical_external_browser_identity, cdp_discovery_endpoint, decode_chunked_body,
-        parse_http_response_body, resolve_cdp_connect_url, resolve_cdp_connect_url_with_timeout,
+        http_get_text_until, parse_http_response_body, resolve_cdp_connect_url,
+        resolve_cdp_connect_url_with_timeout,
     };
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
-    use tokio::time::Duration;
+    use tokio::time::{Duration, Instant};
 
     #[test]
     fn parse_http_response_body_accepts_content_length() {
@@ -461,6 +481,33 @@ mod tests {
                 .contains("Failed to query CDP discovery endpoint"),
             "{error}"
         );
+
+        server.await.expect("server join");
+    }
+
+    #[tokio::test]
+    async fn http_get_text_until_accepts_complete_response_without_waiting_for_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 512];
+            let _ = stream.readable().await;
+            let _ = stream.try_read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n{\"Browser\":\"x\"}")
+                .await
+                .expect("write response");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+
+        let body = http_get_text_until(
+            &format!("http://{address}/json/version"),
+            Instant::now() + Duration::from_millis(100),
+        )
+        .await
+        .expect("complete HTTP response should not require EOF");
+        assert_eq!(body, r#"{"Browser":"x"}"#);
 
         server.await.expect("server join");
     }

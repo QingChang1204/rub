@@ -1,320 +1,36 @@
+mod args;
+mod projection;
+
+use self::args::{
+    ClickArgs, ClickGesture, HoverArgs, KeysArgs, SelectArgs, TextEntryArgs, UploadArgs,
+    click_command_name, click_gesture_name, requested_click_gesture,
+};
+use self::projection::{
+    capture_interaction_baseline, finalize_interaction_projection, finalize_select_projection,
+};
 use super::addressing::resolve_element;
+use super::artifacts::annotate_path_reference_state;
 use super::projection::{
     attach_result, attach_subject, coordinates_subject, element_subject, focused_frame_subject,
 };
-use super::request_args::{LocatorRequestArgs, parse_json_args};
+use super::request_args::parse_json_args;
 use super::*;
-use crate::runtime_refresh::{
-    refresh_live_frame_runtime, refresh_live_interference_state, refresh_live_runtime_state,
-};
-use rub_core::model::{
-    DownloadEvent, InteractionConfirmationKind, InteractionConfirmationStatus, InteractionOutcome,
-    InterferenceRuntimeInfo, InterferenceRuntimeStatus, RuntimeStateSnapshot,
-};
-use std::future::Future;
-use tokio::time::Duration;
-
-const INTERACTION_BROWSER_EVENT_FENCE_TIMEOUT: Duration = Duration::from_millis(250);
-const INTERACTION_BROWSER_EVENT_QUIET_PERIOD: Duration = Duration::from_millis(20);
-
-struct InteractionObservationBaseline {
-    observatory_cursor: u64,
-    observatory_drop_count: u64,
-    request_cursor: u64,
-    network_request_drop_count: u64,
-    download_cursor: u64,
-    browser_event_cursor: u64,
-    runtime_before: Option<RuntimeStateSnapshot>,
-    interference_before: InterferenceRuntimeInfo,
-}
-
-struct InteractionTraceWindows {
-    observatory_events: Vec<rub_core::model::RuntimeObservatoryEvent>,
-    observatory_authoritative: bool,
-    observatory_degraded_reason: Option<String>,
-    network_requests: Vec<rub_core::model::NetworkRequestRecord>,
-    network_authoritative: bool,
-    network_degraded_reason: Option<String>,
-}
-
-struct InteractionProjectionState {
-    runtime_after: RuntimeStateSnapshot,
-    frame_runtime: rub_core::model::FrameRuntimeInfo,
-    interference_after: InterferenceRuntimeInfo,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ClickGesture {
-    Single,
-    Double,
-    Right,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ClickArgs {
-    #[serde(default)]
-    gesture: Option<String>,
-    #[serde(default)]
-    xy: Option<[f64; 2]>,
-    #[serde(default, rename = "wait_after")]
-    _wait_after: Option<serde_json::Value>,
-    #[serde(default, rename = "snapshot_id")]
-    _snapshot_id: Option<String>,
-    #[serde(flatten)]
-    _locator: LocatorRequestArgs,
-    #[serde(default, rename = "_orchestration")]
-    _orchestration: Option<serde_json::Value>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct KeysArgs {
-    keys: String,
-    #[serde(default, rename = "wait_after")]
-    _wait_after: Option<serde_json::Value>,
-    #[serde(default, rename = "_orchestration")]
-    _orchestration: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TextEntryArgs {
-    text: String,
-    #[serde(default)]
-    clear: bool,
-    #[serde(default, rename = "wait_after")]
-    _wait_after: Option<serde_json::Value>,
-    #[serde(default, rename = "snapshot_id")]
-    _snapshot_id: Option<String>,
-    #[serde(flatten)]
-    locator: LocatorRequestArgs,
-    #[serde(default, rename = "_orchestration")]
-    _orchestration: Option<serde_json::Value>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HoverArgs {
-    #[serde(default, rename = "wait_after")]
-    _wait_after: Option<serde_json::Value>,
-    #[serde(default, rename = "snapshot_id")]
-    _snapshot_id: Option<String>,
-    #[serde(flatten)]
-    _locator: LocatorRequestArgs,
-    #[serde(default, rename = "_orchestration")]
-    _orchestration: Option<serde_json::Value>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UploadArgs {
-    path: String,
-    #[serde(default, rename = "wait_after")]
-    _wait_after: Option<serde_json::Value>,
-    #[serde(default, rename = "snapshot_id")]
-    _snapshot_id: Option<String>,
-    #[serde(flatten)]
-    _locator: LocatorRequestArgs,
-    #[serde(default, rename = "_orchestration")]
-    _orchestration: Option<serde_json::Value>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SelectArgs {
-    value: String,
-    #[serde(default, rename = "wait_after")]
-    _wait_after: Option<serde_json::Value>,
-    #[serde(default, rename = "snapshot_id")]
-    _snapshot_id: Option<String>,
-    #[serde(flatten)]
-    _locator: LocatorRequestArgs,
-    #[serde(default, rename = "_orchestration")]
-    _orchestration: Option<serde_json::Value>,
-}
-
-async fn capture_interaction_baseline(
-    router: &DaemonRouter,
-    state: &Arc<SessionState>,
-) -> InteractionObservationBaseline {
-    if let Ok(tabs) = router.browser.list_tabs().await {
-        state.prime_interference_baseline(&tabs).await;
-    }
-    InteractionObservationBaseline {
-        observatory_cursor: state.observatory_cursor().await,
-        observatory_drop_count: state.observatory().await.dropped_event_count,
-        request_cursor: state.network_request_cursor().await,
-        network_request_drop_count: state.network_request_drop_count().await,
-        download_cursor: state.download_cursor().await,
-        browser_event_cursor: state.browser_event_cursor(),
-        runtime_before: crate::interaction_trace::probe_runtime_state(&router.browser).await,
-        interference_before: state.interference_runtime().await,
-    }
-}
-
-async fn capture_interaction_trace_windows(
-    state: &Arc<SessionState>,
-    baseline: &InteractionObservationBaseline,
-) -> InteractionTraceWindows {
-    let observatory_window = state
-        .observatory_event_window_after(
-            baseline.observatory_cursor,
-            baseline.observatory_drop_count,
-        )
-        .await;
-    let network_window = state
-        .network_request_window_after(baseline.request_cursor, baseline.network_request_drop_count)
-        .await;
-    InteractionTraceWindows {
-        observatory_events: observatory_window.events,
-        observatory_authoritative: observatory_window.authoritative,
-        observatory_degraded_reason: observatory_window.degraded_reason,
-        network_requests: network_window.records,
-        network_authoritative: network_window.authoritative,
-        network_degraded_reason: network_window.degraded_reason,
-    }
-}
-
-async fn finalize_interaction_projection(
-    router: &DaemonRouter,
-    state: &Arc<SessionState>,
-    data: &mut serde_json::Value,
-    outcome: &rub_core::model::InteractionOutcome,
-    baseline: &InteractionObservationBaseline,
-) {
-    let projection_state = collect_post_interaction_projection(state, || async {
-        refresh_live_runtime_state(&router.browser, state).await;
-        refresh_live_frame_runtime(&router.browser, state).await;
-        let _ = refresh_live_interference_state(&router.browser, state).await;
-        let interference_after = state.interference_runtime().await;
-        if should_promote_primary_context(outcome, &interference_after)
-            && let Ok(tabs) = router.browser.list_tabs().await
-        {
-            state.adopt_interference_primary_context(&tabs).await;
-        }
-    })
-    .await;
-    state
-        .wait_for_browser_event_quiescence_since(
-            baseline.browser_event_cursor,
-            INTERACTION_BROWSER_EVENT_FENCE_TIMEOUT,
-            INTERACTION_BROWSER_EVENT_QUIET_PERIOD,
-        )
-        .await;
-    let trace_windows = capture_interaction_trace_windows(state, baseline).await;
-    let download_events: Vec<DownloadEvent> =
-        state.download_events_after(baseline.download_cursor).await;
-    attach_interaction_projection(
-        data,
-        outcome,
-        crate::router::projection::ProjectionSignals {
-            frame_runtime: &projection_state.frame_runtime,
-            runtime_before: baseline.runtime_before.as_ref(),
-            runtime_after: Some(&projection_state.runtime_after),
-            interference_before: Some(&baseline.interference_before),
-            interference_after: Some(&projection_state.interference_after),
-            observatory_events: &trace_windows.observatory_events,
-            observatory_authoritative: trace_windows.observatory_authoritative,
-            observatory_degraded_reason: trace_windows.observatory_degraded_reason.as_deref(),
-            network_requests: &trace_windows.network_requests,
-            network_authoritative: trace_windows.network_authoritative,
-            network_degraded_reason: trace_windows.network_degraded_reason.as_deref(),
-            download_events: &download_events,
-        },
-    );
-}
-
-fn should_promote_primary_context(
-    outcome: &InteractionOutcome,
-    interference_after: &InterferenceRuntimeInfo,
-) -> bool {
-    matches!(
-        interference_after.status,
-        InterferenceRuntimeStatus::Inactive
-    ) && matches!(
-        outcome
-            .confirmation
-            .as_ref()
-            .map(|confirmation| (confirmation.status, confirmation.kind)),
-        Some((
-            InteractionConfirmationStatus::Confirmed,
-            Some(InteractionConfirmationKind::ContextChange)
-        ))
-    )
-}
-
-async fn finalize_select_projection(
-    router: &DaemonRouter,
-    state: &Arc<SessionState>,
-    data: &mut serde_json::Value,
-    outcome: &rub_core::model::SelectOutcome,
-    baseline: &InteractionObservationBaseline,
-) {
-    let projection_state = collect_post_interaction_projection(state, || async {
-        refresh_live_runtime_state(&router.browser, state).await;
-        refresh_live_frame_runtime(&router.browser, state).await;
-        let _ = refresh_live_interference_state(&router.browser, state).await;
-    })
-    .await;
-    state
-        .wait_for_browser_event_quiescence_since(
-            baseline.browser_event_cursor,
-            INTERACTION_BROWSER_EVENT_FENCE_TIMEOUT,
-            INTERACTION_BROWSER_EVENT_QUIET_PERIOD,
-        )
-        .await;
-    let trace_windows = capture_interaction_trace_windows(state, baseline).await;
-    let download_events = state.download_events_after(baseline.download_cursor).await;
-    attach_select_projection(
-        data,
-        outcome,
-        crate::router::projection::ProjectionSignals {
-            frame_runtime: &projection_state.frame_runtime,
-            runtime_before: baseline.runtime_before.as_ref(),
-            runtime_after: Some(&projection_state.runtime_after),
-            interference_before: Some(&baseline.interference_before),
-            interference_after: Some(&projection_state.interference_after),
-            observatory_events: &trace_windows.observatory_events,
-            observatory_authoritative: trace_windows.observatory_authoritative,
-            observatory_degraded_reason: trace_windows.observatory_degraded_reason.as_deref(),
-            network_requests: &trace_windows.network_requests,
-            network_authoritative: trace_windows.network_authoritative,
-            network_degraded_reason: trace_windows.network_degraded_reason.as_deref(),
-            download_events: &download_events,
-        },
-    );
-}
-
-async fn collect_post_interaction_projection<F, Fut>(
-    state: &Arc<SessionState>,
-    refresh: F,
-) -> InteractionProjectionState
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    refresh().await;
-    InteractionProjectionState {
-        runtime_after: state.runtime_state_snapshot().await,
-        frame_runtime: state.frame_runtime().await,
-        interference_after: state.interference_runtime().await,
-    }
-}
 
 pub(super) async fn cmd_click(
     router: &DaemonRouter,
     args: &serde_json::Value,
+    deadline: TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     let parsed: ClickArgs = parse_json_args(args, "click")?;
-    cmd_click_with_gesture(router, args, parsed, state).await
+    cmd_click_with_gesture(router, args, parsed, deadline, state).await
 }
 
 async fn cmd_click_with_gesture(
     router: &DaemonRouter,
     raw_args: &serde_json::Value,
     args: ClickArgs,
+    deadline: TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     let gesture = requested_click_gesture(args.gesture.as_deref())?;
@@ -338,7 +54,14 @@ async fn cmd_click_with_gesture(
         return Ok(data);
     }
 
-    let resolved = resolve_element(router, raw_args, state, click_command_name(gesture)).await?;
+    let resolved = resolve_element(
+        router,
+        raw_args,
+        state,
+        deadline,
+        click_command_name(gesture),
+    )
+    .await?;
     let element = resolved.element;
     let baseline = capture_interaction_baseline(router, state).await;
     let outcome = match gesture {
@@ -388,14 +111,16 @@ pub(super) async fn cmd_keys(
 pub(super) async fn cmd_type(
     router: &DaemonRouter,
     args: &serde_json::Value,
+    deadline: TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
-    cmd_text_entry(router, args, state).await
+    cmd_text_entry(router, args, deadline, state).await
 }
 
 async fn cmd_text_entry(
     router: &DaemonRouter,
     raw_args: &serde_json::Value,
+    deadline: TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     let args: TextEntryArgs = parse_json_args(raw_args, "type")?;
@@ -411,7 +136,7 @@ async fn cmd_text_entry(
         }),
     );
     let outcome = if args.locator.is_requested() {
-        let resolved = resolve_element(router, raw_args, state, "type").await?;
+        let resolved = resolve_element(router, raw_args, state, deadline, "type").await?;
         attach_subject(
             &mut data,
             element_subject(&resolved.element, &resolved.snapshot_id),
@@ -441,41 +166,14 @@ async fn cmd_text_entry(
     Ok(data)
 }
 
-fn requested_click_gesture(gesture: Option<&str>) -> Result<ClickGesture, RubError> {
-    let gesture = gesture.unwrap_or("single");
-    match gesture {
-        "single" => Ok(ClickGesture::Single),
-        "double" => Ok(ClickGesture::Double),
-        "right" => Ok(ClickGesture::Right),
-        other => Err(RubError::domain(
-            rub_core::error::ErrorCode::InvalidInput,
-            format!("Unsupported click gesture: {other}"),
-        )),
-    }
-}
-
-fn click_command_name(gesture: ClickGesture) -> &'static str {
-    match gesture {
-        ClickGesture::Single => "click",
-        ClickGesture::Double | ClickGesture::Right => "click",
-    }
-}
-
-fn click_gesture_name(gesture: ClickGesture) -> &'static str {
-    match gesture {
-        ClickGesture::Single => "single",
-        ClickGesture::Double => "double",
-        ClickGesture::Right => "right",
-    }
-}
-
 pub(super) async fn cmd_hover(
     router: &DaemonRouter,
     args: &serde_json::Value,
+    deadline: TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     let _: HoverArgs = parse_json_args(args, "hover")?;
-    let resolved = resolve_element(router, args, state, "hover").await?;
+    let resolved = resolve_element(router, args, state, deadline, "hover").await?;
     let element = resolved.element;
     let baseline = capture_interaction_baseline(router, state).await;
     let outcome = router.browser.hover(&element).await?;
@@ -489,10 +187,11 @@ pub(super) async fn cmd_hover(
 pub(super) async fn cmd_upload(
     router: &DaemonRouter,
     args: &serde_json::Value,
+    deadline: TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     let parsed: UploadArgs = parse_json_args(args, "upload")?;
-    let resolved = resolve_element(router, args, state, "upload").await?;
+    let resolved = resolve_element(router, args, state, deadline, "upload").await?;
     let element = resolved.element;
     let path = parsed.path;
     let baseline = capture_interaction_baseline(router, state).await;
@@ -505,6 +204,14 @@ pub(super) async fn cmd_upload(
             "path": path,
         }),
     );
+    if let Some(result) = data.get_mut("result") {
+        annotate_path_reference_state(
+            result,
+            "router.upload.input_path",
+            "upload_command_request",
+            "external_input_file",
+        );
+    }
     finalize_interaction_projection(router, state, &mut data, &outcome, &baseline).await;
     Ok(data)
 }
@@ -512,10 +219,11 @@ pub(super) async fn cmd_upload(
 pub(super) async fn cmd_select(
     router: &DaemonRouter,
     args: &serde_json::Value,
+    deadline: TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     let parsed: SelectArgs = parse_json_args(args, "select")?;
-    let resolved = resolve_element(router, args, state, "select").await?;
+    let resolved = resolve_element(router, args, state, deadline, "select").await?;
     let element = resolved.element;
     let value = parsed.value;
     let baseline = capture_interaction_baseline(router, state).await;
@@ -535,7 +243,8 @@ pub(super) async fn cmd_select(
 
 #[cfg(test)]
 mod tests {
-    use super::{ClickArgs, collect_post_interaction_projection};
+    use super::args::{ClickArgs, UploadArgs};
+    use super::projection::collect_post_interaction_projection;
     use crate::router::request_args::parse_json_args;
     use crate::session::SessionState;
     use rub_core::model::{
@@ -676,5 +385,21 @@ mod tests {
         )
         .expect("click payload should accept post-wait compatibility field");
         assert!(parsed._wait_after.is_some());
+    }
+
+    #[test]
+    fn typed_upload_payload_accepts_path_state_metadata() {
+        let parsed = parse_json_args::<UploadArgs>(
+            &serde_json::json!({
+                "selector": "input[type=file]",
+                "path": "/tmp/upload.txt",
+                "path_state": {
+                    "path_authority": "cli.upload.path"
+                }
+            }),
+            "upload",
+        )
+        .expect("upload payload should accept display-only path metadata");
+        assert_eq!(parsed.path, "/tmp/upload.txt");
     }
 }

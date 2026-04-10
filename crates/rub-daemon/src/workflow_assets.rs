@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use rub_core::error::{ErrorCode, RubError};
+use rub_core::model::PathReferenceState;
+use serde_json::{Value, json};
 
 use crate::rub_paths::RubPaths;
 
@@ -41,25 +43,80 @@ pub fn load_named_workflow_spec(
     rub_home: &Path,
     name: &str,
 ) -> Result<(String, String, PathBuf), RubError> {
+    load_named_workflow_spec_with_authority(
+        rub_home,
+        name,
+        "rub_daemon.workflow_assets.path",
+        "named_workflow_name",
+    )
+}
+
+pub fn load_named_workflow_spec_with_authority(
+    rub_home: &Path,
+    name: &str,
+    path_authority: &str,
+    upstream_truth: &str,
+) -> Result<(String, String, PathBuf), RubError> {
     let normalized = normalize_workflow_name(name)?;
     let path = resolve_named_workflow_path(rub_home, &normalized)?;
     let path_string = path.display().to_string();
     let contents = std::fs::read_to_string(&path).map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => RubError::domain(
+        std::io::ErrorKind::NotFound => RubError::domain_with_context(
             ErrorCode::FileNotFound,
             format!("Named workflow not found: {normalized} ({path_string})"),
+            json!({
+                "path": path_string,
+                "path_state": workflow_asset_path_state(path_authority, upstream_truth),
+                "reason": "named_workflow_asset_not_found",
+            }),
         ),
-        _ => RubError::domain(
+        _ => RubError::domain_with_context(
             ErrorCode::InvalidInput,
             format!("Failed to read workflow asset {path_string}: {error}"),
+            json!({
+                "path": path_string,
+                "path_state": workflow_asset_path_state(path_authority, upstream_truth),
+                "reason": "named_workflow_asset_read_failed",
+            }),
         ),
     })?;
     Ok((normalized, contents, path))
 }
 
+pub fn workflow_asset_path_state(path_authority: &str, upstream_truth: &str) -> PathReferenceState {
+    PathReferenceState {
+        truth_level: "input_path_reference".to_string(),
+        path_authority: path_authority.to_string(),
+        upstream_truth: upstream_truth.to_string(),
+        path_kind: "workflow_asset_reference".to_string(),
+        control_role: "display_only".to_string(),
+    }
+}
+
+pub(crate) fn annotate_workflow_asset_path_state(
+    payload: &mut Value,
+    state_field: &str,
+    path_authority: &str,
+    upstream_truth: &str,
+) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+
+    object.insert(
+        state_field.to_string(),
+        json!(workflow_asset_path_state(path_authority, upstream_truth)),
+    );
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{load_named_workflow_spec, normalize_workflow_name, resolve_named_workflow_path};
+    use super::{
+        annotate_workflow_asset_path_state, load_named_workflow_spec,
+        load_named_workflow_spec_with_authority, normalize_workflow_name,
+        resolve_named_workflow_path, workflow_asset_path_state,
+    };
+    use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -94,5 +151,72 @@ mod tests {
         assert_eq!(loaded_path, path);
 
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn load_named_workflow_spec_missing_file_preserves_path_state() {
+        let home = std::env::temp_dir().join(format!(
+            "rub-daemon-workflow-assets-missing-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let _ = fs::remove_dir_all(&home);
+
+        let envelope = load_named_workflow_spec_with_authority(
+            &home,
+            "reply_flow",
+            "trigger.workflow.spec_source.path",
+            "trigger_workflow_payload.workflow_name",
+        )
+        .expect_err("missing named workflow should fail")
+        .into_envelope();
+        let context = envelope.context.expect("workflow asset error context");
+        assert_eq!(context["reason"], "named_workflow_asset_not_found");
+        assert_eq!(
+            context["path_state"]["path_authority"],
+            "trigger.workflow.spec_source.path"
+        );
+        assert_eq!(
+            context["path_state"]["upstream_truth"],
+            "trigger_workflow_payload.workflow_name"
+        );
+    }
+
+    #[test]
+    fn workflow_asset_path_state_marks_named_workflow_reference_boundary() {
+        let state = workflow_asset_path_state(
+            "automation.action.workflow_path",
+            "trigger_action_payload.workflow_name",
+        );
+        assert_eq!(state.truth_level, "input_path_reference");
+        assert_eq!(state.path_authority, "automation.action.workflow_path");
+        assert_eq!(state.upstream_truth, "trigger_action_payload.workflow_name");
+        assert_eq!(state.path_kind, "workflow_asset_reference");
+        assert_eq!(state.control_role, "display_only");
+    }
+
+    #[test]
+    fn annotate_workflow_asset_path_state_projects_structured_reference() {
+        let mut payload = json!({
+            "path": "/tmp/rub-home/workflows/reply_flow.json",
+        });
+        annotate_workflow_asset_path_state(
+            &mut payload,
+            "path_state",
+            "orchestration.workflow.spec_source.path",
+            "orchestration_workflow_payload.workflow_name",
+        );
+        assert_eq!(payload["path_state"]["truth_level"], "input_path_reference");
+        assert_eq!(
+            payload["path_state"]["path_authority"],
+            "orchestration.workflow.spec_source.path"
+        );
+        assert_eq!(
+            payload["path_state"]["upstream_truth"],
+            "orchestration_workflow_payload.workflow_name"
+        );
+        assert_eq!(
+            payload["path_state"]["path_kind"],
+            "workflow_asset_reference"
+        );
     }
 }

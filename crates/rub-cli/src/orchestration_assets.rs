@@ -1,6 +1,8 @@
 use crate::commands::{Commands, EffectiveCli, OrchestrationSubcommand};
+use crate::persisted_artifacts::annotate_local_persisted_artifact;
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::fs::atomic_write_bytes;
+use rub_core::model::PathReferenceState;
 use rub_daemon::rub_paths::RubPaths;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -26,6 +28,19 @@ pub(crate) use rub_daemon::orchestration_assets::{
     normalize_orchestration_name, resolve_named_orchestration_path,
 };
 
+fn local_orchestration_asset_path_state(
+    path_authority: &str,
+    path_kind: &str,
+) -> PathReferenceState {
+    PathReferenceState {
+        truth_level: "local_asset_reference".to_string(),
+        path_authority: path_authority.to_string(),
+        upstream_truth: "cli_orchestration_asset_registry".to_string(),
+        path_kind: path_kind.to_string(),
+        control_role: "display_only".to_string(),
+    }
+}
+
 pub fn list_orchestrations(rub_home: &Path) -> Result<Value, RubError> {
     let paths = RubPaths::new(rub_home);
     let directory = paths.orchestrations_dir();
@@ -33,23 +48,27 @@ pub fn list_orchestrations(rub_home: &Path) -> Result<Value, RubError> {
 
     if directory.exists() {
         let entries = std::fs::read_dir(&directory).map_err(|error| {
-            RubError::domain(
+            orchestration_listing_directory_error(
                 ErrorCode::InvalidInput,
                 format!(
                     "Failed to read orchestration directory {}: {error}",
                     directory.display()
                 ),
+                &directory,
+                "orchestration_directory_read_failed",
             )
         })?;
 
         for entry in entries {
             let entry = entry.map_err(|error| {
-                RubError::domain(
+                orchestration_listing_directory_error(
                     ErrorCode::InvalidInput,
                     format!(
                         "Failed to enumerate orchestration directory {}: {error}",
                         directory.display()
                     ),
+                    &directory,
+                    "orchestration_directory_enumeration_failed",
                 )
             })?;
             let path = entry.path();
@@ -58,12 +77,14 @@ pub fn list_orchestrations(rub_home: &Path) -> Result<Value, RubError> {
                 continue;
             }
             let metadata = entry.metadata().map_err(|error| {
-                RubError::domain(
+                orchestration_listing_path_error(
                     ErrorCode::InvalidInput,
                     format!(
                         "Failed to stat orchestration asset {}: {error}",
                         path.display()
                     ),
+                    &path,
+                    "orchestration_asset_stat_failed",
                 )
             })?;
             let Some(name) = asset_name_from_path(&path) else {
@@ -72,6 +93,10 @@ pub fn list_orchestrations(rub_home: &Path) -> Result<Value, RubError> {
             orchestrations.push(json!({
                 "name": name,
                 "path": path.display().to_string(),
+                "path_state": local_orchestration_asset_path_state(
+                    "cli.orchestration_assets.item.path",
+                    "orchestration_asset_reference",
+                ),
                 "size_bytes": metadata.len(),
             }));
         }
@@ -88,11 +113,55 @@ pub fn list_orchestrations(rub_home: &Path) -> Result<Value, RubError> {
         "subject": {
             "kind": "orchestration_asset_registry",
             "directory": directory.display().to_string(),
+            "directory_state": local_orchestration_asset_path_state(
+                "cli.orchestration_assets.directory",
+                "orchestration_asset_directory",
+            ),
         },
         "result": {
             "items": orchestrations,
         }
     }))
+}
+
+fn orchestration_listing_directory_error(
+    code: ErrorCode,
+    message: String,
+    directory: &Path,
+    reason: &str,
+) -> RubError {
+    RubError::domain_with_context(
+        code,
+        message,
+        json!({
+            "directory": directory.display().to_string(),
+            "directory_state": local_orchestration_asset_path_state(
+                "cli.orchestration_assets.directory",
+                "orchestration_asset_registry_directory",
+            ),
+            "reason": reason,
+        }),
+    )
+}
+
+fn orchestration_listing_path_error(
+    code: ErrorCode,
+    message: String,
+    path: &Path,
+    reason: &str,
+) -> RubError {
+    RubError::domain_with_context(
+        code,
+        message,
+        json!({
+            "path": path.display().to_string(),
+            "path_state": local_orchestration_asset_path_state(
+                "cli.orchestration_assets.item.path",
+                "orchestration_asset_reference",
+            ),
+            "reason": reason,
+        }),
+    )
 }
 
 pub fn persist_orchestration_export_asset(
@@ -133,6 +202,7 @@ pub fn persist_orchestration_export_asset(
             "orchestration export response missing canonical spec",
         )
     })?;
+    let rule_identity_projection = result.get("rule_identity_projection").cloned();
     let serialized = serde_json::to_vec_pretty(&spec).map_err(RubError::from)?;
     let mut persisted_artifacts = result
         .get("persisted_artifacts")
@@ -143,29 +213,37 @@ pub fn persist_orchestration_export_asset(
 
     if let Some(name) = save_as {
         let path = resolve_named_orchestration_path(&cli.rub_home, name)?;
-        pending_writes.push(PendingAssetWrite {
-            path: path.clone(),
-            contents: serialized.clone(),
-            artifact: json!({
+        let mut artifact = json!({
             "kind": "orchestration_asset",
             "role": "output",
             "path": path.display().to_string(),
             "asset_name": normalize_orchestration_name(name)?,
-            }),
+        });
+        if let Some(identity) = rule_identity_projection.clone() {
+            artifact["source_rule_identity"] = identity;
+        }
+        pending_writes.push(PendingAssetWrite {
+            path: path.clone(),
+            contents: serialized.clone(),
+            artifact,
         });
     }
 
     if let Some(output_path) = output {
         let path = resolve_cli_path(output_path);
-        pending_writes.push(PendingAssetWrite {
-            path: path.clone(),
-            contents: serialized,
-            artifact: json!({
+        let mut artifact = json!({
             "kind": "orchestration_export_file",
             "role": "output",
             "path": path.display().to_string(),
             "format": "orchestration",
-            }),
+        });
+        if let Some(identity) = rule_identity_projection {
+            artifact["source_rule_identity"] = identity;
+        }
+        pending_writes.push(PendingAssetWrite {
+            path: path.clone(),
+            contents: serialized,
+            artifact,
         });
     }
 
@@ -192,11 +270,13 @@ fn commit_asset_writes(writes: Vec<PendingAssetWrite>) -> Result<Vec<Value>, Rub
             .iter()
             .any(|existing: &CommittedAssetWrite| existing.path == write.path)
         {
-            return Err(asset_write_error(
+            return Err(asset_write_error_at_path(
                 format!(
                     "Duplicate orchestration export path {}",
                     write.path.display()
                 ),
+                &write.path,
+                "orchestration_asset_duplicate_export_path",
                 rollback_asset_writes(&committed).err(),
             ));
         }
@@ -204,8 +284,8 @@ fn commit_asset_writes(writes: Vec<PendingAssetWrite>) -> Result<Vec<Value>, Rub
         let previous_state = match read_previous_asset_state(&write.path) {
             Ok(state) => state,
             Err(error) => {
-                return Err(asset_write_error(
-                    error.to_string(),
+                return Err(asset_write_error_from_source(
+                    error,
                     rollback_asset_writes(&committed).err(),
                 ));
             }
@@ -213,21 +293,23 @@ fn commit_asset_writes(writes: Vec<PendingAssetWrite>) -> Result<Vec<Value>, Rub
         let commit_outcome = match atomic_write_bytes(&write.path, &write.contents, 0o600) {
             Ok(outcome) => outcome,
             Err(error) => {
-                return Err(asset_write_error(
+                return Err(asset_write_error_at_path(
                     format!(
                         "Failed to write orchestration asset {}: {error}",
                         write.path.display()
                     ),
+                    &write.path,
+                    "orchestration_asset_write_failed",
                     rollback_asset_writes(&committed).err(),
                 ));
             }
         };
         let mut artifact = write.artifact;
-        if !commit_outcome.durability_confirmed()
-            && let Some(object) = artifact.as_object_mut()
-        {
-            object.insert("durability_confirmed".to_string(), Value::Bool(false));
-        }
+        annotate_local_persisted_artifact(
+            &mut artifact,
+            "cli.orchestration_export_asset_persistence",
+            commit_outcome,
+        );
 
         committed.push(CommittedAssetWrite {
             path: write.path,
@@ -246,12 +328,20 @@ fn read_previous_asset_state(path: &Path) -> Result<PreviousAssetState, RubError
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(PreviousAssetState::Absent)
         }
-        Err(error) => Err(RubError::domain(
+        Err(error) => Err(RubError::domain_with_context(
             ErrorCode::InvalidInput,
             format!(
                 "Cannot safely overwrite orchestration asset {} because the existing file is not readable for rollback: {error}",
                 path.display()
             ),
+            json!({
+                "path": path.display().to_string(),
+                "path_state": local_orchestration_asset_path_state(
+                    "cli.orchestration_assets.write.path",
+                    "orchestration_asset_reference",
+                ),
+                "reason": "orchestration_asset_unreadable_for_rollback",
+            }),
         )),
     }
 }
@@ -296,17 +386,47 @@ fn remove_newly_created_asset_if_matches(
     }
 }
 
-fn asset_write_error(message: String, rollback_errors: Option<Vec<String>>) -> RubError {
-    match rollback_errors {
-        Some(errors) => RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            message,
-            json!({
-                "rollback_failed": true,
-                "rollback_errors": errors,
-            }),
+fn asset_write_error_at_path(
+    message: String,
+    path: &Path,
+    reason: &str,
+    rollback_errors: Option<Vec<String>>,
+) -> RubError {
+    let mut context = serde_json::Map::from_iter([
+        ("path".to_string(), json!(path.display().to_string())),
+        (
+            "path_state".to_string(),
+            json!(local_orchestration_asset_path_state(
+                "cli.orchestration_assets.write.path",
+                "orchestration_asset_reference",
+            )),
         ),
-        None => RubError::domain(ErrorCode::InvalidInput, message),
+        ("reason".to_string(), json!(reason)),
+    ]);
+    if let Some(errors) = rollback_errors {
+        context.insert("rollback_failed".to_string(), json!(true));
+        context.insert("rollback_errors".to_string(), json!(errors));
+    }
+    RubError::domain_with_context(ErrorCode::InvalidInput, message, Value::Object(context))
+}
+
+fn asset_write_error_from_source(
+    error: RubError,
+    rollback_errors: Option<Vec<String>>,
+) -> RubError {
+    let envelope = error.into_envelope();
+    let mut context = envelope
+        .context
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    if let Some(errors) = rollback_errors {
+        context.insert("rollback_failed".to_string(), json!(true));
+        context.insert("rollback_errors".to_string(), json!(errors));
+    }
+    if context.is_empty() {
+        RubError::domain(envelope.code, envelope.message)
+    } else {
+        RubError::domain_with_context(envelope.code, envelope.message, Value::Object(context))
     }
 }
 
@@ -383,8 +503,45 @@ mod tests {
         );
         assert_eq!(listed["result"]["items"][0]["name"], "a");
         assert_eq!(listed["result"]["items"][1]["name"], "b");
+        assert_eq!(
+            listed["subject"]["directory_state"]["path_authority"],
+            "cli.orchestration_assets.directory"
+        );
+        assert_eq!(
+            listed["result"]["items"][0]["path_state"]["path_authority"],
+            "cli.orchestration_assets.item.path"
+        );
+        assert_eq!(
+            listed["result"]["items"][0]["path_state"]["truth_level"],
+            "local_asset_reference"
+        );
 
         let _ = std::fs::remove_dir_all(rub_home);
+    }
+
+    #[test]
+    fn list_orchestrations_read_failure_preserves_directory_state() {
+        let rub_home = std::env::temp_dir().join(format!(
+            "rub-cli-orchestration-list-failure-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let _ = std::fs::remove_dir_all(&rub_home);
+        std::fs::create_dir_all(&rub_home).expect("create rub_home");
+        let directory = rub_daemon::rub_paths::RubPaths::new(&rub_home).orchestrations_dir();
+        std::fs::write(&directory, b"not-a-directory").expect("seed blocking file");
+
+        let envelope = list_orchestrations(&rub_home)
+            .expect_err("orchestration directory read should fail")
+            .into_envelope();
+        let context = envelope.context.expect("orchestration listing context");
+        assert_eq!(context["reason"], "orchestration_directory_read_failed");
+        assert_eq!(
+            context["directory_state"]["path_authority"],
+            "cli.orchestration_assets.directory"
+        );
+
+        let _ = std::fs::remove_file(&directory);
+        let _ = std::fs::remove_dir_all(&rub_home);
     }
 
     #[test]
@@ -410,6 +567,15 @@ mod tests {
             },
             "result": {
                 "format": "orchestration",
+                "rule_identity_projection": {
+                    "projection_kind": "live_rule_identity",
+                    "projection_authority": "session.orchestration_runtime.rules",
+                    "upstream_truth": "session_orchestration_rule",
+                    "canonical_spec_kind": "replayable_orchestration_registration_spec",
+                    "stripped_from_spec": ["correlation_key", "idempotency_key"],
+                    "correlation_key": "corr-7",
+                    "idempotency_key": "idem-7"
+                },
                 "spec": {
                     "source": { "session_id": "source" },
                     "target": { "session_id": "target" },
@@ -427,6 +593,30 @@ mod tests {
         assert_eq!(
             data["result"]["persisted_artifacts"][0]["asset_name"],
             "reply_rule"
+        );
+        assert_eq!(
+            data["result"]["persisted_artifacts"][0]["projection_state"]["truth_level"],
+            "local_persistence_projection"
+        );
+        assert_eq!(
+            data["result"]["persisted_artifacts"][0]["projection_state"]["projection_kind"],
+            "cli_persisted_artifact"
+        );
+        assert_eq!(
+            data["result"]["persisted_artifacts"][0]["projection_state"]["projection_authority"],
+            "cli.orchestration_export_asset_persistence"
+        );
+        assert_eq!(
+            data["result"]["persisted_artifacts"][0]["projection_state"]["upstream_commit_truth"],
+            "daemon_response_committed"
+        );
+        assert_eq!(
+            data["result"]["persisted_artifacts"][0]["source_rule_identity"]["correlation_key"],
+            "corr-7"
+        );
+        assert_eq!(
+            data["result"]["persisted_artifacts"][0]["source_rule_identity"]["idempotency_key"],
+            "idem-7"
         );
         assert!(data.get("saved_to").is_none(), "{data}");
         assert!(data.get("asset_name").is_none(), "{data}");
@@ -501,6 +691,15 @@ mod tests {
             envelope.message.contains("not readable for rollback"),
             "{envelope:?}"
         );
+        let context = envelope.context.expect("orchestration asset error context");
+        assert_eq!(
+            context["reason"],
+            "orchestration_asset_unreadable_for_rollback"
+        );
+        assert_eq!(
+            context["path_state"]["path_authority"],
+            "cli.orchestration_assets.write.path"
+        );
         assert!(unreadable.is_dir(), "existing target must remain untouched");
 
         let _ = std::fs::remove_dir_all(root);
@@ -525,6 +724,87 @@ mod tests {
             b"other-writer"
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_asset_writes_rejects_duplicate_export_path_with_path_state() {
+        let root = std::env::temp_dir().join(format!(
+            "rub-orchestration-assets-duplicate-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let duplicate = root.join("reply_rule.json");
+
+        let error = commit_asset_writes(vec![
+            PendingAssetWrite {
+                path: duplicate.clone(),
+                contents: br#"{"actions":[1]}"#.to_vec(),
+                artifact: serde_json::json!({
+                    "path": duplicate.display().to_string(),
+                }),
+            },
+            PendingAssetWrite {
+                path: duplicate.clone(),
+                contents: br#"{"actions":[2]}"#.to_vec(),
+                artifact: serde_json::json!({
+                    "path": duplicate.display().to_string(),
+                }),
+            },
+        ])
+        .expect_err("duplicate export path should be rejected");
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::InvalidInput);
+        let context = envelope.context.expect("duplicate path context");
+        assert_eq!(
+            context["reason"],
+            "orchestration_asset_duplicate_export_path"
+        );
+        assert_eq!(
+            context["path_state"]["path_authority"],
+            "cli.orchestration_assets.write.path"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_asset_writes_preserves_path_state_on_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "rub-orchestration-assets-write-failure-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let locked_parent = root.join("locked-parent");
+        std::fs::create_dir_all(&locked_parent).expect("create locked parent");
+        std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o500))
+            .expect("lock parent permissions");
+        let target = locked_parent.join("reply_rule.json");
+
+        let error = commit_asset_writes(vec![PendingAssetWrite {
+            path: target.clone(),
+            contents: br#"{"actions":[]}"#.to_vec(),
+            artifact: serde_json::json!({
+                "path": target.display().to_string(),
+            }),
+        }])
+        .expect_err("write into locked parent should fail");
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::InvalidInput);
+        let context = envelope.context.expect("write failure context");
+        assert_eq!(context["reason"], "orchestration_asset_write_failed");
+        assert_eq!(
+            context["path_state"]["path_authority"],
+            "cli.orchestration_assets.write.path"
+        );
+
+        std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o700))
+            .expect("restore parent permissions");
         let _ = std::fs::remove_dir_all(root);
     }
 }

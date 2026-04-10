@@ -1,11 +1,21 @@
-use super::snapshot::build_stable_snapshot;
+mod memo;
+mod projection;
+mod semantic;
+mod snapshot;
+
+use self::memo::{ParsedLocator, record_memoized_elements, restore_memoized_elements};
+use self::projection::{ambiguous_locator_error, locator_context, selection_context};
+#[cfg(test)]
+use self::semantic::element_matches_text;
+use self::semantic::{
+    resolve_elements_by_label, resolve_elements_by_role, resolve_elements_by_testid,
+    resolve_elements_by_text,
+};
+use self::snapshot::load_snapshot;
 use super::*;
-use crate::locator_memo::LocatorMemoTarget;
-use crate::router::element_semantics::{accessible_label, semantic_role, test_id};
 use crate::router::request_args::{LocatorParseOptions, parse_canonical_locator};
 use rub_core::locator::{CanonicalLocator, LocatorSelection};
 use rub_core::model::{Element, Snapshot};
-use std::collections::HashSet;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -20,57 +30,14 @@ pub(super) struct ResolvedElements {
     pub snapshot_id: String,
 }
 
-#[derive(Debug, Clone)]
-struct ParsedLocator {
-    locator: CanonicalLocator,
-}
-
-impl ParsedLocator {
-    fn memo_key(&self, snapshot: &Snapshot) -> Option<String> {
-        let selection = self.locator.selection().map(selection_context);
-        match &self.locator {
-            CanonicalLocator::Index { .. } => None,
-            CanonicalLocator::Ref { .. } => None,
-            CanonicalLocator::Selector { css: selector, .. } => Some(
-                serde_json::json!({
-                    "url": snapshot.url,
-                    "dom_epoch": snapshot.dom_epoch,
-                    "frame_id": snapshot.frame_context.frame_id,
-                    "kind": "selector",
-                    "value": selector.trim(),
-                    "selection": selection,
-                })
-                .to_string(),
-            ),
-            CanonicalLocator::TargetText { text, .. } => Some(
-                serde_json::json!({
-                    "url": snapshot.url,
-                    "dom_epoch": snapshot.dom_epoch,
-                    "frame_id": snapshot.frame_context.frame_id,
-                    "kind": "target_text",
-                    "value": normalize_locator_text(text),
-                    "selection": selection,
-                })
-                .to_string(),
-            ),
-            CanonicalLocator::Role { .. }
-            | CanonicalLocator::Label { .. }
-            | CanonicalLocator::TestId { .. } => None,
-        }
-    }
-
-    fn requires_a11y_snapshot(&self) -> bool {
-        self.locator.requires_a11y_snapshot()
-    }
-}
-
 pub(super) async fn resolve_element(
     router: &DaemonRouter,
     args: &serde_json::Value,
     state: &Arc<SessionState>,
+    deadline: TransactionDeadline,
     command_name: &str,
 ) -> Result<ResolvedElement, RubError> {
-    let resolved = resolve_elements(router, args, state, command_name).await?;
+    let resolved = resolve_elements(router, args, state, deadline, command_name).await?;
     match resolved.elements.as_slice() {
         [element] => Ok(ResolvedElement {
             element: element.clone(),
@@ -88,10 +55,18 @@ pub(super) async fn resolve_elements(
     router: &DaemonRouter,
     args: &serde_json::Value,
     state: &Arc<SessionState>,
+    deadline: TransactionDeadline,
     command_name: &str,
 ) -> Result<ResolvedElements, RubError> {
     let locator = parse_locator(args)?;
-    let snapshot = load_snapshot(router, args, state, locator.requires_a11y_snapshot()).await?;
+    let snapshot = load_snapshot(
+        router,
+        args,
+        state,
+        deadline,
+        locator.requires_a11y_snapshot(),
+    )
+    .await?;
     if let Some(elements) = restore_memoized_elements(state, &snapshot, &locator).await? {
         return Ok(ResolvedElements {
             elements,
@@ -143,87 +118,6 @@ fn parse_locator(args: &serde_json::Value) -> Result<ParsedLocator, RubError> {
             RubError::domain(ErrorCode::InvalidInput, "Failed to parse element locator")
         })?;
     Ok(ParsedLocator { locator })
-}
-
-async fn load_snapshot(
-    router: &DaemonRouter,
-    args: &serde_json::Value,
-    state: &Arc<SessionState>,
-    prefer_a11y: bool,
-) -> Result<Arc<Snapshot>, RubError> {
-    if let Some(snapshot_id) = args.get("snapshot_id").and_then(|value| value.as_str()) {
-        crate::runtime_refresh::refresh_live_frame_runtime(&router.browser, state).await;
-        let snapshot = state.get_snapshot(snapshot_id).await.ok_or_else(|| {
-            RubError::domain_with_context(
-                ErrorCode::StaleSnapshot,
-                format!("Snapshot {snapshot_id} is unknown or evicted"),
-                serde_json::json!({
-                    "snapshot_id": snapshot_id,
-                    "current_epoch": state.current_epoch(),
-                }),
-            )
-        })?;
-
-        let current_epoch = state.current_epoch();
-        if snapshot.dom_epoch != current_epoch {
-            return Err(RubError::domain_with_context(
-                ErrorCode::StaleSnapshot,
-                format!(
-                    "Snapshot {snapshot_id} is stale: snapshot epoch {} != current epoch {}",
-                    snapshot.dom_epoch, current_epoch
-                ),
-                serde_json::json!({
-                    "snapshot_id": snapshot_id,
-                    "snapshot_epoch": snapshot.dom_epoch,
-                    "current_epoch": current_epoch,
-                }),
-            ));
-        }
-
-        let frame_runtime = state.frame_runtime().await;
-        if matches!(
-            frame_runtime.status,
-            rub_core::model::FrameContextStatus::Stale
-        ) {
-            return Err(RubError::domain_with_context(
-                ErrorCode::StaleSnapshot,
-                format!(
-                    "Snapshot {snapshot_id} cannot be used because the selected frame context is stale"
-                ),
-                serde_json::json!({
-                    "snapshot_id": snapshot_id,
-                    "snapshot_frame_id": snapshot.frame_context.frame_id,
-                    "frame_runtime": frame_runtime,
-                }),
-            ));
-        }
-        let current_frame_id = frame_runtime
-            .current_frame
-            .as_ref()
-            .map(|frame| frame.frame_id.as_str());
-        if current_frame_id != Some(snapshot.frame_context.frame_id.as_str()) {
-            return Err(RubError::domain_with_context(
-                ErrorCode::StaleSnapshot,
-                format!(
-                    "Snapshot {snapshot_id} belongs to frame '{}' but current frame context is '{}'",
-                    snapshot.frame_context.frame_id,
-                    current_frame_id.unwrap_or("unknown"),
-                ),
-                serde_json::json!({
-                    "snapshot_id": snapshot_id,
-                    "snapshot_frame_id": snapshot.frame_context.frame_id,
-                    "current_frame_id": current_frame_id,
-                    "frame_runtime": frame_runtime,
-                }),
-            ));
-        }
-
-        return Ok(snapshot);
-    }
-
-    let snapshot = build_stable_snapshot(router, args, state, None, prefer_a11y, false).await?;
-    let snapshot = state.cache_snapshot(snapshot).await;
-    Ok(snapshot)
 }
 
 async fn resolve_elements_against_locator(
@@ -297,360 +191,17 @@ fn apply_disambiguation(
     })
 }
 
-async fn restore_memoized_elements(
-    state: &Arc<SessionState>,
-    snapshot: &Snapshot,
-    locator: &ParsedLocator,
-) -> Result<Option<Vec<Element>>, RubError> {
-    let Some(key) = locator.memo_key(snapshot) else {
-        return Ok(None);
-    };
-    let Some(targets) = state.lookup_locator_memo(&key).await else {
-        return Ok(None);
-    };
-    Ok(rehydrate_memoized_elements(
-        snapshot,
-        &locator.locator,
-        &targets,
-    ))
-}
-
-async fn record_memoized_elements(
-    state: &Arc<SessionState>,
-    snapshot: &Snapshot,
-    locator: &ParsedLocator,
-    elements: &[Element],
-) {
-    let Some(key) = locator.memo_key(snapshot) else {
-        return;
-    };
-    let targets = memo_targets(elements);
-    if targets.is_empty() {
-        return;
-    }
-    state.record_locator_memo(key, targets).await;
-}
-
-fn rehydrate_memoized_elements(
-    snapshot: &Snapshot,
-    locator: &CanonicalLocator,
-    targets: &[LocatorMemoTarget],
-) -> Option<Vec<Element>> {
-    if targets.is_empty() {
-        return None;
-    }
-
-    let mut seen = HashSet::new();
-    let mut elements = Vec::with_capacity(targets.len());
-    for target in targets {
-        let element = match target {
-            LocatorMemoTarget::ElementRef(element_ref) => snapshot
-                .elements
-                .iter()
-                .find(|element| element.element_ref.as_deref() == Some(element_ref.as_str()))
-                .cloned(),
-            LocatorMemoTarget::Index(index) => snapshot
-                .elements
-                .get(*index as usize)
-                .filter(|element| element.index == *index)
-                .cloned(),
-        }?;
-
-        if !seen.insert(element.index) {
-            return None;
-        }
-        elements.push(element);
-    }
-
-    elements.sort_by_key(|element| element.index);
-    if validate_memoized_elements(locator, &elements) {
-        Some(elements)
-    } else {
-        None
-    }
-}
-
-fn validate_memoized_elements(locator: &CanonicalLocator, elements: &[Element]) -> bool {
-    match locator {
-        CanonicalLocator::Index { index } => {
-            matches!(elements, [element] if element.index == *index)
-        }
-        CanonicalLocator::Ref { element_ref } => {
-            matches!(elements, [element] if element.element_ref.as_deref() == Some(element_ref.as_str()))
-        }
-        CanonicalLocator::Selector { .. } => !elements.is_empty(),
-        CanonicalLocator::TargetText { text: query, .. } => {
-            let normalized_query = normalize_locator_text(query);
-            elements
-                .iter()
-                .all(|element| element_matches_text(element, &normalized_query, true))
-                || elements
-                    .iter()
-                    .all(|element| element_matches_text(element, &normalized_query, false))
-        }
-        CanonicalLocator::Role { role, .. } => {
-            let normalized_query = normalize_locator_text(role);
-            elements
-                .iter()
-                .all(|element| normalize_locator_text(&semantic_role(element)) == normalized_query)
-        }
-        CanonicalLocator::Label { label, .. } => {
-            let normalized_query = normalize_locator_text(label);
-            elements.iter().all(|element| {
-                let candidate = accessible_label(element);
-                !candidate.is_empty()
-                    && normalize_locator_text(&candidate).contains(&normalized_query)
-            })
-        }
-        CanonicalLocator::TestId { testid, .. } => {
-            let normalized_query = normalize_locator_text(testid);
-            elements.iter().all(|element| {
-                test_id(element)
-                    .map(normalize_locator_text)
-                    .is_some_and(|value| value == normalized_query)
-            })
-        }
-    }
-}
-
-fn memo_targets(elements: &[Element]) -> Vec<LocatorMemoTarget> {
-    elements
-        .iter()
-        .filter_map(|element| {
-            element
-                .element_ref
-                .as_ref()
-                .map(|value| LocatorMemoTarget::ElementRef(value.clone()))
-                .or(Some(LocatorMemoTarget::Index(element.index)))
-        })
-        .collect()
-}
-
-fn resolve_elements_by_text(snapshot: &Snapshot, query: &str) -> Result<Vec<Element>, RubError> {
-    let normalized_query = normalize_locator_text(query);
-    let exact = text_matches(snapshot, &normalized_query, true);
-    if !exact.is_empty() {
-        return Ok(exact);
-    }
-
-    let contains = text_matches(snapshot, &normalized_query, false);
-    if contains.is_empty() {
-        return Err(RubError::domain_with_context_and_suggestion(
-            ErrorCode::ElementNotFound,
-            format!("No interactive snapshot element matched text '{query}'"),
-            serde_json::json!({
-                "target_text": query,
-            }),
-            "Run 'rub observe' to see all interactive elements, or use --selector for content-level matching",
-        ));
-    }
-
-    Ok(contains)
-}
-
-fn resolve_elements_by_role(snapshot: &Snapshot, query: &str) -> Result<Vec<Element>, RubError> {
-    let normalized_query = normalize_locator_text(query);
-    let mut matches = snapshot
-        .elements
-        .iter()
-        .filter(|element| normalize_locator_text(&semantic_role(element)) == normalized_query)
-        .cloned()
-        .collect::<Vec<_>>();
-    matches.sort_by_key(|element| element.index);
-    if matches.is_empty() {
-        return Err(RubError::domain_with_context_and_suggestion(
-            ErrorCode::ElementNotFound,
-            format!("No interactive snapshot element matched role '{query}'"),
-            serde_json::json!({
-                "role": query,
-            }),
-            "Run 'rub observe' to see all interactive elements and their roles",
-        ));
-    }
-    Ok(matches)
-}
-
-fn resolve_elements_by_label(snapshot: &Snapshot, query: &str) -> Result<Vec<Element>, RubError> {
-    let normalized_query = normalize_locator_text(query);
-    let mut exact = snapshot
-        .elements
-        .iter()
-        .filter(|element| normalize_locator_text(&accessible_label(element)) == normalized_query)
-        .cloned()
-        .collect::<Vec<_>>();
-    exact.sort_by_key(|element| element.index);
-    if !exact.is_empty() {
-        return Ok(exact);
-    }
-
-    let mut contains = snapshot
-        .elements
-        .iter()
-        .filter(|element| {
-            let label = accessible_label(element);
-            !label.is_empty() && normalize_locator_text(&label).contains(&normalized_query)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    contains.sort_by_key(|element| element.index);
-    if contains.is_empty() {
-        return Err(RubError::domain_with_context_and_suggestion(
-            ErrorCode::ElementNotFound,
-            format!("No interactive snapshot element matched label '{query}'"),
-            serde_json::json!({
-                "label": query,
-            }),
-            "Run 'rub observe' to see all interactive elements and their labels",
-        ));
-    }
-    Ok(contains)
-}
-
-fn resolve_elements_by_testid(snapshot: &Snapshot, query: &str) -> Result<Vec<Element>, RubError> {
-    let normalized_query = normalize_locator_text(query);
-    let mut matches = snapshot
-        .elements
-        .iter()
-        .filter(|element| {
-            test_id(element)
-                .map(normalize_locator_text)
-                .is_some_and(|value| value == normalized_query)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    matches.sort_by_key(|element| element.index);
-    if matches.is_empty() {
-        return Err(RubError::domain_with_context_and_suggestion(
-            ErrorCode::ElementNotFound,
-            format!("No interactive snapshot element matched test id '{query}'"),
-            serde_json::json!({
-                "testid": query,
-            }),
-            "Run 'rub observe' to see all interactive elements and their test IDs",
-        ));
-    }
-    Ok(matches)
-}
-
-fn text_matches(snapshot: &Snapshot, query: &str, exact: bool) -> Vec<Element> {
-    let mut matches = snapshot
-        .elements
-        .iter()
-        .filter(|element| element_matches_text(element, query, exact))
-        .cloned()
-        .collect::<Vec<_>>();
-    matches.sort_by_key(|element| element.index);
-    matches
-}
-
-fn element_matches_text(element: &Element, query: &str, exact: bool) -> bool {
-    let mut candidates = Vec::with_capacity(1 + element.attributes.len());
-    if !element.text.trim().is_empty() {
-        candidates.push(element.text.as_str());
-    }
-    for key in ["aria-label", "placeholder", "title", "alt", "value", "name"] {
-        if let Some(value) = element.attributes.get(key) {
-            candidates.push(value.as_str());
-        }
-    }
-
-    candidates.into_iter().any(|candidate| {
-        let normalized_candidate = normalize_locator_text(candidate);
-        if exact {
-            normalized_candidate == query
-        } else {
-            normalized_candidate.contains(query)
-        }
-    })
-}
-
-fn normalize_locator_text(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
-fn ambiguous_locator_error(
-    command_name: &str,
-    args: &serde_json::Value,
-    matches: &[Element],
-) -> RubError {
-    let locator = locator_context(args);
-
-    RubError::Domain(
-        ErrorEnvelope::new(
-            ErrorCode::InvalidInput,
-            format!(
-                "{command_name} locator matched {} interactive snapshot elements; refine the locator",
-                matches.len()
-            ),
-        )
-        .with_context(serde_json::json!({
-            "locator": locator,
-            "candidates": matches
-                .iter()
-                .take(5)
-                .map(|element| serde_json::json!({
-                    "index": element.index,
-                    "tag": element.tag,
-                    "text": element.text,
-                }))
-                .collect::<Vec<_>>(),
-            "selection": selection_context_from_args(args),
-        }))
-        .with_suggestion(
-            "Refine the locator, or use --first, --last, or --nth to select a single match",
-        ),
-    )
-}
-
-fn locator_context(args: &serde_json::Value) -> serde_json::Value {
-    for (key, alias) in [
-        ("element_ref", "ref"),
-        ("ref", "ref"),
-        ("selector", "selector"),
-        ("target_text", "target_text"),
-        ("role", "role"),
-        ("label", "label"),
-        ("testid", "testid"),
-    ] {
-        if let Some(value) = args.get(key).and_then(|value| value.as_str()) {
-            return serde_json::json!({ alias: value });
-        }
-    }
-    serde_json::json!({ "index": args.get("index") })
-}
-
-fn selection_context(selection: LocatorSelection) -> serde_json::Value {
-    match selection {
-        LocatorSelection::First => serde_json::json!({ "first": true }),
-        LocatorSelection::Last => serde_json::json!({ "last": true }),
-        LocatorSelection::Nth(nth) => serde_json::json!({ "nth": nth }),
-    }
-}
-
-fn selection_context_from_args(args: &serde_json::Value) -> serde_json::Value {
-    if args.get("first").and_then(|value| value.as_bool()) == Some(true) {
-        return serde_json::json!({ "first": true });
-    }
-    if args.get("last").and_then(|value| value.as_bool()) == Some(true) {
-        return serde_json::json!({ "last": true });
-    }
-    if let Some(nth) = args.get("nth").and_then(|value| value.as_u64()) {
-        return serde_json::json!({ "nth": nth });
-    }
-    serde_json::Value::Null
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        LocatorMemoTarget, ambiguous_locator_error, element_matches_text, normalize_locator_text,
-        parse_locator, rehydrate_memoized_elements, resolve_elements_by_role,
+        ambiguous_locator_error, element_matches_text, parse_locator, resolve_elements_by_role,
         resolve_elements_by_testid,
     };
+    use crate::locator_memo::LocatorMemoTarget;
+    use crate::router::addressing::memo::{
+        locator_supports_memo, rehydrate_memoized_elements, snapshot_supports_locator_memo,
+    };
+    use crate::router::addressing::semantic::normalize_locator_text;
     use rub_core::error::ErrorCode;
     use rub_core::locator::{CanonicalLocator, LocatorSelection};
     use rub_core::model::{AXInfo, Element, ElementTag};
@@ -746,6 +297,72 @@ mod tests {
 
         assert_eq!(elements.len(), 1);
         assert_eq!(elements[0].index, 1);
+    }
+
+    #[test]
+    fn selector_locators_do_not_participate_in_locator_memo() {
+        let locator = parse_locator(&serde_json::json!({ "selector": ".cta" }))
+            .expect("selector locator should parse");
+        assert!(!locator_supports_memo(&locator.locator));
+        assert!(
+            locator
+                .memo_key(&snapshot(vec![element(0, "Save", None, Some("frame:10"))]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn snapshot_locator_memo_requires_verified_non_truncated_projection() {
+        let mut unverified = snapshot(vec![element(0, "Save", None, Some("frame:10"))]);
+        unverified.projection.verified = false;
+        assert!(!snapshot_supports_locator_memo(&unverified));
+
+        let mut truncated = snapshot(vec![element(0, "Save", None, Some("frame:10"))]);
+        truncated.truncated = true;
+        assert!(!snapshot_supports_locator_memo(&truncated));
+    }
+
+    #[test]
+    fn target_text_memo_key_changes_when_frame_context_changes() {
+        let locator = parse_locator(&serde_json::json!({ "target_text": "save draft" }))
+            .expect("target_text locator should parse");
+        let root_snapshot = snapshot(vec![element(0, "Save draft", None, Some("main:10"))]);
+        let mut child_snapshot = root_snapshot.clone();
+        child_snapshot.frame_context.frame_id = "child".to_string();
+        child_snapshot.frame_lineage = vec!["main".to_string(), "child".to_string()];
+
+        let root_key = locator
+            .memo_key(&root_snapshot)
+            .expect("root snapshot should support memo");
+        let child_key = locator
+            .memo_key(&child_snapshot)
+            .expect("child snapshot should support memo");
+
+        assert_ne!(
+            root_key, child_key,
+            "memo keys must change when frame continuity changes"
+        );
+    }
+
+    #[test]
+    fn target_text_memo_key_changes_when_projection_fence_changes() {
+        let locator = parse_locator(&serde_json::json!({ "target_text": "save draft" }))
+            .expect("target_text locator should parse");
+        let baseline = snapshot(vec![element(0, "Save draft", None, Some("main:10"))]);
+        let mut changed = baseline.clone();
+        changed.projection.backend_traversal_count = 99;
+
+        let baseline_key = locator
+            .memo_key(&baseline)
+            .expect("baseline snapshot should support memo");
+        let changed_key = locator
+            .memo_key(&changed)
+            .expect("changed snapshot should support memo");
+
+        assert_ne!(
+            baseline_key, changed_key,
+            "memo keys must track projection fence changes that can invalidate reuse"
+        );
     }
 
     #[test]

@@ -32,6 +32,17 @@ pub(super) async fn effective_request_frame_id(
     Ok(selected_frame_id)
 }
 
+pub(super) async fn explicit_or_top_frame_request_id(
+    router: &DaemonRouter,
+    args: &serde_json::Value,
+) -> Result<Option<String>, RubError> {
+    if let Some(frame_id) = orchestration_frame_override(args) {
+        ensure_request_frame_available(router, frame_id).await?;
+        return Ok(Some(frame_id.to_string()));
+    }
+    Ok(None)
+}
+
 pub(super) async fn ensure_request_frame_available(
     router: &DaemonRouter,
     frame_id: &str,

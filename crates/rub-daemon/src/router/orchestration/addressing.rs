@@ -7,7 +7,10 @@ use rub_core::model::{
 use rub_ipc::client::IpcClient;
 use rub_ipc::protocol::{IpcRequest, ResponseStatus};
 
-use crate::orchestration_executor::bind_orchestration_daemon_authority;
+use crate::orchestration_executor::{
+    bind_orchestration_daemon_authority, decode_orchestration_success_result_items,
+};
+use crate::orchestration_runtime::extend_orchestration_session_path_context;
 use crate::router::DaemonRouter;
 use crate::session::SessionState;
 
@@ -70,18 +73,19 @@ async fn list_remote_orchestration_tabs(
     let mut client = IpcClient::connect(std::path::Path::new(&session.socket_path))
         .await
         .map_err(|error| {
+            let mut context = serde_json::json!({
+                "reason": format!("orchestration_{}_session_unreachable", role),
+                "session_id": session.session_id,
+                "session_name": session.session_name,
+            });
+            extend_orchestration_session_path_context(&mut context, session);
             RubError::domain_with_context(
                 ErrorCode::DaemonNotRunning,
                 format!(
                     "Unable to reach orchestration {role} session '{}' at {}: {error}",
                     session.session_name, session.socket_path
                 ),
-                serde_json::json!({
-                    "reason": format!("orchestration_{}_session_unreachable", role),
-                    "session_id": session.session_id,
-                    "session_name": session.session_name,
-                    "socket_path": session.socket_path,
-                }),
+                context,
             )
         })?;
     let response = client
@@ -99,40 +103,40 @@ async fn list_remote_orchestration_tabs(
         )
         .await
         .map_err(|error| {
+            let mut context = serde_json::json!({
+                "reason": format!("orchestration_{}_tabs_query_failed", role),
+                "session_id": session.session_id,
+                "session_name": session.session_name,
+            });
+            extend_orchestration_session_path_context(&mut context, session);
             RubError::domain_with_context(
                 ErrorCode::IpcProtocolError,
                 format!(
                     "Failed to query orchestration {role} session '{}' tabs: {error}",
                     session.session_name
                 ),
-                serde_json::json!({
-                    "reason": format!("orchestration_{}_tabs_query_failed", role),
-                    "session_id": session.session_id,
-                    "session_name": session.session_name,
-                }),
+                context,
             )
         })?;
 
     match response.status {
-        ResponseStatus::Success => response
-            .data
-            .as_ref()
-            .and_then(|data| data.get("tabs").cloned())
-            .ok_or_else(|| {
-                RubError::domain_with_context(
-                    ErrorCode::IpcProtocolError,
-                    format!(
-                        "Orchestration {role} session '{}' returned tabs without a tabs payload",
-                        session.session_name
-                    ),
-                    serde_json::json!({
-                        "reason": format!("orchestration_{}_tabs_payload_missing", role),
-                        "session_id": session.session_id,
-                        "session_name": session.session_name,
-                    }),
-                )
-            })
-            .and_then(|tabs| serde_json::from_value::<Vec<TabInfo>>(tabs).map_err(RubError::from)),
+        ResponseStatus::Success => {
+            let missing_reason = format!("orchestration_{}_tabs_payload_missing", role);
+            let invalid_reason = format!("orchestration_{}_tabs_payload_invalid", role);
+            let missing_message = format!(
+                "Orchestration {role} session '{}' returned tabs without a result.items payload",
+                session.session_name
+            );
+            decode_orchestration_success_result_items::<TabInfo>(
+                response,
+                session,
+                &missing_reason,
+                &missing_message,
+                &invalid_reason,
+                "orchestration tab inventory payload",
+            )
+            .map_err(RubError::Domain)
+        }
         ResponseStatus::Error => {
             let envelope = response.error.unwrap_or_else(|| {
                 rub_core::error::ErrorEnvelope::new(

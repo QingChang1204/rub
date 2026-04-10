@@ -1,18 +1,20 @@
+mod source;
+
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::commands::{Commands, EffectiveCli, InspectSubcommand};
 use crate::daemon_ctl;
 use crate::session_policy::{
-    materialize_connection_request, parse_connection_request, requires_existing_session_validation,
-    resolve_attachment_identity, validate_existing_session_connection_request,
+    materialize_connection_request, parse_connection_request, requested_attachment_identity,
+    requires_existing_session_validation, validate_existing_session_connection_request,
 };
-use crate::timeout_budget::helpers::resolve_extract_builder_spec_source;
 use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
 use rub_ipc::protocol::{IpcRequest, ResponseStatus};
 use serde::Serialize;
-use tokio::fs;
 use uuid::Uuid;
+
+use self::source::{load_extract_spec, load_harvest_sources};
 
 #[derive(Debug, Serialize)]
 struct FollowPageExtractSummary {
@@ -284,8 +286,7 @@ impl HarvestDispatchContext {
             materialize_connection_request(&parse_connection_request(cli)?).await?;
         Ok(Self {
             daemon_args: crate::daemon_args(cli, &connection_request),
-            attachment_identity: resolve_attachment_identity(cli, &connection_request, None)
-                .await?,
+            attachment_identity: requested_attachment_identity(cli, &connection_request),
             connection_request,
         })
     }
@@ -377,93 +378,6 @@ fn harvest_deadline_exhausted(error: &ErrorEnvelope) -> bool {
             == Some("inspect_harvest_timeout_budget_exhausted")
 }
 
-async fn load_extract_spec(
-    inline_spec: Option<&str>,
-    file: Option<&str>,
-    fields: &[String],
-) -> Result<String, RubError> {
-    match (inline_spec, file, fields.is_empty()) {
-        (Some(spec), None, true) => Ok(spec.to_string()),
-        (None, Some(path), true) => {
-            fs::read_to_string(path)
-                .await
-                .map_err(|error| match error.kind() {
-                    std::io::ErrorKind::NotFound => RubError::domain(
-                        ErrorCode::FileNotFound,
-                        format!("inspect harvest extract spec file not found: {path}"),
-                    ),
-                    _ => RubError::domain(
-                        ErrorCode::InvalidInput,
-                        format!("Failed to read inspect harvest extract spec file {path}: {error}"),
-                    ),
-                })
-        }
-        (None, None, false) => {
-            resolve_extract_builder_spec_source("inspect harvest", fields).map(|(spec, _)| spec)
-        }
-        (Some(_), Some(_), _) | (Some(_), _, false) | (_, Some(_), false) => Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            "Use exactly one follow-page extract source: --extract, --extract-file, or one or more --field entries",
-        )),
-        (None, None, true) => Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            "Provide --extract, --extract-file, or one or more --field entries for inspect harvest",
-        )),
-    }
-}
-
-async fn load_harvest_sources(
-    file: &Path,
-    input_field: Option<&str>,
-    url_field: Option<&str>,
-    name_field: Option<&str>,
-    base_url: Option<&str>,
-    limit: Option<u32>,
-) -> Result<Vec<HarvestSource>, RubError> {
-    let raw = fs::read_to_string(file)
-        .await
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => RubError::domain(
-                ErrorCode::FileNotFound,
-                format!("inspect harvest source file not found: {}", file.display()),
-            ),
-            _ => RubError::domain(
-                ErrorCode::InvalidInput,
-                format!(
-                    "Failed to read inspect harvest source file {}: {error}",
-                    file.display()
-                ),
-            ),
-        })?;
-
-    let parsed_sources = match serde_json::from_str::<serde_json::Value>(&raw) {
-        Ok(json) => parse_json_harvest_sources(file, &json, input_field, url_field, name_field)?,
-        Err(_) => parse_text_harvest_sources(&raw)?,
-    };
-    if parsed_sources.is_empty() {
-        return Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            "inspect harvest source did not contain any follow-page URLs",
-        ));
-    }
-
-    let mut resolved = Vec::new();
-    for (index, source) in parsed_sources.into_iter().enumerate() {
-        if let Some(limit) = limit
-            && index as u32 >= limit
-        {
-            break;
-        }
-        resolved.push(HarvestSource {
-            index: index as u32,
-            url: resolve_follow_url(&source.url, base_url)?,
-            source_name: source.source_name,
-            source_row: source.source_row,
-        });
-    }
-    Ok(resolved)
-}
-
 #[derive(Debug)]
 struct ParsedHarvestSource {
     url: String,
@@ -471,221 +385,14 @@ struct ParsedHarvestSource {
     source_row: serde_json::Value,
 }
 
-fn parse_json_harvest_sources(
-    file: &Path,
-    root: &serde_json::Value,
-    input_field: Option<&str>,
-    url_field: Option<&str>,
-    name_field: Option<&str>,
-) -> Result<Vec<ParsedHarvestSource>, RubError> {
-    let selected = resolve_json_harvest_root(file, root, input_field)?;
-
-    let rows = match selected {
-        serde_json::Value::Array(values) => values,
-        serde_json::Value::String(url) => {
-            return Ok(vec![ParsedHarvestSource {
-                url: url.clone(),
-                source_name: None,
-                source_row: serde_json::Value::String(url.clone()),
-            }]);
-        }
-        _ => {
-            return Err(RubError::domain_with_context(
-                ErrorCode::InvalidInput,
-                "inspect harvest JSON input must resolve to an array, string URL, or canonical batch object; use --input-field to select a batch root like data.result",
-                serde_json::json!({
-                    "file": file.display().to_string(),
-                    "input_field": input_field,
-                }),
-            ));
-        }
-    };
-
-    rows.iter()
-        .enumerate()
-        .map(|(index, row)| parse_json_harvest_row(row, index, url_field, name_field))
-        .collect()
-}
-
-fn resolve_json_harvest_root<'a>(
-    file: &Path,
-    root: &'a serde_json::Value,
-    input_field: Option<&str>,
-) -> Result<&'a serde_json::Value, RubError> {
-    if let Some(path) = input_field {
-        let selected = lookup_json_path(root, path).ok_or_else(|| {
-            RubError::domain_with_context(
-                ErrorCode::InvalidInput,
-                format!("inspect harvest input_field '{path}' was not found in the JSON source"),
-                serde_json::json!({
-                    "file": file.display().to_string(),
-                    "input_field": path,
-                }),
-            )
-        })?;
-        return Ok(canonical_batch_root(selected).unwrap_or(selected));
-    }
-
-    if matches!(
-        root,
-        serde_json::Value::Array(_) | serde_json::Value::String(_)
-    ) {
-        return Ok(root);
-    }
-
-    if let Some(items) = canonical_batch_root(root) {
-        return Ok(items);
-    }
-
-    for candidate in ["data.result", "result", "data"] {
-        if let Some(value) = lookup_json_path(root, candidate)
-            && let Some(selected) = canonical_batch_root(value).or(array_or_string_root(value))
-        {
-            return Ok(selected);
-        }
-    }
-
-    Ok(root)
-}
-
-fn parse_json_harvest_row(
-    row: &serde_json::Value,
-    index: usize,
-    url_field: Option<&str>,
-    name_field: Option<&str>,
-) -> Result<ParsedHarvestSource, RubError> {
-    match row {
-        serde_json::Value::String(url) => Ok(ParsedHarvestSource {
-            url: url.clone(),
-            source_name: None,
-            source_row: row.clone(),
-        }),
-        serde_json::Value::Object(_) => {
-            let url_value = match url_field {
-                Some(path) => lookup_json_path(row, path),
-                None => row.get("url").or_else(|| row.get("href")),
-            }
-            .ok_or_else(|| {
-                RubError::domain_with_context(
-                    ErrorCode::InvalidInput,
-                    format!(
-                        "inspect harvest row {index} did not expose a URL; use --url-field or include a top-level 'url'/'href' field"
-                    ),
-                    serde_json::json!({
-                        "row_index": index,
-                        "row": row,
-                        "url_field": url_field,
-                    }),
-                )
-            })?;
-            let url = url_value.as_str().ok_or_else(|| {
-                RubError::domain_with_context(
-                    ErrorCode::InvalidInput,
-                    format!("inspect harvest row {index} URL field must be a string"),
-                    serde_json::json!({
-                        "row_index": index,
-                        "row": row,
-                        "url_field": url_field,
-                    }),
-                )
-            })?;
-            let source_name = name_field
-                .and_then(|path| lookup_json_path(row, path))
-                .and_then(|value| value.as_str())
-                .map(str::to_string);
-            Ok(ParsedHarvestSource {
-                url: url.to_string(),
-                source_name,
-                source_row: row.clone(),
-            })
-        }
-        _ => Err(RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            format!("inspect harvest row {index} must be a string URL or JSON object"),
-            serde_json::json!({
-                "row_index": index,
-                "row": row,
-            }),
-        )),
-    }
-}
-
-fn parse_text_harvest_sources(raw: &str) -> Result<Vec<ParsedHarvestSource>, RubError> {
-    Ok(raw
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| ParsedHarvestSource {
-            url: line.to_string(),
-            source_name: None,
-            source_row: serde_json::Value::String(line.to_string()),
-        })
-        .collect())
-}
-
-fn resolve_follow_url(url: &str, base_url: Option<&str>) -> Result<String, RubError> {
-    if url.starts_with("http://") || url.starts_with("https://") {
-        return Ok(url.to_string());
-    }
-    let Some(base_url) = base_url else {
-        return Err(RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            "inspect harvest encountered a relative URL; provide --base-url to resolve it",
-            serde_json::json!({
-                "url": url,
-            }),
-        ));
-    };
-    let base = reqwest::Url::parse(base_url).map_err(|error| {
-        RubError::domain(
-            ErrorCode::InvalidInput,
-            format!("inspect harvest base URL is invalid: {error}"),
-        )
-    })?;
-    let joined = base.join(url).map_err(|error| {
-        RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            format!("inspect harvest could not resolve relative URL '{url}': {error}"),
-            serde_json::json!({
-                "base_url": base_url,
-                "url": url,
-            }),
-        )
-    })?;
-    Ok(joined.to_string())
-}
-
-fn lookup_json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
-    let mut current = value;
-    for segment in path.split('.') {
-        if segment.is_empty() {
-            return None;
-        }
-        current = current.get(segment)?;
-    }
-    Some(current)
-}
-
-fn canonical_batch_root(value: &serde_json::Value) -> Option<&serde_json::Value> {
-    let items = value.get("items")?;
-    match items {
-        serde_json::Value::Array(_) | serde_json::Value::String(_) => Some(items),
-        _ => None,
-    }
-}
-
-fn array_or_string_root(value: &serde_json::Value) -> Option<&serde_json::Value> {
-    match value {
-        serde_json::Value::Array(_) | serde_json::Value::String(_) => Some(value),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::source::{
+        harvest_extract_spec_file_state, harvest_source_file_state, load_extract_spec,
+        parse_json_harvest_sources, resolve_json_harvest_root,
+    };
     use super::{
         harvest_deadline_exhausted, harvest_timeout_envelope, remaining_harvest_budget_ms,
-        resolve_json_harvest_root,
     };
     use serde_json::json;
     use std::path::Path;
@@ -750,5 +457,57 @@ mod tests {
         let envelope = harvest_timeout_envelope(5_000);
         assert!(harvest_deadline_exhausted(&envelope));
         assert_eq!(envelope.code, rub_core::error::ErrorCode::IpcTimeout);
+    }
+
+    #[test]
+    fn resolve_json_harvest_root_missing_input_field_preserves_file_state() {
+        let value = json!({
+            "data": {
+                "result": {
+                    "items": []
+                }
+            }
+        });
+        let error =
+            resolve_json_harvest_root(Path::new("/tmp/rows.json"), &value, Some("data.missing"))
+                .expect_err("missing input field should fail")
+                .into_envelope();
+        let context = error.context.expect("harvest root context");
+        assert_eq!(context["file"], "/tmp/rows.json");
+        assert_eq!(context["file_state"], json!(harvest_source_file_state()));
+    }
+
+    #[test]
+    fn parse_json_harvest_sources_invalid_root_preserves_file_state() {
+        let error = parse_json_harvest_sources(
+            Path::new("/tmp/rows.json"),
+            &json!({ "unexpected": true }),
+            None,
+            None,
+            None,
+        )
+        .expect_err("invalid root should fail")
+        .into_envelope();
+        let context = error.context.expect("harvest parse context");
+        assert_eq!(context["file"], "/tmp/rows.json");
+        assert_eq!(context["file_state"], json!(harvest_source_file_state()));
+    }
+
+    #[tokio::test]
+    async fn load_extract_spec_missing_file_preserves_path_state() {
+        let error = load_extract_spec(None, Some("./missing-extract.json"), &[])
+            .await
+            .expect_err("missing extract spec file should fail")
+            .into_envelope();
+        let context = error.context.expect("extract spec context");
+        assert_eq!(context["path"], "./missing-extract.json");
+        assert_eq!(
+            context["path_state"],
+            json!(harvest_extract_spec_file_state())
+        );
+        assert_eq!(
+            context["reason"],
+            "inspect_harvest_extract_spec_file_not_found"
+        );
     }
 }

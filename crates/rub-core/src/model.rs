@@ -658,6 +658,8 @@ pub struct SavedAssetEntry {
     pub status: SavedAssetStatus,
     pub output_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_path_state: Option<SavedAssetOutputPathState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
@@ -665,6 +667,16 @@ pub struct SavedAssetEntry {
     pub durability_confirmed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Truth and durability label for the output path surfaced by one saved asset entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedAssetOutputPathState {
+    pub path_kind: String,
+    pub path_authority: String,
+    pub upstream_truth: String,
+    pub control_role: String,
+    pub durability: String,
 }
 
 /// Summary projection for one bulk asset save transaction.
@@ -678,6 +690,17 @@ pub struct BulkAssetSaveSummary {
     pub failed_count: u32,
     pub timed_out_count: u32,
     pub output_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_dir_state: Option<BulkAssetSaveOutputDirState>,
+}
+
+/// Truth label for the bulk-save output directory reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BulkAssetSaveOutputDirState {
+    pub path_kind: String,
+    pub path_authority: String,
+    pub upstream_truth: String,
+    pub control_role: String,
 }
 
 /// Runtime status of the session-scoped JavaScript dialog surface.
@@ -1368,6 +1391,8 @@ pub struct AutomationActionInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_path_state: Option<PathReferenceState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub inline_step_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vars: Vec<String>,
@@ -1703,6 +1728,16 @@ pub struct OrchestrationTraceProjection {
     pub events: Vec<OrchestrationEventInfo>,
 }
 
+/// Truth label for a display-only path reference projected on an operator surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathReferenceState {
+    pub truth_level: String,
+    pub path_authority: String,
+    pub upstream_truth: String,
+    pub path_kind: String,
+    pub control_role: String,
+}
+
 /// One registry-backed session addressable by future orchestration rules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestrationSessionInfo {
@@ -1710,10 +1745,14 @@ pub struct OrchestrationSessionInfo {
     pub session_name: String,
     pub pid: u32,
     pub socket_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket_path_state: Option<PathReferenceState>,
     pub current: bool,
     pub ipc_protocol_version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_data_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_data_dir_state: Option<PathReferenceState>,
 }
 
 /// Read-only orchestration runtime foundation projected from the canonical RUB_HOME registry.

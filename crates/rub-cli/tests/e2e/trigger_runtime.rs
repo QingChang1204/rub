@@ -41,7 +41,6 @@ fn t437_trigger_text_present_fires_cross_tab_click() {
 </html>"#,
         ),
     ]);
-
     let target_url = server.url_for("/trigger-target");
     let source_url = server.url_for("/trigger-source");
 
@@ -89,22 +88,16 @@ fn t437_trigger_text_present_fires_cross_tab_click() {
             "source_tab": source_index.parse::<u64>().unwrap(),
             "target_tab": target_index.parse::<u64>().unwrap(),
             "mode": "once",
-            "condition": {
-                "kind": "text_present",
-                "text": "Ready"
-            },
+            "condition": {"kind": "text_present", "text": "Ready"},
             "action": {
                 "kind": "browser_command",
                 "command": "click",
-                "payload": {
-                    "selector": "#continue"
-                }
+                "payload": {"selector": "#continue"}
             }
         }))
         .unwrap(),
     )
     .unwrap();
-
     let added = parse_json(
         &rub_cmd(&home)
             .args(["trigger", "add", "--file", &spec_path])
@@ -1136,160 +1129,249 @@ fn t437f_trigger_degrades_when_target_selected_frame_becomes_stale() {
     cleanup(&home);
 }
 
-/// T437g: triggers should be able to execute a named workflow asset through the canonical pipe surface.
+/// T437g-T437h: workflow-backed trigger flows should share one browser-backed scenario.
 #[test]
 #[ignore]
 #[serial]
-fn t437g_trigger_fires_named_workflow_on_target_tab() {
-    let home = unique_home();
-    cleanup(&home);
+fn t437g_h_trigger_workflow_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home().to_string();
     std::fs::create_dir_all(PathBuf::from(&home).join("workflows")).unwrap();
 
     let (_rt, server) = start_test_server(vec![
         (
             "/trigger-target-workflow",
             "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Trigger Workflow Target</title></head>
-<body>
-  <input id="name" value="" />
-  <button id="apply">Apply</button>
-  <div id="status">Pending</div>
-  <script>
-    document.getElementById('apply').addEventListener('click', () => {
-      document.getElementById('status').textContent =
-        document.getElementById('name').value || 'Pending';
-    });
-  </script>
-</body>
-</html>"#,
+            r#"<!DOCTYPE html><html><head><title>Trigger Workflow Target</title></head><body><input id="name" value="" /><button id="apply">Apply</button><div id="status">Pending</div><script>document.getElementById('apply').addEventListener('click',()=>{document.getElementById('status').textContent=document.getElementById('name').value||'Pending';});</script></body></html>"#,
         ),
         (
             "/trigger-source-workflow",
             "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Trigger Workflow Source</title></head>
-<body>
-  <div id="status">Waiting</div>
-  <script>
-    setTimeout(() => {
-      document.getElementById('status').textContent = 'Ready';
-    }, 1200);
-  </script>
-</body>
-</html>"#,
+            r#"<!DOCTYPE html><html><head><title>Trigger Workflow Source</title></head><body><div id="status">Waiting</div><script>setTimeout(()=>{document.getElementById('status').textContent='Ready';},1200);</script></body></html>"#,
+        ),
+        (
+            "/trigger-target-workflow-vars",
+            "text/html",
+            r#"<!DOCTYPE html><html><head><title>Trigger Workflow Vars Target</title></head><body><input id="name" value="" /><button id="apply">Apply</button><div id="status">Pending</div><script>document.getElementById('apply').addEventListener('click',()=>{document.getElementById('status').textContent=document.getElementById('name').value||'Pending';});</script></body></html>"#,
+        ),
+        (
+            "/trigger-source-workflow-vars",
+            "text/html",
+            r#"<!DOCTYPE html><html><head><title>Trigger Workflow Vars Source</title></head><body><div id="status">Waiting</div><script>setTimeout(()=>{document.getElementById('status').textContent='Ready';},1200);</script></body></html>"#,
+        ),
+        (
+            "/trigger-target-workflow-source-vars",
+            "text/html",
+            r#"<!DOCTYPE html><html><head><title>Trigger Workflow Source Vars Target</title></head><body><input id="name" value="" /><button id="apply">Apply</button><div id="status">Pending</div><script>document.getElementById('apply').addEventListener('click',()=>{document.getElementById('status').textContent=document.getElementById('name').value||'Pending';});</script></body></html>"#,
+        ),
+        (
+            "/trigger-source-workflow-source-vars",
+            "text/html",
+            r#"<!DOCTYPE html><html><head><title>Trigger Workflow Source Vars Source</title></head><body><div id="question">Answer from source tab</div><div id="status">Waiting</div><script>setTimeout(()=>{document.getElementById('status').textContent='Ready';},1200);</script></body></html>"#,
+        ),
+        (
+            "/trigger-target-workflow-storage",
+            "text/html",
+            r#"<!DOCTYPE html><html><head><title>Trigger Workflow Storage Target</title></head><body><input id="name" value="" /><button id="apply">Apply</button><div id="status">Pending</div><script>document.getElementById('apply').addEventListener('click',()=>{document.getElementById('status').textContent=document.getElementById('name').value||'Pending';});</script></body></html>"#,
+        ),
+        (
+            "/trigger-source-workflow-storage",
+            "text/html",
+            r#"<!DOCTYPE html><html><head><title>Trigger Workflow Storage Source</title></head><body><div id="status">Waiting</div><script>localStorage.removeItem('reply_state');</script></body></html>"#,
+        ),
+        (
+            "/trigger-target-workflow-source-vars-blocked",
+            "text/html",
+            r#"<!DOCTYPE html><html><head><title>Trigger Workflow Source Vars Blocked Target</title></head><body><input id="name" value="" /><button id="apply">Apply</button><div id="status">Pending</div><script>document.getElementById('apply').addEventListener('click',()=>{document.getElementById('status').textContent=document.getElementById('name').value||'Pending';});</script></body></html>"#,
+        ),
+        (
+            "/trigger-source-workflow-source-vars-blocked",
+            "text/html",
+            r#"<!DOCTYPE html><html><head><title>Trigger Workflow Source Vars Blocked Source</title></head><body><div id="status">Waiting</div></body></html>"#,
+        ),
+        (
+            "/trigger-target-removed",
+            "text/html",
+            r#"<!DOCTYPE html><html><head><title>Trigger Removed Target</title></head><body><button id="continue" onclick="document.body.dataset.triggered='yes';document.getElementById('result').textContent='Triggered';">Continue</button><div id="result">Pending</div></body></html>"#,
+        ),
+        (
+            "/trigger-source-removed",
+            "text/html",
+            r#"<!DOCTYPE html><html><head><title>Trigger Removed Source</title></head><body><div id="status">Waiting</div><script>setTimeout(()=>{document.getElementById('status').textContent='Ready';},1800);</script></body></html>"#,
         ),
     ]);
 
-    let target_url = server.url_for("/trigger-target-workflow");
-    let source_url = server.url_for("/trigger-source-workflow");
+    let write_json_file = |name: &str, value: serde_json::Value| -> String {
+        let path = PathBuf::from(&home).join(name);
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        path.to_string_lossy().into_owned()
+    };
 
-    assert_eq!(
-        parse_json(&rub_cmd(&home).args(["open", &target_url]).output().unwrap())["success"],
-        true
-    );
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["exec", &format!("window.open('{source_url}', '_blank')")])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-
-    let tabs = wait_for_tabs_count(&home, 2);
-    let tabs = tabs["data"]["result"]["items"].as_array().unwrap();
-    let target_index = tabs
-        .iter()
-        .find(|tab| tab["title"].as_str() == Some("Trigger Workflow Target"))
-        .and_then(|tab| tab["index"].as_u64())
-        .expect("target tab should exist")
-        .to_string();
-    let source_index = tabs
-        .iter()
-        .find(|tab| tab["title"].as_str() == Some("Trigger Workflow Source"))
-        .and_then(|tab| tab["index"].as_u64())
-        .expect("source tab should exist")
-        .to_string();
-
-    let workflow_path = PathBuf::from(&home).join("workflows/reply_flow.json");
     std::fs::write(
-        &workflow_path,
+        PathBuf::from(&home).join("workflows/reply_flow.json"),
         serde_json::to_vec_pretty(&json!([
-            {
-                "command": "type",
-                "args": {
-                    "selector": "#name",
-                    "text": "Ada from trigger",
-                    "clear": true
-                }
-            },
-            {
-                "command": "click",
-                "args": {
-                    "selector": "#apply",
-                    "wait_after": {
-                        "text": "Ada from trigger",
-                        "timeout_ms": 5000
-                    }
-                }
-            }
+            {"command": "type", "args": {"selector": "#name", "text": "Ada from trigger", "clear": true}},
+            {"command": "click", "args": {"selector": "#apply", "wait_after": {"text": "Ada from trigger", "timeout_ms": 5000}}}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        PathBuf::from(&home).join("workflows/reply_flow_with_vars.json"),
+        serde_json::to_vec_pretty(&json!([
+            {"command": "type", "args": {"selector": "#name", "text": "{{reply_name}}", "clear": true}},
+            {"command": "click", "args": {"selector": "#apply", "wait_after": {"text": "{{reply_name}}", "timeout_ms": 5000}}}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        PathBuf::from(&home).join("workflows/reply_flow_with_source_vars.json"),
+        serde_json::to_vec_pretty(&json!([
+            {"command": "type", "args": {"selector": "#name", "text": "{{reply_name}}", "clear": true}},
+            {"command": "click", "args": {"selector": "#apply", "wait_after": {"text": "{{reply_name}}", "timeout_ms": 5000}}}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        PathBuf::from(&home).join("workflows/reply_flow_from_storage.json"),
+        serde_json::to_vec_pretty(&json!([
+            {"command": "type", "args": {"selector": "#name", "text": "Storage triggered", "clear": true}},
+            {"command": "click", "args": {"selector": "#apply", "wait_after": {"text": "Storage triggered", "timeout_ms": 5000}}}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        PathBuf::from(&home).join("workflows/reply_flow_missing_source_var.json"),
+        serde_json::to_vec_pretty(&json!([
+            {"command": "type", "args": {"selector": "#name", "text": "{{reply_name}}", "clear": true}}
         ]))
         .unwrap(),
     )
     .unwrap();
 
+    let mut expected_tabs = 0_u64;
+    let mut bootstrap = true;
+    let open_pair = |expected_tabs_ref: &mut u64,
+                     bootstrap_ref: &mut bool,
+                     target_url: &str,
+                     source_url: &str,
+                     target_title: &str,
+                     source_title: &str|
+     -> (String, String) {
+        if *bootstrap_ref {
+            let opened = parse_json(&session.cmd().args(["open", target_url]).output().unwrap());
+            assert_eq!(opened["success"], true, "{opened}");
+            let source_opened = parse_json(
+                &session
+                    .cmd()
+                    .args(["exec", &format!("window.open('{source_url}', '_blank')")])
+                    .output()
+                    .unwrap(),
+            );
+            assert_eq!(source_opened["success"], true, "{source_opened}");
+            *bootstrap_ref = false;
+        } else {
+            let opened = parse_json(
+                &session
+                    .cmd()
+                    .args([
+                        "exec",
+                        &format!(
+                            "window.open('{target_url}', '_blank'); window.open('{source_url}', '_blank'); null"
+                        ),
+                    ])
+                    .output()
+                    .unwrap(),
+            );
+            assert_eq!(opened["success"], true, "{opened}");
+        }
+        *expected_tabs_ref += 2;
+        let tabs = wait_for_tabs_count(&home, *expected_tabs_ref);
+        let tabs = tabs["data"]["result"]["items"].as_array().unwrap();
+        let target_index = tabs
+            .iter()
+            .find(|tab| tab["title"].as_str() == Some(target_title))
+            .and_then(|tab| tab["index"].as_u64())
+            .expect("target tab should exist")
+            .to_string();
+        let source_index = tabs
+            .iter()
+            .find(|tab| tab["title"].as_str() == Some(source_title))
+            .and_then(|tab| tab["index"].as_u64())
+            .expect("source tab should exist")
+            .to_string();
+        (target_index, source_index)
+    };
+    let _reset_tabs = |expected_tabs_ref: &mut u64, bootstrap_ref: &mut bool| {
+        let closed = parse_json(&session.cmd().args(["close", "--all"]).output().unwrap());
+        assert_eq!(closed["success"], true, "{closed}");
+        *expected_tabs_ref = 0;
+        *bootstrap_ref = true;
+    };
+
+    let (target_index, source_index) = open_pair(
+        &mut expected_tabs,
+        &mut bootstrap,
+        &server.url_for("/trigger-target-workflow"),
+        &server.url_for("/trigger-source-workflow"),
+        "Trigger Workflow Target",
+        "Trigger Workflow Source",
+    );
     let switched = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["switch", &source_index])
             .output()
             .unwrap(),
     );
     assert_eq!(switched["success"], true, "{switched}");
-
-    let spec_path = format!("{home}/trigger-workflow.json");
-    std::fs::write(
-        &spec_path,
-        serde_json::to_vec_pretty(&json!({
+    let spec_path = write_json_file(
+        "trigger-workflow.json",
+        json!({
             "source_tab": source_index.parse::<u64>().unwrap(),
             "target_tab": target_index.parse::<u64>().unwrap(),
             "mode": "once",
-            "condition": {
-                "kind": "text_present",
-                "text": "Ready"
-            },
-            "action": {
-                "kind": "workflow",
-                "payload": {
-                    "workflow_name": "reply_flow"
-                }
-            }
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
+            "condition": {"kind": "text_present", "text": "Ready"},
+            "action": {"kind": "workflow", "payload": {"workflow_name": "reply_flow"}}
+        }),
+    );
     let added = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["trigger", "add", "--file", &spec_path])
             .output()
             .unwrap(),
     );
     assert_eq!(added["success"], true, "{added}");
-    let trigger_id = added["data"]["result"]["trigger"]["id"]
-        .as_u64()
-        .expect("trigger id should be present");
-
-    let fired = wait_for_trigger_status(&home, trigger_id, "fired");
+    let trigger_id = added["data"]["result"]["trigger"]["id"].as_u64().unwrap();
+    let mut fired = serde_json::Value::Null;
+    for _ in 0..120 {
+        let out = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
+        if out["success"] == true
+            && let Some(trigger) = out["data"]["result"]["items"].as_array().and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["id"].as_u64() == Some(trigger_id))
+            })
+            && trigger["status"].as_str() == Some("fired")
+        {
+            fired = out;
+            break;
+        }
+        fired = out;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_ne!(fired, serde_json::Value::Null);
     let trigger = fired["data"]["result"]["items"]
         .as_array()
         .unwrap()
         .iter()
         .find(|entry| entry["id"].as_u64() == Some(trigger_id))
-        .expect("fired trigger should remain in runtime projection");
+        .unwrap();
+    assert_eq!(trigger["status"], "fired", "{fired}");
     assert_eq!(trigger["last_action_result"]["status"], "fired", "{fired}");
     assert!(
         trigger["last_action_result"]["summary"]
@@ -1298,16 +1380,27 @@ fn t437g_trigger_fires_named_workflow_on_target_tab() {
             .contains("workflow 'reply_flow'"),
         "{fired}"
     );
-
+    assert_eq!(
+        trigger["last_action_result"]["action"]["workflow_path_state"]["path_authority"],
+        "automation.action.workflow_path",
+        "{fired}"
+    );
+    assert_eq!(
+        trigger["last_action_result"]["action"]["workflow_path_state"]["upstream_truth"],
+        "trigger_action_payload.workflow_name",
+        "{fired}"
+    );
     let switched_target = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["switch", &target_index])
             .output()
             .unwrap(),
     );
     assert_eq!(switched_target["success"], true, "{switched_target}");
     let inspected = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["inspect", "text", "--selector", "#status"])
             .output()
             .unwrap(),
@@ -1318,166 +1411,92 @@ fn t437g_trigger_fires_named_workflow_on_target_tab() {
         "{inspected}"
     );
 
-    cleanup(&home);
-}
-
-/// T437h: workflow-backed triggers should support explicit payload.vars bindings on the canonical bridge.
-#[test]
-#[ignore]
-#[serial]
-fn t437h_trigger_named_workflow_supports_explicit_vars() {
-    let home = unique_home();
-    cleanup(&home);
-    std::fs::create_dir_all(PathBuf::from(&home).join("workflows")).unwrap();
-
-    let (_rt, server) = start_test_server(vec![
-        (
-            "/trigger-target-workflow-vars",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Trigger Workflow Vars Target</title></head>
-<body>
-  <input id="name" value="" />
-  <button id="apply">Apply</button>
-  <div id="status">Pending</div>
-  <script>
-    document.getElementById('apply').addEventListener('click', () => {
-      document.getElementById('status').textContent =
-        document.getElementById('name').value || 'Pending';
-    });
-  </script>
-</body>
-</html>"#,
-        ),
-        (
-            "/trigger-source-workflow-vars",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Trigger Workflow Vars Source</title></head>
-<body>
-  <div id="status">Waiting</div>
-  <script>
-    setTimeout(() => {
-      document.getElementById('status').textContent = 'Ready';
-    }, 1200);
-  </script>
-</body>
-</html>"#,
-        ),
-    ]);
-
-    let target_url = server.url_for("/trigger-target-workflow-vars");
-    let source_url = server.url_for("/trigger-source-workflow-vars");
-
-    assert_eq!(
-        parse_json(&rub_cmd(&home).args(["open", &target_url]).output().unwrap())["success"],
-        true
+    let (target_index, source_index) = open_pair(
+        &mut expected_tabs,
+        &mut bootstrap,
+        &server.url_for("/trigger-target-workflow-vars"),
+        &server.url_for("/trigger-source-workflow-vars"),
+        "Trigger Workflow Vars Target",
+        "Trigger Workflow Vars Source",
     );
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["exec", &format!("window.open('{source_url}', '_blank')")])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-
-    let tabs = wait_for_tabs_count(&home, 2);
-    let tabs = tabs["data"]["result"]["items"].as_array().unwrap();
-    let target_index = tabs
-        .iter()
-        .find(|tab| tab["title"].as_str() == Some("Trigger Workflow Vars Target"))
-        .and_then(|tab| tab["index"].as_u64())
-        .expect("target tab should exist")
-        .to_string();
-    let source_index = tabs
-        .iter()
-        .find(|tab| tab["title"].as_str() == Some("Trigger Workflow Vars Source"))
-        .and_then(|tab| tab["index"].as_u64())
-        .expect("source tab should exist")
-        .to_string();
-
-    let workflow_path = PathBuf::from(&home).join("workflows/reply_flow_with_vars.json");
-    std::fs::write(
-        &workflow_path,
-        serde_json::to_vec_pretty(&json!([
-            {
-                "command": "type",
-                "args": {
-                    "selector": "#name",
-                    "text": "{{reply_name}}",
-                    "clear": true
-                }
-            },
-            {
-                "command": "click",
-                "args": {
-                    "selector": "#apply",
-                    "wait_after": {
-                        "text": "{{reply_name}}",
-                        "timeout_ms": 5000
-                    }
-                }
-            }
-        ]))
-        .unwrap(),
-    )
-    .unwrap();
-
     let switched = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["switch", &source_index])
             .output()
             .unwrap(),
     );
     assert_eq!(switched["success"], true, "{switched}");
-
-    let spec_path = format!("{home}/trigger-workflow-vars.json");
-    std::fs::write(
-        &spec_path,
-        serde_json::to_vec_pretty(&json!({
+    let spec_path = write_json_file(
+        "trigger-workflow-vars.json",
+        json!({
             "source_tab": source_index.parse::<u64>().unwrap(),
             "target_tab": target_index.parse::<u64>().unwrap(),
             "mode": "once",
-            "condition": {
-                "kind": "text_present",
-                "text": "Ready"
-            },
-            "action": {
-                "kind": "workflow",
-                "payload": {
-                    "workflow_name": "reply_flow_with_vars",
-                    "vars": {
-                        "reply_name": "Grace from trigger"
-                    }
-                }
-            }
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
+            "condition": {"kind": "text_present", "text": "Ready"},
+            "action": {"kind": "workflow", "payload": {"workflow_name": "reply_flow_with_vars", "vars": {"reply_name": "Grace from trigger"}}}
+        }),
+    );
     let added = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["trigger", "add", "--file", &spec_path])
             .output()
             .unwrap(),
     );
     assert_eq!(added["success"], true, "{added}");
-    let trigger_id = added["data"]["result"]["trigger"]["id"]
-        .as_u64()
-        .expect("trigger id should be present");
-
-    let fired = wait_for_trigger_status(&home, trigger_id, "fired");
+    let trigger_id = added["data"]["result"]["trigger"]["id"].as_u64().unwrap();
+    let switched = parse_json(
+        &session
+            .cmd()
+            .args(["switch", &source_index])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(switched["success"], true, "{switched}");
+    let seeded = parse_json(
+        &session
+            .cmd()
+            .args([
+                "exec",
+                "localStorage.setItem('reply_state','ready'); 'seeded'",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(seeded["success"], true, "{seeded}");
+    let mut fired = serde_json::Value::Null;
+    for _ in 0..120 {
+        let out = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
+        if out["success"] == true
+            && let Some(trigger) = out["data"]["result"]["items"].as_array().and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["id"].as_u64() == Some(trigger_id))
+            })
+            && trigger["status"].as_str() == Some("fired")
+        {
+            fired = out;
+            break;
+        }
+        fired = out;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let trigger = fired["data"]["result"]["items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|entry| entry["id"].as_u64() == Some(trigger_id))
+        })
+        .unwrap_or_else(|| panic!("storage trigger should remain visible: {fired}"));
+    assert_eq!(trigger["status"], "fired", "{fired}");
     let trigger = fired["data"]["result"]["items"]
         .as_array()
         .unwrap()
         .iter()
         .find(|entry| entry["id"].as_u64() == Some(trigger_id))
-        .expect("fired trigger should remain in runtime projection");
+        .unwrap();
     assert_eq!(trigger["last_action_result"]["status"], "fired", "{fired}");
     assert_eq!(
         trigger["last_action_result"]["action"]["kind"], "workflow",
@@ -1492,16 +1511,17 @@ fn t437h_trigger_named_workflow_supports_explicit_vars() {
         json!(["reply_name"]),
         "{fired}"
     );
-
     let switched_target = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["switch", &target_index])
             .output()
             .unwrap(),
     );
     assert_eq!(switched_target["success"], true, "{switched_target}");
     let inspected = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["inspect", "text", "--selector", "#status"])
             .output()
             .unwrap(),
@@ -1511,171 +1531,340 @@ fn t437h_trigger_named_workflow_supports_explicit_vars() {
         inspected["data"]["result"]["value"], "Grace from trigger",
         "{inspected}"
     );
-
-    cleanup(&home);
 }
 
-/// T437i: workflow-backed triggers should support source-derived vars resolved through source-tab live read authority.
+/// T437i-T437l: source vars, storage-backed workflows, blocked source vars, and removed-trigger fences should share one browser-backed scenario.
 #[test]
 #[ignore]
 #[serial]
-fn t437i_trigger_named_workflow_supports_source_derived_vars() {
-    let home = unique_home();
-    cleanup(&home);
+fn t437i_l_trigger_source_vars_storage_blocked_and_removed_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home().to_string();
     std::fs::create_dir_all(PathBuf::from(&home).join("workflows")).unwrap();
 
     let (_rt, server) = start_test_server(vec![
         (
             "/trigger-target-workflow-source-vars",
             "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Trigger Workflow Source Vars Target</title></head>
-<body>
-  <input id="name" value="" />
-  <button id="apply">Apply</button>
-  <div id="status">Pending</div>
-  <script>
-    document.getElementById('apply').addEventListener('click', () => {
-      document.getElementById('status').textContent =
-        document.getElementById('name').value || 'Pending';
-    });
-  </script>
-</body>
-</html>"#,
+            r#"<!DOCTYPE html><html><head><title>Trigger Workflow Source Vars Target</title></head><body><input id="name" value="" /><button id="apply">Apply</button><div id="status">Pending</div><script>document.getElementById('apply').addEventListener('click',()=>{document.getElementById('status').textContent=document.getElementById('name').value||'Pending';});</script></body></html>"#,
         ),
         (
             "/trigger-source-workflow-source-vars",
             "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Trigger Workflow Source Vars Source</title></head>
-<body>
-  <div id="question">Answer from source tab</div>
-  <div id="status">Waiting</div>
-  <script>
-    setTimeout(() => {
-      document.getElementById('status').textContent = 'Ready';
-    }, 1200);
-  </script>
-</body>
-</html>"#,
+            r#"<!DOCTYPE html><html><head><title>Trigger Workflow Source Vars Source</title></head><body><div id="question">Answer from source tab</div><div id="status">Waiting</div><script>setTimeout(()=>{document.getElementById('status').textContent='Ready';},1200);</script></body></html>"#,
+        ),
+        (
+            "/trigger-target-workflow-storage",
+            "text/html",
+            r#"<!DOCTYPE html><html><head><title>Trigger Workflow Storage Target</title></head><body><input id="name" value="" /><button id="apply">Apply</button><div id="status">Pending</div><script>document.getElementById('apply').addEventListener('click',()=>{document.getElementById('status').textContent=document.getElementById('name').value||'Pending';});</script></body></html>"#,
+        ),
+        (
+            "/trigger-source-workflow-storage",
+            "text/html",
+            r#"<!DOCTYPE html><html><head><title>Trigger Workflow Storage Source</title></head><body><div id="status">Waiting</div><script>localStorage.removeItem('reply_state');</script></body></html>"#,
+        ),
+        (
+            "/trigger-target-workflow-source-vars-blocked",
+            "text/html",
+            r#"<!DOCTYPE html><html><head><title>Trigger Workflow Source Vars Blocked Target</title></head><body><input id="name" value="" /><button id="apply">Apply</button><div id="status">Pending</div><script>document.getElementById('apply').addEventListener('click',()=>{document.getElementById('status').textContent=document.getElementById('name').value||'Pending';});</script></body></html>"#,
+        ),
+        (
+            "/trigger-source-workflow-source-vars-blocked",
+            "text/html",
+            r#"<!DOCTYPE html><html><head><title>Trigger Workflow Source Vars Blocked Source</title></head><body><div id="status">Waiting</div><script>setTimeout(()=>{document.getElementById('status').textContent='Ready';},1200);</script></body></html>"#,
+        ),
+        (
+            "/trigger-target-removed",
+            "text/html",
+            r#"<!DOCTYPE html><html><head><title>Trigger Removed Target</title></head><body><button id="continue" onclick="document.body.dataset.triggered='yes';document.getElementById('result').textContent='Triggered';">Continue</button><div id="result">Pending</div></body></html>"#,
+        ),
+        (
+            "/trigger-source-removed",
+            "text/html",
+            r#"<!DOCTYPE html><html><head><title>Trigger Removed Source</title></head><body><div id="status">Waiting</div><script>setTimeout(()=>{document.getElementById('status').textContent='Ready';},1800);</script></body></html>"#,
         ),
     ]);
 
-    let target_url = server.url_for("/trigger-target-workflow-source-vars");
-    let source_url = server.url_for("/trigger-source-workflow-source-vars");
+    let write_json_file = |name: &str, value: serde_json::Value| -> String {
+        let path = PathBuf::from(&home).join(name);
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        path.to_string_lossy().into_owned()
+    };
 
-    assert_eq!(
-        parse_json(&rub_cmd(&home).args(["open", &target_url]).output().unwrap())["success"],
-        true
-    );
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["exec", &format!("window.open('{source_url}', '_blank')")])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-
-    let tabs = wait_for_tabs_count(&home, 2);
-    let tabs = tabs["data"]["result"]["items"].as_array().unwrap();
-    let target_index = tabs
-        .iter()
-        .find(|tab| tab["title"].as_str() == Some("Trigger Workflow Source Vars Target"))
-        .and_then(|tab| tab["index"].as_u64())
-        .expect("target tab should exist")
-        .to_string();
-    let source_index = tabs
-        .iter()
-        .find(|tab| tab["title"].as_str() == Some("Trigger Workflow Source Vars Source"))
-        .and_then(|tab| tab["index"].as_u64())
-        .expect("source tab should exist")
-        .to_string();
-
-    let workflow_path = PathBuf::from(&home).join("workflows/reply_flow_with_source_vars.json");
     std::fs::write(
-        &workflow_path,
+        PathBuf::from(&home).join("workflows/reply_flow_with_source_vars.json"),
         serde_json::to_vec_pretty(&json!([
-            {
-                "command": "type",
-                "args": {
-                    "selector": "#name",
-                    "text": "{{reply_name}}",
-                    "clear": true
-                }
-            },
-            {
-                "command": "click",
-                "args": {
-                    "selector": "#apply",
-                    "wait_after": {
-                        "text": "{{reply_name}}",
-                        "timeout_ms": 5000
-                    }
-                }
-            }
+            {"command": "type", "args": {"selector": "#name", "text": "{{reply_name}}", "clear": true}},
+            {"command": "click", "args": {"selector": "#apply", "wait_after": {"text": "{{reply_name}}", "timeout_ms": 5000}}}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        PathBuf::from(&home).join("workflows/reply_flow_from_storage.json"),
+        serde_json::to_vec_pretty(&json!([
+            {"command": "type", "args": {"selector": "#name", "text": "Storage triggered", "clear": true}},
+            {"command": "click", "args": {"selector": "#apply", "wait_after": {"text": "Storage triggered", "timeout_ms": 5000}}}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        PathBuf::from(&home).join("workflows/reply_flow_missing_source_var.json"),
+        serde_json::to_vec_pretty(&json!([
+            {"command": "type", "args": {"selector": "#name", "text": "{{reply_name}}", "clear": true}}
         ]))
         .unwrap(),
     )
     .unwrap();
 
+    let mut expected_tabs = 0_u64;
+    let mut bootstrap = true;
+    let open_pair = |expected_tabs_ref: &mut u64,
+                     bootstrap_ref: &mut bool,
+                     target_url: &str,
+                     source_url: &str,
+                     target_title: &str,
+                     source_title: &str|
+     -> (String, String) {
+        if *bootstrap_ref {
+            let opened = parse_json(&session.cmd().args(["open", target_url]).output().unwrap());
+            assert_eq!(opened["success"], true, "{opened}");
+            let source_opened = parse_json(
+                &session
+                    .cmd()
+                    .args(["exec", &format!("window.open('{source_url}', '_blank')")])
+                    .output()
+                    .unwrap(),
+            );
+            assert_eq!(source_opened["success"], true, "{source_opened}");
+            *bootstrap_ref = false;
+        } else {
+            let opened = parse_json(
+                &session
+                    .cmd()
+                    .args([
+                        "exec",
+                        &format!(
+                            "window.open('{target_url}', '_blank'); window.open('{source_url}', '_blank'); null"
+                        ),
+                    ])
+                    .output()
+                    .unwrap(),
+            );
+            assert_eq!(opened["success"], true, "{opened}");
+        }
+        *expected_tabs_ref += 2;
+        let tabs = wait_for_tabs_count(&home, *expected_tabs_ref);
+        let tabs = tabs["data"]["result"]["items"].as_array().unwrap();
+        let target_index = tabs
+            .iter()
+            .find(|tab| tab["title"].as_str() == Some(target_title))
+            .and_then(|tab| tab["index"].as_u64())
+            .expect("target tab should exist")
+            .to_string();
+        let source_index = tabs
+            .iter()
+            .find(|tab| tab["title"].as_str() == Some(source_title))
+            .and_then(|tab| tab["index"].as_u64())
+            .expect("source tab should exist")
+            .to_string();
+        (target_index, source_index)
+    };
+    let reset_tabs = |expected_tabs_ref: &mut u64, bootstrap_ref: &mut bool| {
+        let closed = parse_json(&session.cmd().args(["close", "--all"]).output().unwrap());
+        assert_eq!(closed["success"], true, "{closed}");
+        *expected_tabs_ref = 0;
+        *bootstrap_ref = true;
+    };
+
+    let (target_index, source_index) = open_pair(
+        &mut expected_tabs,
+        &mut bootstrap,
+        &server.url_for("/trigger-target-removed"),
+        &server.url_for("/trigger-source-removed"),
+        "Trigger Removed Target",
+        "Trigger Removed Source",
+    );
     let switched = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["switch", &source_index])
             .output()
             .unwrap(),
     );
     assert_eq!(switched["success"], true, "{switched}");
-
-    let spec_path = format!("{home}/trigger-workflow-source-vars.json");
-    std::fs::write(
-        &spec_path,
-        serde_json::to_vec_pretty(&json!({
+    let spec_path = write_json_file(
+        "trigger-removed.json",
+        json!({
             "source_tab": source_index.parse::<u64>().unwrap(),
             "target_tab": target_index.parse::<u64>().unwrap(),
             "mode": "once",
-            "condition": {
-                "kind": "text_present",
-                "text": "Ready"
-            },
-            "action": {
-                "kind": "workflow",
-                "payload": {
-                    "workflow_name": "reply_flow_with_source_vars",
-                    "source_vars": {
-                        "reply_name": {
-                            "kind": "text",
-                            "selector": "#question"
-                        }
-                    }
-                }
-            }
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
+            "condition": {"kind": "text_present", "text": "Ready"},
+            "action": {"kind": "browser_command", "command": "click", "payload": {"selector": "#continue"}}
+        }),
+    );
     let added = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["trigger", "add", "--file", &spec_path])
             .output()
             .unwrap(),
     );
     assert_eq!(added["success"], true, "{added}");
-    let trigger_id = added["data"]["result"]["trigger"]["id"]
-        .as_u64()
-        .expect("trigger id should be present");
+    let trigger_id = added["data"]["result"]["trigger"]["id"].as_u64().unwrap();
+    let removed = parse_json(
+        &session
+            .cmd()
+            .args(["trigger", "remove", &trigger_id.to_string()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(removed["success"], true, "{removed}");
+    assert_eq!(
+        removed["data"]["result"]["removed"]["id"], trigger_id,
+        "{removed}"
+    );
+    std::thread::sleep(Duration::from_millis(2600));
+    let listed = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
+    assert_eq!(listed["success"], true, "{listed}");
+    assert!(
+        listed["data"]["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["id"].as_u64() != Some(trigger_id)),
+        "{listed}"
+    );
+    assert!(listed["data"]["last_trigger_result"].is_null(), "{listed}");
+    let trace = parse_json(
+        &session
+            .cmd()
+            .args(["trigger", "trace", "--last", "5"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(trace["success"], true, "{trace}");
+    let events = trace["data"]["result"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2, "{trace}");
+    assert_eq!(events[0]["kind"], "registered", "{trace}");
+    assert_eq!(events[0]["trigger_id"], trigger_id, "{trace}");
+    assert_eq!(events[1]["kind"], "removed", "{trace}");
+    assert_eq!(events[1]["trigger_id"], trigger_id, "{trace}");
+    assert!(
+        events
+            .iter()
+            .all(|event| event["kind"].as_str() != Some("fired")),
+        "{trace}"
+    );
+    let switched_target = parse_json(
+        &session
+            .cmd()
+            .args(["switch", &target_index])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(switched_target["success"], true, "{switched_target}");
+    let inspected = parse_json(
+        &session
+            .cmd()
+            .args(["inspect", "text", "--selector", "#result"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(inspected["success"], true, "{inspected}");
+    assert_eq!(
+        inspected["data"]["result"]["value"], "Pending",
+        "{inspected}"
+    );
+    reset_tabs(&mut expected_tabs, &mut bootstrap);
 
-    let fired = wait_for_trigger_status(&home, trigger_id, "fired");
+    let (target_index, source_index) = open_pair(
+        &mut expected_tabs,
+        &mut bootstrap,
+        &server.url_for("/trigger-target-workflow-source-vars"),
+        &server.url_for("/trigger-source-workflow-source-vars"),
+        "Trigger Workflow Source Vars Target",
+        "Trigger Workflow Source Vars Source",
+    );
+    let switched = parse_json(
+        &session
+            .cmd()
+            .args(["switch", &source_index])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(switched["success"], true, "{switched}");
+    let spec_path = write_json_file(
+        "trigger-workflow-source-vars.json",
+        json!({
+            "source_tab": source_index.parse::<u64>().unwrap(),
+            "target_tab": target_index.parse::<u64>().unwrap(),
+            "mode": "once",
+            "condition": {"kind": "text_present", "text": "Ready"},
+            "action": {
+                "kind": "workflow",
+                "payload": {
+                    "workflow_name": "reply_flow_with_source_vars",
+                    "source_vars": {
+                        "reply_name": {"kind": "text", "selector": "#question"}
+                    }
+                }
+            }
+        }),
+    );
+    let added = parse_json(
+        &session
+            .cmd()
+            .args(["trigger", "add", "--file", &spec_path])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(added["success"], true, "{added}");
+    let trigger_id = added["data"]["result"]["trigger"]["id"].as_u64().unwrap();
+    let switched = parse_json(
+        &session
+            .cmd()
+            .args(["switch", &source_index])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(switched["success"], true, "{switched}");
+    let seeded = parse_json(
+        &session
+            .cmd()
+            .args([
+                "exec",
+                "localStorage.setItem('reply_state','ready'); 'seeded'",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(seeded["success"], true, "{seeded}");
+    let mut fired = serde_json::Value::Null;
+    for _ in 0..120 {
+        let out = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
+        if out["success"] == true
+            && let Some(trigger) = out["data"]["result"]["items"].as_array().and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["id"].as_u64() == Some(trigger_id))
+            })
+            && trigger["status"].as_str() == Some("fired")
+        {
+            fired = out;
+            break;
+        }
+        fired = out;
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let trigger = fired["data"]["result"]["items"]
         .as_array()
         .unwrap()
         .iter()
         .find(|entry| entry["id"].as_u64() == Some(trigger_id))
-        .expect("fired trigger should remain in runtime projection");
+        .unwrap();
+    assert_eq!(trigger["status"], "fired", "{fired}");
     assert_eq!(trigger["last_action_result"]["status"], "fired", "{fired}");
     assert_eq!(
         trigger["last_action_result"]["action"]["kind"], "workflow",
@@ -1690,16 +1879,17 @@ fn t437i_trigger_named_workflow_supports_source_derived_vars() {
         json!(["reply_name"]),
         "{fired}"
     );
-
     let switched_target = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["switch", &target_index])
             .output()
             .unwrap(),
     );
     assert_eq!(switched_target["success"], true, "{switched_target}");
     let inspected = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["inspect", "text", "--selector", "#status"])
             .output()
             .unwrap(),
@@ -1709,130 +1899,27 @@ fn t437i_trigger_named_workflow_supports_source_derived_vars() {
         inspected["data"]["result"]["value"], "Answer from source tab",
         "{inspected}"
     );
+    reset_tabs(&mut expected_tabs, &mut bootstrap);
 
-    cleanup(&home);
-}
-
-/// T437j: storage_value source conditions should fire a named workflow on the target tab.
-#[test]
-#[ignore]
-#[serial]
-fn t437j_trigger_storage_value_fires_named_workflow() {
-    let home = unique_home();
-    cleanup(&home);
-    std::fs::create_dir_all(PathBuf::from(&home).join("workflows")).unwrap();
-
-    let (_rt, server) = start_test_server(vec![
-        (
-            "/trigger-target-workflow-storage",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Trigger Workflow Storage Target</title></head>
-<body>
-  <input id="name" value="" />
-  <button id="apply">Apply</button>
-  <div id="status">Pending</div>
-  <script>
-    document.getElementById('apply').addEventListener('click', () => {
-      document.getElementById('status').textContent =
-        document.getElementById('name').value || 'Pending';
-    });
-  </script>
-</body>
-</html>"#,
-        ),
-        (
-            "/trigger-source-workflow-storage",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Trigger Workflow Storage Source</title></head>
-<body>
-  <div id="status">Waiting</div>
-  <script>
-    localStorage.removeItem('reply_state');
-    setTimeout(() => {
-      localStorage.setItem('reply_state', 'ready');
-      document.getElementById('status').textContent = 'Storage ready';
-    }, 1200);
-  </script>
-</body>
-</html>"#,
-        ),
-    ]);
-
-    let target_url = server.url_for("/trigger-target-workflow-storage");
-    let source_url = server.url_for("/trigger-source-workflow-storage");
-
-    assert_eq!(
-        parse_json(&rub_cmd(&home).args(["open", &target_url]).output().unwrap())["success"],
-        true
+    let (target_index, source_index) = open_pair(
+        &mut expected_tabs,
+        &mut bootstrap,
+        &server.url_for("/trigger-target-workflow-storage"),
+        &server.url_for("/trigger-source-workflow-storage"),
+        "Trigger Workflow Storage Target",
+        "Trigger Workflow Storage Source",
     );
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["exec", &format!("window.open('{source_url}', '_blank')")])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-
-    let tabs = wait_for_tabs_count(&home, 2);
-    let tabs = tabs["data"]["result"]["items"].as_array().unwrap();
-    let target_index = tabs
-        .iter()
-        .find(|tab| tab["title"].as_str() == Some("Trigger Workflow Storage Target"))
-        .and_then(|tab| tab["index"].as_u64())
-        .expect("target tab should exist")
-        .to_string();
-    let source_index = tabs
-        .iter()
-        .find(|tab| tab["title"].as_str() == Some("Trigger Workflow Storage Source"))
-        .and_then(|tab| tab["index"].as_u64())
-        .expect("source tab should exist")
-        .to_string();
-
-    let workflow_path = PathBuf::from(&home).join("workflows/reply_flow_from_storage.json");
-    std::fs::write(
-        &workflow_path,
-        serde_json::to_vec_pretty(&json!([
-            {
-                "command": "type",
-                "args": {
-                    "selector": "#name",
-                    "text": "Storage triggered",
-                    "clear": true
-                }
-            },
-            {
-                "command": "click",
-                "args": {
-                    "selector": "#apply",
-                    "wait_after": {
-                        "text": "Storage triggered",
-                        "timeout_ms": 5000
-                    }
-                }
-            }
-        ]))
-        .unwrap(),
-    )
-    .unwrap();
-
     let switched = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["switch", &source_index])
             .output()
             .unwrap(),
     );
     assert_eq!(switched["success"], true, "{switched}");
-
-    let spec_path = format!("{home}/trigger-workflow-storage.json");
-    std::fs::write(
-        &spec_path,
-        serde_json::to_vec_pretty(&json!({
+    let spec_path = write_json_file(
+        "trigger-workflow-storage.json",
+        json!({
             "source_tab": source_index.parse::<u64>().unwrap(),
             "target_tab": target_index.parse::<u64>().unwrap(),
             "mode": "once",
@@ -1842,35 +1929,61 @@ fn t437j_trigger_storage_value_fires_named_workflow() {
                 "key": "reply_state",
                 "value": "ready"
             },
-            "action": {
-                "kind": "workflow",
-                "payload": {
-                    "workflow_name": "reply_flow_from_storage"
-                }
-            }
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
+            "action": {"kind": "workflow", "payload": {"workflow_name": "reply_flow_from_storage"}}
+        }),
+    );
     let added = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["trigger", "add", "--file", &spec_path])
             .output()
             .unwrap(),
     );
     assert_eq!(added["success"], true, "{added}");
-    let trigger_id = added["data"]["result"]["trigger"]["id"]
-        .as_u64()
-        .expect("trigger id should be present");
-
-    let fired = wait_for_trigger_status(&home, trigger_id, "fired");
+    let trigger_id = added["data"]["result"]["trigger"]["id"].as_u64().unwrap();
+    let switched = parse_json(
+        &session
+            .cmd()
+            .args(["switch", &source_index])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(switched["success"], true, "{switched}");
+    let seeded = parse_json(
+        &session
+            .cmd()
+            .args([
+                "exec",
+                "localStorage.setItem('reply_state','ready'); 'seeded'",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(seeded["success"], true, "{seeded}");
+    let mut fired = serde_json::Value::Null;
+    for _ in 0..120 {
+        let out = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
+        if out["success"] == true
+            && let Some(trigger) = out["data"]["result"]["items"].as_array().and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["id"].as_u64() == Some(trigger_id))
+            })
+            && trigger["status"].as_str() == Some("fired")
+        {
+            fired = out;
+            break;
+        }
+        fired = out;
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let trigger = fired["data"]["result"]["items"]
         .as_array()
         .unwrap()
         .iter()
         .find(|entry| entry["id"].as_u64() == Some(trigger_id))
-        .expect("fired trigger should remain in runtime projection");
+        .unwrap();
+    assert_eq!(trigger["status"], "fired", "{fired}");
     assert_eq!(trigger["last_action_result"]["status"], "fired", "{fired}");
     assert_eq!(
         trigger["last_condition_evidence"]["summary"], "source_tab_storage_matched:reply_state",
@@ -1880,16 +1993,17 @@ fn t437j_trigger_storage_value_fires_named_workflow() {
         trigger["last_action_result"]["action"]["workflow_name"], "reply_flow_from_storage",
         "{fired}"
     );
-
     let switched_target = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["switch", &target_index])
             .output()
             .unwrap(),
     );
     assert_eq!(switched_target["success"], true, "{switched_target}");
     let inspected = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["inspect", "text", "--selector", "#status"])
             .output()
             .unwrap(),
@@ -1899,160 +2013,93 @@ fn t437j_trigger_storage_value_fires_named_workflow() {
         inspected["data"]["result"]["value"], "Storage triggered",
         "{inspected}"
     );
+    reset_tabs(&mut expected_tabs, &mut bootstrap);
 
-    cleanup(&home);
-}
-
-/// T437k: source_vars resolution failures should block workflow-backed triggers with explainable results.
-#[test]
-#[ignore]
-#[serial]
-fn t437k_trigger_source_var_resolution_failure_is_blocked() {
-    let home = unique_home();
-    cleanup(&home);
-    std::fs::create_dir_all(PathBuf::from(&home).join("workflows")).unwrap();
-
-    let (_rt, server) = start_test_server(vec![
-        (
-            "/trigger-target-workflow-source-vars-blocked",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Trigger Workflow Source Vars Blocked Target</title></head>
-<body>
-  <input id="name" value="" />
-  <button id="apply">Apply</button>
-  <div id="status">Pending</div>
-  <script>
-    document.getElementById('apply').addEventListener('click', () => {
-      document.getElementById('status').textContent =
-        document.getElementById('name').value || 'Pending';
-    });
-  </script>
-</body>
-</html>"#,
-        ),
-        (
-            "/trigger-source-workflow-source-vars-blocked",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Trigger Workflow Source Vars Blocked Source</title></head>
-<body>
-  <div id="status">Waiting</div>
-  <script>
-    setTimeout(() => {
-      document.getElementById('status').textContent = 'Ready';
-    }, 1200);
-  </script>
-</body>
-</html>"#,
-        ),
-    ]);
-
-    let target_url = server.url_for("/trigger-target-workflow-source-vars-blocked");
-    let source_url = server.url_for("/trigger-source-workflow-source-vars-blocked");
-
-    assert_eq!(
-        parse_json(&rub_cmd(&home).args(["open", &target_url]).output().unwrap())["success"],
-        true
+    let (target_index, source_index) = open_pair(
+        &mut expected_tabs,
+        &mut bootstrap,
+        &server.url_for("/trigger-target-workflow-source-vars-blocked"),
+        &server.url_for("/trigger-source-workflow-source-vars-blocked"),
+        "Trigger Workflow Source Vars Blocked Target",
+        "Trigger Workflow Source Vars Blocked Source",
     );
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["exec", &format!("window.open('{source_url}', '_blank')")])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-
-    let tabs = wait_for_tabs_count(&home, 2);
-    let tabs = tabs["data"]["result"]["items"].as_array().unwrap();
-    let target_index = tabs
-        .iter()
-        .find(|tab| tab["title"].as_str() == Some("Trigger Workflow Source Vars Blocked Target"))
-        .and_then(|tab| tab["index"].as_u64())
-        .expect("target tab should exist")
-        .to_string();
-    let source_index = tabs
-        .iter()
-        .find(|tab| tab["title"].as_str() == Some("Trigger Workflow Source Vars Blocked Source"))
-        .and_then(|tab| tab["index"].as_u64())
-        .expect("source tab should exist")
-        .to_string();
-
-    let workflow_path = PathBuf::from(&home).join("workflows/reply_flow_missing_source_var.json");
-    std::fs::write(
-        &workflow_path,
-        serde_json::to_vec_pretty(&json!([
-            {
-                "command": "type",
-                "args": {
-                    "selector": "#name",
-                    "text": "{{reply_name}}",
-                    "clear": true
-                }
-            }
-        ]))
-        .unwrap(),
-    )
-    .unwrap();
-
     let switched = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["switch", &source_index])
             .output()
             .unwrap(),
     );
     assert_eq!(switched["success"], true, "{switched}");
-
-    let spec_path = format!("{home}/trigger-workflow-source-vars-blocked.json");
-    std::fs::write(
-        &spec_path,
-        serde_json::to_vec_pretty(&json!({
+    let spec_path = write_json_file(
+        "trigger-workflow-source-vars-blocked.json",
+        json!({
             "source_tab": source_index.parse::<u64>().unwrap(),
             "target_tab": target_index.parse::<u64>().unwrap(),
             "mode": "once",
-            "condition": {
-                "kind": "text_present",
-                "text": "Ready"
-            },
+            "condition": {"kind": "text_present", "text": "Ready"},
             "action": {
                 "kind": "workflow",
                 "payload": {
                     "workflow_name": "reply_flow_missing_source_var",
                     "source_vars": {
-                        "reply_name": {
-                            "kind": "text",
-                            "selector": "#missing-question"
-                        }
+                        "reply_name": {"kind": "text", "selector": "#missing-question"}
                     }
                 }
             }
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
+        }),
+    );
     let added = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["trigger", "add", "--file", &spec_path])
             .output()
             .unwrap(),
     );
     assert_eq!(added["success"], true, "{added}");
-    let trigger_id = added["data"]["result"]["trigger"]["id"]
-        .as_u64()
-        .expect("trigger id should be present");
-
-    let blocked = wait_for_trigger_status(&home, trigger_id, "blocked");
+    let trigger_id = added["data"]["result"]["trigger"]["id"].as_u64().unwrap();
+    let switched = parse_json(
+        &session
+            .cmd()
+            .args(["switch", &source_index])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(switched["success"], true, "{switched}");
+    let seeded = parse_json(
+        &session
+            .cmd()
+            .args([
+                "exec",
+                "document.getElementById('status').textContent='Ready'; 'seeded'",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(seeded["success"], true, "{seeded}");
+    let mut blocked = serde_json::Value::Null;
+    for _ in 0..120 {
+        let out = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
+        if out["success"] == true
+            && let Some(trigger) = out["data"]["result"]["items"].as_array().and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["id"].as_u64() == Some(trigger_id))
+            })
+            && trigger["last_action_result"]["status"].as_str() == Some("blocked")
+        {
+            blocked = out;
+            break;
+        }
+        blocked = out;
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let trigger = blocked["data"]["result"]["items"]
         .as_array()
         .unwrap()
         .iter()
         .find(|entry| entry["id"].as_u64() == Some(trigger_id))
-        .expect("blocked trigger should remain in runtime projection");
+        .unwrap();
     assert_eq!(
         trigger["last_action_result"]["status"], "blocked",
         "{blocked}"
@@ -2074,16 +2121,17 @@ fn t437k_trigger_source_var_resolution_failure_is_blocked() {
         json!(["reply_name"]),
         "{blocked}"
     );
-
     let switched_target = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["switch", &target_index])
             .output()
             .unwrap(),
     );
     assert_eq!(switched_target["success"], true, "{switched_target}");
     let inspected = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["inspect", "text", "--selector", "#status"])
             .output()
             .unwrap(),
@@ -2093,187 +2141,4 @@ fn t437k_trigger_source_var_resolution_failure_is_blocked() {
         inspected["data"]["result"]["value"], "Pending",
         "{inspected}"
     );
-
-    cleanup(&home);
-}
-
-/// T437l: removed triggers should not fire after source evidence arrives later in the session.
-#[test]
-#[ignore]
-#[serial]
-fn t437l_trigger_removed_before_evidence_does_not_fire() {
-    let home = unique_home();
-    cleanup(&home);
-
-    let (_rt, server) = start_test_server(vec![
-        (
-            "/trigger-target-removed",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Trigger Removed Target</title></head>
-<body>
-  <button id="continue" onclick="
-    document.body.dataset.triggered = 'yes';
-    document.getElementById('result').textContent = 'Triggered';
-  ">Continue</button>
-  <div id="result">Pending</div>
-</body>
-</html>"#,
-        ),
-        (
-            "/trigger-source-removed",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Trigger Removed Source</title></head>
-<body>
-  <div id="status">Waiting</div>
-  <script>
-    setTimeout(() => {
-      document.getElementById('status').textContent = 'Ready';
-    }, 1800);
-  </script>
-</body>
-</html>"#,
-        ),
-    ]);
-
-    let target_url = server.url_for("/trigger-target-removed");
-    let source_url = server.url_for("/trigger-source-removed");
-
-    assert_eq!(
-        parse_json(&rub_cmd(&home).args(["open", &target_url]).output().unwrap())["success"],
-        true
-    );
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["exec", &format!("window.open('{source_url}', '_blank')")])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-
-    let tabs = wait_for_tabs_count(&home, 2);
-    let tabs = tabs["data"]["result"]["items"].as_array().unwrap();
-    let target_index = tabs
-        .iter()
-        .find(|tab| tab["title"].as_str() == Some("Trigger Removed Target"))
-        .and_then(|tab| tab["index"].as_u64())
-        .expect("target tab should exist")
-        .to_string();
-    let source_index = tabs
-        .iter()
-        .find(|tab| tab["title"].as_str() == Some("Trigger Removed Source"))
-        .and_then(|tab| tab["index"].as_u64())
-        .expect("source tab should exist")
-        .to_string();
-
-    let switched = parse_json(
-        &rub_cmd(&home)
-            .args(["switch", &source_index])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(switched["success"], true, "{switched}");
-
-    let spec_path = format!("{home}/trigger-removed.json");
-    std::fs::write(
-        &spec_path,
-        serde_json::to_vec_pretty(&json!({
-            "source_tab": source_index.parse::<u64>().unwrap(),
-            "target_tab": target_index.parse::<u64>().unwrap(),
-            "mode": "once",
-            "condition": {
-                "kind": "text_present",
-                "text": "Ready"
-            },
-            "action": {
-                "kind": "browser_command",
-                "command": "click",
-                "payload": {
-                    "selector": "#continue"
-                }
-            }
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
-    let added = parse_json(
-        &rub_cmd(&home)
-            .args(["trigger", "add", "--file", &spec_path])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(added["success"], true, "{added}");
-    let trigger_id = added["data"]["result"]["trigger"]["id"]
-        .as_u64()
-        .expect("trigger id should be present");
-
-    let removed = parse_json(
-        &rub_cmd(&home)
-            .args(["trigger", "remove", &trigger_id.to_string()])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(removed["success"], true, "{removed}");
-    assert_eq!(removed["data"]["removed"]["id"], trigger_id, "{removed}");
-
-    std::thread::sleep(Duration::from_millis(2600));
-
-    let listed = parse_json(&rub_cmd(&home).args(["trigger", "list"]).output().unwrap());
-    assert_eq!(listed["success"], true, "{listed}");
-    assert!(
-        listed["data"]["result"]["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|entry| entry["id"].as_u64() != Some(trigger_id)),
-        "{listed}"
-    );
-    assert!(listed["data"]["last_trigger_result"].is_null(), "{listed}");
-
-    let trace = parse_json(
-        &rub_cmd(&home)
-            .args(["trigger", "trace", "--last", "5"])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(trace["success"], true, "{trace}");
-    let events = trace["data"]["result"]["events"].as_array().unwrap();
-    assert_eq!(events.len(), 2, "{trace}");
-    assert_eq!(events[0]["kind"], "registered", "{trace}");
-    assert_eq!(events[0]["trigger_id"], trigger_id, "{trace}");
-    assert_eq!(events[1]["kind"], "removed", "{trace}");
-    assert_eq!(events[1]["trigger_id"], trigger_id, "{trace}");
-    assert!(
-        events
-            .iter()
-            .all(|event| event["kind"].as_str() != Some("fired")),
-        "{trace}"
-    );
-
-    let switched_target = parse_json(
-        &rub_cmd(&home)
-            .args(["switch", &target_index])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(switched_target["success"], true, "{switched_target}");
-    let inspected = parse_json(
-        &rub_cmd(&home)
-            .args(["inspect", "text", "--selector", "#result"])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(inspected["success"], true, "{inspected}");
-    assert_eq!(
-        inspected["data"]["result"]["value"], "Pending",
-        "{inspected}"
-    );
-
-    cleanup(&home);
 }

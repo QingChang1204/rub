@@ -64,18 +64,35 @@ pub(crate) struct PageObservation {
     pub(crate) context_replaced: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct PageProbe {
+    url: Option<String>,
+    title: Option<String>,
+    element_count: Option<u32>,
+    text_hash: Option<u64>,
+    text_length: Option<u32>,
+    markup_hash: Option<u64>,
+}
+
 pub(crate) async fn capture_interaction_baseline(
     page: &Arc<Page>,
     object_id: &RemoteObjectId,
 ) -> InteractionBaseline {
     InteractionBaseline {
         before_element: observe_element(page, object_id).await.ok(),
-        before_page: observe_page(page).await,
+        before_page: observe_related_page(page, object_id).await,
     }
 }
 
 pub(crate) async fn capture_page_baseline(page: &Arc<Page>) -> PageObservation {
     observe_page(page).await
+}
+
+pub(crate) async fn capture_related_page_baseline(
+    page: &Arc<Page>,
+    object_id: &RemoteObjectId,
+) -> PageObservation {
+    observe_related_page(page, object_id).await
 }
 
 pub(crate) async fn capture_active_interaction_baseline(
@@ -290,16 +307,6 @@ pub(crate) fn active_element_changed(
 }
 
 pub(crate) async fn observe_page(page: &Arc<Page>) -> PageObservation {
-    #[derive(Debug, Deserialize)]
-    struct PageProbe {
-        url: Option<String>,
-        title: Option<String>,
-        element_count: Option<u32>,
-        text_hash: Option<u64>,
-        text_length: Option<u32>,
-        markup_hash: Option<u64>,
-    }
-
     let probe_result = tokio::time::timeout(
         OBSERVATION_PROBE_TIMEOUT,
         page.evaluate(
@@ -341,6 +348,63 @@ pub(crate) async fn observe_page(page: &Arc<Page>) -> PageObservation {
         Err(_) => (None, false),
     };
 
+    page_observation_from_probe(probe, context_replaced)
+}
+
+pub(crate) async fn observe_related_page(
+    page: &Arc<Page>,
+    object_id: &RemoteObjectId,
+) -> PageObservation {
+    let probe_result = tokio::time::timeout(
+        OBSERVATION_PROBE_TIMEOUT,
+        crate::js::call_function_returning_value(
+            page,
+            object_id,
+            r#"function() {
+                const normalize = (value) => String(value || '')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                const hash = (value) => {
+                    let h = 2166136261 >>> 0;
+                    for (let i = 0; i < value.length; i++) {
+                        h ^= value.charCodeAt(i);
+                        h = Math.imul(h, 16777619) >>> 0;
+                    }
+                    return h >>> 0;
+                };
+                const doc = this.ownerDocument || document;
+                const root = doc.body || doc.documentElement;
+                const normalizedText = normalize(
+                    (root && (root.innerText || root.textContent)) || ''
+                );
+                return {
+                    url: doc.location ? doc.location.href : location.href,
+                    title: doc.title,
+                    element_count: doc.querySelectorAll('*').length,
+                    text_hash: hash(normalizedText),
+                    text_length: normalizedText.length,
+                    markup_hash: hash((doc.documentElement && doc.documentElement.outerHTML) || '')
+                };
+            }"#,
+        ),
+    )
+    .await;
+    let (probe, context_replaced) = match probe_result {
+        Ok(Ok(value)) => (serde_json::from_value::<PageProbe>(value).ok(), false),
+        Ok(Err(err)) => {
+            let message = err.to_string();
+            (None, is_context_replaced_error(&message))
+        }
+        Err(_) => (None, false),
+    };
+
+    page_observation_from_probe(probe, context_replaced)
+}
+
+fn page_observation_from_probe(
+    probe: Option<PageProbe>,
+    context_replaced: bool,
+) -> PageObservation {
     PageObservation {
         available: probe.is_some(),
         url: probe.as_ref().and_then(|value| value.url.clone()),

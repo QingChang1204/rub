@@ -1,4 +1,5 @@
 use crate::commands::{CookiesSubcommand, GetSubcommand, InspectSubcommand};
+use crate::timeout_budget::helpers::input_path_reference_state;
 use rub_core::error::{ErrorCode, RubError};
 use rub_ipc::protocol::IpcRequest;
 
@@ -251,34 +252,55 @@ pub(crate) fn build_cookies_request(
             http_only,
             same_site,
             expires,
-        } => (
-            serde_json::json!({
-                "sub": "set",
-                "name": name,
-                "value": value,
-                "domain": domain,
-                "path": path,
-                "secure": secure,
-                "http_only": http_only,
-                "same_site": same_site,
-                "expires": expires,
-            }),
-            true,
-        ),
+        } => {
+            let mut args = serde_json::Map::new();
+            args.insert("sub".to_string(), serde_json::json!("set"));
+            args.insert("name".to_string(), serde_json::json!(name));
+            args.insert("value".to_string(), serde_json::json!(value));
+            args.insert("path".to_string(), serde_json::json!(path));
+            args.insert("secure".to_string(), serde_json::json!(secure));
+            args.insert("http_only".to_string(), serde_json::json!(http_only));
+            if let Some(domain) = domain {
+                args.insert("domain".to_string(), serde_json::json!(domain));
+            }
+            if let Some(same_site) = same_site {
+                args.insert("same_site".to_string(), serde_json::json!(same_site));
+            }
+            if let Some(expires) = expires {
+                args.insert("expires".to_string(), serde_json::json!(expires));
+            }
+            (serde_json::Value::Object(args), true)
+        }
         CookiesSubcommand::Clear { url } => {
             (serde_json::json!({ "sub": "clear", "url": url }), true)
         }
         CookiesSubcommand::Export { path } => {
             let abs = resolve_cli_path(path);
             (
-                serde_json::json!({ "sub": "export", "path": abs.to_string_lossy() }),
+                serde_json::json!({
+                    "sub": "export",
+                    "path": abs.to_string_lossy(),
+                    "path_state": input_path_reference_state(
+                        "cli.cookies.export.path",
+                        "cli_cookies_export_option",
+                        "cookies_export_file",
+                    ),
+                }),
                 false,
             )
         }
         CookiesSubcommand::Import { path } => {
             let abs = resolve_cli_path(path);
             (
-                serde_json::json!({ "sub": "import", "path": abs.to_string_lossy() }),
+                serde_json::json!({
+                    "sub": "import",
+                    "path": abs.to_string_lossy(),
+                    "path_state": input_path_reference_state(
+                        "cli.cookies.import.path",
+                        "cli_cookies_import_option",
+                        "cookies_import_file",
+                    ),
+                }),
                 true,
             )
         }

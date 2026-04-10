@@ -3,11 +3,12 @@ use crate::commands::{
     TriggerSubcommand,
 };
 use rub_core::error::{ErrorCode, RubError};
-use rub_daemon::orchestration_assets::load_named_orchestration_spec;
+use rub_daemon::orchestration_assets::load_named_orchestration_spec_with_authority;
 use rub_ipc::protocol::IpcRequest;
 use std::path::Path;
 
 use super::super::{mutating_request, resolve_cli_path};
+use crate::timeout_budget::helpers::input_path_reference_state;
 
 pub(crate) fn build_trigger_request(
     timeout: u64,
@@ -17,14 +18,29 @@ pub(crate) fn build_trigger_request(
         TriggerSubcommand::Add { file, paused } => {
             let path = resolve_cli_path(file);
             let path_string = path.display().to_string();
+            let path_state = input_path_reference_state(
+                "cli.trigger.spec_source.path",
+                "cli_trigger_file_option",
+                "trigger_registration_file",
+            );
             let spec = std::fs::read_to_string(&path).map_err(|error| match error.kind() {
-                std::io::ErrorKind::NotFound => RubError::domain(
+                std::io::ErrorKind::NotFound => RubError::domain_with_context(
                     ErrorCode::FileNotFound,
                     format!("Trigger spec file not found: {path_string}"),
+                    serde_json::json!({
+                        "path": path_string,
+                        "path_state": path_state,
+                        "reason": "trigger_spec_file_not_found",
+                    }),
                 ),
-                _ => RubError::domain(
+                _ => RubError::domain_with_context(
                     ErrorCode::InvalidInput,
                     format!("Failed to read trigger spec file {path_string}: {error}"),
+                    serde_json::json!({
+                        "path": path_string,
+                        "path_state": path_state,
+                        "reason": "trigger_spec_file_read_failed",
+                    }),
                 ),
             })?;
             Ok(mutating_request(
@@ -36,6 +52,11 @@ pub(crate) fn build_trigger_request(
                     "spec_source": {
                         "kind": "file",
                         "path": path_string,
+                        "path_state": input_path_reference_state(
+                            "cli.trigger.spec_source.path",
+                            "cli_trigger_file_option",
+                            "trigger_registration_file",
+                        ),
                     }
                 }),
                 timeout,
@@ -96,17 +117,32 @@ pub(crate) fn build_orchestration_request(
                 (Some(file), None) => {
                     let path = resolve_cli_path(file);
                     let path_string = path.display().to_string();
+                    let path_state = input_path_reference_state(
+                        "cli.orchestration.spec_source.path",
+                        "cli_orchestration_file_option",
+                        "orchestration_registration_file",
+                    );
                     let spec =
                         std::fs::read_to_string(&path).map_err(|error| match error.kind() {
-                            std::io::ErrorKind::NotFound => RubError::domain(
+                            std::io::ErrorKind::NotFound => RubError::domain_with_context(
                                 ErrorCode::FileNotFound,
                                 format!("Orchestration spec file not found: {path_string}"),
+                                serde_json::json!({
+                                    "path": path_string,
+                                    "path_state": path_state,
+                                    "reason": "orchestration_spec_file_not_found",
+                                }),
                             ),
-                            _ => RubError::domain(
+                            _ => RubError::domain_with_context(
                                 ErrorCode::InvalidInput,
                                 format!(
                                     "Failed to read orchestration spec file {path_string}: {error}"
                                 ),
+                                serde_json::json!({
+                                    "path": path_string,
+                                    "path_state": path_state,
+                                    "reason": "orchestration_spec_file_read_failed",
+                                }),
                             ),
                         })?;
                     (
@@ -114,17 +150,32 @@ pub(crate) fn build_orchestration_request(
                         serde_json::json!({
                             "kind": "file",
                             "path": path_string,
+                            "path_state": input_path_reference_state(
+                                "cli.orchestration.spec_source.path",
+                                "cli_orchestration_file_option",
+                                "orchestration_registration_file",
+                            ),
                         }),
                     )
                 }
                 (None, Some(asset)) => {
-                    let (name, spec, path) = load_named_orchestration_spec(rub_home, asset)?;
+                    let (name, spec, path) = load_named_orchestration_spec_with_authority(
+                        rub_home,
+                        asset,
+                        "cli.orchestration.spec_source.path",
+                        "cli_orchestration_asset_option",
+                    )?;
                     (
                         spec,
                         serde_json::json!({
                             "kind": "asset",
                             "name": name,
                             "path": path.display().to_string(),
+                            "path_state": input_path_reference_state(
+                                "cli.orchestration.spec_source.path",
+                                "cli_orchestration_asset_option",
+                                "orchestration_asset_reference",
+                            ),
                         }),
                     )
                 }

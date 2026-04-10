@@ -27,6 +27,12 @@ pub struct CommandHistoryEntry {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CommandHistoryProjection {
     pub entries: Vec<CommandHistoryEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_retained_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_retained_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub dropped_before_retention: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub dropped_before_projection: u64,
 }
@@ -83,8 +89,16 @@ impl CommandHistoryState {
             .cloned()
             .collect::<Vec<_>>();
         entries.reverse();
+        let oldest_retained_sequence = self.entries.front().map(|entry| entry.sequence);
+        let newest_retained_sequence = self.entries.back().map(|entry| entry.sequence);
+        let dropped_before_retention = oldest_retained_sequence
+            .map(|sequence| sequence.saturating_sub(1))
+            .unwrap_or(0);
         CommandHistoryProjection {
             entries,
+            oldest_retained_sequence,
+            newest_retained_sequence,
+            dropped_before_retention,
             dropped_before_projection,
         }
     }
@@ -160,6 +174,9 @@ mod tests {
 
         let projection = history.projection(10, 0);
         assert_eq!(projection.entries.len(), 2);
+        assert_eq!(projection.oldest_retained_sequence, Some(1));
+        assert_eq!(projection.newest_retained_sequence, Some(2));
+        assert_eq!(projection.dropped_before_retention, 0);
         assert_eq!(projection.dropped_before_projection, 0);
         assert_eq!(
             projection.entries[0].summary.as_deref(),
@@ -169,5 +186,26 @@ mod tests {
             projection.entries[1].error_code.as_deref(),
             Some("WAIT_TIMEOUT")
         );
+    }
+
+    #[test]
+    fn history_projection_reports_retention_truncation() {
+        let mut history = CommandHistoryState::default();
+
+        for index in 0..70 {
+            let request = IpcRequest::new("open", serde_json::json!({ "index": index }), 1_000);
+            let response = rub_ipc::protocol::IpcResponse::success(
+                format!("req-{index}"),
+                serde_json::json!({}),
+            );
+            history.record(&request, &response);
+        }
+
+        let projection = history.projection(usize::MAX, 0);
+        assert_eq!(projection.entries.len(), 64);
+        assert_eq!(projection.oldest_retained_sequence, Some(7));
+        assert_eq!(projection.newest_retained_sequence, Some(70));
+        assert_eq!(projection.dropped_before_retention, 6);
+        assert_eq!(projection.dropped_before_projection, 0);
     }
 }

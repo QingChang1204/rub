@@ -155,7 +155,17 @@ mod tests {
             "pipe",
             serde_json::json!({
                 "spec": "[]",
-                "spec_source": { "kind": "file", "path": "/tmp/test.json" }
+                "spec_source": {
+                    "kind": "file",
+                    "path": "/tmp/test.json",
+                    "path_state": {
+                        "truth_level": "input_path_reference",
+                        "path_authority": "cli.pipe.spec_source.path",
+                        "upstream_truth": "cli_pipe_file_option",
+                        "path_kind": "workflow_spec_file",
+                        "control_role": "display_only"
+                    }
+                }
             }),
             30_000,
         )
@@ -210,6 +220,10 @@ mod tests {
         assert_eq!(
             projection.entries[0].args["spec_source"]["kind"],
             serde_json::json!("file")
+        );
+        assert_eq!(
+            projection.entries[0].args["spec_source"]["path_state"]["path_authority"],
+            serde_json::json!("cli.pipe.spec_source.path")
         );
         assert_eq!(
             projection.entries[1].capture_class,

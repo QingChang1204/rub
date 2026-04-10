@@ -2,6 +2,7 @@ use crate::commands::{
     Commands, DialogSubcommand, DownloadSubcommand, HandoffSubcommand, RuntimeSubcommand,
     StorageAreaArg, StorageSubcommand, TakeoverSubcommand,
 };
+use crate::timeout_budget::helpers::input_path_reference_state;
 use rub_core::error::{ErrorCode, RubError};
 use rub_ipc::protocol::IpcRequest;
 
@@ -136,7 +137,17 @@ pub(crate) fn build_download_request(
                 serde_json::json!({
                     "sub": "save",
                     "file": file.to_string_lossy(),
+                    "file_state": input_path_reference_state(
+                        "cli.download.save.file",
+                        "cli_download_save_file_option",
+                        "download_save_input_file",
+                    ),
                     "output_dir": output_dir.to_string_lossy(),
+                    "output_dir_state": input_path_reference_state(
+                        "cli.download.save.output_dir",
+                        "cli_download_save_output_dir_option",
+                        "download_save_output_directory",
+                    ),
                     "input_field": input_field,
                     "url_field": url_field,
                     "name_field": name_field,
@@ -199,6 +210,13 @@ pub(crate) fn build_storage_request(
             serde_json::json!({
                 "sub": "export",
                 "path": path.as_deref().map(resolve_cli_path).map(|path| path.to_string_lossy().to_string()),
+                "path_state": path.as_deref().map(|_| {
+                    input_path_reference_state(
+                        "cli.storage.export.path",
+                        "cli_storage_export_option",
+                        "storage_export_file",
+                    )
+                }),
             }),
             timeout,
         )),
@@ -207,6 +225,11 @@ pub(crate) fn build_storage_request(
             serde_json::json!({
                 "sub": "import",
                 "path": resolve_cli_path(path).to_string_lossy(),
+                "path_state": input_path_reference_state(
+                    "cli.storage.import.path",
+                    "cli_storage_import_option",
+                    "storage_import_file",
+                ),
             }),
             timeout,
         )),

@@ -1,5 +1,6 @@
 use clap::Parser;
 use rub_core::error::{ErrorCode, RubError};
+use rub_core::model::PathReferenceState;
 use rub_daemon::rub_paths::{
     RubPaths, default_rub_home as default_rub_home_path, validate_session_name,
 };
@@ -290,6 +291,16 @@ fn canonicalize_existing_ancestor(path: &Path) -> Option<PathBuf> {
     Some(collapse_path_components(&canonical))
 }
 
+fn config_path_state(path_kind: &str) -> PathReferenceState {
+    PathReferenceState {
+        truth_level: "local_runtime_reference".to_string(),
+        path_authority: "cli.config.file.path".to_string(),
+        upstream_truth: "cli_config_file".to_string(),
+        path_kind: path_kind.to_string(),
+        control_role: "display_only".to_string(),
+    }
+}
+
 pub fn load_file_config(rub_home: &Path) -> Result<FileConfig, RubError> {
     let path = RubPaths::new(rub_home).config_path();
     let contents = match std::fs::read_to_string(&path) {
@@ -304,6 +315,7 @@ pub fn load_file_config(rub_home: &Path) -> Result<FileConfig, RubError> {
                 serde_json::json!({
                     "reason": "config_read_failed",
                     "path": path,
+                    "path_state": config_path_state("config_toml_file"),
                 }),
             ));
         }
@@ -316,6 +328,7 @@ pub fn load_file_config(rub_home: &Path) -> Result<FileConfig, RubError> {
             serde_json::json!({
                 "reason": "invalid_config_toml",
                 "path": path,
+                "path_state": config_path_state("config_toml_file"),
             }),
         )
     })
@@ -494,9 +507,11 @@ mod tests {
             .expect_err("invalid toml should fail")
             .into_envelope();
         assert_eq!(error.code, rub_core::error::ErrorCode::InvalidInput);
+        let context = error.context.expect("config error context");
+        assert_eq!(context["reason"], "invalid_config_toml");
         assert_eq!(
-            error.context.expect("config error context")["reason"],
-            "invalid_config_toml"
+            context["path_state"]["path_authority"],
+            "cli.config.file.path"
         );
 
         let _ = std::fs::remove_dir_all(home);
@@ -517,10 +532,9 @@ mod tests {
             .expect_err("directory config path should fail")
             .into_envelope();
         assert_eq!(error.code, rub_core::error::ErrorCode::InvalidInput);
-        assert_eq!(
-            error.context.expect("config read error context")["reason"],
-            "config_read_failed"
-        );
+        let context = error.context.expect("config read error context");
+        assert_eq!(context["reason"], "config_read_failed");
+        assert_eq!(context["path_state"]["path_kind"], "config_toml_file");
 
         let _ = std::fs::remove_dir_all(home);
     }

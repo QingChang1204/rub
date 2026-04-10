@@ -1,17 +1,18 @@
 use super::*;
 
-/// T437m: orchestration rules should form a distinct cross-session registry surface with lifecycle trace.
+/// T437m/T437n: orchestration registry should preserve lifecycle trace, correlation groups,
+/// and duplicate-idempotency rejection within one cross-session browser-backed scenario.
 #[test]
 #[ignore]
 #[serial]
-fn t437m_orchestration_registry_tracks_cross_session_rules() {
-    let home = unique_home();
-    cleanup(&home);
+fn t437m_n_orchestration_registry_and_idempotency_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
     let (_rt, server) = start_standard_site_fixture();
 
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "source", "open", &server.url()])
                 .output()
                 .unwrap()
@@ -20,7 +21,7 @@ fn t437m_orchestration_registry_tracks_cross_session_rules() {
     );
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "target", "open", &server.url()])
                 .output()
                 .unwrap()
@@ -28,14 +29,14 @@ fn t437m_orchestration_registry_tracks_cross_session_rules() {
         true
     );
 
-    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
+    let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
     assert_eq!(sessions["success"], true, "{sessions}");
     let source_session_id = session_id_by_name(&sessions, "source");
     let target_session_id = session_id_by_name(&sessions, "target");
 
-    let spec_path = format!("{home}/orchestration-rule.json");
+    let registry_spec_path = format!("{home}/orchestration-rule.json");
     std::fs::write(
-        &spec_path,
+        &registry_spec_path,
         serde_json::to_vec_pretty(&json!({
             "source": {
                 "session_id": source_session_id,
@@ -64,14 +65,14 @@ fn t437m_orchestration_registry_tracks_cross_session_rules() {
     .unwrap();
 
     let added = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
                 "orchestration",
                 "add",
                 "--file",
-                &spec_path,
+                &registry_spec_path,
             ])
             .output()
             .unwrap(),
@@ -107,7 +108,7 @@ fn t437m_orchestration_registry_tracks_cross_session_rules() {
         .expect("orchestration rule id should be present");
 
     let listed = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args(["--session", "source", "orchestration", "list"])
             .output()
             .unwrap(),
@@ -123,7 +124,7 @@ fn t437m_orchestration_registry_tracks_cross_session_rules() {
     );
 
     let trace = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -149,42 +150,6 @@ fn t437m_orchestration_registry_tracks_cross_session_rules() {
             }),
         "{trace}"
     );
-
-    cleanup(&home);
-}
-
-/// T437n: orchestration registry should project correlation groups and reject duplicate idempotency keys.
-#[test]
-#[ignore]
-#[serial]
-fn t437n_orchestration_groups_rules_and_rejects_duplicate_idempotency_keys() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["--session", "source", "open", &server.url()])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["--session", "target", "open", &server.url()])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-
-    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
-    assert_eq!(sessions["success"], true, "{sessions}");
-    let source_session_id = session_id_by_name(&sessions, "source");
-    let target_session_id = session_id_by_name(&sessions, "target");
 
     let first_spec_path = format!("{home}/orchestration-rule-a.json");
     std::fs::write(
@@ -283,7 +248,7 @@ fn t437n_orchestration_groups_rules_and_rejects_duplicate_idempotency_keys() {
     .unwrap();
 
     let first = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -298,7 +263,7 @@ fn t437n_orchestration_groups_rules_and_rejects_duplicate_idempotency_keys() {
     assert_eq!(first["success"], true, "{first}");
 
     let second = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -311,25 +276,21 @@ fn t437n_orchestration_groups_rules_and_rejects_duplicate_idempotency_keys() {
             .unwrap(),
     );
     assert_eq!(second["success"], true, "{second}");
-    assert_eq!(second["data"]["runtime"]["group_count"], 1, "{second}");
+    let grouped_runtime = second["data"]["runtime"]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|group| group["correlation_key"] == "corr-batch-a")
+        .expect("corr-batch-a group should be present");
     assert_eq!(
-        second["data"]["runtime"]["groups"][0]["correlation_key"], "corr-batch-a",
-        "{second}"
-    );
-    assert_eq!(
-        second["data"]["runtime"]["groups"][0]["rule_ids"]
-            .as_array()
-            .map(|ids| ids.len()),
+        grouped_runtime["rule_ids"].as_array().map(|ids| ids.len()),
         Some(2),
         "{second}"
     );
-    assert_eq!(
-        second["data"]["runtime"]["groups"][0]["active_rule_count"], 2,
-        "{second}"
-    );
+    assert_eq!(grouped_runtime["active_rule_count"], 2, "{second}");
 
     let duplicate = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -353,17 +314,20 @@ fn t437n_orchestration_groups_rules_and_rejects_duplicate_idempotency_keys() {
     );
 
     let listed = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args(["--session", "source", "orchestration", "list"])
             .output()
             .unwrap(),
     );
     assert_eq!(listed["success"], true, "{listed}");
-    assert_eq!(listed["data"]["runtime"]["group_count"], 1, "{listed}");
+    let listed_group = listed["data"]["runtime"]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|group| group["correlation_key"] == "corr-batch-a")
+        .expect("corr-batch-a group should remain present");
     assert_eq!(
-        listed["data"]["groups"][0]["rule_ids"]
-            .as_array()
-            .map(|ids| ids.len()),
+        listed_group["rule_ids"].as_array().map(|ids| ids.len()),
         Some(2),
         "{listed}"
     );
@@ -371,20 +335,21 @@ fn t437n_orchestration_groups_rules_and_rejects_duplicate_idempotency_keys() {
         listed["data"]["result"]["items"]
             .as_array()
             .map(|rules| rules.len()),
-        Some(2),
+        Some(3),
         "{listed}"
     );
 
-    cleanup(&home);
+    cleanup(home);
 }
 
-/// T437o: orchestration execute should commit a multi-action browser-command pipeline on the target session.
+/// T437o/T437p: orchestration execute should truthfully classify fired vs partial-blocked
+/// multi-action pipelines within one cross-session browser-backed scenario.
 #[test]
 #[ignore]
 #[serial]
-fn t437o_orchestration_execute_commits_multi_action_pipeline_across_sessions() {
-    let home = unique_home();
-    cleanup(&home);
+fn t437o_p_orchestration_execute_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
     let (_rt, server) = start_test_server(vec![
         (
             "/orchestration-target-execute",
@@ -416,6 +381,36 @@ fn t437o_orchestration_execute_commits_multi_action_pipeline_across_sessions() {
 </body>
 </html>"#,
         ),
+        (
+            "/orchestration-target-blocked",
+            "text/html",
+            r#"<!DOCTYPE html>
+<html>
+<head><title>Orchestration Blocked Target</title></head>
+<body>
+  <input id="name" value="" />
+  <button id="apply">Apply</button>
+  <div id="status">Pending</div>
+  <script>
+    document.getElementById('apply').addEventListener('click', () => {
+      document.getElementById('status').textContent =
+        document.getElementById('name').value || 'Pending';
+    });
+  </script>
+</body>
+</html>"#,
+        ),
+        (
+            "/orchestration-source-blocked",
+            "text/html",
+            r#"<!DOCTYPE html>
+<html>
+<head><title>Orchestration Blocked Source</title></head>
+<body>
+  <div id="status">Ready</div>
+</body>
+</html>"#,
+        ),
     ]);
 
     let target_url = server.url_for("/orchestration-target-execute");
@@ -423,7 +418,7 @@ fn t437o_orchestration_execute_commits_multi_action_pipeline_across_sessions() {
 
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "source", "open", &source_url])
                 .output()
                 .unwrap()
@@ -432,7 +427,7 @@ fn t437o_orchestration_execute_commits_multi_action_pipeline_across_sessions() {
     );
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "target", "open", &target_url])
                 .output()
                 .unwrap()
@@ -440,7 +435,7 @@ fn t437o_orchestration_execute_commits_multi_action_pipeline_across_sessions() {
         true
     );
 
-    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
+    let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
     assert_eq!(sessions["success"], true, "{sessions}");
     let source_session_id = session_id_by_name(&sessions, "source");
     let target_session_id = session_id_by_name(&sessions, "target");
@@ -490,7 +485,7 @@ fn t437o_orchestration_execute_commits_multi_action_pipeline_across_sessions() {
     .unwrap();
 
     let added = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -509,24 +504,30 @@ fn t437o_orchestration_execute_commits_multi_action_pipeline_across_sessions() {
         .to_string();
 
     let executed = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args(["--session", "source", "orchestration", "execute", &rule_id])
             .output()
             .unwrap(),
     );
     assert_eq!(executed["success"], true, "{executed}");
-    assert_eq!(executed["data"]["result"]["status"], "fired", "{executed}");
     assert_eq!(
-        executed["data"]["result"]["committed_steps"], 2,
-        "{executed}"
-    );
-    assert_eq!(executed["data"]["result"]["total_steps"], 2, "{executed}");
-    assert_eq!(
-        executed["data"]["result"]["steps"][0]["action"]["command"], "type",
+        executed["data"]["result"]["execution"]["status"], "fired",
         "{executed}"
     );
     assert_eq!(
-        executed["data"]["result"]["steps"][0]["result"]["interaction"]["semantic_class"],
+        executed["data"]["result"]["execution"]["committed_steps"], 2,
+        "{executed}"
+    );
+    assert_eq!(
+        executed["data"]["result"]["execution"]["total_steps"], 2,
+        "{executed}"
+    );
+    assert_eq!(
+        executed["data"]["result"]["execution"]["steps"][0]["action"]["command"], "type",
+        "{executed}"
+    );
+    assert_eq!(
+        executed["data"]["result"]["execution"]["steps"][0]["result"]["interaction"]["semantic_class"],
         "set_value",
         "{executed}"
     );
@@ -540,7 +541,7 @@ fn t437o_orchestration_execute_commits_multi_action_pipeline_across_sessions() {
     );
 
     let inspected = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "target",
@@ -557,56 +558,12 @@ fn t437o_orchestration_execute_commits_multi_action_pipeline_across_sessions() {
         inspected["data"]["result"]["value"], "Ada orchestration",
         "{inspected}"
     );
-
-    cleanup(&home);
-}
-
-/// T437p: orchestration execute should stop on the first failing step and classify partial failure truthfully.
-#[test]
-#[ignore]
-#[serial]
-fn t437p_orchestration_execute_reports_partial_blocked_failure() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_test_server(vec![
-        (
-            "/orchestration-target-blocked",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Orchestration Blocked Target</title></head>
-<body>
-  <input id="name" value="" />
-  <button id="apply">Apply</button>
-  <div id="status">Pending</div>
-  <script>
-    document.getElementById('apply').addEventListener('click', () => {
-      document.getElementById('status').textContent =
-        document.getElementById('name').value || 'Pending';
-    });
-  </script>
-</body>
-</html>"#,
-        ),
-        (
-            "/orchestration-source-blocked",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Orchestration Blocked Source</title></head>
-<body>
-  <div id="status">Ready</div>
-</body>
-</html>"#,
-        ),
-    ]);
-
     let target_url = server.url_for("/orchestration-target-blocked");
     let source_url = server.url_for("/orchestration-source-blocked");
 
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "source", "open", &source_url])
                 .output()
                 .unwrap()
@@ -615,7 +572,7 @@ fn t437p_orchestration_execute_reports_partial_blocked_failure() {
     );
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "target", "open", &target_url])
                 .output()
                 .unwrap()
@@ -623,7 +580,7 @@ fn t437p_orchestration_execute_reports_partial_blocked_failure() {
         true
     );
 
-    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
+    let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
     assert_eq!(sessions["success"], true, "{sessions}");
     let source_session_id = session_id_by_name(&sessions, "source");
     let target_session_id = session_id_by_name(&sessions, "target");
@@ -669,7 +626,7 @@ fn t437p_orchestration_execute_reports_partial_blocked_failure() {
     .unwrap();
 
     let added = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -688,31 +645,34 @@ fn t437p_orchestration_execute_reports_partial_blocked_failure() {
         .to_string();
 
     let executed = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args(["--session", "source", "orchestration", "execute", &rule_id])
             .output()
             .unwrap(),
     );
     assert_eq!(executed["success"], true, "{executed}");
     assert_eq!(
-        executed["data"]["result"]["status"], "blocked",
+        executed["data"]["result"]["execution"]["status"], "blocked",
         "{executed}"
     );
     assert_eq!(
-        executed["data"]["result"]["committed_steps"], 1,
-        "{executed}"
-    );
-    assert_eq!(executed["data"]["result"]["total_steps"], 2, "{executed}");
-    assert_eq!(
-        executed["data"]["result"]["steps"][0]["status"], "committed",
+        executed["data"]["result"]["execution"]["committed_steps"], 1,
         "{executed}"
     );
     assert_eq!(
-        executed["data"]["result"]["steps"][1]["status"], "blocked",
+        executed["data"]["result"]["execution"]["total_steps"], 2,
         "{executed}"
     );
     assert_eq!(
-        executed["data"]["result"]["error_code"], "ELEMENT_NOT_FOUND",
+        executed["data"]["result"]["execution"]["steps"][0]["status"], "committed",
+        "{executed}"
+    );
+    assert_eq!(
+        executed["data"]["result"]["execution"]["steps"][1]["status"], "blocked",
+        "{executed}"
+    );
+    assert_eq!(
+        executed["data"]["result"]["execution"]["error_code"], "ELEMENT_NOT_FOUND",
         "{executed}"
     );
     assert_eq!(
@@ -721,7 +681,7 @@ fn t437p_orchestration_execute_reports_partial_blocked_failure() {
     );
 
     let inspected_status = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "target",
@@ -740,7 +700,7 @@ fn t437p_orchestration_execute_reports_partial_blocked_failure() {
     );
 
     let inspected_value = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "target",
@@ -758,24 +718,24 @@ fn t437p_orchestration_execute_reports_partial_blocked_failure() {
         "{inspected_value}"
     );
 
-    cleanup(&home);
+    cleanup(home);
 }
 
-/// T437q: named workflow assets should be able to register and execute orchestration rules
-/// through the canonical pipe surface without inventing a second orchestration engine.
+/// T437q/T437r: workflow-managed orchestration and history export should share one browser-backed
+/// scenario without inventing a second orchestration engine.
 #[test]
 #[ignore]
 #[serial]
-fn t437q_pipe_workflow_can_manage_orchestration_rules() {
-    let home = unique_home();
-    cleanup(&home);
+fn t437q_r_pipe_workflow_and_history_export_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
     let (_rt, server) = start_test_server(vec![
         (
-            "/orchestration-target-workflow",
+            "/orchestration-target",
             "text/html",
             r#"<!DOCTYPE html>
 <html>
-<head><title>Workflow Orchestration Target</title></head>
+<head><title>Orchestration Target</title></head>
 <body>
   <input id="name" value="" />
   <button id="apply">Apply</button>
@@ -790,11 +750,11 @@ fn t437q_pipe_workflow_can_manage_orchestration_rules() {
 </html>"#,
         ),
         (
-            "/orchestration-source-workflow",
+            "/orchestration-source",
             "text/html",
             r#"<!DOCTYPE html>
 <html>
-<head><title>Workflow Orchestration Source</title></head>
+<head><title>Orchestration Source</title></head>
 <body>
   <div id="status">Ready</div>
 </body>
@@ -802,12 +762,12 @@ fn t437q_pipe_workflow_can_manage_orchestration_rules() {
         ),
     ]);
 
-    let target_url = server.url_for("/orchestration-target-workflow");
-    let source_url = server.url_for("/orchestration-source-workflow");
+    let target_url = server.url_for("/orchestration-target");
+    let source_url = server.url_for("/orchestration-source");
 
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "source", "open", &source_url])
                 .output()
                 .unwrap()
@@ -816,7 +776,7 @@ fn t437q_pipe_workflow_can_manage_orchestration_rules() {
     );
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "target", "open", &target_url])
                 .output()
                 .unwrap()
@@ -824,12 +784,12 @@ fn t437q_pipe_workflow_can_manage_orchestration_rules() {
         true
     );
 
-    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
+    let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
     assert_eq!(sessions["success"], true, "{sessions}");
     let source_session_id = session_id_by_name(&sessions, "source");
     let target_session_id = session_id_by_name(&sessions, "target");
 
-    let orchestration_spec = json!({
+    let workflow_spec = json!({
         "source": {
             "session_id": source_session_id,
             "tab_index": 0
@@ -866,8 +826,8 @@ fn t437q_pipe_workflow_can_manage_orchestration_rules() {
             }
         ]
     });
-    let orchestration_spec_string =
-        serde_json::to_string(&orchestration_spec).expect("orchestration spec json");
+    let workflow_spec_string =
+        serde_json::to_string(&workflow_spec).expect("orchestration workflow spec json");
 
     let rub_paths = RubPaths::new(Path::new(&home));
     std::fs::create_dir_all(rub_paths.workflows_dir()).unwrap();
@@ -879,7 +839,7 @@ fn t437q_pipe_workflow_can_manage_orchestration_rules() {
                 "command": "orchestration",
                 "args": {
                     "sub": "add",
-                    "spec": orchestration_spec_string,
+                    "spec": workflow_spec_string,
                     "spec_source": {
                         "kind": "workflow_asset",
                         "path": workflow_path.display().to_string()
@@ -899,7 +859,7 @@ fn t437q_pipe_workflow_can_manage_orchestration_rules() {
     .unwrap();
 
     let actual = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -924,20 +884,20 @@ fn t437q_pipe_workflow_can_manage_orchestration_rules() {
         "{actual}"
     );
     assert_eq!(
-        actual["data"]["steps"][0]["result"]["rule"]["id"], 1,
+        actual["data"]["steps"][0]["result"]["result"]["rule"]["id"], 1,
         "{actual}"
     );
     assert_eq!(
-        actual["data"]["steps"][1]["result"]["result"]["status"], "fired",
+        actual["data"]["steps"][1]["result"]["result"]["execution"]["status"], "fired",
         "{actual}"
     );
     assert_eq!(
-        actual["data"]["steps"][1]["result"]["result"]["committed_steps"], 2,
+        actual["data"]["steps"][1]["result"]["result"]["execution"]["committed_steps"], 2,
         "{actual}"
     );
 
     let inspected = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "target",
@@ -954,77 +914,6 @@ fn t437q_pipe_workflow_can_manage_orchestration_rules() {
         inspected["data"]["result"]["value"], "Workflow orchestration",
         "{inspected}"
     );
-
-    cleanup(&home);
-}
-
-/// T437r: history export should preserve replayable orchestration mutation steps while skipping
-/// orchestration observation subcommands by default.
-#[test]
-#[ignore]
-#[serial]
-fn t437r_history_export_preserves_replayable_orchestration_steps() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_test_server(vec![
-        (
-            "/orchestration-target-export",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Orchestration Export Target</title></head>
-<body>
-  <input id="name" value="" />
-  <button id="apply">Apply</button>
-  <div id="status">Pending</div>
-  <script>
-    document.getElementById('apply').addEventListener('click', () => {
-      document.getElementById('status').textContent =
-        document.getElementById('name').value || 'Pending';
-    });
-  </script>
-</body>
-</html>"#,
-        ),
-        (
-            "/orchestration-source-export",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Orchestration Export Source</title></head>
-<body>
-  <div id="status">Ready</div>
-</body>
-</html>"#,
-        ),
-    ]);
-
-    let target_url = server.url_for("/orchestration-target-export");
-    let source_url = server.url_for("/orchestration-source-export");
-
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["--session", "source", "open", &source_url])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["--session", "target", "open", &target_url])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-
-    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
-    assert_eq!(sessions["success"], true, "{sessions}");
-    let source_session_id = session_id_by_name(&sessions, "source");
-    let target_session_id = session_id_by_name(&sessions, "target");
 
     let spec_path = format!("{home}/orchestration-export.json");
     std::fs::write(
@@ -1071,7 +960,7 @@ fn t437r_history_export_preserves_replayable_orchestration_steps() {
     .unwrap();
 
     let added = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -1086,7 +975,7 @@ fn t437r_history_export_preserves_replayable_orchestration_steps() {
     assert_eq!(added["success"], true, "{added}");
 
     let listed = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args(["--session", "source", "orchestration", "list"])
             .output()
             .unwrap(),
@@ -1094,16 +983,19 @@ fn t437r_history_export_preserves_replayable_orchestration_steps() {
     assert_eq!(listed["success"], true, "{listed}");
 
     let executed = parse_json(
-        &rub_cmd(&home)
-            .args(["--session", "source", "orchestration", "execute", "1"])
+        &rub_cmd(home)
+            .args(["--session", "source", "orchestration", "execute", "2"])
             .output()
             .unwrap(),
     );
     assert_eq!(executed["success"], true, "{executed}");
-    assert_eq!(executed["data"]["result"]["status"], "fired", "{executed}");
+    assert_eq!(
+        executed["data"]["result"]["execution"]["status"], "fired",
+        "{executed}"
+    );
 
     let exported = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -1117,51 +1009,57 @@ fn t437r_history_export_preserves_replayable_orchestration_steps() {
     );
     assert_eq!(exported["success"], true, "{exported}");
     assert_eq!(
-        exported["data"]["steps"]
+        exported["data"]["result"]["steps"]
             .as_array()
             .map(|items| items.len())
             .unwrap_or_default(),
         2,
         "{exported}"
     );
-    assert_eq!(exported["data"]["skipped"]["observation"], 1, "{exported}");
     assert_eq!(
-        exported["data"]["steps"][0]["command"], "orchestration",
+        exported["data"]["result"]["skipped"]["observation"], 1,
         "{exported}"
     );
     assert_eq!(
-        exported["data"]["steps"][0]["args"]["sub"], "add",
+        exported["data"]["result"]["steps"][0]["command"], "orchestration",
         "{exported}"
     );
     assert_eq!(
-        exported["data"]["steps"][0]["source"]["capture_class"], "workflow",
+        exported["data"]["result"]["steps"][0]["args"]["sub"], "add",
         "{exported}"
     );
     assert_eq!(
-        exported["data"]["steps"][1]["command"], "orchestration",
+        exported["data"]["result"]["entries"][0]["source"]["capture_class"], "workflow",
         "{exported}"
     );
     assert_eq!(
-        exported["data"]["steps"][1]["args"]["sub"], "execute",
+        exported["data"]["result"]["steps"][1]["command"], "orchestration",
         "{exported}"
     );
-    assert_eq!(exported["data"]["steps"][1]["args"]["id"], 1, "{exported}");
     assert_eq!(
-        exported["data"]["steps"][1]["source"]["capture_class"], "workflow",
+        exported["data"]["result"]["steps"][1]["args"]["sub"], "execute",
+        "{exported}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["steps"][1]["args"]["id"], 2,
+        "{exported}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["entries"][1]["source"]["capture_class"], "workflow",
         "{exported}"
     );
 
-    cleanup(&home);
+    cleanup(home);
 }
 
-/// T437aa: orchestration rules should export as reusable named assets and replay through the
-/// canonical orchestration registry surface without preserving live-only identity fields.
+/// T437aa/T437ab: orchestration asset export/replay and embedded watch registration should reuse
+/// one browser-backed scenario.
 #[test]
 #[ignore]
 #[serial]
-fn t437aa_orchestration_assets_export_and_replay_named_rules() {
-    let home = unique_home();
-    cleanup(&home);
+fn t437aa_ab_orchestration_assets_and_embedded_watch_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
     let (_rt, server) = start_test_server(vec![
         (
             "/orchestration-target-asset",
@@ -1200,7 +1098,7 @@ fn t437aa_orchestration_assets_export_and_replay_named_rules() {
 
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "source", "open", &source_url])
                 .output()
                 .unwrap()
@@ -1209,7 +1107,7 @@ fn t437aa_orchestration_assets_export_and_replay_named_rules() {
     );
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "target", "open", &target_url])
                 .output()
                 .unwrap()
@@ -1217,7 +1115,7 @@ fn t437aa_orchestration_assets_export_and_replay_named_rules() {
         true
     );
 
-    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
+    let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
     assert_eq!(sessions["success"], true, "{sessions}");
     let source_session_id = session_id_by_name(&sessions, "source");
     let target_session_id = session_id_by_name(&sessions, "target");
@@ -1238,6 +1136,8 @@ fn t437aa_orchestration_assets_export_and_replay_named_rules() {
             "execution_policy": {
                 "max_retries": 2
             },
+            "correlation_key": "asset-corr",
+            "idempotency_key": "asset-idem",
             "condition": {
                 "kind": "text_present",
                 "text": "Ready"
@@ -1270,7 +1170,7 @@ fn t437aa_orchestration_assets_export_and_replay_named_rules() {
     .unwrap();
 
     let added = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -1286,7 +1186,7 @@ fn t437aa_orchestration_assets_export_and_replay_named_rules() {
     assert_eq!(added["data"]["result"]["rule"]["id"], 1, "{added}");
 
     let exported = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -1304,6 +1204,44 @@ fn t437aa_orchestration_assets_export_and_replay_named_rules() {
         exported["data"]["result"]["persisted_artifacts"][0]["asset_name"], "named_reply_rule",
         "{exported}"
     );
+    assert_eq!(
+        exported["data"]["result"]["persisted_artifacts"][0]["projection_state"]["truth_level"],
+        "local_persistence_projection",
+        "{exported}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["persisted_artifacts"][0]["projection_state"]["projection_authority"],
+        "cli.orchestration_export_asset_persistence",
+        "{exported}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["persisted_artifacts"][0]["projection_state"]["durability"],
+        "durable",
+        "{exported}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["rule_identity_projection"]["projection_kind"],
+        "live_rule_identity",
+        "{exported}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["rule_identity_projection"]["correlation_key"], "asset-corr",
+        "{exported}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["rule_identity_projection"]["idempotency_key"], "asset-idem",
+        "{exported}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["persisted_artifacts"][0]["source_rule_identity"]["correlation_key"],
+        "asset-corr",
+        "{exported}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["persisted_artifacts"][0]["source_rule_identity"]["idempotency_key"],
+        "asset-idem",
+        "{exported}"
+    );
     let saved_to = exported["data"]["result"]["persisted_artifacts"][0]["path"]
         .as_str()
         .expect("named orchestration asset path");
@@ -1318,7 +1256,7 @@ fn t437aa_orchestration_assets_export_and_replay_named_rules() {
     );
 
     let listed_assets = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args(["orchestration", "list-assets"])
             .output()
             .unwrap(),
@@ -1336,9 +1274,19 @@ fn t437aa_orchestration_assets_export_and_replay_named_rules() {
         listed_assets["data"]["result"]["items"][0]["name"], "named_reply_rule",
         "{listed_assets}"
     );
+    assert_eq!(
+        listed_assets["data"]["subject"]["directory_state"]["path_authority"],
+        "cli.orchestration_assets.directory",
+        "{listed_assets}"
+    );
+    assert_eq!(
+        listed_assets["data"]["result"]["items"][0]["path_state"]["path_authority"],
+        "cli.orchestration_assets.item.path",
+        "{listed_assets}"
+    );
 
     let removed = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args(["--session", "source", "orchestration", "remove", "1"])
             .output()
             .unwrap(),
@@ -1346,7 +1294,7 @@ fn t437aa_orchestration_assets_export_and_replay_named_rules() {
     assert_eq!(removed["success"], true, "{removed}");
 
     let readded = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -1362,20 +1310,23 @@ fn t437aa_orchestration_assets_export_and_replay_named_rules() {
     assert_eq!(readded["data"]["result"]["rule"]["id"], 2, "{readded}");
 
     let executed = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args(["--session", "source", "orchestration", "execute", "2"])
             .output()
             .unwrap(),
     );
     assert_eq!(executed["success"], true, "{executed}");
-    assert_eq!(executed["data"]["result"]["status"], "fired", "{executed}");
     assert_eq!(
-        executed["data"]["result"]["committed_steps"], 2,
+        executed["data"]["result"]["execution"]["status"], "fired",
+        "{executed}"
+    );
+    assert_eq!(
+        executed["data"]["result"]["execution"]["committed_steps"], 2,
         "{executed}"
     );
 
     let inspected = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "target",
@@ -1392,77 +1343,6 @@ fn t437aa_orchestration_assets_export_and_replay_named_rules() {
         inspected["data"]["result"]["value"], "Named asset orchestration",
         "{inspected}"
     );
-
-    cleanup(&home);
-}
-
-/// T437ab: workflow assets should be able to embed reactive orchestration blocks through a
-/// top-level `watch` alias without inventing a second orchestration engine.
-#[test]
-#[ignore]
-#[serial]
-fn t437ab_pipe_workflow_embedded_watch_block_registers_orchestration_rules() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_test_server(vec![
-        (
-            "/orchestration-target-embedded-watch",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Embedded Watch Target</title></head>
-<body>
-  <input id="name" value="" />
-  <button id="apply">Apply</button>
-  <div id="status">Pending</div>
-  <script>
-    document.getElementById('apply').addEventListener('click', () => {
-      document.getElementById('status').textContent =
-        document.getElementById('name').value || 'Pending';
-    });
-  </script>
-</body>
-</html>"#,
-        ),
-        (
-            "/orchestration-source-embedded-watch",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Embedded Watch Source</title></head>
-<body>
-  <div id="status">Ready</div>
-</body>
-</html>"#,
-        ),
-    ]);
-
-    let target_url = server.url_for("/orchestration-target-embedded-watch");
-    let source_url = server.url_for("/orchestration-source-embedded-watch");
-
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["--session", "source", "open", &source_url])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["--session", "target", "open", &target_url])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-
-    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
-    assert_eq!(sessions["success"], true, "{sessions}");
-    let source_session_id = session_id_by_name(&sessions, "source");
-    let target_session_id = session_id_by_name(&sessions, "target");
 
     let orchestration_spec = json!({
         "source": {
@@ -1521,7 +1401,7 @@ fn t437ab_pipe_workflow_embedded_watch_block_registers_orchestration_rules() {
     .unwrap();
 
     let registered = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -1550,16 +1430,29 @@ fn t437ab_pipe_workflow_embedded_watch_block_registers_orchestration_rules() {
         "{registered}"
     );
     assert_eq!(
-        registered["data"]["steps"][0]["result"]["spec_source"]["kind"], "workflow_embedded",
+        registered["data"]["steps"][0]["result"]["result"]["spec_source"]["kind"],
+        "workflow_embedded",
+        "{registered}"
+    );
+    assert_eq!(
+        registered["data"]["steps"][0]["result"]["result"]["spec_source"]["workflow_source"]["path_state"]
+            ["truth_level"],
+        "input_path_reference",
+        "{registered}"
+    );
+    assert_eq!(
+        registered["data"]["steps"][0]["result"]["result"]["spec_source"]["workflow_source"]["path_state"]
+            ["path_authority"],
+        "cli.pipe.spec_source.path",
         "{registered}"
     );
 
-    let rule_id = registered["data"]["steps"][0]["result"]["rule"]["id"]
+    let rule_id = registered["data"]["steps"][0]["result"]["result"]["rule"]["id"]
         .as_u64()
         .expect("embedded watch rule id") as u32;
 
     let executed = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -1571,14 +1464,17 @@ fn t437ab_pipe_workflow_embedded_watch_block_registers_orchestration_rules() {
             .unwrap(),
     );
     assert_eq!(executed["success"], true, "{executed}");
-    assert_eq!(executed["data"]["result"]["status"], "fired", "{executed}");
     assert_eq!(
-        executed["data"]["result"]["committed_steps"], 2,
+        executed["data"]["result"]["execution"]["status"], "fired",
+        "{executed}"
+    );
+    assert_eq!(
+        executed["data"]["result"]["execution"]["committed_steps"], 2,
         "{executed}"
     );
 
     let inspected = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "target",
@@ -1596,17 +1492,17 @@ fn t437ab_pipe_workflow_embedded_watch_block_registers_orchestration_rules() {
         "{inspected}"
     );
 
-    cleanup(&home);
+    cleanup(home);
 }
 
-/// T437s: repeat-mode orchestration rules should re-arm after success and block
-/// during an active cooldown window instead of behaving like terminal once rules.
+/// T437s/T437y: manual repeat re-arm/cooldown and reactive repeat evidence latching
+/// should reuse one browser-backed scenario without mixing their authorities.
 #[test]
 #[ignore]
 #[serial]
-fn t437s_orchestration_repeat_mode_rearms_and_enforces_cooldown() {
-    let home = unique_home();
-    cleanup(&home);
+fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
     let (_rt, server) = start_test_server(vec![
         (
             "/orchestration-target-repeat",
@@ -1640,6 +1536,47 @@ fn t437s_orchestration_repeat_mode_rearms_and_enforces_cooldown() {
 </body>
 </html>"#,
         ),
+        (
+            "/orchestration-manager-reactive-repeat-latch",
+            "text/html",
+            r#"<!DOCTYPE html>
+<html>
+<head><title>Orchestration Manager Reactive Repeat Latch</title></head>
+<body>
+  <div id="status">Manager</div>
+</body>
+</html>"#,
+        ),
+        (
+            "/orchestration-source-reactive-repeat-latch",
+            "text/html",
+            r#"<!DOCTYPE html>
+<html>
+<head><title>Orchestration Source Reactive Repeat Latch</title></head>
+<body>
+  <div id="status">Ready</div>
+</body>
+</html>"#,
+        ),
+        (
+            "/orchestration-target-reactive-repeat-latch",
+            "text/html",
+            r#"<!DOCTYPE html>
+<html>
+<head><title>Orchestration Target Reactive Repeat Latch</title></head>
+<body>
+  <button id="apply">Apply</button>
+  <div id="status">Pending</div>
+  <script>
+    let applyCount = 0;
+    document.getElementById('apply').addEventListener('click', () => {
+      applyCount += 1;
+      document.getElementById('status').textContent = `Applied:${applyCount}`;
+    });
+  </script>
+</body>
+</html>"#,
+        ),
     ]);
 
     let target_url = server.url_for("/orchestration-target-repeat");
@@ -1647,7 +1584,7 @@ fn t437s_orchestration_repeat_mode_rearms_and_enforces_cooldown() {
 
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "source", "open", &source_url])
                 .output()
                 .unwrap()
@@ -1656,7 +1593,7 @@ fn t437s_orchestration_repeat_mode_rearms_and_enforces_cooldown() {
     );
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "target", "open", &target_url])
                 .output()
                 .unwrap()
@@ -1664,7 +1601,7 @@ fn t437s_orchestration_repeat_mode_rearms_and_enforces_cooldown() {
         true
     );
 
-    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
+    let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
     assert_eq!(sessions["success"], true, "{sessions}");
     let source_session_id = session_id_by_name(&sessions, "source");
     let target_session_id = session_id_by_name(&sessions, "target");
@@ -1718,7 +1655,7 @@ fn t437s_orchestration_repeat_mode_rearms_and_enforces_cooldown() {
     .unwrap();
 
     let added = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -1737,14 +1674,20 @@ fn t437s_orchestration_repeat_mode_rearms_and_enforces_cooldown() {
         .to_string();
 
     let first = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args(["--session", "source", "orchestration", "execute", &rule_id])
             .output()
             .unwrap(),
     );
     assert_eq!(first["success"], true, "{first}");
-    assert_eq!(first["data"]["result"]["status"], "fired", "{first}");
-    assert_eq!(first["data"]["result"]["next_status"], "armed", "{first}");
+    assert_eq!(
+        first["data"]["result"]["execution"]["status"], "fired",
+        "{first}"
+    );
+    assert_eq!(
+        first["data"]["result"]["execution"]["next_status"], "armed",
+        "{first}"
+    );
     assert_eq!(
         first["data"]["result"]["rule"]["status"], "armed",
         "{first}"
@@ -1759,7 +1702,7 @@ fn t437s_orchestration_repeat_mode_rearms_and_enforces_cooldown() {
     );
 
     let inspected_after_first = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "target",
@@ -1781,26 +1724,35 @@ fn t437s_orchestration_repeat_mode_rearms_and_enforces_cooldown() {
     );
 
     let second = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args(["--session", "source", "orchestration", "execute", &rule_id])
             .output()
             .unwrap(),
     );
     assert_eq!(second["success"], true, "{second}");
-    assert_eq!(second["data"]["result"]["status"], "blocked", "{second}");
-    assert_eq!(second["data"]["result"]["next_status"], "armed", "{second}");
     assert_eq!(
-        second["data"]["result"]["reason"], "orchestration_cooldown_active",
+        second["data"]["result"]["execution"]["status"], "blocked",
         "{second}"
     );
-    assert_eq!(second["data"]["result"]["committed_steps"], 0, "{second}");
+    assert_eq!(
+        second["data"]["result"]["execution"]["next_status"], "armed",
+        "{second}"
+    );
+    assert_eq!(
+        second["data"]["result"]["execution"]["reason"], "orchestration_cooldown_active",
+        "{second}"
+    );
+    assert_eq!(
+        second["data"]["result"]["execution"]["committed_steps"], 0,
+        "{second}"
+    );
     assert_eq!(
         second["data"]["result"]["rule"]["status"], "armed",
         "{second}"
     );
 
     let inspected_after_second = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "target",
@@ -1820,21 +1772,27 @@ fn t437s_orchestration_repeat_mode_rearms_and_enforces_cooldown() {
     std::thread::sleep(std::time::Duration::from_millis(1_300));
 
     let third = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args(["--session", "source", "orchestration", "execute", &rule_id])
             .output()
             .unwrap(),
     );
     assert_eq!(third["success"], true, "{third}");
-    assert_eq!(third["data"]["result"]["status"], "fired", "{third}");
-    assert_eq!(third["data"]["result"]["next_status"], "armed", "{third}");
+    assert_eq!(
+        third["data"]["result"]["execution"]["status"], "fired",
+        "{third}"
+    );
+    assert_eq!(
+        third["data"]["result"]["execution"]["next_status"], "armed",
+        "{third}"
+    );
     assert_eq!(
         third["data"]["result"]["rule"]["status"], "armed",
         "{third}"
     );
 
     let inspected_after_third = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "target",
@@ -1855,17 +1813,234 @@ fn t437s_orchestration_repeat_mode_rearms_and_enforces_cooldown() {
         "{inspected_after_third}"
     );
 
-    cleanup(&home);
+    let removed_repeat = parse_json(
+        &rub_cmd(home)
+            .args(["--session", "source", "orchestration", "remove", &rule_id])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(removed_repeat["success"], true, "{removed_repeat}");
+
+    let manager_url = server.url_for("/orchestration-manager-reactive-repeat-latch");
+    let source_url = server.url_for("/orchestration-source-reactive-repeat-latch");
+    let target_url = server.url_for("/orchestration-target-reactive-repeat-latch");
+
+    assert_eq!(
+        parse_json(
+            &rub_cmd(home)
+                .args(["--session", "manager", "open", &manager_url])
+                .output()
+                .unwrap()
+        )["success"],
+        true
+    );
+    assert_eq!(
+        parse_json(
+            &rub_cmd(home)
+                .args(["--session", "source", "open", &source_url])
+                .output()
+                .unwrap()
+        )["success"],
+        true
+    );
+    assert_eq!(
+        parse_json(
+            &rub_cmd(home)
+                .args(["--session", "target", "open", &target_url])
+                .output()
+                .unwrap()
+        )["success"],
+        true
+    );
+
+    let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
+    assert_eq!(sessions["success"], true, "{sessions}");
+    let source_session_id = session_id_by_name(&sessions, "source");
+    let target_session_id = session_id_by_name(&sessions, "target");
+
+    let spec_path = format!("{home}/orchestration-reactive-repeat-latch.json");
+    std::fs::write(
+        &spec_path,
+        serde_json::to_vec_pretty(&json!({
+            "source": {
+                "session_id": source_session_id,
+                "tab_index": 0
+            },
+            "target": {
+                "session_id": target_session_id,
+                "tab_index": 0
+            },
+            "mode": "repeat",
+            "execution_policy": {
+                "cooldown_ms": 1200,
+                "max_retries": 0
+            },
+            "condition": {
+                "kind": "text_present",
+                "text": "Ready"
+            },
+            "actions": [
+                {
+                    "kind": "browser_command",
+                    "command": "click",
+                    "payload": {
+                        "selector": "#apply",
+                        "wait_after": {
+                            "text": "Applied",
+                            "timeout_ms": 5000
+                        }
+                    }
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let added = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "manager",
+                "orchestration",
+                "add",
+                "--file",
+                &spec_path,
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(added["success"], true, "{added}");
+    let rule_id = added["data"]["result"]["rule"]["id"]
+        .as_u64()
+        .expect("reactive orchestration rule id should be present");
+
+    let first = wait_for_orchestration_rule_result(home, "manager", rule_id, "armed", "fired");
+    let first_rule = first["data"]["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"].as_u64() == Some(rule_id))
+        .expect("reactive repeat rule should exist");
+    assert_eq!(first_rule["last_result"]["status"], "fired", "{first}");
+    assert_eq!(first_rule["last_result"]["next_status"], "armed", "{first}");
+    assert!(
+        first_rule["execution_policy"]["cooldown_until_ms"].is_u64(),
+        "{first}"
+    );
+
+    let target_first = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "target",
+                "inspect",
+                "text",
+                "--selector",
+                "#status",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(target_first["success"], true, "{target_first}");
+    assert_eq!(
+        target_first["data"]["result"]["value"], "Applied:1",
+        "{target_first}"
+    );
+
+    std::thread::sleep(Duration::from_millis(2200));
+
+    let target_after_cooldown = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "target",
+                "inspect",
+                "text",
+                "--selector",
+                "#status",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        target_after_cooldown["success"], true,
+        "{target_after_cooldown}"
+    );
+    assert_eq!(
+        target_after_cooldown["data"]["result"]["value"], "Applied:1",
+        "{target_after_cooldown}"
+    );
+
+    let clear_source = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "source",
+                "exec",
+                "document.getElementById('status').textContent = 'Waiting'; 'ok';",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(clear_source["success"], true, "{clear_source}");
+    std::thread::sleep(Duration::from_millis(700));
+
+    let rearm_source = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "source",
+                "exec",
+                "document.getElementById('status').textContent = 'Ready'; 'ok';",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(rearm_source["success"], true, "{rearm_source}");
+
+    let second_applied = wait_for_text_in_session(
+        home,
+        "target",
+        "#status",
+        "Applied:2",
+        Duration::from_secs(8),
+    );
+    assert_eq!(second_applied, "Applied:2");
+
+    let trace = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "manager",
+                "orchestration",
+                "trace",
+                "--last",
+                "10",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(trace["success"], true, "{trace}");
+    let fired_count = trace["data"]["result"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "fired" && event["rule_id"].as_u64() == Some(rule_id))
+        .count();
+    assert_eq!(fired_count, 2, "{trace}");
+
+    cleanup(home);
 }
 
-/// T437t: orchestration rules should become unavailable when the bound target session closes,
-/// and manual execution must reject before attempting any cross-session dispatch.
+/// T437t/T437u: orchestration should truthfully distinguish target-tab continuity loss from
+/// target takeover automation fences within one browser-backed scenario.
 #[test]
 #[ignore]
 #[serial]
-fn t437t_orchestration_rule_becomes_unavailable_when_target_session_closes() {
-    let home = unique_home();
-    cleanup(&home);
+fn t437t_u_orchestration_target_availability_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
     let (_rt, server) = start_test_server(vec![
         (
             "/orchestration-target-unavailable",
@@ -1895,6 +2070,34 @@ fn t437t_orchestration_rule_becomes_unavailable_when_target_session_closes() {
 </body>
 </html>"#,
         ),
+        (
+            "/orchestration-target-takeover",
+            "text/html",
+            r#"<!DOCTYPE html>
+<html>
+<head><title>Orchestration Target Takeover</title></head>
+<body>
+  <button id="apply">Apply</button>
+  <div id="status">Pending</div>
+  <script>
+    document.getElementById('apply').addEventListener('click', () => {
+      document.getElementById('status').textContent = 'Applied';
+    });
+  </script>
+</body>
+</html>"#,
+        ),
+        (
+            "/orchestration-source-takeover",
+            "text/html",
+            r#"<!DOCTYPE html>
+<html>
+<head><title>Orchestration Source Takeover</title></head>
+<body>
+  <div id="status">Ready</div>
+</body>
+</html>"#,
+        ),
     ]);
 
     let target_url = server.url_for("/orchestration-target-unavailable");
@@ -1902,7 +2105,7 @@ fn t437t_orchestration_rule_becomes_unavailable_when_target_session_closes() {
 
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "source", "open", &source_url])
                 .output()
                 .unwrap()
@@ -1911,7 +2114,7 @@ fn t437t_orchestration_rule_becomes_unavailable_when_target_session_closes() {
     );
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "target", "open", &target_url])
                 .output()
                 .unwrap()
@@ -1919,7 +2122,7 @@ fn t437t_orchestration_rule_becomes_unavailable_when_target_session_closes() {
         true
     );
 
-    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
+    let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
     assert_eq!(sessions["success"], true, "{sessions}");
     let source_session_id = session_id_by_name(&sessions, "source");
     let target_session_id = session_id_by_name(&sessions, "target");
@@ -1956,7 +2159,7 @@ fn t437t_orchestration_rule_becomes_unavailable_when_target_session_closes() {
     .unwrap();
 
     let added = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -1974,24 +2177,46 @@ fn t437t_orchestration_rule_becomes_unavailable_when_target_session_closes() {
         .expect("orchestration rule id should be present");
 
     let closed = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args(["--session", "target", "close"])
             .output()
             .unwrap(),
     );
     assert_eq!(closed["success"], true, "{closed}");
 
-    let listed =
-        wait_for_orchestration_unavailable_reason(&home, rule_id, "target_session_missing");
-    assert_eq!(listed["data"]["active_rule_count"], 0, "{listed}");
-    assert_eq!(listed["data"]["unavailable_rule_count"], 1, "{listed}");
+    let listed = wait_for_orchestration_rule_result(home, "source", rule_id, "armed", "degraded");
     assert_eq!(
-        listed["data"]["groups"][0]["unavailable_rule_count"], 1,
+        listed["data"]["runtime"]["active_rule_count"], 1,
         "{listed}"
     );
+    assert_eq!(
+        listed["data"]["runtime"]["unavailable_rule_count"], 0,
+        "{listed}"
+    );
+    assert_eq!(
+        listed["data"]["runtime"]["groups"][0]["unavailable_rule_count"], 0,
+        "{listed}"
+    );
+    let rule = listed["data"]["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"].as_u64() == Some(rule_id))
+        .expect("degraded orchestration rule should remain in runtime projection");
+    assert_eq!(rule["status"], "armed", "{listed}");
+    assert_eq!(rule["last_result"]["status"], "degraded", "{listed}");
+    assert_eq!(
+        rule["last_result"]["error_code"], "TAB_NOT_FOUND",
+        "{listed}"
+    );
+    assert_eq!(
+        rule["last_result"]["reason"], "orchestration_target_tab_missing",
+        "{listed}"
+    );
+    assert!(rule["unavailable_reason"].is_null(), "{listed}");
 
     let trace = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -2010,15 +2235,16 @@ fn t437t_orchestration_rule_becomes_unavailable_when_target_session_closes() {
             .unwrap()
             .iter()
             .any(|event| {
-                event["kind"] == "unavailable"
+                event["kind"] == "degraded"
                     && event["rule_id"].as_u64() == Some(rule_id)
-                    && event["unavailable_reason"] == "target_session_missing"
+                    && event["error_code"] == "TAB_NOT_FOUND"
+                    && event["reason"] == "orchestration_target_tab_missing"
             }),
         "{trace}"
     );
 
     let executed = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -2029,66 +2255,31 @@ fn t437t_orchestration_rule_becomes_unavailable_when_target_session_closes() {
             .output()
             .unwrap(),
     );
-    assert_eq!(executed["success"], false, "{executed}");
-    assert_eq!(executed["error"]["code"], "INVALID_INPUT", "{executed}");
+    assert_eq!(executed["success"], true, "{executed}");
     assert_eq!(
-        executed["error"]["context"]["reason"], "orchestration_rule_unavailable",
+        executed["data"]["result"]["execution"]["status"], "degraded",
         "{executed}"
     );
     assert_eq!(
-        executed["error"]["context"]["unavailable_reason"], "target_session_missing",
+        executed["data"]["result"]["execution"]["error_code"], "TAB_NOT_FOUND",
+        "{executed}"
+    );
+    assert_eq!(
+        executed["data"]["result"]["execution"]["reason"], "orchestration_target_tab_missing",
+        "{executed}"
+    );
+    assert_eq!(
+        executed["data"]["result"]["rule"]["status"], "armed",
         "{executed}"
     );
 
-    cleanup(&home);
-}
-
-/// T437u: orchestration execution should truthfully block when the target session is under
-/// human takeover, instead of bypassing the target session's automation pause fence.
-#[test]
-#[ignore]
-#[serial]
-fn t437u_orchestration_execute_is_blocked_when_target_takeover_is_active() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_test_server(vec![
-        (
-            "/orchestration-target-takeover",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Orchestration Target Takeover</title></head>
-<body>
-  <button id="apply">Apply</button>
-  <div id="status">Pending</div>
-  <script>
-    document.getElementById('apply').addEventListener('click', () => {
-      document.getElementById('status').textContent = 'Applied';
-    });
-  </script>
-</body>
-</html>"#,
-        ),
-        (
-            "/orchestration-source-takeover",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Orchestration Source Takeover</title></head>
-<body>
-  <div id="status">Ready</div>
-</body>
-</html>"#,
-        ),
-    ]);
-
-    let target_url = server.url_for("/orchestration-target-takeover");
-    let source_url = server.url_for("/orchestration-source-takeover");
+    let target_takeover_url = server.url_for("/orchestration-target-takeover");
+    let source_takeover_url = server.url_for("/orchestration-source-takeover");
 
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
-                .args(["--session", "source", "open", &source_url])
+            &rub_cmd(home)
+                .args(["--session", "source", "open", &source_takeover_url])
                 .output()
                 .unwrap()
         )["success"],
@@ -2096,18 +2287,24 @@ fn t437u_orchestration_execute_is_blocked_when_target_takeover_is_active() {
     );
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
-                .args(["--headed", "--session", "target", "open", &target_url])
+            &rub_cmd(home)
+                .args([
+                    "--headed",
+                    "--session",
+                    "target2",
+                    "open",
+                    &target_takeover_url
+                ])
                 .output()
                 .unwrap()
         )["success"],
         true
     );
 
-    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
+    let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
     assert_eq!(sessions["success"], true, "{sessions}");
     let source_session_id = session_id_by_name(&sessions, "source");
-    let target_session_id = session_id_by_name(&sessions, "target");
+    let target_session_id = session_id_by_name(&sessions, "target2");
 
     let spec_path = format!("{home}/orchestration-target-takeover.json");
     std::fs::write(
@@ -2141,7 +2338,7 @@ fn t437u_orchestration_execute_is_blocked_when_target_takeover_is_active() {
     .unwrap();
 
     let added = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "source",
@@ -2160,8 +2357,8 @@ fn t437u_orchestration_execute_is_blocked_when_target_takeover_is_active() {
         .to_string();
 
     let takeover = parse_json(
-        &rub_cmd(&home)
-            .args(["--headed", "--session", "target", "takeover", "start"])
+        &rub_cmd(home)
+            .args(["--headed", "--session", "target2", "takeover", "start"])
             .output()
             .unwrap(),
     );
@@ -2170,42 +2367,45 @@ fn t437u_orchestration_execute_is_blocked_when_target_takeover_is_active() {
         takeover["data"]["runtime"]["status"], "active",
         "{takeover}"
     );
-    assert_eq!(takeover["data"]["automation_paused"], true, "{takeover}");
+    assert_eq!(
+        takeover["data"]["runtime"]["automation_paused"], true,
+        "{takeover}"
+    );
 
     let executed = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args(["--session", "source", "orchestration", "execute", &rule_id])
             .output()
             .unwrap(),
     );
     assert_eq!(executed["success"], true, "{executed}");
     assert_eq!(
-        executed["data"]["result"]["status"], "blocked",
+        executed["data"]["result"]["execution"]["status"], "blocked",
         "{executed}"
     );
     assert_eq!(
-        executed["data"]["result"]["error_code"], "AUTOMATION_PAUSED",
+        executed["data"]["result"]["execution"]["error_code"], "AUTOMATION_PAUSED",
         "{executed}"
     );
     assert_eq!(
-        executed["data"]["result"]["rule"]["status"], "blocked",
+        executed["data"]["result"]["rule"]["status"], "armed",
         "{executed}"
     );
     assert_eq!(
-        executed["data"]["result"]["steps"][0]["status"], "blocked",
+        executed["data"]["result"]["execution"]["steps"][0]["status"], "blocked",
         "{executed}"
     );
     assert_eq!(
-        executed["data"]["result"]["steps"][0]["error_code"], "AUTOMATION_PAUSED",
+        executed["data"]["result"]["execution"]["steps"][0]["error_code"], "AUTOMATION_PAUSED",
         "{executed}"
     );
 
     let inspected = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--headed",
                 "--session",
-                "target",
+                "target2",
                 "inspect",
                 "text",
                 "--selector",
@@ -2220,17 +2420,17 @@ fn t437u_orchestration_execute_is_blocked_when_target_takeover_is_active() {
         "{inspected}"
     );
 
-    cleanup(&home);
+    cleanup(home);
 }
 
-/// T437v: reactive orchestration should be able to probe a remote source session and
-/// fire a canonical action on a remote target session through a manager-hosted registry.
+/// T437v/T437z: reactive cross-session orchestration should preserve both remote source/target
+/// routing and explicit frame routing within one browser-backed scenario.
 #[test]
 #[ignore]
 #[serial]
-fn t437v_reactive_orchestration_fires_across_remote_source_and_target_sessions() {
-    let home = unique_home();
-    cleanup(&home);
+fn t437v_z_reactive_orchestration_remote_and_frame_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
     let (_rt, server) = start_test_server(vec![
         (
             "/orchestration-manager-reactive",
@@ -2271,171 +2471,6 @@ fn t437v_reactive_orchestration_fires_across_remote_source_and_target_sessions()
 </body>
 </html>"#,
         ),
-    ]);
-
-    let manager_url = server.url_for("/orchestration-manager-reactive");
-    let source_url = server.url_for("/orchestration-source-reactive");
-    let target_url = server.url_for("/orchestration-target-reactive");
-
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["--session", "manager", "open", &manager_url])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["--session", "source", "open", &source_url])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["--session", "target", "open", &target_url])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-
-    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
-    assert_eq!(sessions["success"], true, "{sessions}");
-    let source_session_id = session_id_by_name(&sessions, "source");
-    let target_session_id = session_id_by_name(&sessions, "target");
-
-    let spec_path = format!("{home}/orchestration-reactive-remote.json");
-    std::fs::write(
-        &spec_path,
-        serde_json::to_vec_pretty(&json!({
-            "source": {
-                "session_id": source_session_id,
-                "tab_index": 0
-            },
-            "target": {
-                "session_id": target_session_id,
-                "tab_index": 0
-            },
-            "mode": "once",
-            "condition": {
-                "kind": "text_present",
-                "text": "Ready"
-            },
-            "actions": [
-                {
-                    "kind": "browser_command",
-                    "command": "click",
-                    "payload": {
-                        "selector": "#apply",
-                        "wait_after": {
-                            "text": "Applied",
-                            "timeout_ms": 5000
-                        }
-                    }
-                }
-            ]
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
-    let added = parse_json(
-        &rub_cmd(&home)
-            .args([
-                "--session",
-                "manager",
-                "orchestration",
-                "add",
-                "--file",
-                &spec_path,
-            ])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(added["success"], true, "{added}");
-    let rule_id = added["data"]["result"]["rule"]["id"]
-        .as_u64()
-        .expect("reactive orchestration rule id should be present");
-
-    let listed = wait_for_orchestration_status(&home, "manager", rule_id, "fired");
-    assert_eq!(
-        listed["data"]["runtime"]["last_rule_id"], rule_id,
-        "{listed}"
-    );
-    assert_eq!(
-        listed["data"]["runtime"]["last_rule_result"]["status"], "fired",
-        "{listed}"
-    );
-    assert_eq!(
-        listed["data"]["result"]["items"][0]["last_condition_evidence"]["summary"],
-        "source_tab_text_present:Ready",
-        "{listed}"
-    );
-
-    let inspected = parse_json(
-        &rub_cmd(&home)
-            .args([
-                "--session",
-                "target",
-                "inspect",
-                "text",
-                "--selector",
-                "#status",
-            ])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(inspected["success"], true, "{inspected}");
-    assert_eq!(
-        inspected["data"]["result"]["value"], "Applied",
-        "{inspected}"
-    );
-
-    let trace = parse_json(
-        &rub_cmd(&home)
-            .args([
-                "--session",
-                "manager",
-                "orchestration",
-                "trace",
-                "--last",
-                "5",
-            ])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(trace["success"], true, "{trace}");
-    assert!(
-        trace["data"]["result"]["events"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|event| {
-                event["kind"] == "fired"
-                    && event["rule_id"].as_u64() == Some(rule_id)
-                    && event["evidence"]["summary"] == "source_tab_text_present:Ready"
-            }),
-        "{trace}"
-    );
-
-    cleanup(&home);
-}
-
-/// T437z: reactive orchestration should support explicit source/target frame routing across sessions
-/// without mutating the remote sessions' selected-frame authority.
-#[test]
-#[ignore]
-#[serial]
-fn t437z_reactive_orchestration_routes_source_and_target_frames_across_sessions() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_test_server(vec![
         (
             "/orchestration-manager-reactive-frames",
             "text/html",
@@ -2511,13 +2546,13 @@ fn t437z_reactive_orchestration_routes_source_and_target_frames_across_sessions(
         ),
     ]);
 
-    let manager_url = server.url_for("/orchestration-manager-reactive-frames");
-    let source_url = server.url_for("/orchestration-source-reactive-frames");
-    let target_url = server.url_for("/orchestration-target-reactive-frames");
+    let manager_url = server.url_for("/orchestration-manager-reactive");
+    let source_url = server.url_for("/orchestration-source-reactive");
+    let target_url = server.url_for("/orchestration-target-reactive");
 
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "manager", "open", &manager_url])
                 .output()
                 .unwrap()
@@ -2526,7 +2561,7 @@ fn t437z_reactive_orchestration_routes_source_and_target_frames_across_sessions(
     );
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "source", "open", &source_url])
                 .output()
                 .unwrap()
@@ -2535,7 +2570,7 @@ fn t437z_reactive_orchestration_routes_source_and_target_frames_across_sessions(
     );
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "target", "open", &target_url])
                 .output()
                 .unwrap()
@@ -2543,13 +2578,158 @@ fn t437z_reactive_orchestration_routes_source_and_target_frames_across_sessions(
         true
     );
 
-    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
+    let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
     assert_eq!(sessions["success"], true, "{sessions}");
     let source_session_id = session_id_by_name(&sessions, "source");
     let target_session_id = session_id_by_name(&sessions, "target");
 
+    let remote_spec_path = format!("{home}/orchestration-reactive-remote.json");
+    std::fs::write(
+        &remote_spec_path,
+        serde_json::to_vec_pretty(&json!({
+            "source": {
+                "session_id": source_session_id,
+                "tab_index": 0
+            },
+            "target": {
+                "session_id": target_session_id,
+                "tab_index": 0
+            },
+            "mode": "once",
+            "condition": {
+                "kind": "text_present",
+                "text": "Ready"
+            },
+            "actions": [
+                {
+                    "kind": "browser_command",
+                    "command": "click",
+                    "payload": {
+                        "selector": "#apply",
+                        "wait_after": {
+                            "text": "Applied",
+                            "timeout_ms": 5000
+                        }
+                    }
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let remote_added = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "manager",
+                "orchestration",
+                "add",
+                "--file",
+                &remote_spec_path,
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(remote_added["success"], true, "{remote_added}");
+    let remote_rule_id = remote_added["data"]["result"]["rule"]["id"]
+        .as_u64()
+        .expect("reactive orchestration rule id should be present");
+
+    let remote_listed = wait_for_orchestration_status(home, "manager", remote_rule_id, "fired");
+    assert_eq!(
+        remote_listed["data"]["runtime"]["last_rule_id"], remote_rule_id,
+        "{remote_listed}"
+    );
+    assert_eq!(
+        remote_listed["data"]["runtime"]["last_rule_result"]["status"], "fired",
+        "{remote_listed}"
+    );
+    assert_eq!(
+        remote_listed["data"]["result"]["items"][0]["last_condition_evidence"]["summary"],
+        "source_tab_text_present:Ready",
+        "{remote_listed}"
+    );
+
+    let remote_inspected = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "target",
+                "inspect",
+                "text",
+                "--selector",
+                "#status",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(remote_inspected["success"], true, "{remote_inspected}");
+    assert_eq!(
+        remote_inspected["data"]["result"]["value"], "Applied",
+        "{remote_inspected}"
+    );
+
+    let remote_trace = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "manager",
+                "orchestration",
+                "trace",
+                "--last",
+                "5",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(remote_trace["success"], true, "{remote_trace}");
+    assert!(
+        remote_trace["data"]["result"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event["kind"] == "fired"
+                    && event["rule_id"].as_u64() == Some(remote_rule_id)
+                    && event["evidence"]["summary"] == "source_tab_text_present:Ready"
+            }),
+        "{remote_trace}"
+    );
+
+    let manager_frames_url = server.url_for("/orchestration-manager-reactive-frames");
+    let source_frames_url = server.url_for("/orchestration-source-reactive-frames");
+    let target_frames_url = server.url_for("/orchestration-target-reactive-frames");
+    assert_eq!(
+        parse_json(
+            &rub_cmd(home)
+                .args(["--session", "manager", "open", &manager_frames_url])
+                .output()
+                .unwrap()
+        )["success"],
+        true
+    );
+    assert_eq!(
+        parse_json(
+            &rub_cmd(home)
+                .args(["--session", "source", "open", &source_frames_url])
+                .output()
+                .unwrap()
+        )["success"],
+        true
+    );
+    assert_eq!(
+        parse_json(
+            &rub_cmd(home)
+                .args(["--session", "target", "open", &target_frames_url])
+                .output()
+                .unwrap()
+        )["success"],
+        true
+    );
+
     let source_frames = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args(["--session", "source", "frames"])
             .output()
             .unwrap(),
@@ -2558,7 +2738,7 @@ fn t437z_reactive_orchestration_routes_source_and_target_frames_across_sessions(
     let source_frame_id = frame_id_by_name(&source_frames, "source-frame");
 
     let target_frames = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args(["--session", "target", "frames"])
             .output()
             .unwrap(),
@@ -2566,9 +2746,9 @@ fn t437z_reactive_orchestration_routes_source_and_target_frames_across_sessions(
     assert_eq!(target_frames["success"], true, "{target_frames}");
     let target_frame_id = frame_id_by_name(&target_frames, "target-frame");
 
-    let spec_path = format!("{home}/orchestration-reactive-frames.json");
+    let frames_spec_path = format!("{home}/orchestration-reactive-frames.json");
     std::fs::write(
-        &spec_path,
+        &frames_spec_path,
         serde_json::to_vec_pretty(&json!({
             "source": {
                 "session_id": source_session_id,
@@ -2600,14 +2780,14 @@ fn t437z_reactive_orchestration_routes_source_and_target_frames_across_sessions(
     .unwrap();
 
     let added = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "manager",
                 "orchestration",
                 "add",
                 "--file",
-                &spec_path,
+                &frames_spec_path,
             ])
             .output()
             .unwrap(),
@@ -2617,7 +2797,7 @@ fn t437z_reactive_orchestration_routes_source_and_target_frames_across_sessions(
         .as_u64()
         .expect("reactive orchestration frame rule id should be present");
 
-    let fired = wait_for_orchestration_status(&home, "manager", rule_id, "fired");
+    let fired = wait_for_orchestration_status(home, "manager", rule_id, "fired");
     let rule = fired["data"]["result"]["items"]
         .as_array()
         .unwrap()
@@ -2633,7 +2813,7 @@ fn t437z_reactive_orchestration_routes_source_and_target_frames_across_sessions(
     assert_eq!(rule["target"]["frame_id"], target_frame_id, "{fired}");
 
     let switch_target_frame = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args(["--session", "target", "frame", "--name", "target-frame"])
             .output()
             .unwrap(),
@@ -2644,7 +2824,7 @@ fn t437z_reactive_orchestration_routes_source_and_target_frames_across_sessions(
     );
 
     let inspected = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "target",
@@ -2662,16 +2842,17 @@ fn t437z_reactive_orchestration_routes_source_and_target_frames_across_sessions(
         "{inspected}"
     );
 
-    cleanup(&home);
+    cleanup(home);
 }
 
-/// T437w: reactive cross-session orchestration should support workflow payload.source_vars via source-side live read authority.
+/// T437w/T437x: reactive cross-session orchestration workflow source-vars success and blocked
+/// paths should reuse one browser-backed scenario.
 #[test]
 #[ignore]
 #[serial]
-fn t437w_reactive_orchestration_workflow_supports_source_derived_vars() {
-    let home = unique_home();
-    cleanup(&home);
+fn t437w_x_reactive_orchestration_workflow_source_vars_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
     std::fs::create_dir_all(PathBuf::from(&home).join("workflows")).unwrap();
 
     let (_rt, server) = start_test_server(vec![
@@ -2730,7 +2911,7 @@ fn t437w_reactive_orchestration_workflow_supports_source_derived_vars() {
 
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "manager", "open", &manager_url])
                 .output()
                 .unwrap()
@@ -2739,7 +2920,7 @@ fn t437w_reactive_orchestration_workflow_supports_source_derived_vars() {
     );
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "source", "open", &source_url])
                 .output()
                 .unwrap()
@@ -2748,7 +2929,7 @@ fn t437w_reactive_orchestration_workflow_supports_source_derived_vars() {
     );
     assert_eq!(
         parse_json(
-            &rub_cmd(&home)
+            &rub_cmd(home)
                 .args(["--session", "target", "open", &target_url])
                 .output()
                 .unwrap()
@@ -2756,7 +2937,7 @@ fn t437w_reactive_orchestration_workflow_supports_source_derived_vars() {
         true
     );
 
-    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
+    let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
     assert_eq!(sessions["success"], true, "{sessions}");
     let source_session_id = session_id_by_name(&sessions, "source");
     let target_session_id = session_id_by_name(&sessions, "target");
@@ -2825,7 +3006,7 @@ fn t437w_reactive_orchestration_workflow_supports_source_derived_vars() {
     .unwrap();
 
     let added = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "manager",
@@ -2842,7 +3023,7 @@ fn t437w_reactive_orchestration_workflow_supports_source_derived_vars() {
         .as_u64()
         .expect("reactive orchestration rule id should be present");
 
-    let fired = wait_for_orchestration_status(&home, "manager", rule_id, "fired");
+    let fired = wait_for_orchestration_status(home, "manager", rule_id, "fired");
     let rule = fired["data"]["result"]["items"]
         .as_array()
         .unwrap()
@@ -2860,6 +3041,16 @@ fn t437w_reactive_orchestration_workflow_supports_source_derived_vars() {
         "{fired}"
     );
     assert_eq!(
+        rule["last_result"]["steps"][0]["action"]["workflow_path_state"]["path_authority"],
+        "automation.action.workflow_path",
+        "{fired}"
+    );
+    assert_eq!(
+        rule["last_result"]["steps"][0]["action"]["workflow_path_state"]["upstream_truth"],
+        "orchestration_action_payload.workflow_name",
+        "{fired}"
+    );
+    assert_eq!(
         rule["last_result"]["steps"][0]["action"]["source_vars"],
         json!(["reply_name"]),
         "{fired}"
@@ -2870,7 +3061,7 @@ fn t437w_reactive_orchestration_workflow_supports_source_derived_vars() {
     );
 
     let inspected = parse_json(
-        &rub_cmd(&home)
+        &rub_cmd(home)
             .args([
                 "--session",
                 "target",
@@ -2888,108 +3079,18 @@ fn t437w_reactive_orchestration_workflow_supports_source_derived_vars() {
         "{inspected}"
     );
 
-    cleanup(&home);
-}
-
-/// T437x: source-side workflow binding failures should block reactive orchestration before touching the target session.
-#[test]
-#[ignore]
-#[serial]
-fn t437x_reactive_orchestration_workflow_source_var_failure_is_blocked() {
-    let home = unique_home();
-    cleanup(&home);
-    std::fs::create_dir_all(PathBuf::from(&home).join("workflows")).unwrap();
-
-    let (_rt, server) = start_test_server(vec![
-        (
-            "/orchestration-manager-reactive-workflow-vars-blocked",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Orchestration Manager Reactive Workflow Vars Blocked</title></head>
-<body>
-  <div id="status">Manager</div>
-</body>
-</html>"#,
-        ),
-        (
-            "/orchestration-source-reactive-workflow-vars-blocked",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Orchestration Source Reactive Workflow Vars Blocked</title></head>
-<body>
-  <div id="status">Waiting</div>
-  <script>
-    setTimeout(() => {
-      document.getElementById('status').textContent = 'Ready';
-    }, 1200);
-  </script>
-</body>
-</html>"#,
-        ),
-        (
-            "/orchestration-target-reactive-workflow-vars-blocked",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Orchestration Target Reactive Workflow Vars Blocked</title></head>
-<body>
-  <input id="name" value="" />
-  <button id="apply">Apply</button>
-  <div id="status">Pending</div>
-  <script>
-    document.getElementById('apply').addEventListener('click', () => {
-      document.getElementById('status').textContent =
-        document.getElementById('name').value || 'Pending';
-    });
-  </script>
-</body>
-</html>"#,
-        ),
-    ]);
-
-    let manager_url = server.url_for("/orchestration-manager-reactive-workflow-vars-blocked");
-    let source_url = server.url_for("/orchestration-source-reactive-workflow-vars-blocked");
-    let target_url = server.url_for("/orchestration-target-reactive-workflow-vars-blocked");
-
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["--session", "manager", "open", &manager_url])
-                .output()
-                .unwrap()
-        )["success"],
-        true
+    let reopened_target = parse_json(
+        &rub_cmd(home)
+            .args(["--session", "target", "open", &target_url])
+            .output()
+            .unwrap(),
     );
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["--session", "source", "open", &source_url])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["--session", "target", "open", &target_url])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
+    assert_eq!(reopened_target["success"], true, "{reopened_target}");
 
-    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
-    assert_eq!(sessions["success"], true, "{sessions}");
-    let source_session_id = session_id_by_name(&sessions, "source");
-    let target_session_id = session_id_by_name(&sessions, "target");
-
-    let workflow_path =
+    let blocked_workflow_path =
         PathBuf::from(&home).join("workflows/orchestration_reply_missing_source_var.json");
     std::fs::write(
-        &workflow_path,
+        &blocked_workflow_path,
         serde_json::to_vec_pretty(&json!([
             {
                 "command": "type",
@@ -3010,9 +3111,9 @@ fn t437x_reactive_orchestration_workflow_source_var_failure_is_blocked() {
     )
     .unwrap();
 
-    let spec_path = format!("{home}/orchestration-reactive-workflow-vars-blocked.json");
+    let blocked_spec_path = format!("{home}/orchestration-reactive-workflow-vars-blocked.json");
     std::fs::write(
-        &spec_path,
+        &blocked_spec_path,
         serde_json::to_vec_pretty(&json!({
             "source": {
                 "session_id": source_session_id,
@@ -3046,53 +3147,58 @@ fn t437x_reactive_orchestration_workflow_source_var_failure_is_blocked() {
     )
     .unwrap();
 
-    let added = parse_json(
-        &rub_cmd(&home)
+    let added_blocked = parse_json(
+        &rub_cmd(home)
             .args([
                 "--session",
                 "manager",
                 "orchestration",
                 "add",
                 "--file",
-                &spec_path,
+                &blocked_spec_path,
             ])
             .output()
             .unwrap(),
     );
-    assert_eq!(added["success"], true, "{added}");
-    let rule_id = added["data"]["result"]["rule"]["id"]
+    assert_eq!(added_blocked["success"], true, "{added_blocked}");
+    let blocked_rule_id = added_blocked["data"]["result"]["rule"]["id"]
         .as_u64()
-        .expect("reactive orchestration rule id should be present");
+        .expect("blocked reactive orchestration rule id should be present");
 
-    let blocked = wait_for_orchestration_status(&home, "manager", rule_id, "blocked");
-    let rule = blocked["data"]["result"]["items"]
+    let blocked =
+        wait_for_orchestration_rule_result(home, "manager", blocked_rule_id, "armed", "blocked");
+    let blocked_rule = blocked["data"]["result"]["items"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|entry| entry["id"].as_u64() == Some(rule_id))
+        .find(|entry| entry["id"].as_u64() == Some(blocked_rule_id))
         .expect("blocked orchestration rule should remain in runtime projection");
-    assert_eq!(rule["last_result"]["status"], "blocked", "{blocked}");
+    assert_eq!(blocked_rule["status"], "armed", "{blocked}");
     assert_eq!(
-        rule["last_result"]["error_code"], "ELEMENT_NOT_FOUND",
+        blocked_rule["last_result"]["status"], "blocked",
         "{blocked}"
     );
     assert_eq!(
-        rule["last_result"]["steps"][0]["action"]["kind"], "workflow",
+        blocked_rule["last_result"]["error_code"], "ELEMENT_NOT_FOUND",
         "{blocked}"
     );
     assert_eq!(
-        rule["last_result"]["steps"][0]["action"]["workflow_name"],
+        blocked_rule["last_result"]["steps"][0]["action"]["kind"], "workflow",
+        "{blocked}"
+    );
+    assert_eq!(
+        blocked_rule["last_result"]["steps"][0]["action"]["workflow_name"],
         "orchestration_reply_missing_source_var",
         "{blocked}"
     );
     assert_eq!(
-        rule["last_result"]["steps"][0]["action"]["source_vars"],
+        blocked_rule["last_result"]["steps"][0]["action"]["source_vars"],
         json!(["reply_name"]),
         "{blocked}"
     );
 
-    let inspected = parse_json(
-        &rub_cmd(&home)
+    let blocked_target = parse_json(
+        &rub_cmd(home)
             .args([
                 "--session",
                 "target",
@@ -3104,275 +3210,11 @@ fn t437x_reactive_orchestration_workflow_source_var_failure_is_blocked() {
             .output()
             .unwrap(),
     );
-    assert_eq!(inspected["success"], true, "{inspected}");
+    assert_eq!(blocked_target["success"], true, "{blocked_target}");
     assert_eq!(
-        inspected["data"]["result"]["value"], "Pending",
-        "{inspected}"
+        blocked_target["data"]["result"]["value"], "Pending",
+        "{blocked_target}"
     );
 
-    cleanup(&home);
-}
-
-/// T437y: reactive repeat orchestration should not replay the same latched evidence after cooldown;
-/// it should fire again only after the source condition clears and matches again.
-#[test]
-#[ignore]
-#[serial]
-fn t437y_reactive_repeat_orchestration_latches_evidence_until_condition_clears() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_test_server(vec![
-        (
-            "/orchestration-manager-reactive-repeat-latch",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Orchestration Manager Reactive Repeat Latch</title></head>
-<body>
-  <div id="status">Manager</div>
-</body>
-</html>"#,
-        ),
-        (
-            "/orchestration-source-reactive-repeat-latch",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Orchestration Source Reactive Repeat Latch</title></head>
-<body>
-  <div id="status">Ready</div>
-</body>
-</html>"#,
-        ),
-        (
-            "/orchestration-target-reactive-repeat-latch",
-            "text/html",
-            r#"<!DOCTYPE html>
-<html>
-<head><title>Orchestration Target Reactive Repeat Latch</title></head>
-<body>
-  <button id="apply">Apply</button>
-  <div id="status">Pending</div>
-  <script>
-    let applyCount = 0;
-    document.getElementById('apply').addEventListener('click', () => {
-      applyCount += 1;
-      document.getElementById('status').textContent = `Applied:${applyCount}`;
-    });
-  </script>
-</body>
-</html>"#,
-        ),
-    ]);
-
-    let manager_url = server.url_for("/orchestration-manager-reactive-repeat-latch");
-    let source_url = server.url_for("/orchestration-source-reactive-repeat-latch");
-    let target_url = server.url_for("/orchestration-target-reactive-repeat-latch");
-
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["--session", "manager", "open", &manager_url])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["--session", "source", "open", &source_url])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-    assert_eq!(
-        parse_json(
-            &rub_cmd(&home)
-                .args(["--session", "target", "open", &target_url])
-                .output()
-                .unwrap()
-        )["success"],
-        true
-    );
-
-    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
-    assert_eq!(sessions["success"], true, "{sessions}");
-    let source_session_id = session_id_by_name(&sessions, "source");
-    let target_session_id = session_id_by_name(&sessions, "target");
-
-    let spec_path = format!("{home}/orchestration-reactive-repeat-latch.json");
-    std::fs::write(
-        &spec_path,
-        serde_json::to_vec_pretty(&json!({
-            "source": {
-                "session_id": source_session_id,
-                "tab_index": 0
-            },
-            "target": {
-                "session_id": target_session_id,
-                "tab_index": 0
-            },
-            "mode": "repeat",
-            "execution_policy": {
-                "cooldown_ms": 1200,
-                "max_retries": 0
-            },
-            "condition": {
-                "kind": "text_present",
-                "text": "Ready"
-            },
-            "actions": [
-                {
-                    "kind": "browser_command",
-                    "command": "click",
-                    "payload": {
-                        "selector": "#apply",
-                        "wait_after": {
-                            "text": "Applied",
-                            "timeout_ms": 5000
-                        }
-                    }
-                }
-            ]
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
-    let added = parse_json(
-        &rub_cmd(&home)
-            .args([
-                "--session",
-                "manager",
-                "orchestration",
-                "add",
-                "--file",
-                &spec_path,
-            ])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(added["success"], true, "{added}");
-    let rule_id = added["data"]["result"]["rule"]["id"]
-        .as_u64()
-        .expect("reactive orchestration rule id should be present");
-
-    let first = wait_for_orchestration_rule_result(&home, "manager", rule_id, "armed", "fired");
-    let first_rule = first["data"]["result"]["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|entry| entry["id"].as_u64() == Some(rule_id))
-        .expect("reactive repeat rule should exist");
-    assert_eq!(first_rule["last_result"]["status"], "fired", "{first}");
-    assert_eq!(first_rule["last_result"]["next_status"], "armed", "{first}");
-    assert!(
-        first_rule["execution_policy"]["cooldown_until_ms"].is_u64(),
-        "{first}"
-    );
-
-    let target_first = parse_json(
-        &rub_cmd(&home)
-            .args([
-                "--session",
-                "target",
-                "inspect",
-                "text",
-                "--selector",
-                "#status",
-            ])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(target_first["success"], true, "{target_first}");
-    assert_eq!(
-        target_first["data"]["result"]["value"], "Applied:1",
-        "{target_first}"
-    );
-
-    std::thread::sleep(Duration::from_millis(2200));
-
-    let target_after_cooldown = parse_json(
-        &rub_cmd(&home)
-            .args([
-                "--session",
-                "target",
-                "inspect",
-                "text",
-                "--selector",
-                "#status",
-            ])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(
-        target_after_cooldown["success"], true,
-        "{target_after_cooldown}"
-    );
-    assert_eq!(
-        target_after_cooldown["data"]["result"]["value"], "Applied:1",
-        "{target_after_cooldown}"
-    );
-
-    let clear_source = parse_json(
-        &rub_cmd(&home)
-            .args([
-                "--session",
-                "source",
-                "exec",
-                "document.getElementById('status').textContent = 'Waiting'; 'ok';",
-            ])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(clear_source["success"], true, "{clear_source}");
-    std::thread::sleep(Duration::from_millis(700));
-
-    let rearm_source = parse_json(
-        &rub_cmd(&home)
-            .args([
-                "--session",
-                "source",
-                "exec",
-                "document.getElementById('status').textContent = 'Ready'; 'ok';",
-            ])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(rearm_source["success"], true, "{rearm_source}");
-
-    let second_applied = wait_for_text_in_session(
-        &home,
-        "target",
-        "#status",
-        "Applied:2",
-        Duration::from_secs(8),
-    );
-    assert_eq!(second_applied, "Applied:2");
-
-    let trace = parse_json(
-        &rub_cmd(&home)
-            .args([
-                "--session",
-                "manager",
-                "orchestration",
-                "trace",
-                "--last",
-                "10",
-            ])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(trace["success"], true, "{trace}");
-    let fired_count = trace["data"]["result"]["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|event| event["kind"] == "fired" && event["rule_id"].as_u64() == Some(rule_id))
-        .count();
-    assert_eq!(fired_count, 2, "{trace}");
-
-    cleanup(&home);
+    cleanup(home);
 }

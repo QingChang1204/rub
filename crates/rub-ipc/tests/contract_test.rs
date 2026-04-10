@@ -40,6 +40,27 @@ fn ipc_request_rejects_unknown_fields() {
 }
 
 #[test]
+fn strict_request_decode_surfaces_structured_contract_reason() {
+    let error = IpcRequest::from_value_strict(serde_json::json!({
+        "ipc_protocol_version": "1.0",
+        "command": "doctor",
+        "args": {},
+        "timeout_ms": 1000,
+        "unexpected": "field"
+    }))
+    .expect_err("strict request decode should reject unknown fields");
+    assert_eq!(error.code, ErrorCode::IpcProtocolError);
+    assert_eq!(
+        error
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("invalid_ipc_request_contract")
+    );
+}
+
+#[test]
 fn ipc_request_rejects_blank_command_id() {
     let error = serde_json::from_str::<IpcRequest>(
         r#"{
@@ -199,6 +220,50 @@ fn ipc_response_rejects_error_with_success_data() {
     assert!(
         error.to_string().contains("carried success data"),
         "{error}"
+    );
+}
+
+#[test]
+fn strict_response_decode_surfaces_schema_reason() {
+    let error = IpcResponse::from_value_strict(serde_json::json!({
+        "ipc_protocol_version": "1.0",
+        "request_id": "req-1",
+        "status": "success",
+        "data": {},
+        "timing": {"queue_ms":0,"exec_ms":0,"total_ms":0},
+        "unexpected": "field"
+    }))
+    .expect_err("strict response decode should reject unknown fields");
+    assert_eq!(error.code, ErrorCode::IpcProtocolError);
+    assert_eq!(
+        error
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("invalid_ipc_response_schema")
+    );
+}
+
+#[test]
+fn strict_response_decode_surfaces_contract_reason() {
+    let error = IpcResponse::from_value_strict(serde_json::json!({
+        "ipc_protocol_version": "1.0",
+        "request_id": "req-1",
+        "status": "success",
+        "data": {},
+        "error": {"code":"IPC_PROTOCOL_ERROR","message":"bad","suggestion":"report"},
+        "timing": {"queue_ms":0,"exec_ms":0,"total_ms":0}
+    }))
+    .expect_err("strict response decode should reject invalid success/error combination");
+    assert_eq!(error.code, ErrorCode::IpcProtocolError);
+    assert_eq!(
+        error
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("invalid_ipc_response_contract")
     );
 }
 

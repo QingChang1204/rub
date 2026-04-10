@@ -2,72 +2,42 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rub_core::error::{ErrorCode, RubError};
-use rub_core::model::{DownloadEntry, DownloadRuntimeStatus, DownloadState};
+use rub_core::model::{DownloadRuntimeStatus, DownloadState};
 
-use crate::router::request_args::parse_json_args;
 use crate::session::SessionState;
 
 use super::DaemonRouter;
 
+mod args;
 mod asset_save;
+mod projection;
 
-use asset_save::DownloadSaveArgs;
-
-#[derive(Debug)]
-enum DownloadCommand {
-    Wait(DownloadWaitArgs),
-    Cancel(DownloadCancelArgs),
-    Save(DownloadSaveArgs),
-}
-
-impl DownloadCommand {
-    fn parse(args: &serde_json::Value) -> Result<Self, RubError> {
-        match args
-            .get("sub")
-            .and_then(|value| value.as_str())
-            .unwrap_or("wait")
-        {
-            "wait" => Ok(Self::Wait(parse_json_args(args, "download wait")?)),
-            "cancel" => Ok(Self::Cancel(parse_json_args(args, "download cancel")?)),
-            "save" => Ok(Self::Save(parse_json_args(args, "download save")?)),
-            other => Err(RubError::domain(
-                ErrorCode::InvalidInput,
-                format!("Unknown download subcommand: '{other}'"),
-            )),
-        }
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DownloadWaitArgs {
-    #[serde(rename = "sub")]
-    _sub: String,
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    state: Option<String>,
-    #[serde(default)]
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DownloadCancelArgs {
-    #[serde(rename = "sub")]
-    _sub: String,
-    id: String,
-}
+use self::args::{
+    DownloadCancelArgs, DownloadCommand, DownloadWaitArgs, matches_wait_state, parse_wait_state,
+    wait_state_label,
+};
+use self::projection::{
+    download_payload, download_registry_result, download_registry_subject, download_subject,
+    download_wait_timeout_error,
+};
 
 pub(super) async fn cmd_downloads(
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     let runtime = state.download_runtime().await;
+    let mut result = download_registry_result(&runtime);
+    annotate_download_runtime_path_states(&mut result);
+    let mut runtime_projection = serde_json::to_value(runtime).map_err(RubError::from)?;
+    annotate_download_runtime_path_states(&mut runtime_projection);
     Ok(download_payload(
         download_registry_subject(),
-        download_registry_result(&runtime),
-        serde_json::to_value(runtime).map_err(RubError::from)?,
+        result,
+        runtime_projection,
     ))
+}
+
+pub(super) fn annotate_download_runtime_path_states(runtime: &mut serde_json::Value) {
+    projection::annotate_download_runtime_path_states(runtime);
 }
 
 pub(super) async fn cmd_download(
@@ -121,13 +91,15 @@ async fn cmd_download_wait(
             && let Some(download) = state.download_entry(guid).await
             && matches_wait_state(&download, desired_state)
         {
+            let mut runtime_projection = serde_json::to_value(runtime).map_err(RubError::from)?;
+            annotate_download_runtime_path_states(&mut runtime_projection);
             return Ok(download_payload(
                 download_subject(Some(guid), "wait", Some(wait_state_label(desired_state))),
                 serde_json::json!({
                     "download": download,
                     "matched": true,
                 }),
-                serde_json::to_value(runtime).map_err(RubError::from)?,
+                runtime_projection,
             ));
         }
 
@@ -165,218 +137,43 @@ async fn cmd_download_cancel(
         if let Some(download) = state.download_entry(&guid).await
             && download.state == DownloadState::Canceled
         {
+            let mut runtime_projection = serde_json::to_value(runtime).map_err(RubError::from)?;
+            annotate_download_runtime_path_states(&mut runtime_projection);
             return Ok(download_payload(
                 download_subject(Some(guid.as_str()), "cancel", None),
                 serde_json::json!({
                     "download": download,
                 }),
-                serde_json::to_value(runtime).map_err(RubError::from)?,
+                runtime_projection,
             ));
         }
         if Instant::now() >= deadline {
+            let mut context = serde_json::json!({
+                "kind": "download",
+                "id": guid,
+                "state": "canceled",
+                "timeout_ms": 2_000u64,
+                "download_runtime": runtime,
+                "download": state.download_entry(&guid).await,
+            });
+            if let Some(download_runtime) = context.get_mut("download_runtime") {
+                annotate_download_runtime_path_states(download_runtime);
+            }
             return Err(RubError::domain_with_context(
                 ErrorCode::WaitTimeout,
                 format!("Timed out waiting for download '{guid}' to reach canceled state"),
-                serde_json::json!({
-                    "kind": "download",
-                    "id": guid,
-                    "state": "canceled",
-                    "timeout_ms": 2_000u64,
-                    "download_runtime": runtime,
-                    "download": state.download_entry(&guid).await,
-                }),
+                context,
             ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DownloadWaitState {
-    Started,
-    InProgress,
-    Completed,
-    Failed,
-    Canceled,
-    Terminal,
-}
-
-fn parse_wait_state(value: Option<&str>) -> Result<DownloadWaitState, RubError> {
-    match value.unwrap_or("completed") {
-        "started" => Ok(DownloadWaitState::Started),
-        "in_progress" => Ok(DownloadWaitState::InProgress),
-        "completed" => Ok(DownloadWaitState::Completed),
-        "failed" => Ok(DownloadWaitState::Failed),
-        "canceled" => Ok(DownloadWaitState::Canceled),
-        "terminal" => Ok(DownloadWaitState::Terminal),
-        other => Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            format!("Unknown download wait state '{other}'"),
-        )),
-    }
-}
-
-fn matches_wait_state(download: &DownloadEntry, desired: DownloadWaitState) -> bool {
-    match desired {
-        DownloadWaitState::Started => download.state == DownloadState::Started,
-        DownloadWaitState::InProgress => download.state == DownloadState::InProgress,
-        DownloadWaitState::Completed => download.state == DownloadState::Completed,
-        DownloadWaitState::Failed => download.state == DownloadState::Failed,
-        DownloadWaitState::Canceled => download.state == DownloadState::Canceled,
-        DownloadWaitState::Terminal => matches!(
-            download.state,
-            DownloadState::Completed | DownloadState::Failed | DownloadState::Canceled
-        ),
-    }
-}
-
-fn download_wait_timeout_error(
-    target_guid: Option<&str>,
-    desired_state: &str,
-    timeout: Duration,
-    elapsed: Duration,
-    runtime: rub_core::model::DownloadRuntimeInfo,
-    current_download: Option<DownloadEntry>,
-) -> RubError {
-    let mut context = serde_json::json!({
-        "kind": "download",
-        "id": target_guid,
-        "state": desired_state,
-        "timeout_ms": timeout.as_millis() as u64,
-        "elapsed_ms": elapsed.as_millis() as u64,
-        "download_runtime": runtime,
-    });
-
-    if let Some(download) = current_download.as_ref() {
-        context["download"] = serde_json::to_value(download).unwrap_or(serde_json::Value::Null);
-    }
-
-    let message = match current_download.as_ref() {
-        Some(download) => format!(
-            "Download wait timed out before '{desired_state}' was observed; current state is '{}'{}",
-            download_state_label(download.state),
-            format_download_progress(download)
-        ),
-        None => format!(
-            "Download wait timed out before '{desired_state}' was observed; no matching download has been observed yet"
-        ),
-    };
-    let suggestion = match current_download.as_ref() {
-        Some(download)
-            if matches!(
-                download.state,
-                DownloadState::Started | DownloadState::InProgress
-            ) =>
-        {
-            "Download is still in progress. Run 'rub downloads' to inspect current progress, or retry with a longer --timeout.".to_string()
-        }
-        Some(_) => {
-            "Run 'rub downloads' to inspect the latest lifecycle state and verify the requested wait target.".to_string()
-        }
-        None => {
-            "Run 'rub downloads' to confirm the download started, or retry with a longer --timeout if the browser has not emitted the first download event yet.".to_string()
-        }
-    };
-
-    RubError::domain_with_context_and_suggestion(
-        ErrorCode::WaitTimeout,
-        message,
-        context,
-        suggestion,
-    )
-}
-
-fn download_payload(
-    subject: serde_json::Value,
-    result: serde_json::Value,
-    runtime: serde_json::Value,
-) -> serde_json::Value {
-    serde_json::json!({
-        "subject": subject,
-        "result": result,
-        "runtime": runtime,
-    })
-}
-
-fn download_registry_subject() -> serde_json::Value {
-    serde_json::json!({
-        "kind": "download_registry",
-    })
-}
-
-fn download_subject(
-    id: Option<&str>,
-    operation: &str,
-    wait_state: Option<&str>,
-) -> serde_json::Value {
-    let mut subject = serde_json::Map::new();
-    subject.insert(
-        "kind".to_string(),
-        serde_json::Value::String("download".to_string()),
-    );
-    subject.insert(
-        "operation".to_string(),
-        serde_json::Value::String(operation.to_string()),
-    );
-    if let Some(id) = id {
-        subject.insert("id".to_string(), serde_json::Value::String(id.to_string()));
-    }
-    if let Some(wait_state) = wait_state {
-        subject.insert(
-            "wait_state".to_string(),
-            serde_json::Value::String(wait_state.to_string()),
-        );
-    }
-    serde_json::Value::Object(subject)
-}
-
-fn download_registry_result(runtime: &rub_core::model::DownloadRuntimeInfo) -> serde_json::Value {
-    serde_json::json!({
-        "download_dir": runtime.download_dir,
-        "active_downloads": runtime.active_downloads,
-        "completed_downloads": runtime.completed_downloads,
-        "last_download": runtime.last_download,
-    })
-}
-
-fn download_state_label(state: DownloadState) -> &'static str {
-    match state {
-        DownloadState::Started => "started",
-        DownloadState::InProgress => "in_progress",
-        DownloadState::Completed => "completed",
-        DownloadState::Failed => "failed",
-        DownloadState::Canceled => "canceled",
-    }
-}
-
-fn wait_state_label(state: DownloadWaitState) -> &'static str {
-    match state {
-        DownloadWaitState::Started => "started",
-        DownloadWaitState::InProgress => "in_progress",
-        DownloadWaitState::Completed => "completed",
-        DownloadWaitState::Failed => "failed",
-        DownloadWaitState::Canceled => "canceled",
-        DownloadWaitState::Terminal => "terminal",
-    }
-}
-
-fn format_download_progress(download: &DownloadEntry) -> String {
-    match download.total_bytes {
-        Some(total_bytes) if total_bytes > 0 => {
-            format!(" ({} / {} bytes)", download.received_bytes, total_bytes)
-        }
-        _ if download.received_bytes > 0 => {
-            format!(" ({} bytes received)", download.received_bytes)
-        }
-        _ => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        DownloadWaitState, download_wait_timeout_error, matches_wait_state, parse_wait_state,
-    };
+    use super::args::DownloadWaitState;
+    use super::projection::download_wait_timeout_error;
+    use super::{annotate_download_runtime_path_states, matches_wait_state, parse_wait_state};
     use rub_core::error::ErrorCode;
     use rub_core::model::{DownloadEntry, DownloadMode, DownloadRuntimeInfo, DownloadState};
     use std::time::Duration;
@@ -454,6 +251,39 @@ mod tests {
         assert_eq!(
             envelope.context.as_ref().unwrap()["download"]["guid"],
             "guid-1"
+        );
+        assert_eq!(
+            envelope.context.as_ref().unwrap()["download_runtime"]["download_dir_state"]["path_kind"],
+            "managed_download_directory"
+        );
+    }
+
+    #[test]
+    fn annotate_download_runtime_path_states_marks_managed_directory_reference() {
+        let mut runtime = serde_json::json!({
+            "download_dir": "/tmp/downloads",
+            "active_downloads": [],
+            "completed_downloads": [],
+            "last_download": null,
+        });
+
+        annotate_download_runtime_path_states(&mut runtime);
+
+        assert_eq!(
+            runtime["download_dir_state"]["truth_level"],
+            "operator_path_reference"
+        );
+        assert_eq!(
+            runtime["download_dir_state"]["path_authority"],
+            "session.download_runtime.download_dir"
+        );
+        assert_eq!(
+            runtime["download_dir_state"]["upstream_truth"],
+            "session_download_runtime"
+        );
+        assert_eq!(
+            runtime["download_dir_state"]["path_kind"],
+            "managed_download_directory"
         );
     }
 }

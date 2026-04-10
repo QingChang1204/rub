@@ -10,8 +10,8 @@ use tokio::time::{Duration, Instant, sleep};
 use super::observation::{
     ActiveInteractionBaseline, InteractionBaseline, active_element_changed, active_element_matches,
     confirmation_observation_degraded, element_state_changed, observe_active_element,
-    observe_active_element_in_context, observe_element, observe_page, page_changed, page_mutated,
-    typed_effect_contradicted, typed_effect_observed,
+    observe_active_element_in_context, observe_element, observe_page, observe_related_page,
+    page_changed, page_mutated, typed_effect_contradicted, typed_effect_observed,
 };
 use crate::dialogs::{SharedDialogRuntime, pending_dialog};
 
@@ -333,7 +333,7 @@ pub(crate) async fn confirm_input(
         }
 
         if Instant::now() >= deadline {
-            let after_page = observe_page(page).await;
+            let after_page = observe_related_page(page, object_id).await;
             if observed.is_none() {
                 return degraded(
                     Some(InteractionConfirmationKind::ValueApplied),
@@ -392,7 +392,7 @@ pub(crate) async fn confirm_select(
         }
 
         if Instant::now() >= deadline {
-            let after_page = observe_page(page).await;
+            let after_page = observe_related_page(page, object_id).await;
             if observed.is_none() {
                 return degraded(
                     Some(InteractionConfirmationKind::SelectionApplied),
@@ -456,7 +456,7 @@ pub(crate) async fn confirm_upload(
         }
 
         if Instant::now() >= deadline {
-            let after_page = observe_page(page).await;
+            let after_page = observe_related_page(page, object_id).await;
             if observed.is_none() {
                 return degraded(
                     Some(InteractionConfirmationKind::FilesAttached),

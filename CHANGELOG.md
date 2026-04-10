@@ -131,7 +131,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--profile` to reuse a persistent Chrome user profile
 - Session-scoped command history replayed in structured JSON
 - `close` — graceful browser teardown; `--all` closes every active session
-- Structured JSON output (`stdout_schema_version: "3.0"`) on every command — consistent envelope across all surfaces
+- Structured stdout contract: default command surfaces emit JSON (`stdout_schema_version: "3.0"`); `exec --raw` remains an explicit raw-value surface
 - `command_id` at-most-once execution guarantee for mutating commands
 - Post-action waiting via `--wait-after-selector` and `--wait-after-text` on all interaction commands
 - Interaction confirmation: `value_applied`, `context_change`, `confirmed`, `unconfirmed`, `contradicted`

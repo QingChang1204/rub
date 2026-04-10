@@ -2,10 +2,11 @@
 //!
 //! # Logical Structure
 //!
-//! This file contains six responsibility domains, all sharing a dense private
-//! type graph (`ReplayReconnectStrategy`, `ReplaySendLifecycle`, etc.) that
-//! makes physical file splitting non-trivial. Future refactoring should extract
-//! these into a `daemon_ctl/` sub-module tree using `pub(super)` boundaries.
+//! This file contains six responsibility domains. The startup lifecycle slice
+//! (signal files, startup lock, ready wait) has already been extracted into
+//! `daemon_ctl/startup.rs`; the remaining dense private type graph
+//! (`ReplayReconnectStrategy`, `ReplaySendLifecycle`, etc.) still makes further
+//! physical splitting non-trivial.
 //!
 //! | Domain | Lines | Key Public APIs |
 //! |--------|-------|-----------------|
@@ -26,31 +27,70 @@
 //! - Registry files are projections (INV-005). Live status probing MUST use socket or
 //!   health check, not PID files.
 
-use crate::connection_hardening::{
-    AttemptError, ConnectionFailureClass, RetryAttribution, RetryFailure, RetryPolicy,
-    attach_connection_diagnostics, classify_error_code, classify_io_transient,
-    classify_transport_message, run_with_bounded_retry,
-};
-use crate::timeout_budget::helpers::mutating_request;
-use std::os::fd::AsRawFd;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::Command;
-use std::time::{Duration, Instant};
-
-use rub_core::process::is_process_alive;
+#[cfg(test)]
+use crate::connection_hardening::RetryAttribution;
 use rub_ipc::client::IpcClient;
-use rub_ipc::protocol::IpcRequest;
-use uuid::Uuid;
 
-use rub_core::error::{ErrorCode, RubError};
-use rub_core::model::LaunchPolicyInfo;
-use rub_daemon::rub_paths::RubPaths;
+mod bootstrap;
+mod close_all;
+mod close_existing;
+mod connect;
+mod handshake;
+mod ipc;
+mod process_identity;
+mod process_lifecycle;
+mod projection;
+mod registry;
+mod replay;
+mod startup;
 
-const READY_FILE_ENV: &str = "RUB_DAEMON_READY_FILE";
-const ERROR_FILE_ENV: &str = "RUB_DAEMON_ERROR_FILE";
-const SESSION_ID_ENV: &str = "RUB_SESSION_ID";
+pub use self::bootstrap::{BootstrapClient, bootstrap_client};
+pub(crate) use self::close_all::close_all_sessions;
+#[cfg(test)]
+pub(crate) use self::close_all::{
+    CloseAllDisposition, classify_close_all_result, close_all_session_targets,
+};
+pub use self::close_existing::close_existing_session;
+pub(crate) use self::connect::{
+    ShutdownFenceStatus, TransientSocketPolicy, authority_bound_deferred_client, connect_ipc_once,
+    connect_ipc_with_retry, detect_or_connect_hardened, preferred_socket_path_for_session,
+    remaining_budget_duration, remaining_budget_ms, wait_for_shutdown_until,
+};
+#[cfg(test)]
+pub(crate) use self::connect::{maybe_upgrade_if_needed, socket_candidates_for_session};
+pub(crate) use self::handshake::{HandshakePayload, fetch_launch_policy_for_session};
+use self::handshake::{
+    fetch_handshake_info, fetch_handshake_info_with_timeout, handshake_attempt_error,
+};
+use self::ipc::{
+    ipc_budget_exhausted_error, ipc_transport_error, replay_recoverable_transport_reason,
+};
+pub(crate) use self::ipc::{ipc_timeout_error, project_request_onto_deadline};
+#[cfg(test)]
+pub(crate) use self::process_identity::command_matches_daemon_identity;
+pub(crate) use self::process_lifecycle::terminate_spawned_daemon_force;
+pub(crate) use self::projection::{
+    DaemonCtlPathContext, daemon_ctl_path_error, daemon_ctl_path_state, daemon_ctl_socket_error,
+    project_batch_close_result,
+};
+pub(crate) use self::registry::{
+    cleanup_stale, latest_definitely_stale_entry_by_name, latest_registry_entry_by_name,
+    registry_authority_snapshot, registry_entry_by_name, terminate_registry_entry_process,
+};
+#[cfg(test)]
+pub(crate) use self::replay::replay_retry_matches_daemon_authority;
+pub(crate) use self::replay::{
+    ReplayRecoveryContext, send_existing_request_with_replay_recovery,
+    send_request_with_replay_recovery,
+};
+#[cfg(all(test, unix))]
+use self::startup::detach_daemon_session;
+pub use self::startup::startup_signal_paths;
+#[cfg(test)]
+use self::startup::{
+    StartupSignalFiles, acquire_startup_lock, read_startup_error, startup_lock_scope_keys,
+    startup_ready_retry_timeout_failure, try_lock_exclusive, unlock, wait_for_ready,
+};
 
 #[cfg(test)]
 static FORCE_SETSID_FAILURE: std::sync::atomic::AtomicBool =
@@ -67,186 +107,6 @@ pub enum DaemonConnection {
     NeedStart,
 }
 
-pub struct BootstrapClient {
-    pub client: IpcClient,
-    pub connected_to_existing_daemon: bool,
-    pub daemon_session_id: Option<String>,
-}
-
-struct BootstrapResolution {
-    client: IpcClient,
-    connected_to_existing_daemon: bool,
-    daemon_session_id: Option<String>,
-}
-
-impl BootstrapResolution {
-    fn connected(client: IpcClient, daemon_session_id: Option<String>) -> Self {
-        Self {
-            client,
-            connected_to_existing_daemon: true,
-            daemon_session_id,
-        }
-    }
-
-    fn started(client: IpcClient, daemon_session_id: String) -> Self {
-        Self {
-            client,
-            connected_to_existing_daemon: false,
-            daemon_session_id: Some(daemon_session_id),
-        }
-    }
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct HandshakePayload {
-    daemon_session_id: String,
-    launch_policy: LaunchPolicyInfo,
-}
-
-pub struct StartupSignalFiles {
-    pub ready_file: std::path::PathBuf,
-    pub error_file: std::path::PathBuf,
-    pub daemon_pid: u32,
-    pub session_id: String,
-}
-
-struct StartupSignalCleanup<'a> {
-    signals: &'a StartupSignalFiles,
-}
-
-impl Drop for StartupSignalCleanup<'_> {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.signals.ready_file);
-        let _ = std::fs::remove_file(&self.signals.error_file);
-    }
-}
-
-struct StartupReadyMonitor {
-    socket_path: std::path::PathBuf,
-    committed_path: std::path::PathBuf,
-}
-
-enum StartupReadinessObservation {
-    Pending,
-    ReadyToHandshake,
-    Error(RubError),
-    DaemonExitedBeforeCommit {
-        ready_written: bool,
-        committed_session_id: Option<String>,
-    },
-}
-
-#[cfg(unix)]
-fn detach_daemon_session() -> std::io::Result<()> {
-    #[cfg(test)]
-    if FORCE_SETSID_FAILURE.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        return Err(std::io::Error::other("forced setsid failure"));
-    }
-
-    if unsafe { libc::setsid() } == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
-pub struct StartupLockGuard {
-    files: Vec<std::fs::File>,
-}
-
-fn replay_recoverable_transport_reason(
-    error: &(dyn std::error::Error + 'static),
-) -> Option<&'static str> {
-    error
-        .downcast_ref::<std::io::Error>()
-        .and_then(classify_io_transient)
-        .or_else(|| classify_transport_message(&error.to_string()))
-}
-
-fn ipc_transport_error(
-    error: impl std::fmt::Display,
-    command_id: Option<&str>,
-    extra_context: Option<serde_json::Value>,
-) -> RubError {
-    ipc_classified_error(
-        ErrorCode::IpcProtocolError,
-        "IPC error",
-        error,
-        command_id,
-        extra_context,
-    )
-}
-
-fn ipc_timeout_error(
-    error: impl std::fmt::Display,
-    command_id: Option<&str>,
-    extra_context: Option<serde_json::Value>,
-) -> RubError {
-    ipc_classified_error(
-        ErrorCode::IpcTimeout,
-        "IPC timeout",
-        error,
-        command_id,
-        extra_context,
-    )
-}
-
-fn ipc_budget_exhausted_error(
-    command_id: Option<&str>,
-    original_timeout_ms: u64,
-    phase: &str,
-) -> RubError {
-    ipc_classified_error(
-        ErrorCode::IpcTimeout,
-        "IPC timeout",
-        format!("IPC request exhausted the declared timeout budget of {original_timeout_ms}ms"),
-        command_id,
-        Some(serde_json::json!({
-            "reason": "ipc_replay_budget_exhausted",
-            "phase": phase,
-            "original_timeout_ms": original_timeout_ms,
-        })),
-    )
-}
-
-pub(crate) fn project_request_onto_deadline(
-    request: &IpcRequest,
-    deadline: Instant,
-) -> Option<IpcRequest> {
-    let remaining_timeout_ms = remaining_budget_ms(deadline);
-    if remaining_timeout_ms == 0 {
-        return None;
-    }
-
-    let mut projected = request.clone();
-    projected.timeout_ms = projected.timeout_ms.min(remaining_timeout_ms);
-    crate::timeout_budget::align_embedded_timeout_authority(&mut projected);
-    Some(projected)
-}
-
-fn ipc_classified_error(
-    code: ErrorCode,
-    prefix: &str,
-    error: impl std::fmt::Display,
-    command_id: Option<&str>,
-    extra_context: Option<serde_json::Value>,
-) -> RubError {
-    let mut context = serde_json::Map::new();
-    if let Some(command_id) = command_id {
-        context.insert("command_id".to_string(), serde_json::json!(command_id));
-    }
-    if let Some(extra) = extra_context
-        && let Some(extra_object) = extra.as_object()
-    {
-        context.extend(extra_object.clone());
-    }
-    RubError::domain_with_context(
-        code,
-        format!("{prefix}: {error}"),
-        serde_json::Value::Object(context),
-    )
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BatchCloseResult {
     pub closed: Vec<String>,
@@ -255,1792 +115,10 @@ pub struct BatchCloseResult {
     pub failed: Vec<String>,
 }
 
-pub fn project_batch_close_result(rub_home: &Path, result: &BatchCloseResult) -> serde_json::Value {
-    serde_json::json!({
-        "subject": {
-            "kind": "session_batch_close",
-            "rub_home": rub_home.display().to_string(),
-        },
-        "result": {
-            "closed": result.closed,
-            "cleaned_stale": result.cleaned_stale,
-            "failed": result.failed,
-        }
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CloseAllDisposition {
-    Closed,
-    CleanedStale,
-    Failed,
-}
-
-enum TransientSocketPolicy {
-    NeedStartBeforeLock,
-    FailAfterLock,
-}
-
 #[derive(Debug)]
 pub enum ExistingCloseOutcome {
     Closed(Box<rub_ipc::protocol::IpcResponse>),
     Noop,
-}
-
-#[derive(Debug, Clone)]
-struct CloseAllSessionTarget {
-    session_name: String,
-    authority_entry: Option<rub_daemon::session::RegistryEntry>,
-    stale_entries: Vec<rub_daemon::session::RegistryEntry>,
-    has_uncertain_entries: bool,
-}
-
-pub async fn bootstrap_client(
-    rub_home: &Path,
-    session_name: &str,
-    command_deadline: Instant,
-    extra_args: &[String],
-    attachment_identity: Option<&str>,
-) -> Result<BootstrapClient, RubError> {
-    let resolution = match detect_or_connect_hardened(
-        rub_home,
-        session_name,
-        TransientSocketPolicy::NeedStartBeforeLock,
-    )
-    .await?
-    {
-        DaemonConnection::Connected {
-            client,
-            daemon_session_id,
-        } => BootstrapResolution::connected(client, daemon_session_id),
-        DaemonConnection::NeedStart => {
-            resolve_bootstrap_after_lock(
-                rub_home,
-                session_name,
-                command_deadline,
-                extra_args,
-                attachment_identity,
-            )
-            .await?
-        }
-    };
-
-    Ok(BootstrapClient {
-        client: resolution.client,
-        connected_to_existing_daemon: resolution.connected_to_existing_daemon,
-        daemon_session_id: resolution.daemon_session_id,
-    })
-}
-
-async fn resolve_bootstrap_after_lock(
-    rub_home: &Path,
-    session_name: &str,
-    command_deadline: Instant,
-    extra_args: &[String],
-    attachment_identity: Option<&str>,
-) -> Result<BootstrapResolution, RubError> {
-    let startup_session_id = rub_daemon::session::new_session_id();
-    let startup_lock = acquire_startup_lock_until(
-        rub_home,
-        session_name,
-        attachment_identity,
-        command_deadline,
-    )
-    .await?;
-
-    let resolution = match detect_or_connect_hardened(
-        rub_home,
-        session_name,
-        TransientSocketPolicy::FailAfterLock,
-    )
-    .await?
-    {
-        DaemonConnection::Connected {
-            client,
-            daemon_session_id,
-        } => Ok(BootstrapResolution::connected(client, daemon_session_id)),
-        DaemonConnection::NeedStart => {
-            start_new_daemon_bootstrap(
-                rub_home,
-                session_name,
-                &startup_session_id,
-                extra_args,
-                command_deadline,
-            )
-            .await
-        }
-    };
-
-    drop(startup_lock);
-    resolution
-}
-
-async fn start_new_daemon_bootstrap(
-    rub_home: &Path,
-    session_name: &str,
-    startup_session_id: &str,
-    extra_args: &[String],
-    command_deadline: Instant,
-) -> Result<BootstrapResolution, RubError> {
-    let signals = start_daemon(rub_home, session_name, startup_session_id, extra_args)?;
-    let ready = wait_for_ready_until(rub_home, session_name, &signals, command_deadline).await;
-    if ready.is_err() {
-        cleanup_failed_startup(rub_home, session_name, &signals).await;
-    }
-    ready.map(|(client, daemon_session_id)| BootstrapResolution::started(client, daemon_session_id))
-}
-
-pub async fn close_existing_session(
-    rub_home: &Path,
-    session_name: &str,
-    timeout_ms: u64,
-) -> Result<ExistingCloseOutcome, RubError> {
-    if !rub_home.exists() {
-        return Ok(ExistingCloseOutcome::Noop);
-    }
-
-    let (mut client, daemon_session_id) = match detect_or_connect_hardened(
-        rub_home,
-        session_name,
-        TransientSocketPolicy::FailAfterLock,
-    )
-    .await?
-    {
-        DaemonConnection::Connected {
-            client,
-            daemon_session_id,
-        } => (client, daemon_session_id),
-        DaemonConnection::NeedStart => return Ok(ExistingCloseOutcome::Noop),
-    };
-
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let request = mutating_request("close", serde_json::json!({}), timeout_ms.max(1));
-    let response = send_existing_request_with_replay_recovery(
-        &mut client,
-        &request,
-        deadline,
-        rub_home,
-        session_name,
-        daemon_session_id.as_deref(),
-    )
-    .await
-    .map_err(|error| {
-        RubError::domain_with_context(
-            ErrorCode::IpcProtocolError,
-            format!("Failed to close existing session '{session_name}': {error}"),
-            serde_json::json!({
-                "session": session_name,
-                "daemon_session_id": daemon_session_id,
-                "command_id": request.command_id,
-            }),
-        )
-    })?;
-    Ok(ExistingCloseOutcome::Closed(Box::new(response)))
-}
-
-pub(crate) async fn send_existing_request_with_replay_recovery(
-    client: &mut IpcClient,
-    request: &IpcRequest,
-    deadline: Instant,
-    rub_home: &Path,
-    session: &str,
-    original_daemon_session_id: Option<&str>,
-) -> Result<rub_ipc::protocol::IpcResponse, RubError> {
-    send_request_with_replay_strategy(
-        client,
-        request,
-        deadline,
-        original_daemon_session_id,
-        ReplayReconnectStrategy::Existing { rub_home, session },
-    )
-    .await
-}
-
-pub async fn send_request_with_replay_recovery(
-    client: &mut IpcClient,
-    request: &IpcRequest,
-    deadline: Instant,
-    recovery: ReplayRecoveryContext<'_>,
-) -> Result<rub_ipc::protocol::IpcResponse, RubError> {
-    send_request_with_replay_strategy(
-        client,
-        request,
-        deadline,
-        recovery.original_daemon_session_id,
-        ReplayReconnectStrategy::Bootstrap(recovery),
-    )
-    .await
-}
-
-#[derive(Clone, Copy)]
-pub struct ReplayRecoveryContext<'a> {
-    pub rub_home: &'a Path,
-    pub session: &'a str,
-    pub daemon_args: &'a [String],
-    pub attachment_identity: Option<&'a str>,
-    pub original_daemon_session_id: Option<&'a str>,
-}
-
-struct ReplayAttempt<'a> {
-    started: std::time::Instant,
-    command_id: &'a str,
-    retry_reason: &'static str,
-    original_timeout_ms: u64,
-    original_daemon_session_id: Option<&'a str>,
-}
-
-struct ReplayReconnectResult {
-    client: IpcClient,
-    daemon_session_id: Option<String>,
-}
-
-#[derive(Clone, Copy)]
-enum ReplayReconnectStrategy<'a> {
-    Existing {
-        rub_home: &'a Path,
-        session: &'a str,
-    },
-    Bootstrap(ReplayRecoveryContext<'a>),
-}
-
-#[derive(Clone, Copy)]
-struct ReplaySendLifecycle<'a> {
-    deadline: Instant,
-    original_daemon_session_id: Option<&'a str>,
-    strategy: ReplayReconnectStrategy<'a>,
-}
-
-impl ReplayAttempt<'_> {
-    fn elapsed_ms(&self) -> u64 {
-        self.started.elapsed().as_millis() as u64
-    }
-}
-
-fn bind_request_to_daemon_authority(
-    request: &IpcRequest,
-    daemon_session_id: Option<&str>,
-) -> IpcRequest {
-    if request.daemon_session_id.is_none()
-        && let Some(daemon_session_id) = daemon_session_id
-    {
-        return request
-            .clone()
-            .with_daemon_session_id(daemon_session_id.to_string())
-            .expect("validated daemon session id must remain protocol-valid");
-    }
-    request.clone()
-}
-
-impl<'a> ReplaySendLifecycle<'a> {
-    async fn send(
-        self,
-        client: &mut IpcClient,
-        request: &IpcRequest,
-    ) -> Result<rub_ipc::protocol::IpcResponse, RubError> {
-        let started = std::time::Instant::now();
-        let request = bind_request_to_daemon_authority(request, self.original_daemon_session_id);
-        let original_timeout_ms = request.timeout_ms;
-        let request = self.project_initial_request(&request)?;
-        match client.send(&request).await {
-            Ok(response) => Ok(response),
-            Err(error) => {
-                self.retry_after_transport(&*error, &request, started, original_timeout_ms)
-                    .await
-            }
-        }
-    }
-
-    fn project_initial_request(&self, request: &IpcRequest) -> Result<IpcRequest, RubError> {
-        project_request_onto_deadline(request, self.deadline).ok_or_else(|| {
-            ipc_budget_exhausted_error(
-                request.command_id.as_deref(),
-                request.timeout_ms,
-                "initial_send",
-            )
-        })
-    }
-
-    async fn retry_after_transport(
-        self,
-        transport_error: &(dyn std::error::Error + 'static),
-        request: &IpcRequest,
-        started: Instant,
-        original_timeout_ms: u64,
-    ) -> Result<rub_ipc::protocol::IpcResponse, RubError> {
-        let Some(command_id) = request.command_id.as_deref() else {
-            return Err(ipc_transport_error(transport_error, None, None));
-        };
-        let Some(retry_reason) = replay_recoverable_transport_reason(transport_error) else {
-            return Err(ipc_transport_error(transport_error, Some(command_id), None));
-        };
-        let attempt = ReplayAttempt {
-            started,
-            command_id,
-            retry_reason,
-            original_timeout_ms,
-            original_daemon_session_id: self.original_daemon_session_id,
-        };
-        let (mut replay_client, replay_request) = self
-            .reconnect_for_replay(transport_error, request, &attempt)
-            .await?;
-        let replay_timeout_ms = replay_request.timeout_ms;
-
-        replay_client
-            .send(&replay_request)
-            .await
-            .map_err(|replay_error| {
-                ipc_transport_error(
-                    replay_error,
-                    Some(command_id),
-                    Some(serde_json::json!({
-                        "reason": "ipc_replay_retry_failed",
-                        "retry_reason": retry_reason,
-                        "daemon_session_id": self.original_daemon_session_id,
-                        "elapsed_ms": started.elapsed().as_millis() as u64,
-                        "remaining_timeout_ms": replay_timeout_ms,
-                    })),
-                )
-            })
-    }
-
-    fn budget_exhausted_after_transport(
-        self,
-        transport_error: &(dyn std::error::Error + 'static),
-        attempt: &ReplayAttempt<'_>,
-        phase: Option<&str>,
-    ) -> RubError {
-        ipc_timeout_error(
-            transport_error,
-            Some(attempt.command_id),
-            Some(serde_json::json!({
-                "reason": "ipc_replay_budget_exhausted",
-                "retry_reason": attempt.retry_reason,
-                "elapsed_ms": attempt.elapsed_ms(),
-                "original_timeout_ms": attempt.original_timeout_ms,
-                "phase": phase,
-            })),
-        )
-    }
-
-    fn identity_changed_error(
-        self,
-        transport_error: &(dyn std::error::Error + 'static),
-        attempt: &ReplayAttempt<'_>,
-        reconnected_daemon_session_id: Option<&str>,
-    ) -> RubError {
-        ipc_transport_error(
-            transport_error,
-            Some(attempt.command_id),
-            Some(serde_json::json!({
-                "reason": "ipc_replay_daemon_identity_changed",
-                "retry_reason": attempt.retry_reason,
-                "original_daemon_session_id": attempt.original_daemon_session_id,
-                "reconnected_daemon_session_id": reconnected_daemon_session_id,
-            })),
-        )
-    }
-
-    async fn reconnect_client(
-        self,
-        transport_error: &(dyn std::error::Error + 'static),
-        attempt: &ReplayAttempt<'_>,
-    ) -> Result<ReplayReconnectResult, RubError> {
-        if remaining_budget_ms(self.deadline) == 0 {
-            return Err(self.budget_exhausted_after_transport(transport_error, attempt, None));
-        }
-
-        match self.strategy {
-            ReplayReconnectStrategy::Existing { rub_home, session } => {
-                match detect_or_connect_hardened(
-                    rub_home,
-                    session,
-                    TransientSocketPolicy::FailAfterLock,
-                )
-                .await
-                {
-                    Ok(DaemonConnection::Connected {
-                        client,
-                        daemon_session_id,
-                    }) => Ok(ReplayReconnectResult {
-                        client,
-                        daemon_session_id,
-                    }),
-                    Ok(DaemonConnection::NeedStart) => Err(ipc_transport_error(
-                        transport_error,
-                        Some(attempt.command_id),
-                        Some(serde_json::json!({
-                            "reason": "ipc_replay_existing_daemon_unavailable",
-                            "retry_reason": attempt.retry_reason,
-                            "original_daemon_session_id": attempt.original_daemon_session_id,
-                            "elapsed_ms": attempt.elapsed_ms(),
-                        })),
-                    )),
-                    Err(reconnect_error) => Err(ipc_transport_error(
-                        transport_error,
-                        Some(attempt.command_id),
-                        Some(serde_json::json!({
-                            "reason": "ipc_replay_reconnect_failed",
-                            "retry_reason": attempt.retry_reason,
-                            "original_daemon_session_id": attempt.original_daemon_session_id,
-                            "elapsed_ms": attempt.elapsed_ms(),
-                            "reconnect_error": reconnect_error.into_envelope(),
-                        })),
-                    )),
-                }
-            }
-            ReplayReconnectStrategy::Bootstrap(recovery) => bootstrap_client(
-                recovery.rub_home,
-                recovery.session,
-                self.deadline,
-                recovery.daemon_args,
-                recovery.attachment_identity,
-            )
-            .await
-            .map(|bootstrap| ReplayReconnectResult {
-                client: bootstrap.client,
-                daemon_session_id: bootstrap.daemon_session_id,
-            })
-            .map_err(|reconnect_error| {
-                ipc_transport_error(
-                    transport_error,
-                    Some(attempt.command_id),
-                    Some(serde_json::json!({
-                        "reason": "ipc_replay_reconnect_failed",
-                        "retry_reason": attempt.retry_reason,
-                        "original_daemon_session_id": attempt.original_daemon_session_id,
-                        "elapsed_ms": attempt.elapsed_ms(),
-                        "reconnect_error": reconnect_error.into_envelope(),
-                    })),
-                )
-            }),
-        }
-    }
-
-    fn project_retry_request(
-        self,
-        transport_error: &(dyn std::error::Error + 'static),
-        request: &IpcRequest,
-        attempt: &ReplayAttempt<'_>,
-    ) -> Result<IpcRequest, RubError> {
-        let replay_request =
-            project_request_onto_deadline(request, self.deadline).ok_or_else(|| {
-                self.budget_exhausted_after_transport(transport_error, attempt, Some("replay_send"))
-            })?;
-        if replay_request.timeout_ms == 0 {
-            return Err(self.budget_exhausted_after_transport(
-                transport_error,
-                attempt,
-                Some("replay_send"),
-            ));
-        }
-        Ok(replay_request)
-    }
-
-    async fn reconnect_for_replay(
-        self,
-        transport_error: &(dyn std::error::Error + 'static),
-        request: &IpcRequest,
-        attempt: &ReplayAttempt<'_>,
-    ) -> Result<(IpcClient, IpcRequest), RubError> {
-        let reconnect = self.reconnect_client(transport_error, attempt).await?;
-        if !replay_retry_matches_daemon_authority(
-            attempt.original_daemon_session_id,
-            reconnect.daemon_session_id.as_deref(),
-        ) {
-            return Err(self.identity_changed_error(
-                transport_error,
-                attempt,
-                reconnect.daemon_session_id.as_deref(),
-            ));
-        }
-
-        let replay_request = self.project_retry_request(transport_error, request, attempt)?;
-        Ok((reconnect.client, replay_request))
-    }
-}
-
-async fn send_request_with_replay_strategy(
-    client: &mut IpcClient,
-    request: &IpcRequest,
-    deadline: Instant,
-    original_daemon_session_id: Option<&str>,
-    strategy: ReplayReconnectStrategy<'_>,
-) -> Result<rub_ipc::protocol::IpcResponse, RubError> {
-    ReplaySendLifecycle {
-        deadline,
-        original_daemon_session_id,
-        strategy,
-    }
-    .send(client, request)
-    .await
-}
-
-fn replay_retry_matches_daemon_authority(
-    original_daemon_session_id: Option<&str>,
-    reconnected_daemon_session_id: Option<&str>,
-) -> bool {
-    match (original_daemon_session_id, reconnected_daemon_session_id) {
-        (Some(original), Some(reconnected)) => original == reconnected,
-        _ => false,
-    }
-}
-
-/// Start a daemon process for the given session.
-pub fn start_daemon(
-    rub_home: &Path,
-    session_name: &str,
-    session_id: &str,
-    extra_args: &[String],
-) -> Result<StartupSignalFiles, RubError> {
-    let exe = std::env::current_exe().map_err(|e| {
-        RubError::domain(
-            ErrorCode::DaemonStartFailed,
-            format!("Cannot find rub binary: {e}"),
-        )
-    })?;
-    std::fs::create_dir_all(rub_home)?;
-
-    let startup_id = Uuid::now_v7().to_string();
-    let session_paths = RubPaths::new(rub_home).session_runtime(session_name, session_id);
-    std::fs::create_dir_all(session_paths.session_dir())?;
-    let ready_file = session_paths.startup_ready_path(&startup_id);
-    let error_file = session_paths.startup_error_path(&startup_id);
-    let _ = std::fs::remove_file(&ready_file);
-    let _ = std::fs::remove_file(&error_file);
-
-    let mut cmd = Command::new(exe);
-    cmd.arg("__daemon")
-        .arg("--session")
-        .arg(session_name)
-        .arg("--session-id")
-        .arg(session_id)
-        .arg("--rub-home")
-        .arg(rub_home.to_string_lossy().as_ref())
-        .env(READY_FILE_ENV, &ready_file)
-        .env(ERROR_FILE_ENV, &error_file);
-    cmd.env(SESSION_ID_ENV, session_id);
-
-    for arg in extra_args {
-        cmd.arg(arg);
-    }
-
-    // Detach from parent
-    #[cfg(unix)]
-    {
-        use std::process::Stdio;
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        // Use pre_exec for setsid on Unix
-        unsafe {
-            cmd.pre_exec(detach_daemon_session);
-        }
-    }
-
-    let child = cmd.spawn().map_err(|e| {
-        RubError::domain(
-            ErrorCode::DaemonStartFailed,
-            format!("Failed to spawn daemon: {e}"),
-        )
-    })?;
-
-    Ok(StartupSignalFiles {
-        ready_file,
-        error_file,
-        daemon_pid: child.id(),
-        session_id: session_id.to_string(),
-    })
-}
-
-#[cfg(test)]
-pub async fn acquire_startup_lock(
-    rub_home: &Path,
-    session_name: &str,
-    attachment_identity: Option<&str>,
-    timeout_ms: u64,
-) -> Result<StartupLockGuard, RubError> {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
-    acquire_startup_lock_until(rub_home, session_name, attachment_identity, deadline).await
-}
-
-pub async fn acquire_startup_lock_until(
-    rub_home: &Path,
-    session_name: &str,
-    attachment_identity: Option<&str>,
-    deadline: Instant,
-) -> Result<StartupLockGuard, RubError> {
-    std::fs::create_dir_all(rub_home)?;
-    let paths = RubPaths::new(rub_home);
-    std::fs::create_dir_all(paths.startup_locks_dir())?;
-    let mut files = Vec::new();
-    for scope_key in startup_lock_scope_keys(session_name, attachment_identity) {
-        let lock_path = paths.startup_lock_path(&scope_key);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|e| {
-                RubError::domain(
-                    ErrorCode::DaemonStartFailed,
-                    format!("Failed to open startup lock {}: {e}", lock_path.display()),
-                )
-            })?;
-
-        loop {
-            match try_lock_exclusive(&file) {
-                Ok(()) => {
-                    files.push(file);
-                    break;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        return Err(RubError::domain(
-                            ErrorCode::DaemonStartFailed,
-                            "Timed out waiting for daemon startup lock before the command deadline",
-                        ));
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(err) => {
-                    return Err(RubError::domain(
-                        ErrorCode::DaemonStartFailed,
-                        format!("Failed to acquire daemon startup lock: {err}"),
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(StartupLockGuard { files })
-}
-
-/// Wait for daemon startup to commit by observing the ready marker and then
-/// confirming an explicit handshake against the session socket.
-#[cfg(test)]
-pub async fn wait_for_ready(
-    rub_home: &Path,
-    session_name: &str,
-    signals: &StartupSignalFiles,
-    timeout_ms: u64,
-) -> Result<(IpcClient, String), RubError> {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
-    wait_for_ready_until(rub_home, session_name, signals, deadline).await
-}
-
-pub async fn wait_for_ready_until(
-    rub_home: &Path,
-    session_name: &str,
-    signals: &StartupSignalFiles,
-    deadline: Instant,
-) -> Result<(IpcClient, String), RubError> {
-    let monitor = StartupReadyMonitor::new(rub_home, session_name, &signals.session_id);
-    let _signal_cleanup = StartupSignalCleanup { signals };
-    let timeout_ms = remaining_budget_ms(deadline).max(1);
-    let mut last_transport_retry: Option<RetryAttribution> = None;
-
-    loop {
-        match monitor.observe(signals)? {
-            StartupReadinessObservation::Error(error) => {
-                let envelope = error.into_envelope();
-                let classified = classify_error_code(envelope.code);
-                let error = RubError::Domain(envelope);
-                return Err(if let Some(attribution) = last_transport_retry.as_ref() {
-                    attach_connection_diagnostics(error, attribution, classified)
-                } else {
-                    error
-                });
-            }
-            StartupReadinessObservation::DaemonExitedBeforeCommit {
-                ready_written,
-                committed_session_id,
-            } => {
-                return Err(RubError::domain_with_context(
-                    ErrorCode::DaemonStartFailed,
-                    format!(
-                        "Daemon for session '{session_name}' exited before startup authority committed"
-                    ),
-                    serde_json::json!({
-                        "reason": "daemon_exited_before_startup_commit",
-                        "session": session_name,
-                        "session_id": signals.session_id,
-                        "daemon_pid": signals.daemon_pid,
-                        "ready_marker_present": ready_written,
-                        "commit_marker_value": committed_session_id,
-                    }),
-                ));
-            }
-            StartupReadinessObservation::ReadyToHandshake => {
-                match connect_ready_client(&monitor.socket_path, &signals.session_id, deadline)
-                    .await
-                {
-                    Ok((client, daemon_session_id, _attribution)) => {
-                        return Ok((client, daemon_session_id));
-                    }
-                    Err(failure)
-                        if matches!(
-                            failure.final_failure_class,
-                            ConnectionFailureClass::TransportTransient
-                        ) =>
-                    {
-                        last_transport_retry = Some(failure.attribution);
-                    }
-                    Err(failure) => {
-                        return Err(failure.into_error());
-                    }
-                }
-            }
-            StartupReadinessObservation::Pending => {}
-        }
-
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let sleep_for = std::cmp::min(
-            std::time::Duration::from_millis(100),
-            deadline.saturating_duration_since(now),
-        );
-        tokio::time::sleep(sleep_for).await;
-    }
-
-    let error = RubError::domain(
-        ErrorCode::DaemonStartFailed,
-        format!("Daemon did not become ready within {}ms", timeout_ms),
-    );
-    Err(if let Some(attribution) = last_transport_retry.as_ref() {
-        attach_connection_diagnostics(
-            error,
-            attribution,
-            ConnectionFailureClass::TransportTransient,
-        )
-    } else {
-        error
-    })
-}
-
-impl StartupReadyMonitor {
-    fn new(rub_home: &Path, session_name: &str, session_id: &str) -> Self {
-        let session_runtime = RubPaths::new(rub_home).session_runtime(session_name, session_id);
-        Self {
-            socket_path: session_runtime.socket_path(),
-            committed_path: session_runtime.startup_committed_path(),
-        }
-    }
-
-    fn observe(
-        &self,
-        signals: &StartupSignalFiles,
-    ) -> Result<StartupReadinessObservation, RubError> {
-        if signals.error_file.exists() {
-            let envelope = read_startup_error(&signals.error_file)?;
-            return Ok(StartupReadinessObservation::Error(RubError::Domain(
-                envelope,
-            )));
-        }
-
-        let ready_written = signals.ready_file.exists();
-        let committed_session_id = std::fs::read_to_string(&self.committed_path).ok();
-        let committed = committed_session_id.as_deref() == Some(signals.session_id.as_str());
-        if !committed && !is_process_alive(signals.daemon_pid) {
-            return Ok(StartupReadinessObservation::DaemonExitedBeforeCommit {
-                ready_written,
-                committed_session_id,
-            });
-        }
-
-        if ready_written && committed {
-            Ok(StartupReadinessObservation::ReadyToHandshake)
-        } else {
-            Ok(StartupReadinessObservation::Pending)
-        }
-    }
-}
-
-async fn connect_ready_client(
-    socket_path: &Path,
-    expected_session_id: &str,
-    deadline: Instant,
-) -> Result<(IpcClient, String, RetryAttribution), RetryFailure> {
-    let socket_path = socket_path.to_path_buf();
-    let expected_session_id = expected_session_id.to_string();
-    let policy = RetryPolicy::default();
-    let mut attribution = RetryAttribution::default();
-
-    loop {
-        let Some(remaining) = remaining_budget_duration(deadline) else {
-            return Err(startup_ready_retry_timeout_failure(attribution));
-        };
-        let attempt = tokio::time::timeout(remaining, async {
-            let mut handshake_client = connect_ipc_once(
-                &socket_path,
-                ErrorCode::DaemonStartFailed,
-                "Failed to connect to the daemon socket while confirming startup readiness",
-            )
-            .await?;
-
-            let handshake = fetch_handshake_info_with_timeout(
-                &mut handshake_client,
-                remaining_budget_ms(deadline).max(1),
-            )
-            .await
-            .map_err(handshake_attempt_error)?;
-            if handshake.daemon_session_id != expected_session_id {
-                return Err(AttemptError::terminal(
-                    RubError::domain_with_context(
-                        ErrorCode::DaemonStartFailed,
-                        "Daemon startup handshake resolved a different daemon authority than the committed session",
-                        serde_json::json!({
-                            "reason": "startup_handshake_authority_mismatch",
-                            "expected_session_id": expected_session_id,
-                            "handshake_session_id": handshake.daemon_session_id,
-                            "socket_path": socket_path.display().to_string(),
-                        }),
-                    ),
-                    ConnectionFailureClass::ProtocolMismatch,
-                ));
-            }
-
-            let client = authority_bound_deferred_client(&socket_path, &handshake.daemon_session_id)
-                .map_err(|error| {
-                    AttemptError::terminal(
-                        RubError::domain(
-                            ErrorCode::DaemonStartFailed,
-                            format!(
-                                "Failed to bind startup daemon authority after handshake: {error}"
-                            ),
-                        ),
-                        ConnectionFailureClass::ProtocolMismatch,
-                    )
-                })?;
-
-            Ok((client, handshake.daemon_session_id))
-        })
-        .await;
-
-        match attempt {
-            Ok(Ok((client, daemon_session_id))) => {
-                return Ok((client, daemon_session_id, attribution));
-            }
-            Ok(Err(attempt_error)) => {
-                if let Some(reason) = attempt_error.transient_reason.clone()
-                    && attribution.retry_count < policy.max_retries
-                    && remaining_budget_duration(deadline).is_some()
-                {
-                    attribution.retry_count += 1;
-                    attribution.retry_reason = Some(reason);
-                    if let Some(delay) = remaining_budget_duration(deadline) {
-                        tokio::time::sleep(delay.min(policy.delay)).await;
-                        continue;
-                    }
-                }
-
-                return Err(RetryFailure {
-                    error: attempt_error.error,
-                    attribution,
-                    final_failure_class: if attempt_error.transient_reason.is_some() {
-                        ConnectionFailureClass::TransportTransient
-                    } else {
-                        attempt_error.final_failure_class
-                    },
-                });
-            }
-            Err(_) => return Err(startup_ready_retry_timeout_failure(attribution)),
-        }
-    }
-}
-
-pub async fn fetch_launch_policy(client: &mut IpcClient) -> Result<LaunchPolicyInfo, RubError> {
-    Ok(fetch_handshake_info(client).await?.launch_policy)
-}
-
-async fn fetch_handshake_info(client: &mut IpcClient) -> Result<HandshakePayload, RubError> {
-    fetch_handshake_info_with_timeout(client, 3_000).await
-}
-
-async fn fetch_handshake_info_with_timeout(
-    client: &mut IpcClient,
-    timeout_ms: u64,
-) -> Result<HandshakePayload, RubError> {
-    let request = IpcRequest::new("_handshake", serde_json::json!({}), timeout_ms.max(1));
-    let response = client
-        .send(&request)
-        .await
-        .map_err(|e| RubError::domain(ErrorCode::IpcProtocolError, e.to_string()))?;
-
-    if response.status == rub_ipc::protocol::ResponseStatus::Error {
-        let envelope = response.error.unwrap_or_else(|| {
-            rub_core::error::ErrorEnvelope::new(
-                ErrorCode::IpcProtocolError,
-                "Handshake returned an empty error envelope",
-            )
-        });
-        return Err(RubError::Domain(envelope));
-    }
-
-    let data = response.data.unwrap_or_default();
-    serde_json::from_value(data).map_err(|e| {
-        RubError::domain(
-            ErrorCode::IpcProtocolError,
-            format!("Invalid handshake payload: {e}"),
-        )
-    })
-}
-
-fn startup_ready_retry_timeout_failure(attribution: RetryAttribution) -> RetryFailure {
-    RetryFailure {
-        error: RubError::domain_with_context(
-            ErrorCode::DaemonStartFailed,
-            "Daemon readiness handshake exceeded the declared startup timeout",
-            serde_json::json!({
-                "reason": "startup_handshake_timeout",
-            }),
-        ),
-        attribution,
-        final_failure_class: ConnectionFailureClass::TransportTransient,
-    }
-}
-
-pub async fn fetch_launch_policy_for_session(
-    rub_home: &Path,
-    session: &str,
-) -> Result<LaunchPolicyInfo, RubError> {
-    let socket_path = preferred_socket_path_for_session(rub_home, session)?;
-    let (launch_policy, _attribution) = run_with_bounded_retry(RetryPolicy::default(), || async {
-        let (mut client, _connect_attr) = connect_ipc_with_retry(
-            &socket_path,
-            ErrorCode::IpcProtocolError,
-            format!("Failed to connect to session '{session}' for launch policy check"),
-        )
-        .await
-        .map_err(RetryFailure::into_attempt_error)?;
-        fetch_launch_policy(&mut client)
-            .await
-            .map_err(handshake_attempt_error)
-    })
-    .await
-    .map_err(RetryFailure::into_error)?;
-    Ok(launch_policy)
-}
-
-pub async fn close_all_sessions(
-    rub_home: &Path,
-    timeout: u64,
-) -> Result<BatchCloseResult, RubError> {
-    let command_deadline = Instant::now() + Duration::from_millis(timeout.max(1));
-    if !rub_home.exists() {
-        return Ok(BatchCloseResult {
-            closed: Vec::new(),
-            cleaned_stale: Vec::new(),
-            failed: Vec::new(),
-        });
-    }
-
-    let snapshot = registry_authority_snapshot(rub_home)?;
-    if snapshot.sessions.is_empty() {
-        return Ok(BatchCloseResult {
-            closed: Vec::new(),
-            cleaned_stale: Vec::new(),
-            failed: Vec::new(),
-        });
-    }
-
-    let mut closed = Vec::new();
-    let mut cleaned_stale = Vec::new();
-    let mut failed = Vec::new();
-
-    for target in close_all_session_targets(&snapshot) {
-        if remaining_budget_ms(command_deadline) == 0 {
-            failed.push(target.session_name);
-            continue;
-        }
-        let mut session_cleaned_stale = false;
-        for entry in &target.stale_entries {
-            cleanup_stale(rub_home, entry);
-            let _ = rub_daemon::session::deregister_session(rub_home, &entry.session_id);
-            session_cleaned_stale = true;
-        }
-
-        let Some(entry) = target.authority_entry.as_ref() else {
-            if target.has_uncertain_entries {
-                failed.push(target.session_name);
-            } else if session_cleaned_stale {
-                cleaned_stale.push(target.session_name);
-            }
-            continue;
-        };
-
-        let session_paths =
-            RubPaths::new(rub_home).session_runtime(&entry.session_name, &entry.session_id);
-        let mut graceful_close = false;
-
-        if let Some(socket_path) = session_paths.existing_socket_paths().into_iter().next()
-            && let Ok(mut client) = IpcClient::connect(&socket_path).await
-        {
-            let request = mutating_request(
-                "close",
-                serde_json::json!({}),
-                remaining_budget_ms(command_deadline).max(1),
-            );
-            graceful_close = matches!(
-                send_existing_request_with_replay_recovery(
-                    &mut client,
-                    &request,
-                    command_deadline,
-                    rub_home,
-                    &target.session_name,
-                    Some(entry.session_id.as_str()),
-                )
-                .await,
-                Ok(response) if response.status == rub_ipc::protocol::ResponseStatus::Success
-            );
-        }
-
-        let termination_requested = terminate_registry_entry_process(rub_home, entry).is_ok();
-        let shutdown = wait_for_shutdown_until(rub_home, entry, command_deadline).await;
-
-        let still_running =
-            is_process_alive(entry.pid) || !session_paths.existing_socket_paths().is_empty();
-        match classify_close_all_result(
-            graceful_close,
-            termination_requested,
-            shutdown,
-            still_running,
-        ) {
-            CloseAllDisposition::Closed => {
-                cleanup_stale(rub_home, entry);
-                let _ = rub_daemon::session::deregister_session(rub_home, &entry.session_id);
-                closed.push(target.session_name);
-            }
-            CloseAllDisposition::CleanedStale => {
-                cleanup_stale(rub_home, entry);
-                let _ = rub_daemon::session::deregister_session(rub_home, &entry.session_id);
-                cleaned_stale.push(target.session_name);
-            }
-            CloseAllDisposition::Failed => {
-                failed.push(target.session_name);
-            }
-        }
-    }
-
-    Ok(BatchCloseResult {
-        closed,
-        cleaned_stale,
-        failed,
-    })
-}
-
-fn close_all_session_targets(
-    snapshot: &rub_daemon::session::RegistryAuthoritySnapshot,
-) -> Vec<CloseAllSessionTarget> {
-    snapshot
-        .sessions
-        .iter()
-        .map(|session| CloseAllSessionTarget {
-            session_name: session.session_name.clone(),
-            authority_entry: session
-                .authoritative_entry()
-                .map(|entry| entry.entry.clone()),
-            stale_entries: session.stale_entries(),
-            has_uncertain_entries: session.has_uncertain_entries(),
-        })
-        .collect()
-}
-
-/// Clean up stale projection files.
-fn cleanup_stale(rub_home: &Path, entry: &rub_daemon::session::RegistryEntry) {
-    rub_daemon::session::cleanup_projections(rub_home, entry);
-}
-
-async fn maybe_upgrade_if_needed(
-    _rub_home: &Path,
-    session_name: &str,
-    authority_entry: Option<&rub_daemon::session::RegistryEntry>,
-    handshake: &HandshakePayload,
-    socket_path: &Path,
-) -> Result<DaemonConnection, RubError> {
-    if let Some(entry) = authority_entry
-        && handshake.daemon_session_id != entry.session_id
-    {
-        return Err(RubError::domain_with_context(
-            ErrorCode::IpcProtocolError,
-            format!(
-                "Connected daemon authority for session '{session_name}' did not match the authoritative registry entry"
-            ),
-            serde_json::json!({
-                "reason": "daemon_authority_mismatch",
-                "session": session_name,
-                "registry_session_id": entry.session_id,
-                "handshake_session_id": handshake.daemon_session_id,
-                "socket_path": entry.socket_path,
-            }),
-        ));
-    }
-
-    Ok(DaemonConnection::Connected {
-        client: authority_bound_deferred_client(socket_path, &handshake.daemon_session_id)
-            .map_err(|error| {
-                RubError::domain(
-                    ErrorCode::IpcProtocolError,
-                    format!("Failed to bind connected daemon authority: {error}"),
-                )
-            })?,
-        daemon_session_id: Some(handshake.daemon_session_id.clone()),
-    })
-}
-
-async fn hard_cut_outdated_daemon(
-    rub_home: &Path,
-    session_name: &str,
-    entry: &rub_daemon::session::RegistryEntry,
-) -> Result<(), RubError> {
-    let _ = terminate_registry_entry_process(rub_home, entry);
-    let shutdown = wait_for_shutdown(rub_home, entry).await;
-    if shutdown.lifecycle_committed() {
-        cleanup_stale(rub_home, entry);
-    }
-    if !shutdown.fully_released() {
-        return Err(RubError::domain_with_context(
-            ErrorCode::IpcVersionMismatch,
-            format!(
-                "Session '{session_name}' is still owned by an outdated daemon or browser profile after hard-cut upgrade fencing"
-            ),
-            serde_json::json!({
-                "session": session_name,
-                "daemon_protocol_version": entry.ipc_protocol_version,
-                "cli_protocol_version": rub_ipc::protocol::IPC_PROTOCOL_VERSION,
-                "reason": "hard_cut_upgrade_fence_incomplete",
-                "user_data_dir": entry.user_data_dir,
-            }),
-        ));
-    }
-    Ok(())
-}
-
-async fn probe_upgrade_check(client: &mut IpcClient, session_name: &str) -> Result<(), RubError> {
-    client
-        .send(&IpcRequest::new(
-            "_upgrade_check",
-            serde_json::json!({}),
-            3_000,
-        ))
-        .await
-        .map(|_| ())
-        .map_err(|error| {
-            RubError::domain(
-                ErrorCode::IpcProtocolError,
-                format!("Failed to fetch upgrade status for session '{session_name}': {error}"),
-            )
-        })
-}
-
-async fn detect_or_connect_hardened(
-    rub_home: &Path,
-    session_name: &str,
-    transient_socket_policy: TransientSocketPolicy,
-) -> Result<DaemonConnection, RubError> {
-    let authority_entry = registry_entry_by_name(rub_home, session_name)?;
-    let socket_paths = socket_candidates_for_session(authority_entry.as_ref())?;
-
-    if socket_paths.is_empty() {
-        return Ok(DaemonConnection::NeedStart);
-    }
-
-    let mut last_failure = None;
-    for socket_path in socket_paths {
-        match connect_ipc_with_retry(
-            &socket_path,
-            ErrorCode::IpcProtocolError,
-            "Failed to connect to an existing daemon socket",
-        )
-        .await
-        {
-            Ok((mut handshake_client, _attribution)) => {
-                let mut requires_handshake_reconnect = false;
-                if let Some(entry) = authority_entry.as_ref()
-                    && entry.ipc_protocol_version != rub_ipc::protocol::IPC_PROTOCOL_VERSION
-                {
-                    match probe_upgrade_check(&mut handshake_client, session_name).await {
-                        Ok(()) => requires_handshake_reconnect = true,
-                        Err(_) => {
-                            // Only a successful live probe can override a stale registry
-                            // protocol projection. Otherwise we fall back to the restart path.
-                            // The probe consumes a single-use IPC client, so the handshake must
-                            // reconnect on success.
-                            //
-                            // This keeps protocol authority with the live daemon while honoring
-                            // the one-request-per-connection transport contract.
-                            //
-                            // When the probe fails, we preserve the prior hard-cut/start
-                            // behavior for unreachable or outdated daemons.
-                            hard_cut_outdated_daemon(rub_home, session_name, entry).await?;
-                            return Ok(DaemonConnection::NeedStart);
-                        }
-                    }
-                }
-                if requires_handshake_reconnect {
-                    let (reconnected_client, _attribution) = connect_ipc_with_retry(
-                        &socket_path,
-                        ErrorCode::IpcProtocolError,
-                        "Failed to reconnect to daemon socket after upgrade probe",
-                    )
-                    .await
-                    .map_err(|failure| failure.into_error())?;
-                    handshake_client = reconnected_client;
-                }
-                let handshake = fetch_handshake_info(&mut handshake_client).await?;
-                return maybe_upgrade_if_needed(
-                    rub_home,
-                    session_name,
-                    authority_entry.as_ref(),
-                    &handshake,
-                    &socket_path,
-                )
-                .await;
-            }
-            Err(failure) => {
-                last_failure = Some(failure);
-            }
-        }
-    }
-
-    let pid_paths = authority_entry
-        .as_ref()
-        .map(|entry| {
-            RubPaths::new(rub_home)
-                .session_runtime(&entry.session_name, &entry.session_id)
-                .existing_pid_paths()
-        })
-        .unwrap_or_else(|| {
-            RubPaths::new(rub_home)
-                .session(session_name)
-                .existing_pid_paths()
-        });
-    if let Some(dead_pid) = pid_paths.into_iter().find_map(|pid_path| {
-        std::fs::read_to_string(&pid_path)
-            .ok()
-            .and_then(|pid_str| pid_str.trim().parse::<u32>().ok())
-            .filter(|pid| !is_process_alive(*pid))
-    }) {
-        tracing::warn!(
-            session = session_name,
-            pid = dead_pid,
-            "Detected stale daemon after connect retry failure, cleaning up"
-        );
-        if let Some(entry) = latest_registry_entry_by_name(rub_home, session_name)? {
-            cleanup_stale(rub_home, &entry);
-        }
-        return Ok(DaemonConnection::NeedStart);
-    }
-
-    let Some(failure) = last_failure else {
-        return Ok(DaemonConnection::NeedStart);
-    };
-    if matches!(
-        transient_socket_policy,
-        TransientSocketPolicy::NeedStartBeforeLock
-    ) && matches!(
-        failure.final_failure_class,
-        ConnectionFailureClass::TransportTransient
-    ) {
-        return Ok(DaemonConnection::NeedStart);
-    }
-
-    Err(failure.into_error())
-}
-
-fn authority_bound_deferred_client(
-    socket_path: &Path,
-    daemon_session_id: &str,
-) -> Result<IpcClient, String> {
-    IpcClient::deferred(socket_path.to_path_buf()).bind_daemon_session_id(daemon_session_id)
-}
-
-async fn connect_ipc_with_retry(
-    socket_path: &Path,
-    error_code: ErrorCode,
-    message_prefix: impl AsRef<str>,
-) -> Result<(IpcClient, RetryAttribution), RetryFailure> {
-    let socket_path = socket_path.to_path_buf();
-    let message_prefix = message_prefix.as_ref().to_string();
-    run_with_bounded_retry(RetryPolicy::default(), move || {
-        let socket_path = socket_path.clone();
-        let message_prefix = message_prefix.clone();
-        async move {
-            IpcClient::connect(&socket_path).await.map_err(|error| {
-                let message = format!("{} {}: {error}", message_prefix, socket_path.display());
-                if let Some(reason) = classify_io_transient(&error) {
-                    AttemptError::retryable(RubError::domain(error_code, message), reason)
-                } else {
-                    AttemptError::terminal(
-                        RubError::domain(error_code, message),
-                        classify_error_code(error_code),
-                    )
-                }
-            })
-        }
-    })
-    .await
-}
-
-async fn connect_ipc_once(
-    socket_path: &Path,
-    error_code: ErrorCode,
-    message_prefix: impl AsRef<str>,
-) -> Result<IpcClient, AttemptError> {
-    IpcClient::connect(socket_path).await.map_err(|error| {
-        let message = format!(
-            "{} {}: {error}",
-            message_prefix.as_ref(),
-            socket_path.display()
-        );
-        if let Some(reason) = classify_io_transient(&error) {
-            AttemptError::retryable(RubError::domain(error_code, message), reason)
-        } else {
-            AttemptError::terminal(
-                RubError::domain(error_code, message),
-                classify_error_code(error_code),
-            )
-        }
-    })
-}
-
-fn handshake_attempt_error(error: RubError) -> AttemptError {
-    let envelope = error.into_envelope();
-    if let Some(reason) = classify_transport_message(&envelope.message) {
-        AttemptError::retryable(RubError::Domain(envelope), reason)
-    } else {
-        AttemptError::terminal(
-            RubError::Domain(envelope.clone()),
-            classify_error_code(envelope.code),
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ShutdownFenceStatus {
-    daemon_stopped: bool,
-    profile_released: bool,
-}
-
-impl ShutdownFenceStatus {
-    fn lifecycle_committed(self) -> bool {
-        self.daemon_stopped
-    }
-
-    fn fully_released(self) -> bool {
-        self.daemon_stopped && self.profile_released
-    }
-}
-
-fn classify_close_all_result(
-    graceful_close: bool,
-    termination_requested: bool,
-    shutdown: ShutdownFenceStatus,
-    still_running: bool,
-) -> CloseAllDisposition {
-    if shutdown.fully_released() {
-        if graceful_close {
-            CloseAllDisposition::Closed
-        } else {
-            CloseAllDisposition::CleanedStale
-        }
-    } else if graceful_close
-        || termination_requested
-        || still_running
-        || shutdown.lifecycle_committed()
-    {
-        CloseAllDisposition::Failed
-    } else {
-        CloseAllDisposition::CleanedStale
-    }
-}
-
-async fn wait_for_shutdown_until(
-    rub_home: &Path,
-    entry: &rub_daemon::session::RegistryEntry,
-    deadline: Instant,
-) -> ShutdownFenceStatus {
-    let session_paths =
-        RubPaths::new(rub_home).session_runtime(&entry.session_name, &entry.session_id);
-    while Instant::now() < deadline {
-        let profile_released = profile_released(entry);
-        let daemon_stopped =
-            session_paths.existing_socket_paths().is_empty() && !is_process_alive(entry.pid);
-        if daemon_stopped {
-            return ShutdownFenceStatus {
-                daemon_stopped: true,
-                profile_released,
-            };
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    ShutdownFenceStatus {
-        daemon_stopped: false,
-        profile_released: profile_released(entry),
-    }
-}
-
-async fn wait_for_shutdown(
-    rub_home: &Path,
-    entry: &rub_daemon::session::RegistryEntry,
-) -> ShutdownFenceStatus {
-    wait_for_shutdown_until(rub_home, entry, Instant::now() + Duration::from_secs(5)).await
-}
-
-fn profile_released(entry: &rub_daemon::session::RegistryEntry) -> bool {
-    entry.user_data_dir.as_deref().is_none_or(
-        |user_data_dir| match rub_cdp::managed_profile_in_use(Path::new(user_data_dir)) {
-            Ok(in_use) => !in_use,
-            Err(_) => false,
-        },
-    )
-}
-
-fn socket_candidates_for_session(
-    authority_entry: Option<&rub_daemon::session::RegistryEntry>,
-) -> Result<Vec<std::path::PathBuf>, RubError> {
-    let mut candidates = Vec::new();
-    if let Some(entry) = authority_entry {
-        let path = std::path::PathBuf::from(&entry.socket_path);
-        if path.exists() {
-            candidates.push(path);
-        }
-    }
-    Ok(candidates)
-}
-
-pub(crate) fn remaining_budget_ms(deadline: Instant) -> u64 {
-    deadline
-        .checked_duration_since(Instant::now())
-        .map(|remaining| remaining.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
-}
-
-fn remaining_budget_duration(deadline: Instant) -> Option<Duration> {
-    deadline.checked_duration_since(Instant::now())
-}
-
-fn preferred_socket_path_for_session(
-    rub_home: &Path,
-    session_name: &str,
-) -> Result<std::path::PathBuf, RubError> {
-    let authority_entry = registry_entry_by_name(rub_home, session_name)?;
-    if let Some(path) = socket_candidates_for_session(authority_entry.as_ref())?
-        .into_iter()
-        .next()
-    {
-        return Ok(path);
-    }
-
-    Ok(authority_entry
-        .as_ref()
-        .map(|entry| {
-            RubPaths::new(rub_home)
-                .session_runtime(&entry.session_name, &entry.session_id)
-                .socket_path()
-        })
-        .unwrap_or_else(|| RubPaths::new(rub_home).session(session_name).socket_path()))
-}
-
-fn registry_entry_by_name(
-    rub_home: &Path,
-    session_name: &str,
-) -> Result<Option<rub_daemon::session::RegistryEntry>, RubError> {
-    Ok(registry_authority_snapshot(rub_home)?
-        .session(session_name)
-        .and_then(|session| {
-            session
-                .authoritative_entry()
-                .map(|entry| entry.entry.clone())
-        }))
-}
-
-fn latest_registry_entry_by_name(
-    rub_home: &Path,
-    session_name: &str,
-) -> Result<Option<rub_daemon::session::RegistryEntry>, RubError> {
-    Ok(registry_authority_snapshot(rub_home)?
-        .session(session_name)
-        .and_then(|session| session.latest_entry().map(|entry| entry.entry.clone())))
-}
-
-fn terminate_registry_entry_process(
-    rub_home: &Path,
-    entry: &rub_daemon::session::RegistryEntry,
-) -> std::io::Result<()> {
-    if !process_matches_registry_entry(rub_home, entry)? {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "Refused to kill pid {} because it no longer matches daemon authority for session '{}' under {}",
-                entry.pid,
-                entry.session_name,
-                rub_home.display()
-            ),
-        ));
-    }
-    let result = unsafe { libc::kill(entry.pid as i32, libc::SIGTERM) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-pub fn terminate_spawned_daemon(pid: u32) -> std::io::Result<()> {
-    let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-pub async fn terminate_spawned_daemon_force(pid: u32) -> std::io::Result<()> {
-    let _ = terminate_spawned_daemon(pid);
-    for _ in 0..20 {
-        if !is_process_alive(pid) {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    let result = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-    if result == 0 || !is_process_alive(pid) {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-async fn cleanup_failed_startup(rub_home: &Path, session_name: &str, signals: &StartupSignalFiles) {
-    let _ = terminate_failed_startup_process(rub_home, session_name, signals).await;
-
-    let runtime_paths = RubPaths::new(rub_home).session_runtime(session_name, &signals.session_id);
-    for _ in 0..20 {
-        if !is_process_alive(signals.daemon_pid)
-            && runtime_paths
-                .actual_socket_paths()
-                .into_iter()
-                .all(|path| !path.exists())
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    if !is_process_alive(signals.daemon_pid) {
-        let cleanup_entry = rub_daemon::session::RegistryEntry {
-            session_id: signals.session_id.clone(),
-            session_name: session_name.to_string(),
-            pid: signals.daemon_pid,
-            socket_path: runtime_paths.socket_path().display().to_string(),
-            created_at: String::new(),
-            ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
-            user_data_dir: None,
-            attachment_identity: None,
-            connection_target: None,
-        };
-        let _ = rub_daemon::session::deregister_session(rub_home, &signals.session_id);
-        cleanup_stale(rub_home, &cleanup_entry);
-    }
-
-    let _ = std::fs::remove_file(&signals.ready_file);
-    let _ = std::fs::remove_file(&signals.error_file);
-}
-
-async fn terminate_failed_startup_process(
-    rub_home: &Path,
-    session_name: &str,
-    signals: &StartupSignalFiles,
-) -> std::io::Result<()> {
-    if !process_matches_daemon_identity(
-        rub_home,
-        session_name,
-        Some(signals.session_id.as_str()),
-        signals.daemon_pid,
-    )? {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "Refused to kill pid {} because it no longer matches failed-startup daemon authority for session '{}' under {}",
-                signals.daemon_pid,
-                session_name,
-                rub_home.display()
-            ),
-        ));
-    }
-    terminate_spawned_daemon_force(signals.daemon_pid).await
-}
-
-fn process_matches_registry_entry(
-    rub_home: &Path,
-    entry: &rub_daemon::session::RegistryEntry,
-) -> std::io::Result<bool> {
-    process_matches_daemon_identity(
-        rub_home,
-        &entry.session_name,
-        Some(entry.session_id.as_str()),
-        entry.pid,
-    )
-}
-
-fn process_matches_daemon_identity(
-    rub_home: &Path,
-    session_name: &str,
-    session_id: Option<&str>,
-    pid: u32,
-) -> std::io::Result<bool> {
-    let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()?;
-    if !output.status.success() {
-        return Ok(false);
-    }
-    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if command.is_empty() {
-        return Ok(false);
-    }
-    Ok(command_matches_daemon_identity(
-        &command,
-        rub_home,
-        session_name,
-        session_id,
-    ))
-}
-
-fn command_matches_daemon_identity(
-    command: &str,
-    rub_home: &Path,
-    session_name: &str,
-    session_id: Option<&str>,
-) -> bool {
-    if !command.contains("__daemon")
-        || extract_flag_value(command, "--session").as_deref() != Some(session_name)
-        || extract_flag_value(command, "--rub-home").as_deref()
-            != Some(rub_home.to_string_lossy().as_ref())
-    {
-        return false;
-    }
-    match session_id {
-        Some(session_id) => {
-            extract_flag_value(command, "--session-id").as_deref() == Some(session_id)
-        }
-        None => true,
-    }
-}
-
-fn extract_flag_value(command: &str, flag: &str) -> Option<String> {
-    let inline_prefix = format!("{flag}=");
-    let mut parts = tokenize_command(command).into_iter();
-    while let Some(part) = parts.next() {
-        if part == flag {
-            return parts.next();
-        }
-        if let Some(value) = part.strip_prefix(&inline_prefix) {
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
-fn tokenize_command(command: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut in_single_quotes = false;
-    let mut in_double_quotes = false;
-    let mut escaping = false;
-
-    for ch in command.chars() {
-        if escaping {
-            current.push(ch);
-            escaping = false;
-            continue;
-        }
-
-        match ch {
-            '\\' if !in_single_quotes => escaping = true,
-            '\'' if !in_double_quotes => in_single_quotes = !in_single_quotes,
-            '"' if !in_single_quotes => in_double_quotes = !in_double_quotes,
-            ch if ch.is_whitespace() && !in_single_quotes && !in_double_quotes => {
-                if !current.is_empty() {
-                    parts.push(std::mem::take(&mut current));
-                }
-            }
-            _ => current.push(ch),
-        }
-    }
-
-    if escaping {
-        current.push('\\');
-    }
-    if !current.is_empty() {
-        parts.push(current);
-    }
-    parts
-}
-
-fn registry_authority_snapshot(
-    rub_home: &Path,
-) -> Result<rub_daemon::session::RegistryAuthoritySnapshot, RubError> {
-    rub_daemon::session::registry_authority_snapshot(rub_home).map_err(|e| {
-        RubError::domain(
-            ErrorCode::DaemonStartFailed,
-            format!("Failed to resolve registry authority: {e}"),
-        )
-    })
-}
-
-fn read_startup_error(path: &Path) -> Result<rub_core::error::ErrorEnvelope, RubError> {
-    let contents = std::fs::read_to_string(path)?;
-    let envelope = serde_json::from_str(&contents).unwrap_or_else(|_| {
-        rub_core::error::ErrorEnvelope::new(ErrorCode::DaemonStartFailed, contents)
-    });
-    Ok(envelope)
-}
-
-pub fn startup_signal_paths() -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
-    (
-        std::env::var_os(READY_FILE_ENV).map(std::path::PathBuf::from),
-        std::env::var_os(ERROR_FILE_ENV).map(std::path::PathBuf::from),
-    )
-}
-
-impl Drop for StartupLockGuard {
-    fn drop(&mut self) {
-        for file in &self.files {
-            let _ = unlock(file);
-        }
-    }
-}
-
-fn startup_lock_scope_keys(session_name: &str, attachment_identity: Option<&str>) -> Vec<String> {
-    let mut keys = vec![format!("session-{session_name}")];
-    if let Some(identity) = attachment_identity {
-        keys.push(format!("attachment-{identity}"));
-    }
-    keys
-}
-
-fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-fn unlock(file: &std::fs::File) -> std::io::Result<()> {
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
 }
 
 #[cfg(test)]
@@ -2050,16 +128,17 @@ mod tests {
     use super::{
         ShutdownFenceStatus, StartupSignalFiles, acquire_startup_lock, classify_close_all_result,
         close_all_session_targets, close_all_sessions, command_matches_daemon_identity,
-        ipc_timeout_error, project_request_onto_deadline, read_startup_error,
-        registry_authority_snapshot, replay_retry_matches_daemon_authority,
-        socket_candidates_for_session, startup_lock_scope_keys, startup_signal_paths,
-        try_lock_exclusive, unlock, wait_for_ready,
+        fetch_handshake_info_with_timeout, ipc_timeout_error, project_batch_close_result,
+        project_request_onto_deadline, read_startup_error, registry_authority_snapshot,
+        replay_retry_matches_daemon_authority, socket_candidates_for_session,
+        startup_lock_scope_keys, startup_signal_paths, try_lock_exclusive, unlock, wait_for_ready,
     };
     use crate::timeout_budget::WAIT_IPC_BUFFER_MS;
     use rub_core::error::ErrorCode;
     use rub_core::model::LaunchPolicyInfo;
     use rub_daemon::rub_paths::RubPaths;
     use rub_daemon::session::{RegistryData, RegistryEntry, write_registry};
+    use rub_ipc::client::IpcClient;
     use rub_ipc::codec::NdJsonCodec;
     use rub_ipc::protocol::{IpcRequest, IpcResponse, ResponseStatus};
     use std::path::Path;
@@ -2073,6 +152,7 @@ mod tests {
     #[cfg(unix)]
     use std::{
         io::{BufRead as _, BufReader as StdBufReader, Write as _},
+        os::unix::fs::symlink,
         os::unix::net::UnixListener as StdUnixListener,
     };
 
@@ -2333,6 +413,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detect_or_connect_hardened_cleans_stale_dead_pid_and_requests_restart() {
+        let home = temp_home();
+        std::fs::create_dir_all(&home).unwrap();
+        let runtime = RubPaths::new(&home).session_runtime("default", "sess-stale");
+        let projection = RubPaths::new(&home).session("default");
+        std::fs::create_dir_all(runtime.session_dir()).unwrap();
+        std::fs::create_dir_all(projection.projection_dir()).unwrap();
+
+        std::fs::write(runtime.pid_path(), "999999").unwrap();
+        std::fs::write(projection.canonical_pid_path(), "999999").unwrap();
+        std::fs::create_dir_all(runtime.socket_path().parent().unwrap()).unwrap();
+        std::fs::write(runtime.socket_path(), b"stale").unwrap();
+        let _ = std::fs::remove_file(projection.canonical_socket_path());
+        symlink(runtime.socket_path(), projection.canonical_socket_path()).unwrap();
+        std::fs::write(runtime.startup_committed_path(), "sess-stale").unwrap();
+        std::fs::write(projection.startup_committed_path(), "sess-stale").unwrap();
+
+        write_registry(
+            &home,
+            &RegistryData {
+                sessions: vec![RegistryEntry {
+                    session_id: "sess-stale".to_string(),
+                    session_name: "default".to_string(),
+                    pid: 999_999,
+                    socket_path: runtime.socket_path().display().to_string(),
+                    created_at: "2026-04-09T00:00:00Z".to_string(),
+                    ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+                    user_data_dir: None,
+                    attachment_identity: None,
+                    connection_target: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        let resolution = super::detect_or_connect_hardened(
+            &home,
+            "default",
+            super::TransientSocketPolicy::NeedStartBeforeLock,
+        )
+        .await
+        .expect("stale authority should resolve to restart");
+        assert!(
+            matches!(resolution, super::DaemonConnection::NeedStart),
+            "stale dead authority must fail closed to restart"
+        );
+
+        assert!(
+            !runtime.pid_path().exists(),
+            "stale runtime pid file must be cleaned"
+        );
+        assert!(
+            !projection.canonical_pid_path().exists(),
+            "stale projection pid file must be cleaned"
+        );
+        assert!(
+            !runtime.socket_path().exists(),
+            "stale runtime socket must be cleaned"
+        );
+        assert!(
+            !projection.canonical_socket_path().exists(),
+            "stale projection socket must be cleaned"
+        );
+        assert!(
+            !projection.startup_committed_path().exists(),
+            "stale startup commit marker must be cleaned"
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn detect_or_connect_hardened_reconnects_after_successful_upgrade_probe() {
+        let home = temp_home();
+        std::fs::create_dir_all(&home).unwrap();
+        let runtime = RubPaths::new(&home).session_runtime("default", "sess-default");
+        std::fs::create_dir_all(runtime.session_dir()).unwrap();
+        std::fs::create_dir_all(
+            runtime
+                .startup_committed_path()
+                .parent()
+                .expect("startup commit marker parent"),
+        )
+        .unwrap();
+        std::fs::write(runtime.pid_path(), std::process::id().to_string()).unwrap();
+        std::fs::write(runtime.startup_committed_path(), "sess-default").unwrap();
+
+        let socket_path = runtime.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        write_registry(
+            &home,
+            &RegistryData {
+                sessions: vec![RegistryEntry {
+                    session_id: "sess-default".to_string(),
+                    session_name: "default".to_string(),
+                    pid: std::process::id(),
+                    socket_path: socket_path.display().to_string(),
+                    created_at: "2026-04-09T00:00:00Z".to_string(),
+                    ipc_protocol_version: "0.9".to_string(),
+                    user_data_dir: None,
+                    attachment_identity: None,
+                    connection_target: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        let server = tokio::spawn(async move {
+            for (index, expected_command) in ["_handshake", "_upgrade_check", "_handshake"]
+                .into_iter()
+                .enumerate()
+            {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let request: IpcRequest = NdJsonCodec::read(&mut reader)
+                    .await
+                    .expect("read request")
+                    .expect("request");
+                assert_eq!(request.command, expected_command);
+                let response = IpcResponse::success(
+                    format!("response-{expected_command}"),
+                    serde_json::json!({
+                        "daemon_session_id": "sess-default",
+                        "launch_policy": {
+                            "headless": true,
+                            "ignore_cert_errors": false,
+                            "hide_infobars": false
+                        }
+                    }),
+                );
+                let write_result = NdJsonCodec::write(&mut writer, &response).await;
+                if index == 0 {
+                    let _ = write_result;
+                } else {
+                    write_result.expect("write response");
+                }
+            }
+        });
+
+        let resolution = super::detect_or_connect_hardened(
+            &home,
+            "default",
+            super::TransientSocketPolicy::NeedStartBeforeLock,
+        )
+        .await
+        .expect("upgrade reconnect path should succeed");
+        let super::DaemonConnection::Connected {
+            daemon_session_id, ..
+        } = resolution
+        else {
+            panic!("successful upgrade probe should reconnect to a live daemon");
+        };
+        assert_eq!(daemon_session_id.as_deref(), Some("sess-default"));
+
+        server.await.expect("server task");
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
     async fn close_all_sessions_noops_without_creating_rub_home() {
         let home = temp_home();
         let _ = std::fs::remove_dir_all(&home);
@@ -2442,8 +685,9 @@ mod tests {
 
     #[test]
     fn replay_budget_exhaustion_maps_to_ipc_timeout() {
+        let source = std::io::Error::new(std::io::ErrorKind::TimedOut, "replay budget exhausted");
         let error = ipc_timeout_error(
-            "replay budget exhausted",
+            &source,
             None,
             Some(serde_json::json!({
                 "reason": "ipc_replay_budget_exhausted",
@@ -2464,6 +708,66 @@ mod tests {
             }
             other => panic!("expected domain timeout error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_handshake_info_preserves_version_mismatch_code_and_context() {
+        let socket_dir = std::path::PathBuf::from(format!("/tmp/rdi-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let socket_path = socket_dir.join("ipc.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let _: IpcRequest = NdJsonCodec::read(&mut reader)
+                .await
+                .expect("read request")
+                .expect("request");
+            let mut response = IpcResponse::success(
+                "req-1",
+                serde_json::json!({
+                    "daemon_session_id": "sess-default",
+                    "launch_policy": serde_json::to_value(LaunchPolicyInfo {
+                        headless: true,
+                        ignore_cert_errors: false,
+                        hide_infobars: false,
+                        user_data_dir: None,
+                        connection_target: None,
+                        stealth_level: None,
+                        stealth_patches: None,
+                        stealth_default_enabled: None,
+                        humanize_enabled: None,
+                        humanize_speed: None,
+                        stealth_coverage: None,
+                    }).unwrap(),
+                }),
+            );
+            response.ipc_protocol_version = "0.9".to_string();
+            NdJsonCodec::write(&mut writer, &response)
+                .await
+                .expect("write response");
+        });
+
+        let mut client = IpcClient::connect(&socket_path).await.expect("connect");
+        let error = fetch_handshake_info_with_timeout(&mut client, 1_000)
+            .await
+            .expect_err("mismatched protocol should fail");
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::IpcVersionMismatch);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("ipc_response_protocol_version_mismatch")
+        );
+
+        server.await.expect("server join");
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&socket_dir);
     }
 
     #[cfg(unix)]
@@ -2523,7 +827,14 @@ mod tests {
         let error = acquire_startup_lock(&home, "default", None, 75)
             .await
             .expect_err("contention should time out");
-        assert_eq!(error.into_envelope().code, ErrorCode::DaemonStartFailed);
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::DaemonStartFailed);
+        let context = envelope.context.expect("startup lock timeout context");
+        assert_eq!(context["reason"], "startup_lock_timeout");
+        assert_eq!(
+            context["lock_path_state"]["path_authority"],
+            "daemon_ctl.startup.lock_path"
+        );
         assert!(
             start.elapsed() >= std::time::Duration::from_millis(50),
             "startup lock should wait rather than spin"
@@ -2544,6 +855,25 @@ mod tests {
         let envelope = read_startup_error(&error_path).expect("fallback envelope should parse");
         assert_eq!(envelope.code, ErrorCode::DaemonStartFailed);
         assert_eq!(envelope.message, "daemon failed before structured envelope");
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn read_startup_error_missing_file_preserves_error_file_state() {
+        let home = temp_home();
+        std::fs::create_dir_all(&home).unwrap();
+        let error_path = home.join("missing.error");
+
+        let envelope = read_startup_error(&error_path)
+            .expect_err("missing startup error file should fail")
+            .into_envelope();
+        let context = envelope.context.expect("startup error file context");
+        assert_eq!(context["reason"], "startup_error_file_read_failed");
+        assert_eq!(
+            context["error_file_state"]["path_authority"],
+            "daemon_ctl.startup.error_file"
+        );
 
         let _ = std::fs::remove_dir_all(home);
     }
@@ -2766,6 +1096,24 @@ mod tests {
     }
 
     #[test]
+    fn startup_ready_retry_timeout_failure_preserves_socket_path_state() {
+        let failure = super::startup_ready_retry_timeout_failure(
+            super::RetryAttribution::default(),
+            Path::new("/tmp/rub.sock"),
+        );
+        let context = failure
+            .error
+            .into_envelope()
+            .context
+            .expect("timeout context");
+        assert_eq!(context["reason"], "startup_handshake_timeout");
+        assert_eq!(
+            context["socket_path_state"]["path_authority"],
+            "daemon_ctl.startup.handshake.socket_path"
+        );
+    }
+
+    #[test]
     fn socket_candidates_require_authority_entry() {
         assert!(socket_candidates_for_session(None).unwrap().is_empty());
 
@@ -2794,6 +1142,44 @@ mod tests {
     }
 
     #[test]
+    fn registry_authority_snapshot_failure_preserves_rub_home_state() {
+        let home = temp_home();
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::write(&home, b"not-a-directory").unwrap();
+
+        let envelope = registry_authority_snapshot(&home)
+            .expect_err("invalid rub_home should fail")
+            .into_envelope();
+        let context = envelope.context.expect("registry authority context");
+        assert_eq!(context["reason"], "registry_authority_resolution_failed");
+        assert_eq!(
+            context["rub_home_state"]["path_authority"],
+            "daemon_ctl.registry_authority.rub_home"
+        );
+
+        let _ = std::fs::remove_file(home);
+    }
+
+    #[test]
+    fn daemon_ctl_socket_error_preserves_socket_path_state_and_reason() {
+        let error = super::daemon_ctl_socket_error(
+            ErrorCode::DaemonStartFailed,
+            "boom".to_string(),
+            Path::new("/tmp/rub.sock"),
+            "daemon_ctl.startup.handshake.socket_path",
+            "startup_ready_monitor.socket_path",
+            "startup_handshake_bind_failed",
+        )
+        .into_envelope();
+        let context = error.context.expect("daemon_ctl socket error context");
+        assert_eq!(context["reason"], "startup_handshake_bind_failed");
+        assert_eq!(
+            context["socket_path_state"]["path_authority"],
+            "daemon_ctl.startup.handshake.socket_path"
+        );
+    }
+
+    #[test]
     fn command_match_requires_session_id_when_present() {
         let rub_home = Path::new("/tmp/rub-e2e-home");
         let command =
@@ -2810,5 +1196,122 @@ mod tests {
             "default",
             Some("sess-stale"),
         ));
+    }
+
+    #[test]
+    fn project_batch_close_result_marks_subject_rub_home_as_local_runtime_reference() {
+        let projected = project_batch_close_result(
+            Path::new("/tmp/rub-home"),
+            &super::BatchCloseResult {
+                closed: vec!["default".to_string()],
+                cleaned_stale: vec!["work".to_string()],
+                failed: vec!["broken".to_string()],
+            },
+        );
+
+        assert_eq!(
+            projected["subject"]["rub_home_state"]["path_authority"],
+            "cli.close_all.subject.rub_home"
+        );
+        assert_eq!(
+            projected["subject"]["rub_home_state"]["truth_level"],
+            "local_runtime_reference"
+        );
+    }
+
+    #[test]
+    fn daemon_ctl_path_state_marks_display_only_local_runtime_reference() {
+        let state = super::daemon_ctl_path_state(
+            "daemon_ctl.upgrade.registry_entry.socket_path",
+            "registry_authority_entry",
+            "session_socket",
+        );
+
+        assert_eq!(state.truth_level, "local_runtime_reference");
+        assert_eq!(
+            state.path_authority,
+            "daemon_ctl.upgrade.registry_entry.socket_path"
+        );
+        assert_eq!(state.upstream_truth, "registry_authority_entry");
+        assert_eq!(state.path_kind, "session_socket");
+        assert_eq!(state.control_role, "display_only");
+    }
+
+    #[test]
+    fn daemon_ctl_path_error_preserves_path_state_and_reason() {
+        let error = super::daemon_ctl_path_error(
+            ErrorCode::DaemonStartFailed,
+            "boom".to_string(),
+            super::DaemonCtlPathContext {
+                path_key: "socket_path",
+                path: Path::new("/tmp/rub.sock"),
+                path_authority: "daemon_ctl.connect.socket_path",
+                upstream_truth: "session_socket_candidates",
+                path_kind: "session_socket",
+                reason: "daemon_socket_connect_failed",
+            },
+        )
+        .into_envelope();
+        let context = error.context.expect("daemon_ctl path error context");
+        assert_eq!(context["reason"], "daemon_socket_connect_failed");
+        assert_eq!(
+            context["socket_path_state"]["path_authority"],
+            "daemon_ctl.connect.socket_path"
+        );
+        assert_eq!(
+            context["socket_path_state"]["upstream_truth"],
+            "session_socket_candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_authority_mismatch_preserves_socket_path_state() {
+        let entry = RegistryEntry {
+            session_id: "sess-registry".to_string(),
+            session_name: "default".to_string(),
+            pid: 4242,
+            socket_path: "/tmp/rub-home/default.sock".to_string(),
+            created_at: "2026-04-08T00:00:00Z".to_string(),
+            ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+            user_data_dir: None,
+            attachment_identity: None,
+            connection_target: None,
+        };
+        let handshake = super::HandshakePayload {
+            daemon_session_id: "sess-handshake".to_string(),
+            launch_policy: LaunchPolicyInfo {
+                headless: true,
+                ignore_cert_errors: false,
+                hide_infobars: true,
+                user_data_dir: None,
+                connection_target: None,
+                stealth_level: None,
+                stealth_patches: None,
+                stealth_default_enabled: None,
+                humanize_enabled: None,
+                humanize_speed: None,
+                stealth_coverage: None,
+            },
+        };
+
+        let error = super::maybe_upgrade_if_needed(
+            Path::new("/tmp/rub-home"),
+            "default",
+            Some(&entry),
+            &handshake,
+            Path::new("/tmp/rub-home/default.sock"),
+        )
+        .await
+        .err()
+        .expect("mismatched authority must fail")
+        .into_envelope();
+
+        assert_eq!(error.code, ErrorCode::IpcProtocolError);
+        let context = error.context.expect("context");
+        assert_eq!(context["reason"], "daemon_authority_mismatch");
+        assert_eq!(
+            context["socket_path_state"]["path_authority"],
+            "daemon_ctl.upgrade.registry_entry.socket_path"
+        );
     }
 }

@@ -4,8 +4,8 @@ use super::{
     humanize_budget_ms_for_command_args,
 };
 use crate::commands::{
-    Commands, EffectiveCli, ElementAddressArgs, InspectSubcommand, InterceptSubcommand,
-    ObservationProjectionArgs, ObservationScopeArgs, OrchestrationSubcommand,
+    Commands, CookiesSubcommand, EffectiveCli, ElementAddressArgs, InspectSubcommand,
+    InterceptSubcommand, ObservationProjectionArgs, ObservationScopeArgs, OrchestrationSubcommand,
     RequestedLaunchPolicy, RuntimeSubcommand, StateFormatArg, StorageSubcommand,
     TakeoverSubcommand, TriggerSubcommand, WaitAfterArgs,
 };
@@ -206,6 +206,29 @@ fn download_save_request_projects_bulk_asset_save_surface() {
             .expect("download save file path should be serialized"),
     );
     assert_eq!(normalize_test_path(&actual_file), expected_file);
+    assert_eq!(
+        request.args["file_state"]["path_authority"],
+        "cli.download.save.file"
+    );
+    assert_eq!(
+        request.args["file_state"]["path_kind"],
+        "download_save_input_file"
+    );
+    let expected_output_dir = std::env::current_dir().expect("cwd").join("saved-assets");
+    let actual_output_dir = PathBuf::from(
+        request.args["output_dir"]
+            .as_str()
+            .expect("download save output dir should be serialized"),
+    );
+    assert_eq!(normalize_test_path(&actual_output_dir), expected_output_dir);
+    assert_eq!(
+        request.args["output_dir_state"]["path_authority"],
+        "cli.download.save.output_dir"
+    );
+    assert_eq!(
+        request.args["output_dir_state"]["path_kind"],
+        "download_save_output_directory"
+    );
 }
 
 #[test]
@@ -247,6 +270,14 @@ fn storage_export_import_requests_resolve_cli_paths_before_ipc() {
             .expect("export path should serialize"),
     );
     assert_eq!(normalize_test_path(&export_path), expected_export);
+    assert_eq!(
+        export_request.args["path_state"]["path_authority"],
+        "cli.storage.export.path"
+    );
+    assert_eq!(
+        export_request.args["path_state"]["path_kind"],
+        "storage_export_file"
+    );
 
     let expected_import = std::env::current_dir()
         .expect("cwd")
@@ -261,6 +292,84 @@ fn storage_export_import_requests_resolve_cli_paths_before_ipc() {
             .expect("import path should serialize"),
     );
     assert_eq!(normalize_test_path(&import_path), expected_import);
+    assert_eq!(
+        import_request.args["path_state"]["path_authority"],
+        "cli.storage.import.path"
+    );
+    assert_eq!(
+        import_request.args["path_state"]["path_kind"],
+        "storage_import_file"
+    );
+}
+
+#[test]
+fn cookies_export_import_requests_resolve_cli_paths_before_ipc() {
+    let expected_export = std::env::current_dir()
+        .expect("cwd")
+        .join("cookies-export.json");
+    let export_request = build_request(&cli_with(Commands::Cookies(CookiesSubcommand::Export {
+        path: "./cookies-export.json".to_string(),
+    })))
+    .expect("cookies export request");
+    let export_path = PathBuf::from(
+        export_request.args["path"]
+            .as_str()
+            .expect("cookies export path should serialize"),
+    );
+    assert_eq!(normalize_test_path(&export_path), expected_export);
+    assert_eq!(
+        export_request.args["path_state"]["path_authority"],
+        "cli.cookies.export.path"
+    );
+    assert_eq!(
+        export_request.args["path_state"]["path_kind"],
+        "cookies_export_file"
+    );
+
+    let expected_import = std::env::current_dir()
+        .expect("cwd")
+        .join("cookies-import.json");
+    let import_request = build_request(&cli_with(Commands::Cookies(CookiesSubcommand::Import {
+        path: "./cookies-import.json".to_string(),
+    })))
+    .expect("cookies import request");
+    let import_path = PathBuf::from(
+        import_request.args["path"]
+            .as_str()
+            .expect("cookies import path should serialize"),
+    );
+    assert_eq!(normalize_test_path(&import_path), expected_import);
+    assert_eq!(
+        import_request.args["path_state"]["path_authority"],
+        "cli.cookies.import.path"
+    );
+    assert_eq!(
+        import_request.args["path_state"]["path_kind"],
+        "cookies_import_file"
+    );
+}
+
+#[test]
+fn cookies_set_request_omits_unset_optional_fields() {
+    let request = build_request(&cli_with(Commands::Cookies(CookiesSubcommand::Set {
+        name: "session".to_string(),
+        value: "abc".to_string(),
+        domain: None,
+        path: "/".to_string(),
+        secure: false,
+        http_only: false,
+        same_site: None,
+        expires: None,
+    })))
+    .expect("cookies set request");
+
+    assert_eq!(request.command, "cookies");
+    assert_eq!(request.args["sub"], "set");
+    assert_eq!(request.args["name"], "session");
+    assert_eq!(request.args["value"], "abc");
+    assert!(request.args.get("domain").is_none(), "{request:?}");
+    assert!(request.args.get("same_site").is_none(), "{request:?}");
+    assert!(request.args.get("expires").is_none(), "{request:?}");
 }
 
 #[test]
@@ -316,8 +425,45 @@ fn pipe_file_request_loads_spec_and_records_file_source() {
         request.args["spec_source"]["path"],
         serde_json::json!(path.display().to_string())
     );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["path_authority"],
+        "cli.pipe.spec_source.path"
+    );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["upstream_truth"],
+        "cli_pipe_file_option"
+    );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["path_kind"],
+        "workflow_spec_file"
+    );
 
     let _ = fs::remove_file(path);
+}
+
+#[test]
+fn pipe_file_request_missing_file_reports_path_context() {
+    let path = std::env::temp_dir().join(format!("rub-pipe-missing-{}.json", uuid::Uuid::now_v7()));
+    let _ = fs::remove_file(&path);
+
+    let cli = cli_with(Commands::Pipe {
+        spec: None,
+        file: Some(path.display().to_string()),
+        workflow: None,
+        list_workflows: false,
+        vars: Vec::new(),
+        wait_after: WaitAfterArgs::default(),
+    });
+
+    let error = build_request(&cli).expect_err("missing pipe file should be rejected");
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::FileNotFound);
+    let context = envelope.context.expect("pipe file error context");
+    assert_eq!(context["reason"], "pipe_spec_file_not_found");
+    assert_eq!(
+        context["path_state"]["path_authority"],
+        "cli.pipe.spec_source.path"
+    );
 }
 
 #[test]
@@ -352,8 +498,48 @@ fn fill_file_request_loads_spec_and_records_file_source() {
         request.args["spec_source"]["path"],
         serde_json::json!(path.display().to_string())
     );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["path_authority"],
+        "cli.fill.spec_source.path"
+    );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["upstream_truth"],
+        "cli_fill_file_option"
+    );
 
     let _ = fs::remove_file(path);
+}
+
+#[test]
+fn fill_file_request_missing_file_reports_path_context() {
+    let path = std::env::temp_dir().join(format!("rub-fill-missing-{}.json", uuid::Uuid::now_v7()));
+    let _ = fs::remove_file(&path);
+
+    let cli = cli_with(Commands::Fill {
+        spec: None,
+        file: Some(path.display().to_string()),
+        submit_index: None,
+        submit_selector: None,
+        submit_target_text: None,
+        submit_ref: None,
+        submit_role: None,
+        submit_label: None,
+        submit_testid: None,
+        submit_first: false,
+        submit_last: false,
+        submit_nth: None,
+        wait_after: WaitAfterArgs::default(),
+    });
+
+    let error = build_request(&cli).expect_err("missing fill file should be rejected");
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::FileNotFound);
+    let context = envelope.context.expect("fill file error context");
+    assert_eq!(context["reason"], "json_spec_file_not_found");
+    assert_eq!(
+        context["path_state"]["path_authority"],
+        "cli.fill.spec_source.path"
+    );
 }
 
 #[test]
@@ -405,6 +591,14 @@ fn extract_file_request_loads_spec_and_records_file_source() {
     assert_eq!(
         request.args["spec_source"]["path"],
         serde_json::json!(path.display().to_string())
+    );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["path_authority"],
+        "cli.extract.spec_source.path"
+    );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["upstream_truth"],
+        "cli_extract_file_option"
     );
 
     let _ = fs::remove_file(path);
@@ -582,6 +776,14 @@ fn screenshot_positional_path_builds_output_path() {
     );
     let expected = std::env::current_dir().expect("cwd").join("capture.png");
     assert_eq!(normalize_test_path(&actual), expected);
+    assert_eq!(
+        request.args["path_state"]["path_authority"],
+        "cli.screenshot.path"
+    );
+    assert_eq!(
+        request.args["path_state"]["path_kind"],
+        "screenshot_output_file"
+    );
 }
 
 #[test]
@@ -604,6 +806,42 @@ fn observe_request_resolves_output_path_before_ipc() {
         .expect("cwd")
         .join("captures/observe.png");
     assert_eq!(normalize_test_path(&actual), expected);
+    assert_eq!(
+        request.args["path_state"]["path_authority"],
+        "cli.observe.path"
+    );
+    assert_eq!(
+        request.args["path_state"]["path_kind"],
+        "observe_output_file"
+    );
+}
+
+#[test]
+fn upload_request_resolves_input_path_before_ipc() {
+    let cli = cli_with(Commands::Upload {
+        operands: vec!["./fixtures/upload.txt".to_string()],
+        target: ElementAddressArgs {
+            selector: Some("input[type=file]".to_string()),
+            ..ElementAddressArgs::default()
+        },
+        wait_after: WaitAfterArgs::default(),
+    });
+
+    let request = build_request(&cli).expect("upload request should build");
+    let actual = PathBuf::from(
+        request.args["path"]
+            .as_str()
+            .expect("upload path should serialize"),
+    );
+    let expected = std::env::current_dir()
+        .expect("cwd")
+        .join("fixtures/upload.txt");
+    assert_eq!(normalize_test_path(&actual), expected);
+    assert_eq!(
+        request.args["path_state"]["path_authority"],
+        "cli.upload.path"
+    );
+    assert_eq!(request.args["path_state"]["path_kind"], "upload_input_file");
 }
 
 #[test]
@@ -691,6 +929,14 @@ fn inspect_list_file_request_loads_spec_and_records_file_source() {
     assert_eq!(
         request.args["spec_source"]["path"],
         serde_json::json!(path.display().to_string())
+    );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["path_authority"],
+        "cli.inspect_list.spec_source.path"
+    );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["upstream_truth"],
+        "cli_inspect_list_file_option"
     );
 
     let _ = fs::remove_file(path);
@@ -924,6 +1170,14 @@ fn pipe_request_loads_named_workflow_assets() {
         request.args["spec_source"]["path"],
         serde_json::json!(workflow_path.display().to_string())
     );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["path_authority"],
+        "cli.pipe.spec_source.path"
+    );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["upstream_truth"],
+        "cli_pipe_workflow_option"
+    );
 
     let _ = fs::remove_dir_all(home);
 }
@@ -991,6 +1245,14 @@ fn trigger_add_request_loads_spec_file_and_records_source() {
     assert_eq!(
         request.args["spec_source"]["path"],
         serde_json::json!(path.display().to_string())
+    );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["path_authority"],
+        "cli.trigger.spec_source.path"
+    );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["path_kind"],
+        "trigger_registration_file"
     );
 
     let _ = fs::remove_file(path);
@@ -1064,6 +1326,14 @@ fn orchestration_add_request_loads_spec_file_and_records_source() {
         request.args["spec_source"]["path"],
         serde_json::json!(path.display().to_string())
     );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["path_authority"],
+        "cli.orchestration.spec_source.path"
+    );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["path_kind"],
+        "orchestration_registration_file"
+    );
 
     let _ = fs::remove_file(path);
 }
@@ -1107,8 +1377,98 @@ fn orchestration_add_request_loads_named_asset_and_records_source() {
     assert_eq!(request.args["sub"], "add");
     assert_eq!(request.args["spec_source"]["kind"], "asset");
     assert_eq!(request.args["spec_source"]["name"], "reply_rule");
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["path_authority"],
+        "cli.orchestration.spec_source.path"
+    );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["upstream_truth"],
+        "cli_orchestration_asset_option"
+    );
+    assert_eq!(
+        request.args["spec_source"]["path_state"]["path_kind"],
+        "orchestration_asset_reference"
+    );
 
     let _ = fs::remove_dir_all(rub_home);
+}
+
+#[test]
+fn orchestration_add_missing_asset_reports_path_context() {
+    let rub_home = std::env::temp_dir().join(format!(
+        "rub-orchestration-missing-asset-home-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let _ = fs::remove_dir_all(&rub_home);
+
+    let cli = cli_with_with_home(
+        Commands::Orchestration {
+            subcommand: OrchestrationSubcommand::Add {
+                file: None,
+                asset: Some("reply_rule".to_string()),
+                paused: false,
+            },
+        },
+        rub_home,
+    );
+
+    let error = build_request(&cli)
+        .expect_err("missing orchestration asset should fail")
+        .into_envelope();
+    assert_eq!(error.code, ErrorCode::FileNotFound);
+    let context = error.context.expect("orchestration asset path context");
+    assert_eq!(context["reason"], "named_orchestration_asset_not_found");
+    assert_eq!(
+        context["path_state"]["path_authority"],
+        "cli.orchestration.spec_source.path"
+    );
+    assert_eq!(
+        context["path_state"]["path_kind"],
+        "orchestration_asset_reference"
+    );
+}
+
+#[test]
+fn trigger_add_missing_file_reports_path_context() {
+    let cli = cli_with(Commands::Trigger {
+        subcommand: TriggerSubcommand::Add {
+            file: "./missing-trigger.json".to_string(),
+            paused: false,
+        },
+    });
+
+    let error = build_request(&cli)
+        .expect_err("missing trigger file should fail")
+        .into_envelope();
+    assert_eq!(error.code, ErrorCode::FileNotFound);
+    let context = error.context.expect("trigger add path context");
+    assert_eq!(context["reason"], "trigger_spec_file_not_found");
+    assert_eq!(
+        context["path_state"]["path_authority"],
+        "cli.trigger.spec_source.path"
+    );
+}
+
+#[test]
+fn orchestration_add_missing_file_reports_path_context() {
+    let cli = cli_with(Commands::Orchestration {
+        subcommand: OrchestrationSubcommand::Add {
+            file: Some("./missing-orchestration.json".to_string()),
+            asset: None,
+            paused: false,
+        },
+    });
+
+    let error = build_request(&cli)
+        .expect_err("missing orchestration file should fail")
+        .into_envelope();
+    assert_eq!(error.code, ErrorCode::FileNotFound);
+    let context = error.context.expect("orchestration add path context");
+    assert_eq!(context["reason"], "orchestration_spec_file_not_found");
+    assert_eq!(
+        context["path_state"]["path_authority"],
+        "cli.orchestration.spec_source.path"
+    );
 }
 
 #[test]

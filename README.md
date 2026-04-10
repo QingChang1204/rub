@@ -12,7 +12,7 @@
 
 ---
 
-**rub** is a Rust CLI + persistent daemon for headless browser automation over Chrome DevTools Protocol (CDP). It produces deterministic JSON output, maintains persistent browser sessions, and targets DOM elements through snapshot-based addressing — all designed for reliable AI agent integration without the overhead of Node.js or Python runtimes.
+**rub** is a Rust CLI + persistent daemon for headless browser automation over Chrome DevTools Protocol (CDP). It produces deterministic machine-facing output: the standard JSON envelope on default surfaces, plus an explicit raw stdout surface for `exec --raw`. It maintains persistent browser sessions and targets DOM elements through snapshot-based addressing — all designed for reliable AI agent integration without the overhead of Node.js or Python runtimes.
 
 ## Why rub?
 
@@ -64,7 +64,7 @@ When a language model drives a browser through Playwright or Puppeteer, it runs 
 ## Features
 
 ### 🤖 Agent-Native Interface
-- **Structured JSON output** — every command returns one JSON object to stdout. No HTML to parse, no selectors to guess.
+- **Structured stdout contract** — default command surfaces return one JSON object to stdout; `exec --raw` is an explicit raw-value surface. No HTML to parse, no selectors to guess.
 - **Snapshot-based element targeting** — elements are addressed by snapshot ID + index, eliminating race conditions from DOM mutations.
 - **At-most-once execution** — mutating commands carry a `command_id` to prevent duplicate side effects during retries.
 - **Interaction trace** — `--verbose` / `--trace` flags expose what the runtime observed before and after each action.

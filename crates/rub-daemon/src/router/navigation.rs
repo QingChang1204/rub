@@ -6,218 +6,28 @@ use super::observation_scope::{
     apply_observation_scope, apply_projection_limit, attach_scope_metadata, parse_observation_scope,
 };
 use super::projection::{
-    attach_result, attach_subject, navigation_subject, page_entity, tab_entity, tab_subject,
-    viewport_subject,
+    attach_result, attach_subject, navigation_subject, page_entity, viewport_subject,
 };
 use super::request_args::parse_json_args;
-use super::snapshot::{
-    ExternalDomFenceOutcome, build_stable_snapshot, settle_external_dom_fence,
-    sleep_full_settle_window,
-};
+use super::snapshot::build_stable_snapshot;
 use super::state_format::{StateFormat, project_snapshot};
 use super::url_normalization::normalize_open_url;
 use super::*;
-use rub_core::model::TabInfo;
-use rub_ipc::codec::MAX_FRAME_BYTES;
 
-const INLINE_SCREENSHOT_RESPONSE_OVERHEAD_BYTES: usize = 64 * 1024;
-const NAVIGATION_PROJECTION_SETTLE_RETRIES: usize = 6;
-const NAVIGATION_PROJECTION_SETTLE_DELAY_MS: u64 = 100;
+mod args;
+mod screenshot;
+mod settle;
+mod tabs;
 
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OpenArgs {
-    url: String,
-    #[serde(default)]
-    load_strategy: Option<String>,
-    #[serde(default, rename = "wait_after")]
-    _wait_after: Option<serde_json::Value>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StateArgs {
-    #[serde(default)]
-    limit: Option<u64>,
-    #[serde(default)]
-    format: Option<String>,
-    #[serde(default)]
-    a11y: bool,
-    #[serde(default)]
-    viewport: bool,
-    #[serde(default)]
-    diff: Option<String>,
-    #[serde(default)]
-    listeners: bool,
-    #[serde(default, rename = "compact")]
-    _compact: bool,
-    #[serde(default, rename = "depth")]
-    _depth: Option<u64>,
-    #[serde(default, rename = "scope")]
-    _scope: Option<serde_json::Value>,
-    #[serde(default, rename = "scope_selector")]
-    _scope_selector: Option<String>,
-    #[serde(default, rename = "scope_role")]
-    _scope_role: Option<String>,
-    #[serde(default, rename = "scope_label")]
-    _scope_label: Option<String>,
-    #[serde(default, rename = "scope_testid")]
-    _scope_testid: Option<String>,
-    #[serde(default, rename = "scope_first")]
-    _scope_first: bool,
-    #[serde(default, rename = "scope_last")]
-    _scope_last: bool,
-    #[serde(default, rename = "scope_nth")]
-    _scope_nth: Option<u64>,
-    #[serde(default, rename = "_orchestration")]
-    _orchestration: Option<serde_json::Value>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ScrollArgs {
-    #[serde(default)]
-    direction: Option<String>,
-    #[serde(default)]
-    amount: Option<u32>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReloadArgs {
-    #[serde(default)]
-    load_strategy: Option<String>,
-    #[serde(default, rename = "wait_after")]
-    _wait_after: Option<serde_json::Value>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ScreenshotArgs {
-    #[serde(default)]
-    full: bool,
-    #[serde(default)]
-    highlight: bool,
-    #[serde(default)]
-    path: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SwitchArgs {
-    index: u32,
-    #[serde(default, rename = "wait_after")]
-    _wait_after: Option<serde_json::Value>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CloseTabArgs {
-    #[serde(default)]
-    index: Option<u32>,
-}
-
-fn parse_optional_load_strategy(
-    value: Option<&str>,
-    name: &str,
-) -> Result<rub_core::model::LoadStrategy, RubError> {
-    let Some(value) = value else {
-        return Ok(rub_core::model::LoadStrategy::default());
-    };
-    serde_json::from_value(serde_json::Value::String(value.to_string())).map_err(|_| {
-        RubError::domain(
-            ErrorCode::InvalidInput,
-            format!(
-                "Invalid {name} '{}'; expected one of: load, domcontentloaded, networkidle",
-                value
-            ),
-        )
-    })
-}
-
-fn parse_optional_scroll_direction(
-    value: Option<&str>,
-    name: &str,
-) -> Result<rub_core::model::ScrollDirection, RubError> {
-    let Some(value) = value else {
-        return Ok(rub_core::model::ScrollDirection::Down);
-    };
-    serde_json::from_value(serde_json::Value::String(value.to_string())).map_err(|_| {
-        RubError::domain(
-            ErrorCode::InvalidInput,
-            format!("Invalid {name} '{}'; expected one of: up, down", value),
-        )
-    })
-}
-
-async fn settle_navigation_projection(
-    router: &DaemonRouter,
-    state: &Arc<SessionState>,
-    reason: &str,
-    deadline: TransactionDeadline,
-) -> PendingExternalDomCommit {
-    state.clear_all_snapshots().await;
-    state.select_frame(None).await;
-    let pending_external_dom_commit =
-        match settle_external_dom_fence(state, reason, Some(deadline)).await {
-            ExternalDomFenceOutcome::Settled => PendingExternalDomCommit::Clear,
-            ExternalDomFenceOutcome::IncompleteDueToDeadline
-            | ExternalDomFenceOutcome::Unstable => PendingExternalDomCommit::Preserve,
-        };
-
-    for attempt in 0..NAVIGATION_PROJECTION_SETTLE_RETRIES {
-        if deadline.remaining_duration().is_none() {
-            tracing::debug!(
-                reason,
-                attempt,
-                "settle_navigation_projection: deadline exhausted, stopping early"
-            );
-            return pending_external_dom_commit;
-        }
-        let tabs = router.browser.list_tabs().await.ok();
-        if let Some(tabs) = tabs.as_ref() {
-            state.adopt_interference_primary_context(tabs).await;
-        }
-        crate::runtime_refresh::refresh_live_frame_runtime(&router.browser, state).await;
-        if active_tab_and_frame_runtime_converged(state, tabs.as_deref()).await {
-            return pending_external_dom_commit;
-        }
-        if attempt + 1 < NAVIGATION_PROJECTION_SETTLE_RETRIES
-            && !sleep_full_settle_window(Some(deadline), NAVIGATION_PROJECTION_SETTLE_DELAY_MS)
-                .await
-        {
-            tracing::debug!(
-                reason,
-                attempt,
-                "settle_navigation_projection: deadline too close for another full settle window, stopping early"
-            );
-            return pending_external_dom_commit;
-        }
-    }
-
-    pending_external_dom_commit
-}
-
-fn is_page_load_timeout(error: &RubError) -> bool {
-    matches!(error, RubError::Domain(envelope) if envelope.code == ErrorCode::PageLoadTimeout)
-}
-
-async fn active_tab_and_frame_runtime_converged(
-    state: &Arc<SessionState>,
-    tabs: Option<&[TabInfo]>,
-) -> bool {
-    let Some(active_tab) = tabs.and_then(|tabs| tabs.iter().find(|tab| tab.active)) else {
-        return false;
-    };
-    state
-        .frame_runtime()
-        .await
-        .current_frame
-        .is_some_and(|frame| {
-            frame.target_id.as_deref() == Some(active_tab.target_id.as_str())
-                && frame.url.as_deref() == Some(active_tab.url.as_str())
-        })
-}
+use self::args::{
+    OpenArgs, ReloadArgs, ScrollArgs, StateArgs, parse_optional_load_strategy,
+    parse_optional_scroll_direction,
+};
+pub(super) use self::screenshot::{
+    cmd_screenshot, inline_screenshot_payload_exceeds_limit, write_screenshot_artifact,
+};
+use self::settle::{active_tab_entity, is_page_load_timeout, settle_navigation_projection};
+pub(super) use self::tabs::{cmd_close_tab, cmd_switch, cmd_tabs};
 
 pub(super) async fn cmd_open(
     router: &DaemonRouter,
@@ -271,6 +81,7 @@ pub(super) async fn cmd_open(
 pub(super) async fn cmd_state(
     router: &DaemonRouter,
     args: &serde_json::Value,
+    deadline: TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     let parsed: StateArgs = parse_json_args(args, "state")?;
@@ -315,8 +126,16 @@ pub(super) async fn cmd_state(
         } else {
             limit
         };
-    let mut snapshot =
-        build_stable_snapshot(router, args, state, capture_limit, a11y, listeners).await?;
+    let mut snapshot = build_stable_snapshot(
+        router,
+        args,
+        state,
+        deadline,
+        capture_limit,
+        a11y,
+        listeners,
+    )
+    .await?;
     let mut scoped_metadata = None::<(rub_core::observation::ObservationScope, u32, u32)>;
     if let Some(scope) = observation_scope.as_ref() {
         let scoped = apply_observation_scope(router, snapshot, scope).await?;
@@ -561,193 +380,13 @@ pub(super) async fn cmd_reload(
         .with_pending_external_dom_commit(pending_external_dom_commit))
 }
 
-pub(super) async fn cmd_screenshot(
-    router: &DaemonRouter,
-    args: &serde_json::Value,
-) -> Result<serde_json::Value, RubError> {
-    let parsed: ScreenshotArgs = parse_json_args(args, "screenshot")?;
-    let full_page = parsed.full;
-    let highlight = parsed.highlight;
-
-    let highlight_info = if highlight {
-        let snapshot = router.browser.snapshot(None).await?;
-        let count = router.browser.highlight_elements(&snapshot).await?;
-        Some(count)
-    } else {
-        None
-    };
-
-    let screenshot_result = router.browser.screenshot(full_page).await;
-    let highlight_cleanup_result = if highlight_info.is_some() {
-        Some(router.browser.cleanup_highlights().await)
-    } else {
-        None
-    };
-    let png_bytes = match (screenshot_result, highlight_cleanup_result) {
-        (Ok(bytes), Some(Ok(()))) => bytes,
-        (Ok(bytes), None) => bytes,
-        (Ok(_), Some(Err(cleanup_error))) => return Err(cleanup_error),
-        (Err(screenshot_error), Some(Ok(()))) => return Err(screenshot_error),
-        (Err(screenshot_error), Some(Err(cleanup_error))) => {
-            return Err(RubError::domain_with_context(
-                ErrorCode::InternalError,
-                format!("Failed to capture screenshot: {screenshot_error}"),
-                serde_json::json!({
-                    "highlight_cleanup_error": cleanup_error.to_string(),
-                }),
-            ));
-        }
-        (Err(screenshot_error), None) => return Err(screenshot_error),
-    };
-
-    let highlight_requested = highlight_info.is_some();
-
-    let artifact = if let Some(path) = parsed.path.as_deref() {
-        std::fs::write(path, &png_bytes)?;
-        serde_json::json!({
-            "kind": "screenshot",
-            "format": "png",
-            "output_path": path,
-            "size_bytes": png_bytes.len(),
-        })
-    } else {
-        ensure_inline_screenshot_fits_protocol(png_bytes.len())?;
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-        serde_json::json!({
-            "kind": "screenshot",
-            "format": "png",
-            "base64": b64,
-            "size_bytes": png_bytes.len(),
-        })
-    };
-    let mut data = serde_json::json!({});
-    attach_subject(
-        &mut data,
-        serde_json::json!({
-            "kind": "page_view",
-            "full_page": full_page,
-        }),
-    );
-    attach_result(
-        &mut data,
-        serde_json::json!({
-            "artifact": artifact,
-            "highlight": {
-                "requested": highlight_requested,
-                "highlighted_count": highlight_info,
-                "cleanup": highlight_requested,
-            },
-        }),
-    );
-    Ok(data)
-}
-
-pub(super) fn inline_screenshot_payload_exceeds_limit(png_bytes_len: usize) -> bool {
-    let encoded_len = png_bytes_len.saturating_add(2) / 3 * 4;
-    encoded_len.saturating_add(INLINE_SCREENSHOT_RESPONSE_OVERHEAD_BYTES) > MAX_FRAME_BYTES
-}
-
-fn ensure_inline_screenshot_fits_protocol(png_bytes_len: usize) -> Result<(), RubError> {
-    if inline_screenshot_payload_exceeds_limit(png_bytes_len) {
-        return Err(RubError::domain_with_context(
-            ErrorCode::IpcProtocolError,
-            "Inline screenshot payload exceeds IPC frame limit; save to a file with --path",
-            serde_json::json!({
-                "reason": "inline_screenshot_exceeds_ipc_frame_limit",
-                "size_bytes": png_bytes_len,
-                "max_frame_bytes": MAX_FRAME_BYTES,
-            }),
-        ));
-    }
-    Ok(())
-}
-
-pub(super) async fn cmd_tabs(router: &DaemonRouter) -> Result<serde_json::Value, RubError> {
-    let tabs = router.browser.list_tabs().await?;
-    let active_tab = tabs.iter().find(|tab| tab.active).map(tab_entity);
-    Ok(serde_json::json!({
-        "subject": {
-            "kind": "tab_registry",
-        },
-        "result": {
-            "items": tabs,
-            "active_tab": active_tab,
-        },
-    }))
-}
-
-pub(super) async fn cmd_switch(
-    router: &DaemonRouter,
-    args: &serde_json::Value,
-    deadline: TransactionDeadline,
-    state: &Arc<SessionState>,
-) -> Result<CommandDispatchOutcome, RubError> {
-    let parsed: SwitchArgs = parse_json_args(args, "switch")?;
-    let tab = router.browser.switch_tab(parsed.index).await?;
-    let pending_external_dom_commit =
-        settle_navigation_projection(router, state, "switch", deadline).await;
-    let mut data = serde_json::json!({});
-    attach_subject(&mut data, tab_subject(parsed.index));
-    attach_result(
-        &mut data,
-        serde_json::json!({
-            "active_tab": tab_entity(&tab),
-        }),
-    );
-    Ok(CommandDispatchOutcome::new(data)
-        .with_pending_external_dom_commit(pending_external_dom_commit))
-}
-
-pub(super) async fn cmd_close_tab(
-    router: &DaemonRouter,
-    args: &serde_json::Value,
-    deadline: TransactionDeadline,
-    state: &Arc<SessionState>,
-) -> Result<CommandDispatchOutcome, RubError> {
-    let parsed: CloseTabArgs = parse_json_args(args, "close-tab")?;
-    let index = parsed.index;
-    let before_tabs = router.browser.list_tabs().await?;
-    let closed_index = index.unwrap_or_else(|| {
-        before_tabs
-            .iter()
-            .find(|tab| tab.active)
-            .map(|tab| tab.index)
-            .unwrap_or(0)
-    });
-    let tabs = router.browser.close_tab(index).await?;
-    let pending_external_dom_commit =
-        settle_navigation_projection(router, state, "close-tab", deadline).await;
-    let active_tab = tabs.iter().find(|tab| tab.active).ok_or_else(|| {
-        RubError::Internal("close-tab completed without an active tab".to_string())
-    })?;
-    let mut data = serde_json::json!({});
-    attach_subject(&mut data, tab_subject(closed_index));
-    attach_result(
-        &mut data,
-        serde_json::json!({
-            "remaining_tabs": tabs.len(),
-            "active_tab": tab_entity(active_tab),
-        }),
-    );
-    Ok(CommandDispatchOutcome::new(data)
-        .with_pending_external_dom_commit(pending_external_dom_commit))
-}
-
-async fn active_tab_entity(router: &DaemonRouter) -> Result<serde_json::Value, RubError> {
-    let tabs = router.browser.list_tabs().await?;
-    let active_tab = tabs.iter().find(|tab| tab.active).ok_or_else(|| {
-        RubError::Internal("navigation completed without an active tab".to_string())
-    })?;
-    Ok(tab_entity(active_tab))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        OpenArgs, ScrollArgs, StateArgs, inline_screenshot_payload_exceeds_limit,
-        parse_optional_load_strategy, parse_optional_scroll_direction,
+    use super::args::{
+        OpenArgs, ScreenshotArgs, ScrollArgs, StateArgs, SwitchArgs, parse_optional_load_strategy,
+        parse_optional_scroll_direction,
     };
+    use super::{inline_screenshot_payload_exceeds_limit, write_screenshot_artifact};
     use crate::router::request_args::parse_json_args;
     use rub_core::error::ErrorCode;
     use rub_core::model::{LoadStrategy, ScrollDirection};
@@ -836,9 +475,69 @@ mod tests {
     }
 
     #[test]
+    fn typed_switch_payload_accepts_trigger_metadata_but_stays_strict_otherwise() {
+        let parsed = parse_json_args::<SwitchArgs>(
+            &serde_json::json!({
+                "index": 2,
+                "_trigger": {
+                    "kind": "trigger_action",
+                }
+            }),
+            "switch",
+        )
+        .expect("switch payload should accept trigger metadata");
+        assert_eq!(parsed.index, 2);
+
+        let error = parse_json_args::<SwitchArgs>(
+            &serde_json::json!({
+                "index": 2,
+                "mystery": true,
+            }),
+            "switch",
+        )
+        .expect_err("unknown switch fields should still fail")
+        .into_envelope();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
     fn inline_screenshot_limit_helper_flags_oversized_payloads() {
         assert!(!inline_screenshot_payload_exceeds_limit(1024));
         assert!(inline_screenshot_payload_exceeds_limit(7 * 1024 * 1024));
+    }
+
+    #[test]
+    fn screenshot_artifact_marks_file_truth_boundary() {
+        let root =
+            std::env::temp_dir().join(format!("rub-screenshot-artifact-{}", uuid::Uuid::now_v7()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let output = root.join("page.png");
+
+        let artifact = write_screenshot_artifact(
+            output.to_str().expect("utf-8 path"),
+            b"png",
+            "router.screenshot_artifact",
+            "page_screenshot_result",
+        )
+        .expect("write screenshot artifact");
+
+        assert_eq!(artifact["output_path"], output.display().to_string());
+        assert_eq!(
+            artifact["artifact_state"]["truth_level"],
+            "command_artifact"
+        );
+        assert_eq!(
+            artifact["artifact_state"]["artifact_authority"],
+            "router.screenshot_artifact"
+        );
+        assert_eq!(
+            artifact["artifact_state"]["upstream_truth"],
+            "page_screenshot_result"
+        );
+        assert_eq!(artifact["artifact_state"]["durability"], "durable");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -864,5 +563,20 @@ mod tests {
         .expect_err("unknown state fields must still be rejected")
         .into_envelope();
         assert_eq!(error.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn typed_screenshot_payload_accepts_path_state_metadata() {
+        let parsed = parse_json_args::<ScreenshotArgs>(
+            &serde_json::json!({
+                "path": "/tmp/capture.png",
+                "path_state": {
+                    "path_authority": "cli.screenshot.path"
+                }
+            }),
+            "screenshot",
+        )
+        .expect("screenshot payload should accept display-only path metadata");
+        assert_eq!(parsed.path.as_deref(), Some("/tmp/capture.png"));
     }
 }

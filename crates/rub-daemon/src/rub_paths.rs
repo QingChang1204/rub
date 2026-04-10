@@ -260,6 +260,10 @@ impl SessionPaths {
         self.projection_dir().join("startup.committed")
     }
 
+    pub fn post_commit_journal_path(&self) -> PathBuf {
+        self.session_dir().join("post-commit.journal.ndjson")
+    }
+
     pub fn download_dir(&self) -> PathBuf {
         match self.session_id.as_deref() {
             Some(session_id) => self
@@ -470,6 +474,10 @@ mod tests {
             PathBuf::from("/tmp/rub-home/sessions/default/startup.committed")
         );
         assert_eq!(
+            session.post_commit_journal_path(),
+            PathBuf::from("/tmp/rub-home/sessions/default/post-commit.journal.ndjson")
+        );
+        assert_eq!(
             session.download_dir(),
             PathBuf::from("/tmp/rub-home/downloads/default")
         );
@@ -530,6 +538,10 @@ mod tests {
         assert_eq!(
             session.startup_committed_path(),
             PathBuf::from("/tmp/rub-home/sessions/default/startup.committed")
+        );
+        assert_eq!(
+            session.post_commit_journal_path(),
+            PathBuf::from("/tmp/rub-home/sessions/by-id/sess-123/post-commit.journal.ndjson")
         );
         assert_eq!(
             session.download_dir(),

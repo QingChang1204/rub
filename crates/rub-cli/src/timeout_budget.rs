@@ -10,10 +10,11 @@ use serde_json::Value;
 pub(crate) use self::budget::WAIT_IPC_BUFFER_MS;
 use self::budget::{command_timeout_ms, humanize_budget_ms_for_command_args};
 use self::helpers::{
-    WaitProbeArgs, element_address_args, merge_json_objects, mutating_request,
-    observation_projection_args, observation_scope_args, optional_element_address_args,
-    parse_indexed_operand, resolve_cli_path, resolve_inspect_list_spec_source,
-    resolve_json_spec_source, resolve_pipe_spec, wait_command_args, with_wait_after,
+    WaitProbeArgs, element_address_args, input_path_reference_state, merge_json_objects,
+    mutating_request, observation_projection_args, observation_scope_args,
+    optional_element_address_args, parse_indexed_operand, resolve_cli_path,
+    resolve_inspect_list_spec_source, resolve_json_spec_source, resolve_pipe_spec,
+    wait_command_args, with_wait_after,
 };
 use self::subcommands::{
     build_cookies_request, build_dialog_request, build_download_request, build_get_request,
@@ -126,6 +127,13 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
             merge_json_objects(
                 serde_json::json!({
                     "path": path.as_deref().map(resolve_cli_path).map(|path| path.to_string_lossy().to_string()),
+                    "path_state": path.as_deref().map(|_| {
+                        input_path_reference_state(
+                            "cli.observe.path",
+                            "cli_observe_path_option",
+                            "observe_output_file",
+                        )
+                    }),
                     "full": full,
                     "limit": limit,
                 }),
@@ -259,6 +267,16 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
                     .or(path.as_deref())
                     .map(resolve_cli_path)
                     .map(|path| path.to_string_lossy().to_string()),
+                "path_state": output_path
+                    .as_deref()
+                    .or(path.as_deref())
+                    .map(|_| {
+                        input_path_reference_state(
+                            "cli.screenshot.path",
+                            "cli_screenshot_path_option",
+                            "screenshot_output_file",
+                        )
+                    }),
                 "full": full,
                 "highlight": highlight,
             }),
@@ -518,6 +536,11 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
                         element_address_args(index, target)?,
                         serde_json::json!({
                             "path": abs.to_string_lossy(),
+                            "path_state": input_path_reference_state(
+                                "cli.upload.path",
+                                "cli_upload_operand",
+                                "upload_input_file",
+                            ),
                         }),
                     ),
                     wait_after,

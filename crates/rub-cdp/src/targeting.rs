@@ -10,8 +10,6 @@ use rub_core::model::{BoundingBox, Element, ElementTag};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const INTERACTIVE_SELECTOR: &str =
-    "a, button, input, textarea, select, option, label, [role], [onclick], [tabindex]";
 const READ_FALLBACK_SELECTOR: &str = "*";
 
 #[derive(Debug, Clone)]
@@ -31,13 +29,27 @@ pub(crate) async fn resolve_element(
     page: &Arc<Page>,
     element: &Element,
 ) -> Result<ResolvedElement, RubError> {
-    resolve_element_with_fallback_selector(
-        page,
-        element,
-        INTERACTIVE_SELECTOR,
-        "Interactive element query failed",
-    )
-    .await
+    let Some(backend_node_id) = parse_backend_node_id(element.element_ref.as_deref()) else {
+        return Err(unverified_write_target_error(
+            element,
+            "snapshot element does not carry a verified backend node id",
+        ));
+    };
+
+    let remote_object_id = resolve_remote_object(page, backend_node_id)
+        .await
+        .map_err(|_| {
+            unverified_write_target_error(
+                element,
+                "snapshot element backend node id no longer resolves in the live DOM",
+            )
+        })?;
+
+    Ok(ResolvedElement {
+        remote_object_id,
+        backend_node_id: Some(backend_node_id),
+        verified: true,
+    })
 }
 
 pub(crate) async fn resolve_read_element(
@@ -111,12 +123,26 @@ async fn resolve_element_with_fallback_selector(
     ))
 }
 
+fn unverified_write_target_error(element: &Element, reason: &str) -> RubError {
+    RubError::domain_with_context(
+        ErrorCode::StaleSnapshot,
+        "Mutating interactions require a verified target from the current snapshot authority",
+        serde_json::json!({
+            "reason": "unverified_write_target",
+            "detail": reason,
+            "element_index": element.index,
+            "element_ref": element.element_ref,
+            "tag": element.tag,
+        }),
+    )
+}
+
 async fn resolve_element_within_frame_snapshot(
     page: &Arc<Page>,
     expected: &Element,
     frame_id: Option<&str>,
 ) -> Result<Option<ResolvedElement>, RubError> {
-    let snapshot = crate::dom::build_snapshot_for_frame(page, 0, None, frame_id).await?;
+    let snapshot = crate::dom::build_snapshot_for_frame(page, 0, Some(0), frame_id).await?;
     let mut best_match: Option<(CandidateMatchRank, ResolvedElement)> = None;
 
     for candidate in snapshot.elements {
@@ -573,8 +599,9 @@ mod tests {
         CandidateMatchRank, bounding_box_center_distance, bounding_box_match_score,
         bounding_box_shape_matches, candidate_points, candidate_rank_precedes,
         parse_backend_node_id, parse_element_ref_frame_id, snapshot_candidate_match_rank,
-        tag_matches,
+        tag_matches, unverified_write_target_error,
     };
+    use rub_core::error::ErrorCode;
     use rub_core::model::{BoundingBox, Element, ElementTag};
     use std::collections::HashMap;
 
@@ -730,5 +757,40 @@ mod tests {
             ..expected.clone()
         };
         assert!(snapshot_candidate_match_rank(&expected, &candidate).is_none());
+    }
+
+    #[test]
+    fn unverified_write_target_error_is_reported_as_stale_snapshot() {
+        let error = unverified_write_target_error(
+            &Element {
+                index: 7,
+                tag: ElementTag::Button,
+                text: "Save".to_string(),
+                attributes: HashMap::new(),
+                element_ref: None,
+                bounding_box: None,
+                ax_info: None,
+                listeners: None,
+                depth: None,
+            },
+            "snapshot element does not carry a verified backend node id",
+        );
+
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::StaleSnapshot);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx["reason"].as_str()),
+            Some("unverified_write_target")
+        );
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx["element_index"].as_u64()),
+            Some(7)
+        );
     }
 }

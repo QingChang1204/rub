@@ -7,10 +7,10 @@ use super::*;
 #[test]
 #[serial]
 fn t038b_close_noops_without_bootstrap() {
-    let home = unique_home();
-    cleanup(&home);
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
 
-    let output = rub_cmd(&home).arg("close").output().unwrap();
+    let output = rub_cmd(home).arg("close").output().unwrap();
     let json = parse_json(&output);
     assert_eq!(json["success"], true, "{json}");
     assert_eq!(json["data"]["result"]["closed"], false, "{json}");
@@ -19,23 +19,21 @@ fn t038b_close_noops_without_bootstrap() {
         "{json}"
     );
     assert!(
-        !std::path::Path::new(&home).exists(),
+        !std::path::Path::new(home).exists(),
         "close must not create RUB_HOME when no daemon authority exists"
     );
-
-    cleanup(&home);
 }
 
 #[test]
 #[ignore]
 #[serial]
 fn t039_daemon_auto_start_lifecycle() {
-    let home = unique_home();
-    cleanup(&home);
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
     let (_rt, server) = start_standard_site_fixture();
 
     // open auto-starts daemon
-    let output = rub_cmd(&home)
+    let output = rub_cmd(home)
         .args(["open", &server.url()])
         .output()
         .unwrap();
@@ -43,56 +41,55 @@ fn t039_daemon_auto_start_lifecycle() {
     assert_eq!(json["success"], true, "open should succeed");
 
     // daemon PID file should exist
-    assert!(default_session_pid_path(&home).exists());
+    assert!(default_session_pid_path(home).exists());
 
     // close should work
-    let output = rub_cmd(&home).arg("close").output().unwrap();
+    let output = rub_cmd(home).arg("close").output().unwrap();
     let json = parse_json(&output);
     assert_eq!(json["success"], true, "close should succeed");
-
-    cleanup(&home);
 }
 
 #[test]
 #[ignore]
 #[serial]
 fn t040_stale_pid_recovery() {
-    let home = unique_home();
-    cleanup(&home);
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
     let (_rt, server) = start_standard_site_fixture();
 
     // Start daemon
-    let output = rub_cmd(&home)
+    let output = rub_cmd(home)
         .args(["open", &server.url()])
         .output()
         .unwrap();
     assert_eq!(parse_json(&output)["success"], true);
 
     // Kill daemon brutally
-    let pid_str = std::fs::read_to_string(default_session_pid_path(&home)).unwrap();
+    let pid_str = std::fs::read_to_string(default_session_pid_path(home)).unwrap();
     let pid: i32 = pid_str.trim().parse().unwrap();
     unsafe {
         libc::kill(pid, libc::SIGKILL);
     }
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    assert!(
+        wait_for_home_processes_to_exit(home, std::time::Duration::from_secs(5)),
+        "daemon process tree must fully exit before stale recovery is asserted"
+    );
 
     // Next command should auto-restart
-    let output = rub_cmd(&home)
+    let output = rub_cmd(home)
         .args(["open", &server.url()])
         .output()
         .unwrap();
     let json = parse_json(&output);
     assert_eq!(json["success"], true, "should auto-restart after stale PID");
-
-    cleanup(&home);
 }
 
 #[test]
 #[ignore]
 #[serial]
 fn t042_sessions_list() {
-    let home = unique_home();
-    cleanup(&home);
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
     let (_rt, server) = start_test_server(vec![(
         "/",
         "text/html",
@@ -100,21 +97,27 @@ fn t042_sessions_list() {
     )]);
 
     // Start daemon
-    let output = rub_cmd(&home)
+    let output = rub_cmd(home)
         .args(["open", &server.url()])
         .output()
         .unwrap();
     assert_eq!(parse_json(&output)["success"], true);
 
     // List sessions
-    let output = rub_cmd(&home).arg("sessions").output().unwrap();
+    let output = rub_cmd(home).arg("sessions").output().unwrap();
     let json = parse_json(&output);
     assert_eq!(json["success"], true);
     let sessions = json["data"]["result"]["items"].as_array().unwrap();
     assert!(!sessions.is_empty(), "should have at least one session");
+    assert_eq!(
+        json["data"]["subject"]["rub_home_state"]["path_authority"],
+        "cli.sessions.subject.rub_home"
+    );
     assert_eq!(sessions[0]["name"], "default");
-
-    cleanup(&home);
+    assert_eq!(
+        sessions[0]["socket_state"]["path_authority"],
+        "cli.sessions.result.items.socket"
+    );
 }
 
 // ============================================================
@@ -124,77 +127,131 @@ fn t042_sessions_list() {
 #[test]
 #[ignore]
 #[serial]
-fn t052_open_url_json_response() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
+fn t052_065_navigation_state_and_json_contract_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
+    let many_html = r#"<!DOCTYPE html>
+<html>
+<head><title>Default Snapshot Limit</title></head>
+<body>
+<script>
+  for (let i = 0; i < 650; i += 1) {
+    const button = document.createElement('button');
+    button.textContent = `Button ${i}`;
+    document.body.appendChild(button);
+  }
+</script>
+</body>
+</html>"#;
+    let (_rt, server) = start_test_server(vec![
+        (
+            "/",
+            "text/html",
+            r#"<!DOCTYPE html>
+<html>
+<head><title>Example Domain</title></head>
+<body>
+  <main>
+    <h1>Example Domain</h1>
+    <p>This domain is for use in illustrative examples in documents.</p>
+    <button id="advance" onclick="document.body.dataset.clicked='yes'">Advance</button>
+  </main>
+</body>
+</html>"#,
+        ),
+        (
+            "/forms/post",
+            "text/html",
+            r#"<!DOCTYPE html>
+<html>
+<head><title>Form Fixture</title></head>
+<body>
+  <form>
+    <input name="custname" />
+    <input name="custtel" />
+    <input name="custemail" />
+    <select name="size">
+      <option value="small">Small</option>
+      <option value="medium">Medium</option>
+      <option value="large">Large</option>
+    </select>
+    <textarea name="comments"></textarea>
+  </form>
+  <div style="height: 2200px"></div>
+</body>
+</html>"#,
+        ),
+        (
+            "/html",
+            "text/html",
+            r#"<!DOCTYPE html>
+<html>
+<head><title>Scroll Fixture</title></head>
+<body>
+  <article>
+    <h1>Scroll Fixture</h1>
+    <p>This page is intentionally tall for scrolling tests.</p>
+  </article>
+  <div style="height: 2600px"></div>
+</body>
+</html>"#,
+        ),
+        ("/status/404", "text/plain", "404 Not Found"),
+        ("/many", "text/html", many_html),
+    ]);
 
-    let output = rub_cmd(&home)
+    let open_output = session
+        .cmd()
         .args(["open", &server.url()])
         .output()
         .unwrap();
-    let json = parse_json(&output);
-    assert_eq!(json["success"], true);
+    let open_json: serde_json::Value =
+        serde_json::from_slice(&open_output.stdout).expect("open output must be JSON");
+    assert_eq!(open_json["success"], true, "{open_json}");
+    assert_eq!(open_json["stdout_schema_version"], "3.0");
+    let request_id = open_json["request_id"].as_str().unwrap();
+    assert!(request_id.len() >= 32, "request_id should be a UUID");
     assert!(
-        json["data"]["result"]["page"]["url"]
+        request_id.contains('-'),
+        "request_id should be hyphenated UUID"
+    );
+    assert!(
+        open_json["data"]["result"]["page"]["url"]
             .as_str()
             .unwrap()
             .contains(&server.url())
     );
-    assert_eq!(json["data"]["result"]["page"]["title"], "Example Domain");
+    assert_eq!(
+        open_json["data"]["result"]["page"]["title"],
+        "Example Domain"
+    );
     assert!(
-        json["data"]["result"]["page"]["final_url"]
+        open_json["data"]["result"]["page"]["final_url"]
             .as_str()
             .unwrap()
             .contains(&server.url())
     );
-    assert!(json["data"]["result"]["page"]["http_status"].is_number());
+    assert!(open_json["data"]["result"]["page"]["http_status"].is_number());
 
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t052b_open_bare_localhost_url_applies_smart_completion() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
     let bare = server
         .url()
         .strip_prefix("http://")
         .expect("test server should expose localhost http url")
         .to_string();
-
-    let output = rub_cmd(&home).args(["open", &bare]).output().unwrap();
-    let json = parse_json(&output);
-    assert_eq!(json["success"], true, "{json}");
+    let bare_open = parse_json(&session.cmd().args(["open", &bare]).output().unwrap());
+    assert_eq!(bare_open["success"], true, "{bare_open}");
     assert!(
-        json["data"]["result"]["page"]["url"]
+        bare_open["data"]["result"]["page"]["url"]
             .as_str()
             .is_some_and(|url| url.contains(&server.url())),
-        "{json}"
+        "{bare_open}"
     );
 
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t053_state_snapshot() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    let output = rub_cmd(&home).arg("state").output().unwrap();
-    let json = parse_json(&output);
-    let snapshot = &json["data"]["result"]["snapshot"];
-    assert_eq!(json["success"], true);
+    let state_output = session.cmd().arg("state").output().unwrap();
+    let state_json: serde_json::Value =
+        serde_json::from_slice(&state_output.stdout).expect("state output must be JSON");
+    let snapshot = &state_json["data"]["result"]["snapshot"];
+    assert_eq!(state_json["success"], true);
+    assert_eq!(state_json["stdout_schema_version"], "3.0");
     assert!(
         snapshot["snapshot_id"].as_str().is_some(),
         "snapshot_id missing"
@@ -205,164 +262,83 @@ fn t053_state_snapshot() {
     assert!(elements[0]["tag"].as_str().is_some());
     assert!(elements[0]["index"].is_number());
 
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t054_state_limit() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    rub_cmd(&home)
+    session
+        .cmd()
         .args(["open", &server.url_for("/forms/post")])
         .output()
         .unwrap();
-    let output = rub_cmd(&home)
-        .args(["state", "--limit", "3"])
+    let limit_json = parse_json(
+        &session
+            .cmd()
+            .args(["state", "--limit", "3"])
+            .output()
+            .unwrap(),
+    );
+    let limited_snapshot = &limit_json["data"]["result"]["snapshot"];
+    assert_eq!(limit_json["success"], true);
+    let limited_elements = limited_snapshot["elements"].as_array().unwrap();
+    assert!(limited_elements.len() <= 3, "should respect limit");
+    assert_eq!(limited_snapshot["truncated"], true);
+    assert!(limited_snapshot["total_count"].as_u64().unwrap() > 3);
+
+    session
+        .cmd()
+        .args(["open", &server.url_for("/many")])
         .output()
         .unwrap();
-    let json = parse_json(&output);
-    let snapshot = &json["data"]["result"]["snapshot"];
-    assert_eq!(json["success"], true);
-    let elements = snapshot["elements"].as_array().unwrap();
-    assert!(elements.len() <= 3, "should respect limit");
-    assert_eq!(snapshot["truncated"], true);
-    assert!(snapshot["total_count"].as_u64().unwrap() > 3);
+    let default_limit_json = parse_json(&session.cmd().arg("state").output().unwrap());
+    let default_snapshot = &default_limit_json["data"]["result"]["snapshot"];
+    assert_eq!(default_limit_json["success"], true, "{default_limit_json}");
+    assert_eq!(
+        default_snapshot["elements"]
+            .as_array()
+            .map(|items| items.len())
+            .unwrap_or_default(),
+        500,
+        "default state snapshot should retain the documented 500 elements"
+    );
+    assert_eq!(default_snapshot["truncated"], true, "{default_limit_json}");
+    assert!(
+        default_snapshot["total_count"].as_u64().unwrap_or_default() > 500,
+        "{default_limit_json}"
+    );
 
-    cleanup(&home);
+    let exec_output = session.cmd().args(["exec", "1+1"]).output().unwrap();
+    let _: serde_json::Value =
+        serde_json::from_slice(&exec_output.stdout).expect("exec output must be JSON");
+
+    let sessions_output = session.cmd().arg("sessions").output().unwrap();
+    let _: serde_json::Value =
+        serde_json::from_slice(&sessions_output.stdout).expect("sessions output must be JSON");
+
+    let screenshot_output = session.cmd().arg("screenshot").output().unwrap();
+    let _: serde_json::Value =
+        serde_json::from_slice(&screenshot_output.stdout).expect("screenshot output must be JSON");
+
+    let close_output = session.cmd().arg("close").output().unwrap();
+    let _: serde_json::Value =
+        serde_json::from_slice(&close_output.stdout).expect("close output must be JSON");
 }
 
 #[test]
 #[ignore]
 #[serial]
 fn t055_open_nonexistent_domain() {
-    let home = unique_home();
-    cleanup(&home);
+    let session = ManagedBrowserSession::new();
 
-    let output = rub_cmd(&home)
+    let output = session
+        .cmd()
         .args(["open", "https://this-domain-does-not-exist-12345.invalid"])
         .output()
         .unwrap();
     let json = parse_json(&output);
     assert_eq!(json["success"], false);
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t057_e2e_binary_json() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    let output = rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Must be valid JSON
-    let _: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
-
-    cleanup(&home);
 }
 
 // ============================================================
 // Phase 5: Structured output tests (T063-T065)
+// Covered by `t052_065_navigation_state_and_json_contract_grouped_scenario`.
 // ============================================================
-
-#[test]
-#[ignore]
-#[serial]
-fn t063_all_output_valid_json() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    // open
-    let out = rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    let _: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("open output must be JSON");
-
-    // state
-    let out = rub_cmd(&home).arg("state").output().unwrap();
-    let _: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("state output must be JSON");
-
-    // exec
-    let out = rub_cmd(&home).args(["exec", "1+1"]).output().unwrap();
-    let _: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("exec output must be JSON");
-
-    // sessions
-    let out = rub_cmd(&home).arg("sessions").output().unwrap();
-    let _: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("sessions output must be JSON");
-
-    // screenshot
-    let out = rub_cmd(&home).arg("screenshot").output().unwrap();
-    let _: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("screenshot output must be JSON");
-
-    // close
-    let out = rub_cmd(&home).arg("close").output().unwrap();
-    let _: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("close output must be JSON");
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t064_stdout_schema_version() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    let out = rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    let json = parse_json(&out);
-    assert_eq!(json["stdout_schema_version"], "3.0");
-
-    let out = rub_cmd(&home).arg("state").output().unwrap();
-    let json = parse_json(&out);
-    assert_eq!(json["stdout_schema_version"], "3.0");
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t065_request_id_uuid() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    let out = rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    let json = parse_json(&out);
-    let request_id = json["request_id"].as_str().unwrap();
-    assert!(request_id.len() >= 32, "request_id should be a UUID");
-    assert!(
-        request_id.contains('-'),
-        "request_id should be hyphenated UUID"
-    );
-
-    cleanup(&home);
-}
 
 // ============================================================
 // Phase 6: Interaction tests (T074-T080)
@@ -371,329 +347,56 @@ fn t065_request_id_uuid() {
 #[test]
 #[ignore]
 #[serial]
-fn t075_click_without_snapshot_uses_implicit_live_snapshot() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    rub_cmd(&home)
-        .args(["open", &server.url_for("/click")])
-        .output()
-        .unwrap();
-    let state = run_state(&home);
-    let index = find_element_index(&state, |element| {
-        element["text"].as_str() == Some("Advance")
-    });
-    // click without --snapshot should auto-capture a live snapshot in non-strict mode
-    let out = rub_cmd(&home)
-        .args(["click", &index.to_string()])
-        .output()
-        .unwrap();
-    let json = parse_json(&out);
-    assert_eq!(json["success"], true, "{json}");
-    assert_eq!(
-        json["data"]["interaction"]["confirmation_status"], "confirmed",
-        "{json}"
-    );
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t077_click_out_of_range() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    let state_out = rub_cmd(&home).arg("state").output().unwrap();
-    let state = parse_json(&state_out);
-    let snap = state["data"]["result"]["snapshot"]["snapshot_id"]
-        .as_str()
-        .unwrap();
-
-    // Click way out of range
-    let out = rub_cmd(&home)
-        .args(["click", "999", "--snapshot", snap])
-        .output()
-        .unwrap();
-    let json = parse_json(&out);
-    assert_eq!(json["success"], false);
-    assert_eq!(json["error"]["code"], "ELEMENT_NOT_FOUND");
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t077b_click_occluded_target_reports_not_interactable() {
-    let home = unique_home();
-    cleanup(&home);
-
-    let (_rt, server) = start_test_server(vec![(
-        "/click-occluded",
-        "text/html",
-        r#"<!DOCTYPE html>
+fn t075_081d_interaction_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
+    let (_rt, standard) = start_standard_site_fixture();
+    let (_rt, custom) = start_test_server(vec![
+        (
+            "/click-occluded",
+            "text/html",
+            r#"<!DOCTYPE html>
 <html>
 <body style="margin:0">
   <button id="target" style="position:absolute;left:40px;top:40px;width:160px;height:56px;">Occluded CTA</button>
   <div style="position:fixed;inset:0;background:rgba(0,0,0,0.35);z-index:999"></div>
 </body>
 </html>"#,
-    )]);
-
-    rub_cmd(&home)
-        .args(["open", &server.url_for("/click-occluded")])
-        .output()
-        .unwrap();
-    let state = run_state(&home);
-    let snap = snapshot_id(&state);
-    let index = find_element_index(&state, |element| {
-        element["text"].as_str() == Some("Occluded CTA")
-    });
-
-    let out = rub_cmd(&home)
-        .args(["click", &index.to_string(), "--snapshot", &snap])
-        .output()
-        .unwrap();
-    let json = parse_json(&out);
-    assert_eq!(json["success"], false);
-    assert_eq!(json["error"]["code"], "ELEMENT_NOT_INTERACTABLE");
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t077c_click_hidden_target_reports_not_interactable() {
-    let home = unique_home();
-    cleanup(&home);
-
-    let (_rt, server) = start_test_server(vec![(
-        "/click-hidden",
-        "text/html",
-        r#"<!DOCTYPE html>
+        ),
+        (
+            "/click-hidden",
+            "text/html",
+            r#"<!DOCTYPE html>
 <html>
 <body>
   <button style="display:none">Hidden CTA</button>
 </body>
 </html>"#,
-    )]);
-
-    rub_cmd(&home)
-        .args(["open", &server.url_for("/click-hidden")])
-        .output()
-        .unwrap();
-    let state = run_state(&home);
-    let snap = snapshot_id(&state);
-    let index = find_element_index(&state, |element| {
-        element["text"].as_str() == Some("Hidden CTA")
-    });
-
-    let out = rub_cmd(&home)
-        .args(["click", &index.to_string(), "--snapshot", &snap])
-        .output()
-        .unwrap();
-    let json = parse_json(&out);
-    assert_eq!(json["success"], false);
-    assert_eq!(json["error"]["code"], "ELEMENT_NOT_INTERACTABLE");
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t077ca_click_disabled_target_reports_not_interactable() {
-    let home = unique_home();
-    cleanup(&home);
-    let url = "data:text/html,%3C%21DOCTYPE%20html%3E%3Chtml%3E%3Cbody%3E%3Cbutton%20disabled%3EDisabled%20CTA%3C/button%3E%3C/body%3E%3C/html%3E";
-
-    rub_cmd(&home).args(["open", url]).output().unwrap();
-    let state = run_state(&home);
-    let snap = snapshot_id(&state);
-    let index = find_element_index(&state, |element| {
-        element["tag"].as_str() == Some("button")
-            && element["text"].as_str() == Some("Disabled CTA")
-    });
-
-    let out = rub_cmd(&home)
-        .args(["click", &index.to_string(), "--snapshot", &snap])
-        .output()
-        .unwrap();
-    let json = parse_json(&out);
-    assert_eq!(json["success"], false);
-    assert_eq!(json["error"]["code"], "ELEMENT_NOT_INTERACTABLE");
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t077cb_click_aria_disabled_target_reports_not_interactable() {
-    let home = unique_home();
-    cleanup(&home);
-    let url = "data:text/html,%3C%21DOCTYPE%20html%3E%3Chtml%3E%3Cbody%3E%3Ca%20href%3D%22%23next%22%20role%3D%22button%22%20aria-disabled%3D%22true%22%3EAria%20Disabled%20CTA%3C/a%3E%3C/body%3E%3C/html%3E";
-
-    rub_cmd(&home).args(["open", url]).output().unwrap();
-    let state = run_state(&home);
-    let snap = snapshot_id(&state);
-    let index = find_element_index(&state, |element| {
-        element["tag"].as_str() == Some("link")
-            && element["text"].as_str() == Some("Aria Disabled CTA")
-    });
-
-    let out = rub_cmd(&home)
-        .args(["click", &index.to_string(), "--snapshot", &snap])
-        .output()
-        .unwrap();
-    let json = parse_json(&out);
-    assert_eq!(json["success"], false);
-    assert_eq!(json["error"]["code"], "ELEMENT_NOT_INTERACTABLE");
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t077d_hover_occluded_target_reports_not_interactable() {
-    let home = unique_home();
-    cleanup(&home);
-
-    let (_rt, server) = start_test_server(vec![(
-        "/hover-occluded",
-        "text/html",
-        r#"<!DOCTYPE html>
+        ),
+        (
+            "/hover-occluded",
+            "text/html",
+            r#"<!DOCTYPE html>
 <html>
 <body style="margin:0">
   <button id="target" style="position:absolute;left:40px;top:40px;width:160px;height:56px;">Occluded Hover</button>
   <div style="position:fixed;inset:0;background:rgba(0,0,0,0.35);z-index:999"></div>
 </body>
 </html>"#,
-    )]);
-
-    rub_cmd(&home)
-        .args(["open", &server.url_for("/hover-occluded")])
-        .output()
-        .unwrap();
-    let state = run_state(&home);
-    let snap = snapshot_id(&state);
-    let index = find_element_index(&state, |element| {
-        element["text"].as_str() == Some("Occluded Hover")
-    });
-
-    let out = rub_cmd(&home)
-        .args(["hover", &index.to_string(), "--snapshot", &snap])
-        .output()
-        .unwrap();
-    let json = parse_json(&out);
-    assert_eq!(json["success"], false);
-    assert_eq!(json["error"]["code"], "ELEMENT_NOT_INTERACTABLE");
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t077e_hover_hidden_target_reports_not_interactable() {
-    let home = unique_home();
-    cleanup(&home);
-
-    let (_rt, server) = start_test_server(vec![(
-        "/hover-hidden",
-        "text/html",
-        r#"<!DOCTYPE html>
+        ),
+        (
+            "/hover-hidden",
+            "text/html",
+            r#"<!DOCTYPE html>
 <html>
 <body>
   <button id="target" style="display:none">Invisible Hover</button>
 </body>
 </html>"#,
-    )]);
-
-    rub_cmd(&home)
-        .args(["open", &server.url_for("/hover-hidden")])
-        .output()
-        .unwrap();
-    let state = run_state(&home);
-    let snap = snapshot_id(&state);
-    let index = find_element_index(&state, |element| {
-        element["text"].as_str() == Some("Invisible Hover")
-    });
-
-    let out = rub_cmd(&home)
-        .args(["hover", &index.to_string(), "--snapshot", &snap])
-        .output()
-        .unwrap();
-    let json = parse_json(&out);
-    assert_eq!(json["success"], false);
-    assert_eq!(json["error"]["code"], "ELEMENT_NOT_INTERACTABLE");
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t080_input_text_into_form() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    rub_cmd(&home)
-        .args(["open", &server.url_for("/forms/post")])
-        .output()
-        .unwrap();
-    let state_out = rub_cmd(&home).arg("state").output().unwrap();
-    let state = parse_json(&state_out);
-    let snap = state["data"]["result"]["snapshot"]["snapshot_id"]
-        .as_str()
-        .unwrap();
-
-    // Type into first field (custname)
-    let out = rub_cmd(&home)
-        .args(["type", "--index", "0", "Test User", "--snapshot", snap])
-        .output()
-        .unwrap();
-    let json = parse_json(&out);
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["interaction"]["semantic_class"], "set_value");
-    assert!(json["data"]["dom_epoch"].is_number());
-
-    // Verify via JS
-    let out = rub_cmd(&home)
-        .args([
-            "exec",
-            "document.querySelector('input[name=custname]').value",
-        ])
-        .output()
-        .unwrap();
-    let json = parse_json(&out);
-    assert_eq!(json["data"]["result"], "Test User");
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t081_type_reports_contradicted_effect() {
-    let home = unique_home();
-    cleanup(&home);
-
-    let (_rt, server) = start_test_server(vec![(
-        "/input-contradicted",
-        "text/html",
-        r#"<!DOCTYPE html>
+        ),
+        (
+            "/input-contradicted",
+            "text/html",
+            r#"<!DOCTYPE html>
 <html>
 <body>
   <input name="username" />
@@ -705,19 +408,247 @@ fn t081_type_reports_contradicted_effect() {
   </script>
 </body>
 </html>"#,
-    )]);
+        ),
+        (
+            "/input-disabled",
+            "text/html",
+            r#"<!doctype html>
+<html><body>
+  <input name="username" value="" disabled />
+</body></html>"#,
+        ),
+        (
+            "/input-readonly",
+            "text/html",
+            r#"<!doctype html>
+<html><body>
+  <input name="username" value="locked" readonly />
+</body></html>"#,
+        ),
+        (
+            "/input-fieldset-disabled",
+            "text/html",
+            r#"<!doctype html>
+<html><body>
+  <fieldset disabled>
+    <input name="username" value="" />
+  </fieldset>
+</body></html>"#,
+        ),
+    ]);
 
-    rub_cmd(&home)
-        .args(["open", &server.url_for("/input-contradicted")])
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", &standard.url_for("/click")])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+    let state = run_state(session.home());
+    let index = find_element_index(&state, |element| {
+        element["text"].as_str() == Some("Advance")
+    });
+    let out = session
+        .cmd()
+        .args(["click", &index.to_string()])
         .output()
         .unwrap();
-    let state = run_state(&home);
+    let json = parse_json(&out);
+    assert_eq!(json["success"], true, "{json}");
+    assert_eq!(
+        json["data"]["interaction"]["confirmation_status"], "confirmed",
+        "{json}"
+    );
+
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", &standard.url()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+    let state = run_state(session.home());
+    let snap = snapshot_id(&state);
+    let out = session
+        .cmd()
+        .args(["click", "999", "--snapshot", &snap])
+        .output()
+        .unwrap();
+    let json = parse_json(&out);
+    assert_eq!(json["success"], false);
+    assert_eq!(json["error"]["code"], "ELEMENT_NOT_FOUND");
+
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", &custom.url_for("/click-occluded")])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+    let state = run_state(session.home());
+    let snap = snapshot_id(&state);
+    let index = find_element_index(&state, |element| {
+        element["text"].as_str() == Some("Occluded CTA")
+    });
+    let out = session
+        .cmd()
+        .args(["click", &index.to_string(), "--snapshot", &snap])
+        .output()
+        .unwrap();
+    let json = parse_json(&out);
+    assert_eq!(json["success"], false);
+    assert_eq!(json["error"]["code"], "ELEMENT_NOT_INTERACTABLE");
+
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", &custom.url_for("/click-hidden")])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+    let state = run_state(session.home());
+    let snap = snapshot_id(&state);
+    let index = find_element_index(&state, |element| {
+        element["text"].as_str() == Some("Hidden CTA")
+    });
+    let out = session
+        .cmd()
+        .args(["click", &index.to_string(), "--snapshot", &snap])
+        .output()
+        .unwrap();
+    let json = parse_json(&out);
+    assert_eq!(json["success"], false);
+    assert_eq!(json["error"]["code"], "ELEMENT_NOT_INTERACTABLE");
+
+    let disabled_url = "data:text/html,%3C%21DOCTYPE%20html%3E%3Chtml%3E%3Cbody%3E%3Cbutton%20disabled%3EDisabled%20CTA%3C/button%3E%3C/body%3E%3C/html%3E";
+    let opened = parse_json(&session.cmd().args(["open", disabled_url]).output().unwrap());
+    assert_eq!(opened["success"], true, "{opened}");
+    let state = run_state(session.home());
+    let snap = snapshot_id(&state);
+    let index = find_element_index(&state, |element| {
+        element["tag"].as_str() == Some("button")
+            && element["text"].as_str() == Some("Disabled CTA")
+    });
+    let out = session
+        .cmd()
+        .args(["click", &index.to_string(), "--snapshot", &snap])
+        .output()
+        .unwrap();
+    let json = parse_json(&out);
+    assert_eq!(json["success"], false);
+    assert_eq!(json["error"]["code"], "ELEMENT_NOT_INTERACTABLE");
+
+    let aria_url = "data:text/html,%3C%21DOCTYPE%20html%3E%3Chtml%3E%3Cbody%3E%3Ca%20href%3D%22%23next%22%20role%3D%22button%22%20aria-disabled%3D%22true%22%3EAria%20Disabled%20CTA%3C/a%3E%3C/body%3E%3C/html%3E";
+    let opened = parse_json(&session.cmd().args(["open", aria_url]).output().unwrap());
+    assert_eq!(opened["success"], true, "{opened}");
+    let state = run_state(session.home());
+    let snap = snapshot_id(&state);
+    let index = find_element_index(&state, |element| {
+        element["tag"].as_str() == Some("link")
+            && element["text"].as_str() == Some("Aria Disabled CTA")
+    });
+    let out = session
+        .cmd()
+        .args(["click", &index.to_string(), "--snapshot", &snap])
+        .output()
+        .unwrap();
+    let json = parse_json(&out);
+    assert_eq!(json["success"], false);
+    assert_eq!(json["error"]["code"], "ELEMENT_NOT_INTERACTABLE");
+
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", &custom.url_for("/hover-occluded")])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+    let state = run_state(session.home());
+    let snap = snapshot_id(&state);
+    let index = find_element_index(&state, |element| {
+        element["text"].as_str() == Some("Occluded Hover")
+    });
+    let out = session
+        .cmd()
+        .args(["hover", &index.to_string(), "--snapshot", &snap])
+        .output()
+        .unwrap();
+    let json = parse_json(&out);
+    assert_eq!(json["success"], false);
+    assert_eq!(json["error"]["code"], "ELEMENT_NOT_INTERACTABLE");
+
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", &custom.url_for("/hover-hidden")])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+    let state = run_state(session.home());
+    let snap = snapshot_id(&state);
+    let index = find_element_index(&state, |element| {
+        element["text"].as_str() == Some("Invisible Hover")
+    });
+    let out = session
+        .cmd()
+        .args(["hover", &index.to_string(), "--snapshot", &snap])
+        .output()
+        .unwrap();
+    let json = parse_json(&out);
+    assert_eq!(json["success"], false);
+    assert_eq!(json["error"]["code"], "ELEMENT_NOT_INTERACTABLE");
+
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", &standard.url_for("/forms/post")])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+    let state = run_state(session.home());
+    let snap = snapshot_id(&state);
+    let out = session
+        .cmd()
+        .args(["type", "--index", "0", "Test User", "--snapshot", &snap])
+        .output()
+        .unwrap();
+    let json = parse_json(&out);
+    assert_eq!(json["success"], true);
+    assert_eq!(json["data"]["interaction"]["semantic_class"], "set_value");
+    assert!(json["data"]["dom_epoch"].is_number());
+    let out = session
+        .cmd()
+        .args([
+            "exec",
+            "document.querySelector('input[name=custname]').value",
+        ])
+        .output()
+        .unwrap();
+    let json = parse_json(&out);
+    assert_eq!(json["data"]["result"], "Test User");
+
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", &custom.url_for("/input-contradicted")])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+    let state = run_state(session.home());
     let snap = snapshot_id(&state);
     let index = find_element_index(&state, |element| {
         element["attributes"]["name"].as_str() == Some("username")
     });
-
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args([
             "type",
             "--index",
@@ -744,91 +675,55 @@ fn t081_type_reports_contradicted_effect() {
         json["data"]["interaction"]["confirmation_details"]["observed"]["value"],
         "TEST USER"
     );
-
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["exec", "document.querySelector('input').value"])
         .output()
         .unwrap();
     let verify = parse_json(&out);
     assert_eq!(verify["data"]["result"], "TEST USER");
 
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t081b_type_disabled_reports_not_interactable() {
-    let home = unique_home();
-    let (_runtime, server) = start_test_server(vec![(
-        "/input-disabled",
-        "text/html",
-        r#"<!doctype html>
-<html><body>
-  <input name="username" value="" disabled />
-</body></html>"#,
-    )]);
-
-    let open = rub_cmd(&home)
-        .args(["open", &server.url_for("/input-disabled")])
-        .output()
-        .unwrap();
-    assert_eq!(parse_json(&open)["success"], true);
-
-    let state = rub_cmd(&home).arg("state").output().unwrap();
-    let state_json = parse_json(&state);
-    let snapshot = state_json["data"]["result"]["snapshot"]["snapshot_id"]
-        .as_str()
-        .unwrap();
-
-    let out = rub_cmd(&home)
-        .args(["type", "--index", "0", "blocked", "--snapshot", snapshot])
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", &custom.url_for("/input-disabled")])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+    let state = run_state(session.home());
+    let snapshot = snapshot_id(&state);
+    let out = session
+        .cmd()
+        .args(["type", "--index", "0", "blocked", "--snapshot", &snapshot])
         .output()
         .unwrap();
     let json = parse_json(&out);
     assert_eq!(json["success"], false, "{json}");
     assert_eq!(json["error"]["code"], "ELEMENT_NOT_INTERACTABLE");
 
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t081c_type_readonly_reports_not_interactable() {
-    let home = unique_home();
-    let (_runtime, server) = start_test_server(vec![(
-        "/input-readonly",
-        "text/html",
-        r#"<!doctype html>
-<html><body>
-  <input name="username" value="locked" readonly />
-</body></html>"#,
-    )]);
-
-    let open = rub_cmd(&home)
-        .args(["open", &server.url_for("/input-readonly")])
-        .output()
-        .unwrap();
-    assert_eq!(parse_json(&open)["success"], true);
-
-    let state = rub_cmd(&home).arg("state").output().unwrap();
-    let state_json = parse_json(&state);
-    let snapshot = state_json["data"]["result"]["snapshot"]["snapshot_id"]
-        .as_str()
-        .unwrap();
-    let index = find_element_index(&state_json, |element| {
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", &custom.url_for("/input-readonly")])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+    let state = run_state(session.home());
+    let snapshot = snapshot_id(&state);
+    let index = find_element_index(&state, |element| {
         element["tag"] == "input" && element["attributes"]["name"] == "username"
     });
-
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args([
             "type",
             "--index",
             &index.to_string(),
             "new-value",
             "--snapshot",
-            snapshot,
+            &snapshot,
         ])
         .output()
         .unwrap();
@@ -842,48 +737,28 @@ fn t081c_type_readonly_reports_not_interactable() {
             .contains("readonly")
     );
 
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t081d_type_fieldset_disabled_reports_not_interactable() {
-    let home = unique_home();
-    let (_runtime, server) = start_test_server(vec![(
-        "/input-fieldset-disabled",
-        "text/html",
-        r#"<!doctype html>
-<html><body>
-  <fieldset disabled>
-    <input name="username" value="" />
-  </fieldset>
-</body></html>"#,
-    )]);
-
-    let open = rub_cmd(&home)
-        .args(["open", &server.url_for("/input-fieldset-disabled")])
-        .output()
-        .unwrap();
-    assert_eq!(parse_json(&open)["success"], true);
-
-    let state = rub_cmd(&home).arg("state").output().unwrap();
-    let state_json = parse_json(&state);
-    let snapshot = state_json["data"]["result"]["snapshot"]["snapshot_id"]
-        .as_str()
-        .unwrap();
-    let index = find_element_index(&state_json, |element| {
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", &custom.url_for("/input-fieldset-disabled")])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+    let state = run_state(session.home());
+    let snapshot = snapshot_id(&state);
+    let index = find_element_index(&state, |element| {
         element["tag"] == "input" && element["attributes"]["name"] == "username"
     });
-
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args([
             "type",
             "--index",
             &index.to_string(),
             "blocked",
             "--snapshot",
-            snapshot,
+            &snapshot,
         ])
         .output()
         .unwrap();
@@ -896,8 +771,6 @@ fn t081d_type_fieldset_disabled_reports_not_interactable() {
             .unwrap()
             .contains("disabled")
     );
-
-    cleanup(&home);
 }
 
 // ============================================================
@@ -907,56 +780,31 @@ fn t081d_type_fieldset_disabled_reports_not_interactable() {
 #[test]
 #[ignore]
 #[serial]
-fn t084_exec_valid_js() {
-    let home = unique_home();
-    cleanup(&home);
+fn t084_089_exec_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
     let (_rt, server) = start_standard_site_fixture();
 
-    rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    let out = rub_cmd(&home).args(["exec", "2 + 2"]).output().unwrap();
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", &server.url()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+
+    let out = session.cmd().args(["exec", "2 + 2"]).output().unwrap();
     let json = parse_json(&out);
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["result"], 4);
     assert!(json["data"]["dom_epoch"].is_number());
 
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t086_exec_undefined_returns_null() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    let out = rub_cmd(&home).args(["exec", "undefined"]).output().unwrap();
+    let out = session.cmd().args(["exec", "undefined"]).output().unwrap();
     let json = parse_json(&out);
     assert_eq!(json["success"], true);
 
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t088_exec_non_json_result_is_summarized() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args([
             "exec",
             &format!("window.open('{}', '_blank')", server.url()),
@@ -968,7 +816,7 @@ fn t088_exec_non_json_result_is_summarized() {
     assert_eq!(json["data"]["result"]["__rub_projection"], "summary");
     assert_eq!(json["data"]["result"]["kind"], "Window");
 
-    let tabs = parse_json(&rub_cmd(&home).args(["tabs"]).output().unwrap());
+    let tabs = parse_json(&session.cmd().args(["tabs"]).output().unwrap());
     assert_eq!(tabs["success"], true);
     assert!(
         tabs["data"]["result"]["items"]
@@ -979,17 +827,8 @@ fn t088_exec_non_json_result_is_summarized() {
         "window.open side effect should still create a new tab"
     );
 
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t088b_exec_raw_prints_result_without_json_envelope() {
-    let home = unique_home();
-    cleanup(&home);
-
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["exec", "--raw", "'The Page Title'"])
         .output()
         .unwrap();
@@ -1003,22 +842,8 @@ fn t088b_exec_raw_prints_result_without_json_envelope() {
         "The Page Title"
     );
 
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t089_exec_timeout_reports_execution_phase() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args([
             "--timeout",
             "100",
@@ -1040,8 +865,6 @@ fn t089_exec_timeout_reports_execution_phase() {
         "timeout should remain within the requested budget: {json}"
     );
     assert!(json["error"]["context"]["exec_budget_ms"].is_number());
-
-    cleanup(&home);
 }
 
 // ============================================================
@@ -1051,156 +874,22 @@ fn t089_exec_timeout_reports_execution_phase() {
 #[test]
 #[ignore]
 #[serial]
-fn t093_scroll_down() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    rub_cmd(&home)
-        .args(["open", &server.url_for("/forms/post")])
-        .output()
-        .unwrap();
-    let out = rub_cmd(&home).args(["scroll", "down"]).output().unwrap();
-    let json = parse_json(&out);
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["subject"]["kind"], "viewport");
-    assert_eq!(json["data"]["result"]["direction"], "down");
-    assert!(json["data"]["result"]["position"]["y"].is_number());
-    assert!(json["data"]["dom_epoch"].is_number());
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t095_navigate_back() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    rub_cmd(&home)
-        .args(["open", &server.url_for("/html")])
-        .output()
-        .unwrap();
-    let out = rub_cmd(&home).arg("back").output().unwrap();
-    let json = parse_json(&out);
-    assert_eq!(json["success"], true);
-    assert!(
-        json["data"]["result"]["page"]["url"]
-            .as_str()
-            .unwrap()
-            .contains(&server.url())
-    );
-    assert_eq!(json["data"]["subject"]["action"], "back");
-    assert!(json["data"]["result"]["at_start"].is_boolean());
-    assert!(json["data"]["dom_epoch"].is_number());
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t095b_navigate_forward() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    rub_cmd(&home)
-        .args(["open", &server.url_for("/html")])
-        .output()
-        .unwrap();
-    rub_cmd(&home).arg("back").output().unwrap();
-
-    let out = rub_cmd(&home).arg("forward").output().unwrap();
-    let json = parse_json(&out);
-    assert_eq!(json["success"], true, "{json}");
-    assert!(
-        json["data"]["result"]["page"]["url"]
-            .as_str()
-            .is_some_and(|url| url.contains(&server.url_for("/html"))),
-        "{json}"
-    );
-    assert_eq!(json["data"]["subject"]["action"], "forward");
-    assert!(json["data"]["result"]["at_end"].is_boolean(), "{json}");
-    assert!(json["data"]["dom_epoch"].is_number(), "{json}");
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t095f_back_and_forward_report_same_tab_history_summary() {
-    let home = unique_home();
-    cleanup(&home);
+fn t093_095g_navigation_reload_and_dialog_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
 
     let (_rt, server) = start_test_server(vec![
         (
-            "/alpha",
+            "/scroll",
             "text/html",
-            r#"<!DOCTYPE html><html><head><title>Alpha History Page</title></head><body><h1>Alpha</h1></body></html>"#,
+            r#"<!DOCTYPE html>
+<html>
+<head><title>Scroll Fixture</title></head>
+<body>
+  <article><h1>Scroll Fixture</h1></article>
+  <div style="height: 2600px"></div>
+</body>
+</html>"#,
         ),
-        (
-            "/beta",
-            "text/html",
-            r#"<!DOCTYPE html><html><head><title>Beta History Page</title></head><body><h1>Beta</h1></body></html>"#,
-        ),
-    ]);
-
-    let alpha = server.url_for("/alpha");
-    let beta = server.url_for("/beta");
-
-    assert_eq!(
-        parse_json(&rub_cmd(&home).args(["open", &alpha]).output().unwrap())["success"],
-        true
-    );
-    assert_eq!(
-        parse_json(&rub_cmd(&home).args(["open", &beta]).output().unwrap())["success"],
-        true
-    );
-
-    let back = parse_json(&rub_cmd(&home).arg("back").output().unwrap());
-    assert_eq!(back["success"], true, "{back}");
-    assert_eq!(
-        back["data"]["result"]["page"]["title"], "Alpha History Page",
-        "{back}"
-    );
-    assert_eq!(back["data"]["result"]["page"]["url"], alpha, "{back}");
-    assert_eq!(back["data"]["result"]["page"]["final_url"], alpha, "{back}");
-
-    let forward = parse_json(&rub_cmd(&home).arg("forward").output().unwrap());
-    assert_eq!(forward["success"], true, "{forward}");
-    assert_eq!(
-        forward["data"]["result"]["page"]["title"], "Beta History Page",
-        "{forward}"
-    );
-    assert_eq!(forward["data"]["result"]["page"]["url"], beta, "{forward}");
-    assert_eq!(
-        forward["data"]["result"]["page"]["final_url"], beta,
-        "{forward}"
-    );
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t095g_back_summary_stays_on_active_tab_with_background_tab_present() {
-    let home = unique_home();
-    cleanup(&home);
-
-    let (_rt, server) = start_test_server(vec![
         (
             "/alpha",
             "text/html",
@@ -1216,45 +905,103 @@ fn t095g_back_summary_stays_on_active_tab_with_background_tab_present() {
             "text/html",
             r#"<!DOCTYPE html><html><head><title>Popup Context</title></head><body><h1>Popup</h1></body></html>"#,
         ),
+        (
+            "/reload",
+            "text/html",
+            r#"<!DOCTYPE html>
+<html>
+<head><title>Reload Fixture</title></head>
+<body>
+  <h1 id="title">Original</h1>
+  <button id="change" onclick="document.getElementById('title').textContent='Changed'">Change</button>
+</body>
+</html>"#,
+        ),
+        (
+            "/dialog-alert",
+            "text/html",
+            r#"<!DOCTYPE html>
+<html>
+<head><title>Dialog Fixture</title></head>
+<body>
+  <button id="trigger" onclick="setTimeout(() => alert('Hello!'), 0)">Show Alert</button>
+</body>
+</html>"#,
+        ),
+        (
+            "/dialog-prompt",
+            "text/html",
+            r#"<!DOCTYPE html>
+<html>
+<head><title>Prompt Fixture</title></head>
+<body>
+  <button id="trigger" onclick="setTimeout(() => { document.body.dataset.prompt = prompt('Enter value:', 'seed') ?? 'null'; }, 0)">Show Prompt</button>
+</body>
+</html>"#,
+        ),
     ]);
+
+    let scroll = parse_json(
+        &session
+            .cmd()
+            .args(["open", &server.url_for("/scroll")])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(scroll["success"], true, "Step 1: open scroll");
+    let scroll = parse_json(&session.cmd().args(["scroll", "down"]).output().unwrap());
+    assert_eq!(scroll["success"], true, "{scroll}");
+    assert_eq!(scroll["data"]["subject"]["kind"], "viewport");
+    assert_eq!(scroll["data"]["result"]["direction"], "down");
+    assert!(scroll["data"]["result"]["position"]["y"].is_number());
+    assert!(scroll["data"]["dom_epoch"].is_number());
 
     let alpha = server.url_for("/alpha");
     let beta = server.url_for("/beta");
     let popup = server.url_for("/popup");
 
+    let open_alpha = parse_json(&session.cmd().args(["open", &alpha]).output().unwrap());
+    assert_eq!(open_alpha["success"], true, "Step 2: open alpha");
+    let open_beta = parse_json(&session.cmd().args(["open", &beta]).output().unwrap());
+    assert_eq!(open_beta["success"], true, "Step 3: open beta");
+
+    let back = parse_json(&session.cmd().arg("back").output().unwrap());
+    assert_eq!(back["success"], true, "{back}");
+    assert_eq!(back["data"]["subject"]["action"], "back");
+    assert!(back["data"]["result"]["at_start"].is_boolean());
+    assert!(back["data"]["dom_epoch"].is_number());
     assert_eq!(
-        parse_json(&rub_cmd(&home).args(["open", &alpha]).output().unwrap())["success"],
-        true
+        back["data"]["result"]["page"]["title"],
+        "Alpha History Page"
     );
+    assert_eq!(back["data"]["result"]["page"]["url"], alpha);
+    assert_eq!(back["data"]["result"]["page"]["final_url"], alpha);
+
+    let forward = parse_json(&session.cmd().arg("forward").output().unwrap());
+    assert_eq!(forward["success"], true, "{forward}");
+    assert_eq!(forward["data"]["subject"]["action"], "forward");
+    assert!(
+        forward["data"]["result"]["at_end"].is_boolean(),
+        "{forward}"
+    );
+    assert!(forward["data"]["dom_epoch"].is_number(), "{forward}");
     assert_eq!(
-        parse_json(&rub_cmd(&home).args(["open", &beta]).output().unwrap())["success"],
-        true
+        forward["data"]["result"]["page"]["title"],
+        "Beta History Page"
     );
+    assert_eq!(forward["data"]["result"]["page"]["url"], beta);
+    assert_eq!(forward["data"]["result"]["page"]["final_url"], beta);
 
     let popup_open = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["exec", &format!("window.open('{popup}', '_blank')")])
             .output()
             .unwrap(),
     );
     assert_eq!(popup_open["success"], true, "{popup_open}");
 
-    let tabs = (0..30)
-        .find_map(|_| {
-            let out = parse_json(&rub_cmd(&home).arg("tabs").output().unwrap());
-            if out["data"]["result"]["items"]
-                .as_array()
-                .map(|items| items.len() as u64)
-                .unwrap_or(0)
-                >= 2
-            {
-                Some(out)
-            } else {
-                std::thread::sleep(Duration::from_millis(100));
-                None
-            }
-        })
-        .expect("popup tab should appear");
+    let tabs = wait_for_tabs_count(session.home(), 2);
     let beta_index = tabs["data"]["result"]["items"]
         .as_array()
         .unwrap()
@@ -1263,9 +1010,9 @@ fn t095g_back_summary_stays_on_active_tab_with_background_tab_present() {
         .and_then(|tab| tab["index"].as_u64())
         .expect("beta tab should exist")
         .to_string();
-
     let switched = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["switch", &beta_index])
             .output()
             .unwrap(),
@@ -1276,86 +1023,67 @@ fn t095g_back_summary_stays_on_active_tab_with_background_tab_present() {
         "Beta History Page"
     );
 
-    let back = parse_json(&rub_cmd(&home).arg("back").output().unwrap());
-    assert_eq!(back["success"], true, "{back}");
+    let back_with_popup = parse_json(&session.cmd().arg("back").output().unwrap());
+    assert_eq!(back_with_popup["success"], true, "{back_with_popup}");
     assert_eq!(
-        back["data"]["result"]["page"]["title"], "Alpha History Page",
-        "{back}"
+        back_with_popup["data"]["result"]["page"]["title"],
+        "Alpha History Page"
     );
-    assert_eq!(back["data"]["result"]["page"]["url"], alpha, "{back}");
-    assert_eq!(back["data"]["result"]["page"]["final_url"], alpha, "{back}");
-
-    let forward = parse_json(&rub_cmd(&home).arg("forward").output().unwrap());
-    assert_eq!(forward["success"], true, "{forward}");
+    assert_eq!(back_with_popup["data"]["result"]["page"]["url"], alpha);
     assert_eq!(
-        forward["data"]["result"]["page"]["title"], "Beta History Page",
-        "{forward}"
-    );
-    assert_eq!(forward["data"]["result"]["page"]["url"], beta, "{forward}");
-    assert_eq!(
-        forward["data"]["result"]["page"]["final_url"], beta,
-        "{forward}"
+        back_with_popup["data"]["result"]["page"]["final_url"],
+        alpha
     );
 
-    cleanup(&home);
-}
+    let forward_with_popup = parse_json(&session.cmd().arg("forward").output().unwrap());
+    assert_eq!(forward_with_popup["success"], true, "{forward_with_popup}");
+    assert_eq!(
+        forward_with_popup["data"]["result"]["page"]["title"],
+        "Beta History Page"
+    );
+    assert_eq!(forward_with_popup["data"]["result"]["page"]["url"], beta);
+    assert_eq!(
+        forward_with_popup["data"]["result"]["page"]["final_url"],
+        beta
+    );
 
-#[test]
-#[ignore]
-#[serial]
-fn t095c_reload_restores_page_dom() {
-    let home = unique_home();
-    cleanup(&home);
-
-    let (_rt, server) = start_test_server(vec![(
-        "/",
-        "text/html",
-        r#"<!DOCTYPE html>
-<html>
-<head><title>Reload Fixture</title></head>
-<body>
-  <h1 id="title">Original</h1>
-  <button id="change" onclick="document.getElementById('title').textContent='Changed'">Change</button>
-</body>
-</html>"#,
-    )]);
-
-    let opened = parse_json(
-        &rub_cmd(&home)
-            .args(["open", &server.url()])
+    let reload_open = parse_json(
+        &session
+            .cmd()
+            .args(["open", &server.url_for("/reload")])
             .output()
             .unwrap(),
     );
-    assert_eq!(opened["success"], true, "{opened}");
-
-    let clicked = parse_json(
-        &rub_cmd(&home)
+    assert_eq!(reload_open["success"], true, "Step 4: open reload");
+    let reload_click = parse_json(
+        &session
+            .cmd()
             .args(["click", "--selector", "#change"])
             .output()
             .unwrap(),
     );
-    assert_eq!(clicked["success"], true, "{clicked}");
-
+    assert_eq!(reload_click["success"], true, "{reload_click}");
     let changed = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["exec", "document.getElementById('title').textContent"])
             .output()
             .unwrap(),
     );
     assert_eq!(changed["success"], true, "{changed}");
     assert_eq!(changed["data"]["result"], "Changed", "{changed}");
-
     let reloaded = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["reload", "--wait-after-text", "Original"])
             .output()
             .unwrap(),
     );
     assert_eq!(reloaded["success"], true, "{reloaded}");
     assert!(reloaded["data"]["dom_epoch"].is_number(), "{reloaded}");
-
     let restored = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["exec", "document.getElementById('title').textContent"])
             .output()
             .unwrap(),
@@ -1363,159 +1091,102 @@ fn t095c_reload_restores_page_dom() {
     assert_eq!(restored["success"], true, "{restored}");
     assert_eq!(restored["data"]["result"], "Original", "{restored}");
 
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t095d_dialog_runtime_surfaces_pending_alert_and_dismisses() {
-    let home = unique_home();
-    cleanup(&home);
-
-    let (_rt, server) = start_test_server(vec![(
-        "/dialog-alert",
-        "text/html",
-        r#"<!DOCTYPE html>
-<html>
-<head><title>Dialog Fixture</title></head>
-<body>
-  <button id="trigger" onclick="setTimeout(() => alert('Hello!'), 0)">Show Alert</button>
-</body>
-</html>"#,
-    )]);
-
-    let opened = parse_json(
-        &rub_cmd(&home)
+    let alert_open = parse_json(
+        &session
+            .cmd()
             .args(["open", &server.url_for("/dialog-alert")])
             .output()
             .unwrap(),
     );
-    assert_eq!(opened["success"], true, "{opened}");
-
-    let clicked = parse_json(
-        &rub_cmd(&home)
+    assert_eq!(alert_open["success"], true, "Step 5: open alert");
+    let alert_click = parse_json(
+        &session
+            .cmd()
             .args(["click", "--selector", "#trigger"])
             .output()
             .unwrap(),
     );
-    assert_eq!(clicked["success"], true, "{clicked}");
-
-    let pending = wait_for_pending_dialog(&home);
-    assert_eq!(pending["data"]["runtime"]["status"], "active", "{pending}");
+    assert_eq!(alert_click["success"], true, "{alert_click}");
+    let pending_alert = wait_for_pending_dialog(session.home());
+    assert_eq!(pending_alert["data"]["runtime"]["status"], "active");
     assert_eq!(
-        pending["data"]["runtime"]["pending_dialog"]["kind"], "alert",
-        "{pending}"
+        pending_alert["data"]["runtime"]["pending_dialog"]["kind"],
+        "alert"
     );
     assert_eq!(
-        pending["data"]["runtime"]["pending_dialog"]["message"], "Hello!",
-        "{pending}"
+        pending_alert["data"]["runtime"]["pending_dialog"]["message"],
+        "Hello!"
     );
-
-    let runtime = parse_json(&rub_cmd(&home).args(["runtime", "dialog"]).output().unwrap());
-    assert_eq!(runtime["success"], true, "{runtime}");
+    let alert_runtime = parse_json(&session.cmd().args(["runtime", "dialog"]).output().unwrap());
+    assert_eq!(alert_runtime["success"], true, "{alert_runtime}");
     assert_eq!(
-        runtime["data"]["runtime"]["pending_dialog"]["kind"], "alert",
-        "{runtime}"
+        alert_runtime["data"]["runtime"]["pending_dialog"]["kind"],
+        "alert"
     );
-
-    let dismissed = parse_json(&rub_cmd(&home).args(["dialog", "dismiss"]).output().unwrap());
+    let dismissed = parse_json(&session.cmd().args(["dialog", "dismiss"]).output().unwrap());
     assert_eq!(dismissed["success"], true, "{dismissed}");
-    assert!(
-        dismissed["data"]["result"]["pending_dialog"].is_null(),
-        "{dismissed}"
-    );
+    assert!(dismissed["data"]["result"]["pending_dialog"].is_null());
     assert_eq!(
-        dismissed["data"]["result"]["last_result"]["accepted"], false,
-        "{dismissed}"
+        dismissed["data"]["result"]["last_result"]["accepted"],
+        false
     );
 
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t095e_dialog_accept_prompt_records_user_input() {
-    let home = unique_home();
-    cleanup(&home);
-
-    let (_rt, server) = start_test_server(vec![(
-        "/dialog-prompt",
-        "text/html",
-        r#"<!DOCTYPE html>
-<html>
-<head><title>Prompt Fixture</title></head>
-<body>
-  <button id="trigger" onclick="setTimeout(() => { document.body.dataset.prompt = prompt('Enter value:', 'seed') ?? 'null'; }, 0)">Show Prompt</button>
-</body>
-</html>"#,
-    )]);
-
-    let opened = parse_json(
-        &rub_cmd(&home)
+    let prompt_open = parse_json(
+        &session
+            .cmd()
             .args(["open", &server.url_for("/dialog-prompt")])
             .output()
             .unwrap(),
     );
-    assert_eq!(opened["success"], true, "{opened}");
-
-    let clicked = parse_json(
-        &rub_cmd(&home)
+    assert_eq!(prompt_open["success"], true, "Step 6: open prompt");
+    let prompt_click = parse_json(
+        &session
+            .cmd()
             .args(["click", "--selector", "#trigger"])
             .output()
             .unwrap(),
     );
-    assert_eq!(clicked["success"], true, "{clicked}");
-
-    let pending = wait_for_pending_dialog(&home);
+    assert_eq!(prompt_click["success"], true, "{prompt_click}");
+    let pending_prompt = wait_for_pending_dialog(session.home());
     assert_eq!(
-        pending["data"]["runtime"]["pending_dialog"]["kind"], "prompt",
-        "{pending}"
+        pending_prompt["data"]["runtime"]["pending_dialog"]["kind"],
+        "prompt"
     );
     assert_eq!(
-        pending["data"]["runtime"]["pending_dialog"]["default_prompt"], "seed",
-        "{pending}"
+        pending_prompt["data"]["runtime"]["pending_dialog"]["default_prompt"],
+        "seed"
     );
-
     let accepted = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["dialog", "accept", "--prompt-text", "typed"])
             .output()
             .unwrap(),
     );
     assert_eq!(accepted["success"], true, "{accepted}");
-    assert!(
-        accepted["data"]["result"]["pending_dialog"].is_null(),
-        "{accepted}"
-    );
+    assert!(accepted["data"]["result"]["pending_dialog"].is_null());
+    assert_eq!(accepted["data"]["result"]["last_result"]["accepted"], true);
     assert_eq!(
-        accepted["data"]["result"]["last_result"]["accepted"], true,
-        "{accepted}"
+        accepted["data"]["result"]["last_result"]["user_input"],
+        "typed"
     );
-    assert_eq!(
-        accepted["data"]["result"]["last_result"]["user_input"], "typed",
-        "{accepted}"
-    );
-
     let waited = parse_json(
-        &rub_cmd(&home)
+        &session
+            .cmd()
             .args(["wait", "--selector", "body[data-prompt='typed']"])
             .output()
             .unwrap(),
     );
     assert_eq!(waited["success"], true, "{waited}");
-
-    let value = parse_json(
-        &rub_cmd(&home)
+    let prompt_value = parse_json(
+        &session
+            .cmd()
             .args(["exec", "document.body.dataset.prompt"])
             .output()
             .unwrap(),
     );
-    assert_eq!(value["success"], true, "{value}");
-    assert_eq!(value["data"]["result"], "typed", "{value}");
-
-    cleanup(&home);
+    assert_eq!(prompt_value["success"], true, "{prompt_value}");
+    assert_eq!(prompt_value["data"]["result"], "typed", "{prompt_value}");
 }
 
 // ============================================================
@@ -1525,17 +1196,19 @@ fn t095e_dialog_accept_prompt_records_user_input() {
 #[test]
 #[ignore]
 #[serial]
-fn t100_screenshot_to_file() {
-    let home = unique_home();
-    cleanup(&home);
+fn t100_101_screenshot_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
     let screenshot_path = format!("{home}/test.png");
     let (_rt, server) = start_standard_site_fixture();
 
-    rub_cmd(&home)
+    session
+        .cmd()
         .args(["open", &server.url()])
         .output()
         .unwrap();
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["screenshot", "--path", &screenshot_path])
         .output()
         .unwrap();
@@ -1548,23 +1221,7 @@ fn t100_screenshot_to_file() {
             > 0
     );
     assert!(std::path::Path::new(&screenshot_path).exists());
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t101_screenshot_base64() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    let out = rub_cmd(&home).arg("screenshot").output().unwrap();
+    let out = session.cmd().arg("screenshot").output().unwrap();
     let json = parse_json(&out);
     assert_eq!(json["success"], true);
     assert!(
@@ -1579,8 +1236,6 @@ fn t101_screenshot_base64() {
             .unwrap()
             > 0
     );
-
-    cleanup(&home);
 }
 
 // ============================================================
@@ -1591,8 +1246,7 @@ fn t101_screenshot_base64() {
 #[ignore]
 #[serial]
 fn t107_doctor_health() {
-    let home = unique_home();
-    cleanup(&home);
+    let session = ManagedBrowserSession::new();
 
     let (_rt, server) = start_test_server(vec![
         (
@@ -1603,11 +1257,13 @@ fn t107_doctor_health() {
         ("/doctor-data", "application/json", r#"{"ok":true}"#),
     ]);
 
-    rub_cmd(&home)
+    session
+        .cmd()
         .args(["open", &server.url_for("/doctor")])
         .output()
         .unwrap();
-    let exec = rub_cmd(&home)
+    let exec = session
+        .cmd()
         .args([
             "exec",
             "console.error('doctor-health'); fetch('/doctor-data').then((r) => r.text())",
@@ -1617,13 +1273,29 @@ fn t107_doctor_health() {
     let exec_json = parse_json(&exec);
     assert_eq!(exec_json["success"], true, "{exec_json}");
 
-    let out = rub_cmd(&home).arg("doctor").output().unwrap();
+    let out = session.cmd().arg("doctor").output().unwrap();
     let json = parse_json(&out);
     let report = doctor_result(&json);
     let runtime = doctor_runtime(&json);
     assert_eq!(json["success"], true);
     assert_eq!(report["daemon"]["running"], true);
     assert_eq!(report["browser"]["healthy"], true);
+    assert_eq!(
+        report["browser"]["path_state"]["truth_level"],
+        "operator_path_reference"
+    );
+    assert_eq!(
+        report["browser"]["path_state"]["path_authority"],
+        "router.doctor.browser_path"
+    );
+    assert_eq!(
+        report["socket"]["path_state"]["path_kind"],
+        "daemon_socket_reference"
+    );
+    assert_eq!(
+        report["disk"]["rub_home_state"]["path_kind"],
+        "daemon_home_directory"
+    );
     assert!(report["daemon"]["pid"].is_number());
     assert!(report["disk"]["log_size_mb"].is_number());
     assert!(report["launch_policy"]["headless"].is_boolean());
@@ -1736,6 +1408,23 @@ fn t107_doctor_health() {
             >= 1,
         "{json}"
     );
+    let first_orchestration_session = &runtime["orchestration_runtime"]["known_sessions"][0];
+    assert_eq!(
+        first_orchestration_session["socket_path_state"]["truth_level"], "operator_path_reference",
+        "{json}"
+    );
+    assert_eq!(
+        first_orchestration_session["socket_path_state"]["path_authority"],
+        "session.orchestration_runtime.known_sessions.socket_path",
+        "{json}"
+    );
+    if !first_orchestration_session["user_data_dir"].is_null() {
+        assert_eq!(
+            first_orchestration_session["user_data_dir_state"]["path_kind"],
+            "managed_user_data_directory",
+            "{json}"
+        );
+    }
     assert_eq!(runtime["integration_runtime"]["handoff_ready"], false);
     assert_eq!(
         report["capabilities"]["integration_runtime_projection"],
@@ -1763,34 +1452,29 @@ fn t107_doctor_health() {
     );
     assert_eq!(report["capabilities"]["non_blocking_wait"], true);
     assert_eq!(report["capabilities"]["startup_locking"], true);
-
-    cleanup(&home);
 }
 
 #[test]
 #[ignore]
 #[serial]
 fn t108_legacy_automation_compat_mode_is_rejected() {
-    let home = unique_home();
-    cleanup(&home);
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
 
-    let output = rub_cmd(&home)
+    let output = rub_cmd(home)
         .args(["--automation-compat-mode", "doctor"])
         .output()
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--automation-compat-mode"));
-
-    cleanup(&home);
 }
 
 #[test]
 #[ignore]
 #[serial]
 fn t372_humanize_doctor_reports_l2() {
-    let home = unique_home();
-    cleanup(&home);
+    let session = ManagedBrowserSession::new();
 
     let (_rt, server) = start_test_server(vec![(
         "/humanize",
@@ -1798,7 +1482,8 @@ fn t372_humanize_doctor_reports_l2() {
         r#"<!DOCTYPE html><html><body><button>Humanize</button></body></html>"#,
     )]);
 
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args([
             "--humanize",
             "--humanize-speed",
@@ -1810,7 +1495,8 @@ fn t372_humanize_doctor_reports_l2() {
         .unwrap();
     assert_eq!(parse_json(&out)["success"], true);
 
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["--humanize", "--humanize-speed", "slow", "doctor"])
         .output()
         .unwrap();
@@ -1824,20 +1510,17 @@ fn t372_humanize_doctor_reports_l2() {
     assert!(risk["risk"].is_string());
     assert!(risk["severity"].is_string());
     assert!(risk["mitigation"].is_string());
-
-    cleanup(&home);
 }
 
 #[test]
 #[ignore]
 #[serial]
 fn t373_default_stealth_masks_headless_user_agent() {
-    let home = unique_home();
-    cleanup(&home);
+    let session = ManagedBrowserSession::new();
 
     let (url, request_rx, handle) = start_header_capture_server();
 
-    let out = rub_cmd(&home).args(["open", &url]).output().unwrap();
+    let out = session.cmd().args(["open", &url]).output().unwrap();
     assert_eq!(parse_json(&out)["success"], true);
 
     let request = request_rx
@@ -1849,7 +1532,8 @@ fn t373_default_stealth_masks_headless_user_agent() {
         "network-layer User-Agent should not leak HeadlessChrome: {request}"
     );
 
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["exec", "navigator.userAgent"])
         .output()
         .unwrap();
@@ -1863,20 +1547,19 @@ fn t373_default_stealth_masks_headless_user_agent() {
     );
 
     let _ = handle.join();
-    cleanup(&home);
 }
 
 #[test]
 #[ignore]
 #[serial]
-fn t374_state_does_not_trigger_data_rub_mutation_observer() {
-    let home = unique_home();
-    cleanup(&home);
+fn t374_375_state_cleanup_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
 
-    let (_rt, server) = start_test_server(vec![(
-        "/mutations",
-        "text/html",
-        r#"<!DOCTYPE html>
+    let (_rt, server) = start_test_server(vec![
+        (
+            "/mutations",
+            "text/html",
+            r#"<!DOCTYPE html>
 <html>
 <head>
   <title>Mutation Fixture</title>
@@ -1898,18 +1581,26 @@ fn t374_state_does_not_trigger_data_rub_mutation_observer() {
   <button>Probe</button>
 </body>
 </html>"#,
-    )]);
+        ),
+        (
+            "/data-rub-cleanup",
+            "text/html",
+            r#"<!DOCTYPE html><html><body><button>Probe</button></body></html>"#,
+        ),
+    ]);
 
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["open", &server.url_for("/mutations")])
         .output()
         .unwrap();
     assert_eq!(parse_json(&out)["success"], true);
 
-    let out = rub_cmd(&home).arg("state").output().unwrap();
+    let out = session.cmd().arg("state").output().unwrap();
     assert_eq!(parse_json(&out)["success"], true);
 
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["exec", "window.__rubMutations.length"])
         .output()
         .unwrap();
@@ -1917,32 +1608,18 @@ fn t374_state_does_not_trigger_data_rub_mutation_observer() {
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["result"], 0);
 
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t375_state_leaves_no_data_rub_attributes() {
-    let home = unique_home();
-    cleanup(&home);
-
-    let (_rt, server) = start_test_server(vec![(
-        "/data-rub-cleanup",
-        "text/html",
-        r#"<!DOCTYPE html><html><body><button>Probe</button></body></html>"#,
-    )]);
-
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["open", &server.url_for("/data-rub-cleanup")])
         .output()
         .unwrap();
     assert_eq!(parse_json(&out)["success"], true);
 
-    let out = rub_cmd(&home).arg("state").output().unwrap();
+    let out = session.cmd().arg("state").output().unwrap();
     assert_eq!(parse_json(&out)["success"], true);
 
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args([
             "exec",
             "document.querySelectorAll('[data-rub-node-index],[data-rub-highlight]').length",
@@ -1952,48 +1629,30 @@ fn t375_state_leaves_no_data_rub_attributes() {
     let json = parse_json(&out);
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["result"], 0);
-
-    cleanup(&home);
 }
 
 #[test]
 #[ignore]
 #[serial]
-fn t376_default_stealth_hides_webdriver() {
-    let home = unique_home();
-    cleanup(&home);
+fn t376_378_383_default_stealth_surface_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
     let (_rt, server) = start_standard_site_fixture();
 
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["open", &server.url()])
         .output()
         .unwrap();
     assert_eq!(parse_json(&out)["success"], true);
 
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["exec", "navigator.webdriver"])
         .output()
         .unwrap();
     let json = parse_json(&out);
     assert_eq!(json["success"], true);
     assert!(json["data"]["result"].is_null());
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t383_default_stealth_removes_webdriver_property_shape() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    let out = rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    assert_eq!(parse_json(&out)["success"], true);
 
     let probe = r#"(() => ({
         read_type: typeof navigator.webdriver,
@@ -2002,7 +1661,7 @@ fn t383_default_stealth_removes_webdriver_property_shape() {
         proto_property: Object.prototype.hasOwnProperty.call(Object.getPrototypeOf(navigator), 'webdriver'),
         proto_descriptor_present: Object.getOwnPropertyDescriptor(Object.getPrototypeOf(navigator), 'webdriver') !== undefined
     }))()"#;
-    let out = rub_cmd(&home).args(["exec", probe]).output().unwrap();
+    let out = session.cmd().args(["exec", probe]).output().unwrap();
     let json = parse_json(&out);
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["result"]["read_type"], "undefined");
@@ -2011,24 +1670,8 @@ fn t383_default_stealth_removes_webdriver_property_shape() {
     assert_eq!(json["data"]["result"]["proto_property"], false);
     assert_eq!(json["data"]["result"]["proto_descriptor_present"], false);
 
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t377_default_stealth_exposes_chrome_runtime() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    let out = rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    assert_eq!(parse_json(&out)["success"], true);
-
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["exec", "typeof chrome.runtime"])
         .output()
         .unwrap();
@@ -2036,67 +1679,47 @@ fn t377_default_stealth_exposes_chrome_runtime() {
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["result"], "object");
 
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t378_default_stealth_exposes_plugins() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_standard_site_fixture();
-
-    let out = rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    assert_eq!(parse_json(&out)["success"], true);
-
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["exec", "navigator.plugins.length"])
         .output()
         .unwrap();
     let json = parse_json(&out);
     assert_eq!(json["success"], true);
     assert!(json["data"]["result"].as_u64().unwrap_or(0) > 0);
-
-    cleanup(&home);
 }
 
 #[test]
 #[ignore]
 #[serial]
 fn t379_no_stealth_restores_webdriver() {
-    let home = unique_home();
-    cleanup(&home);
+    let session = ManagedBrowserSession::new();
     let (_rt, server) = start_standard_site_fixture();
 
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["--no-stealth", "open", &server.url()])
         .output()
         .unwrap();
     assert_eq!(parse_json(&out)["success"], true);
 
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["--no-stealth", "exec", "navigator.webdriver"])
         .output()
         .unwrap();
     let json = parse_json(&out);
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["result"], true);
-
-    cleanup(&home);
 }
 
 #[test]
 #[ignore]
 #[serial]
 fn t380_doctor_reports_default_l1_with_clean_args_patch() {
-    let home = unique_home();
-    cleanup(&home);
+    let session = ManagedBrowserSession::new();
 
-    let out = rub_cmd(&home).arg("doctor").output().unwrap();
+    let out = session.cmd().arg("doctor").output().unwrap();
     let json = parse_json(&out);
     let report = doctor_result(&json);
     assert_eq!(json["success"], true);
@@ -2106,29 +1729,27 @@ fn t380_doctor_reports_default_l1_with_clean_args_patch() {
         .as_array()
         .unwrap();
     assert!(patches.iter().any(|value| value == "clean_chrome_args"));
-
-    cleanup(&home);
 }
 
 #[test]
 #[ignore]
 #[serial]
-fn t384_doctor_reports_stealth_coverage_after_open() {
-    let home = unique_home();
-    cleanup(&home);
+fn t384_385_default_stealth_coverage_and_worker_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
     let (_rt, server) = start_test_server(vec![(
         "/",
         "text/html",
         r#"<!DOCTYPE html><html><body><div>Stealth Coverage Fixture</div></body></html>"#,
     )]);
 
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["open", &server.url()])
         .output()
         .unwrap();
     assert_eq!(parse_json(&out)["success"], true);
 
-    let out = rub_cmd(&home).arg("doctor").output().unwrap();
+    let out = session.cmd().arg("doctor").output().unwrap();
     let json = parse_json(&out);
     let report = doctor_result(&json);
     assert_eq!(json["success"], true);
@@ -2198,19 +1819,65 @@ fn t384_doctor_reports_stealth_coverage_after_open() {
         report["launch_policy"]["stealth_coverage"]["self_probe"]["unsupported_surfaces"],
         json!(["service_worker"])
     );
-
-    cleanup(&home);
+    let probe = r#"(async () => {
+        const workerSource = `
+            self.onmessage = () => {
+                self.postMessage({
+                    userAgent: navigator.userAgent,
+                    webdriverIn: ('webdriver' in navigator),
+                    webdriverType: typeof navigator.webdriver,
+                    chromeRuntime: typeof (self.chrome && self.chrome.runtime)
+                });
+            };
+        `;
+        const workerBlob = new Blob([workerSource], { type: 'text/javascript' });
+        const workerUrl = URL.createObjectURL(workerBlob);
+        try {
+            return await new Promise((resolve, reject) => {
+                const worker = new Worker(workerUrl);
+                const timer = setTimeout(() => {
+                    worker.terminate();
+                    reject(new Error('worker timeout'));
+                }, 5000);
+                worker.onmessage = (event) => {
+                    clearTimeout(timer);
+                    worker.terminate();
+                    resolve(event.data);
+                };
+                worker.onerror = (event) => {
+                    clearTimeout(timer);
+                    worker.terminate();
+                    reject(new Error(event.message || 'worker error'));
+                };
+                worker.postMessage('go');
+            });
+        } finally {
+            URL.revokeObjectURL(workerUrl);
+        }
+    })()"#;
+    let out = session.cmd().args(["exec", probe]).output().unwrap();
+    let json = parse_json(&out);
+    assert_eq!(json["success"], true);
+    assert!(
+        !json["data"]["result"]["userAgent"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("HeadlessChrome")
+    );
+    assert_eq!(json["data"]["result"]["webdriverIn"], false);
+    assert_eq!(json["data"]["result"]["webdriverType"], "undefined");
+    assert_eq!(json["data"]["result"]["chromeRuntime"], "object");
 }
 
 #[test]
 #[ignore]
 #[serial]
 fn t384b_default_stealth_projects_platform_consistent_webgl_profile() {
-    let home = unique_home();
-    cleanup(&home);
+    let session = ManagedBrowserSession::new();
     let (_rt, server) = start_standard_site_fixture();
 
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["open", &server.url()])
         .output()
         .unwrap();
@@ -2228,7 +1895,7 @@ fn t384b_default_stealth_projects_platform_consistent_webgl_profile() {
             renderer: gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)
         };
     })()"#;
-    let out = rub_cmd(&home).args(["exec", probe]).output().unwrap();
+    let out = session.cmd().args(["exec", probe]).output().unwrap();
     let json = parse_json(&out);
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["result"]["supported"], true);
@@ -2249,19 +1916,17 @@ fn t384b_default_stealth_projects_platform_consistent_webgl_profile() {
         "linux" => assert!(renderer.contains("OpenGL"), "{renderer}"),
         _ => assert!(!renderer.is_empty()),
     }
-
-    cleanup(&home);
 }
 
 #[test]
 #[ignore]
 #[serial]
 fn t384c_default_stealth_stabilizes_canvas_and_audio_fingerprints() {
-    let home = unique_home();
-    cleanup(&home);
+    let session = ManagedBrowserSession::new();
     let (_rt, server) = start_standard_site_fixture();
 
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["open", &server.url()])
         .output()
         .unwrap();
@@ -2294,26 +1959,24 @@ fn t384c_default_stealth_stabilizes_canvas_and_audio_fingerprints() {
             audio_changed: nonZeroIndices.length >= 2,
         };
     })()"#;
-    let out = rub_cmd(&home).args(["exec", probe]).output().unwrap();
+    let out = session.cmd().args(["exec", probe]).output().unwrap();
     let json = parse_json(&out);
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["result"]["canvas_stable"], true);
     assert_eq!(json["data"]["result"]["canvas_changed"], true);
     assert_eq!(json["data"]["result"]["audio_stable"], true);
     assert_eq!(json["data"]["result"]["audio_changed"], true);
-
-    cleanup(&home);
 }
 
 #[test]
 #[ignore]
 #[serial]
 fn t384d_default_stealth_projects_desktop_environment_consistency() {
-    let home = unique_home();
-    cleanup(&home);
+    let session = ManagedBrowserSession::new();
     let (_rt, server) = start_standard_site_fixture();
 
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["open", &server.url()])
         .output()
         .unwrap();
@@ -2330,7 +1993,7 @@ fn t384d_default_stealth_projects_desktop_environment_consistency() {
         outer_width: Number(window.outerWidth || 0),
         outer_height: Number(window.outerHeight || 0)
     }))()"#;
-    let out = rub_cmd(&home).args(["exec", probe]).output().unwrap();
+    let out = session.cmd().args(["exec", probe]).output().unwrap();
     let json = parse_json(&out);
     assert_eq!(json["success"], true);
 
@@ -2385,19 +2048,17 @@ fn t384d_default_stealth_projects_desktop_environment_consistency() {
             );
         }
     }
-
-    cleanup(&home);
 }
 
 #[test]
 #[ignore]
 #[serial]
 fn t384e_default_stealth_cloaks_permissions_query_and_touch_getters() {
-    let home = unique_home();
-    cleanup(&home);
+    let session = ManagedBrowserSession::new();
     let (_rt, server) = start_standard_site_fixture();
 
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["open", &server.url()])
         .output()
         .unwrap();
@@ -2433,7 +2094,7 @@ fn t384e_default_stealth_cloaks_permissions_query_and_touch_getters() {
             touch_getter_native: touchSource ? /\[native code\]/.test(touchSource) : true,
         };
     })()"#;
-    let out = rub_cmd(&home).args(["exec", probe]).output().unwrap();
+    let out = session.cmd().args(["exec", probe]).output().unwrap();
     let json = parse_json(&out);
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["result"]["query_native"], true, "{json}");
@@ -2456,88 +2117,16 @@ fn t384e_default_stealth_cloaks_permissions_query_and_touch_getters() {
         json["data"]["result"]["touch_getter_native"], true,
         "{json}"
     );
-
-    cleanup(&home);
-}
-
-#[test]
-#[ignore]
-#[serial]
-fn t385_default_stealth_bridges_worker_identity() {
-    let home = unique_home();
-    cleanup(&home);
-    let (_rt, server) = start_test_server(vec![(
-        "/",
-        "text/html",
-        r#"<!DOCTYPE html><html><body><div>Worker Bridge Fixture</div></body></html>"#,
-    )]);
-
-    let out = rub_cmd(&home)
-        .args(["open", &server.url()])
-        .output()
-        .unwrap();
-    assert_eq!(parse_json(&out)["success"], true);
-
-    let probe = r#"(async () => {
-        const workerSource = `
-            self.onmessage = () => {
-                self.postMessage({
-                    userAgent: navigator.userAgent,
-                    webdriverIn: ('webdriver' in navigator),
-                    webdriverType: typeof navigator.webdriver,
-                    chromeRuntime: typeof (self.chrome && self.chrome.runtime)
-                });
-            };
-        `;
-        const workerBlob = new Blob([workerSource], { type: 'text/javascript' });
-        const workerUrl = URL.createObjectURL(workerBlob);
-        try {
-            return await new Promise((resolve, reject) => {
-                const worker = new Worker(workerUrl);
-                const timer = setTimeout(() => {
-                    worker.terminate();
-                    reject(new Error('worker timeout'));
-                }, 5000);
-                worker.onmessage = (event) => {
-                    clearTimeout(timer);
-                    worker.terminate();
-                    resolve(event.data);
-                };
-                worker.onerror = (event) => {
-                    clearTimeout(timer);
-                    worker.terminate();
-                    reject(new Error(event.message || 'worker error'));
-                };
-                worker.postMessage('go');
-            });
-        } finally {
-            URL.revokeObjectURL(workerUrl);
-        }
-    })()"#;
-    let out = rub_cmd(&home).args(["exec", probe]).output().unwrap();
-    let json = parse_json(&out);
-    assert_eq!(json["success"], true);
-    assert!(
-        !json["data"]["result"]["userAgent"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("HeadlessChrome")
-    );
-    assert_eq!(json["data"]["result"]["webdriverIn"], false);
-    assert_eq!(json["data"]["result"]["webdriverType"], "undefined");
-    assert_eq!(json["data"]["result"]["chromeRuntime"], "object");
-
-    cleanup(&home);
 }
 
 #[test]
 #[ignore]
 #[serial]
 fn t381_doctor_reports_l0_when_stealth_disabled() {
-    let home = unique_home();
-    cleanup(&home);
+    let session = ManagedBrowserSession::new();
 
-    let out = rub_cmd(&home)
+    let out = session
+        .cmd()
         .args(["--no-stealth", "doctor"])
         .output()
         .unwrap();
@@ -2546,8 +2135,6 @@ fn t381_doctor_reports_l0_when_stealth_disabled() {
     assert_eq!(json["success"], true);
     assert_eq!(report["launch_policy"]["stealth_level"], "L0");
     assert_eq!(report["launch_policy"]["stealth_default_enabled"], false);
-
-    cleanup(&home);
 }
 
 #[test]

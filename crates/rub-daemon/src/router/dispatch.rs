@@ -47,22 +47,22 @@ pub(super) async fn dispatch_named_command(
                 .map(CommandDispatchOutcome::new)
         }
         Some(CommandName::Open) => navigation::cmd_open(router, args, deadline, state).await,
-        Some(CommandName::State) => navigation::cmd_state(router, args, state)
+        Some(CommandName::State) => navigation::cmd_state(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
-        Some(CommandName::Observe) => observe::cmd_observe(router, args, state)
+        Some(CommandName::Observe) => observe::cmd_observe(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
         Some(CommandName::Orchestration) => orchestration::cmd_orchestration(router, args, state)
             .await
             .map(CommandDispatchOutcome::new),
-        Some(CommandName::Inspect) => inspect::cmd_inspect(router, args, state)
+        Some(CommandName::Inspect) => inspect::cmd_inspect(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
-        Some(CommandName::Find) => find::cmd_find(router, args, state)
+        Some(CommandName::Find) => find::cmd_find(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
-        Some(CommandName::Click) => interaction::cmd_click(router, args, state)
+        Some(CommandName::Click) => interaction::cmd_click(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
         Some(CommandName::Exec) => query::cmd_exec(router, args, state)
@@ -122,7 +122,7 @@ pub(super) async fn dispatch_named_command(
         Some(CommandName::Keys) => interaction::cmd_keys(router, args, state)
             .await
             .map(CommandDispatchOutcome::new),
-        Some(CommandName::Type) => interaction::cmd_type(router, args, state)
+        Some(CommandName::Type) => interaction::cmd_type(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
         Some(CommandName::Wait) => {
@@ -140,25 +140,25 @@ pub(super) async fn dispatch_named_command(
         Some(CommandName::CloseTab) => {
             navigation::cmd_close_tab(router, args, deadline, state).await
         }
-        Some(CommandName::Get) => query::cmd_get(router, args, state)
+        Some(CommandName::Get) => query::cmd_get(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
-        Some(CommandName::Hover) => interaction::cmd_hover(router, args, state)
+        Some(CommandName::Hover) => interaction::cmd_hover(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
         Some(CommandName::Cookies) => runtime::cmd_cookies(router, args)
             .await
             .map(CommandDispatchOutcome::new),
-        Some(CommandName::Upload) => interaction::cmd_upload(router, args, state)
+        Some(CommandName::Upload) => interaction::cmd_upload(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
-        Some(CommandName::Select) => interaction::cmd_select(router, args, state)
+        Some(CommandName::Select) => interaction::cmd_select(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
         Some(CommandName::Fill) => workflow::cmd_fill(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
-        Some(CommandName::Extract) => extract::cmd_extract(router, args, None, state)
+        Some(CommandName::Extract) => extract::cmd_extract(router, args, None, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
         Some(CommandName::Pipe) => workflow::cmd_pipe(router, args, deadline, state)

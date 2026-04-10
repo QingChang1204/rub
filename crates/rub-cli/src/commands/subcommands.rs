@@ -714,4 +714,13 @@ mod tests {
         assert!(!help.contains("\"cmd\":\"open\""), "{help}");
         assert!(!help.contains("`cmd` key"), "{help}");
     }
+
+    #[test]
+    fn exec_help_marks_raw_as_explicit_non_json_surface() {
+        let help = render_subcommand_long_help("exec");
+        assert!(
+            help.contains("Print the result directly instead of the standard JSON envelope"),
+            "{help}"
+        );
+    }
 }

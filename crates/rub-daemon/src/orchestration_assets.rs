@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use rub_core::error::{ErrorCode, RubError};
+use rub_core::model::PathReferenceState;
 
 use crate::rub_paths::RubPaths;
 
@@ -43,26 +44,64 @@ pub fn load_named_orchestration_spec(
     rub_home: &Path,
     name: &str,
 ) -> Result<(String, String, PathBuf), RubError> {
+    load_named_orchestration_spec_with_authority(
+        rub_home,
+        name,
+        "rub_daemon.orchestration_assets.path",
+        "named_orchestration_asset_name",
+    )
+}
+
+pub fn load_named_orchestration_spec_with_authority(
+    rub_home: &Path,
+    name: &str,
+    path_authority: &str,
+    upstream_truth: &str,
+) -> Result<(String, String, PathBuf), RubError> {
     let normalized = normalize_orchestration_name(name)?;
     let path = resolve_named_orchestration_path(rub_home, &normalized)?;
     let path_string = path.display().to_string();
     let contents = std::fs::read_to_string(&path).map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => RubError::domain(
+        std::io::ErrorKind::NotFound => RubError::domain_with_context(
             ErrorCode::FileNotFound,
             format!("Named orchestration asset not found: {normalized} ({path_string})"),
+            serde_json::json!({
+                "path": path_string,
+                "path_state": orchestration_asset_path_state(path_authority, upstream_truth),
+                "reason": "named_orchestration_asset_not_found",
+            }),
         ),
-        _ => RubError::domain(
+        _ => RubError::domain_with_context(
             ErrorCode::InvalidInput,
             format!("Failed to read orchestration asset {path_string}: {error}"),
+            serde_json::json!({
+                "path": path_string,
+                "path_state": orchestration_asset_path_state(path_authority, upstream_truth),
+                "reason": "named_orchestration_asset_read_failed",
+            }),
         ),
     })?;
     Ok((normalized, contents, path))
 }
 
+pub fn orchestration_asset_path_state(
+    path_authority: &str,
+    upstream_truth: &str,
+) -> PathReferenceState {
+    PathReferenceState {
+        truth_level: "input_path_reference".to_string(),
+        path_authority: path_authority.to_string(),
+        upstream_truth: upstream_truth.to_string(),
+        path_kind: "orchestration_asset_reference".to_string(),
+        control_role: "display_only".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        load_named_orchestration_spec, normalize_orchestration_name,
+        load_named_orchestration_spec, load_named_orchestration_spec_with_authority,
+        normalize_orchestration_name, orchestration_asset_path_state,
         resolve_named_orchestration_path,
     };
     use std::fs;
@@ -106,5 +145,46 @@ mod tests {
         assert_eq!(loaded_path, path);
 
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn load_named_orchestration_spec_missing_file_preserves_path_state() {
+        let home = std::env::temp_dir().join(format!(
+            "rub-daemon-orchestration-assets-missing-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let _ = fs::remove_dir_all(&home);
+
+        let envelope = load_named_orchestration_spec_with_authority(
+            &home,
+            "reply_rule",
+            "cli.orchestration.spec_source.path",
+            "cli_orchestration_asset_option",
+        )
+        .expect_err("missing named orchestration asset should fail")
+        .into_envelope();
+        let context = envelope.context.expect("orchestration asset error context");
+        assert_eq!(context["reason"], "named_orchestration_asset_not_found");
+        assert_eq!(
+            context["path_state"]["path_authority"],
+            "cli.orchestration.spec_source.path"
+        );
+        assert_eq!(
+            context["path_state"]["upstream_truth"],
+            "cli_orchestration_asset_option"
+        );
+    }
+
+    #[test]
+    fn orchestration_asset_path_state_marks_named_asset_boundary() {
+        let state = orchestration_asset_path_state(
+            "cli.orchestration.spec_source.path",
+            "cli_orchestration_asset_option",
+        );
+        assert_eq!(state.truth_level, "input_path_reference");
+        assert_eq!(state.path_authority, "cli.orchestration.spec_source.path");
+        assert_eq!(state.upstream_truth, "cli_orchestration_asset_option");
+        assert_eq!(state.path_kind, "orchestration_asset_reference");
+        assert_eq!(state.control_role, "display_only");
     }
 }

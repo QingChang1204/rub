@@ -1,6 +1,5 @@
 use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::dom::SetFileInputFilesParams;
-use chromiumoxide::cdp::js_protocol::runtime::ExecutionContextId;
 use rub_core::InteractionOutcome;
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{Element, InteractionActuation, InteractionSemanticClass, SelectOutcome};
@@ -17,7 +16,8 @@ pub(crate) async fn input_text(
 ) -> Result<InteractionOutcome, RubError> {
     let resolved = crate::targeting::resolve_element(page, element).await?;
     ensure_text_control_editable(page, &resolved.remote_object_id).await?;
-    let before_page = crate::interaction::capture_page_baseline(page).await;
+    let before_page =
+        crate::interaction::capture_related_page_baseline(page, &resolved.remote_object_id).await;
 
     crate::interaction::prepare_text_input(page, &resolved.remote_object_id, clear).await?;
     crate::keyboard::focus_pause(humanize).await;
@@ -49,8 +49,8 @@ pub(crate) async fn type_into(
 ) -> Result<InteractionOutcome, RubError> {
     let resolved = crate::targeting::resolve_element(page, element).await?;
     ensure_text_control_editable(page, &resolved.remote_object_id).await?;
-    let active_context_id = resolve_element_context(page, element).await?;
-    let before_page = crate::interaction::capture_page_baseline(page).await;
+    let before_page =
+        crate::interaction::capture_related_page_baseline(page, &resolved.remote_object_id).await;
 
     crate::interaction::prepare_text_input(page, &resolved.remote_object_id, clear).await?;
     crate::keyboard::focus_pause(humanize).await;
@@ -68,14 +68,8 @@ pub(crate) async fn type_into(
         crate::interaction::clear_text_input(page, &resolved.remote_object_id).await?;
         crate::interaction::confirm_input(page, &resolved.remote_object_id, "", before_page).await
     } else {
-        let baseline = crate::interaction::capture_active_interaction_baseline_in_context(
-            page,
-            active_context_id,
-        )
-        .await;
         crate::keyboard::type_text(page, text, humanize).await?;
-        crate::interaction::confirm_typed_text_in_context(page, text, baseline, active_context_id)
-            .await
+        crate::interaction::confirm_input(page, &resolved.remote_object_id, text, before_page).await
     };
 
     Ok(InteractionOutcome {
@@ -84,19 +78,6 @@ pub(crate) async fn type_into(
         actuation: Some(InteractionActuation::Keyboard),
         confirmation: Some(confirmation),
     })
-}
-
-async fn resolve_element_context(
-    page: &Arc<Page>,
-    element: &Element,
-) -> Result<Option<ExecutionContextId>, RubError> {
-    let frame_id = element
-        .element_ref
-        .as_deref()
-        .and_then(|element_ref| element_ref.split_once(':').map(|(frame_id, _)| frame_id));
-    Ok(crate::frame_runtime::resolve_frame_context(page, frame_id)
-        .await?
-        .execution_context_id)
 }
 
 pub(crate) async fn upload_file(
@@ -113,7 +94,8 @@ pub(crate) async fn upload_file(
 
     let resolved = crate::targeting::resolve_element(page, element).await?;
     ensure_control_enabled(page, &resolved.remote_object_id).await?;
-    let before_page = crate::interaction::capture_page_baseline(page).await;
+    let before_page =
+        crate::interaction::capture_related_page_baseline(page, &resolved.remote_object_id).await;
     let backend_node_id = resolved.backend_node_id.ok_or_else(|| {
         RubError::domain(ErrorCode::ElementNotFound, "Element has no backend node id")
     })?;
@@ -172,7 +154,8 @@ pub(crate) async fn select_option(
 ) -> Result<SelectOutcome, RubError> {
     let resolved = crate::targeting::resolve_element(page, element).await?;
     ensure_control_enabled(page, &resolved.remote_object_id).await?;
-    let before_page = crate::interaction::capture_page_baseline(page).await;
+    let before_page =
+        crate::interaction::capture_related_page_baseline(page, &resolved.remote_object_id).await;
 
     let value_literal = js_string_literal(value)?;
     let js = format!(

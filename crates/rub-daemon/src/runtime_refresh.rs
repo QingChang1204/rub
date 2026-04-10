@@ -4,217 +4,27 @@ use std::sync::Arc;
 use rub_core::error::RubError;
 use rub_core::model::{
     HumanVerificationHandoffStatus, InterferenceKind, InterferenceRuntimeInfo, LaunchPolicyInfo,
-    OrchestrationSessionInfo, TabInfo,
+    TabInfo,
 };
 use rub_core::port::BrowserPort;
 
+use crate::orchestration_runtime::projected_orchestration_session;
 use crate::session::SessionState;
 
-pub(crate) async fn refresh_live_runtime_state(
-    browser: &Arc<dyn BrowserPort>,
-    state: &Arc<SessionState>,
-) {
-    let sequence = state.allocate_runtime_state_sequence();
-    match browser.probe_runtime_state().await {
-        Ok(runtime_state) => {
-            state
-                .publish_runtime_state_snapshot(sequence, runtime_state)
-                .await;
-        }
-        Err(error) => {
-            state
-                .mark_runtime_state_probe_degraded(sequence, error.to_string())
-                .await;
-        }
-    }
-}
+mod interference;
+mod orchestration;
+mod surfaces;
 
-pub(crate) async fn refresh_live_dialog_runtime(
-    browser: &Arc<dyn BrowserPort>,
-    state: &Arc<SessionState>,
-) {
-    match browser.dialog_runtime().await {
-        Ok(runtime) => {
-            state.set_dialog_projection(0, runtime).await;
-        }
-        Err(error) => {
-            state
-                .mark_dialog_runtime_degraded(0, format!("dialog_probe_failed:{error}"))
-                .await;
-        }
-    }
-}
-
-pub(crate) async fn refresh_live_frame_runtime(
-    browser: &Arc<dyn BrowserPort>,
-    state: &Arc<SessionState>,
-) {
-    match browser.list_frames().await {
-        Ok(frames) => {
-            state.apply_frame_inventory(&frames).await;
-        }
-        Err(error) => {
-            state
-                .mark_frame_runtime_degraded(format!("frame_probe_failed:{error}"))
-                .await;
-        }
-    }
-}
-
-pub(crate) async fn refresh_takeover_runtime(
-    browser: &Arc<dyn BrowserPort>,
-    state: &Arc<SessionState>,
-) {
-    let launch_policy = browser.launch_policy();
-    state.refresh_takeover_runtime(&launch_policy).await;
-}
-
-pub(crate) async fn refresh_orchestration_runtime(state: &Arc<SessionState>) {
-    let sequence = state.allocate_orchestration_runtime_sequence();
-    match load_registry_authority_snapshot(state.rub_home.clone()).await {
-        Ok(snapshot) => {
-            let mut known_sessions = Vec::new();
-            for entry in snapshot.active_entries() {
-                let current = entry.session_id == state.session_id;
-                known_sessions.push(OrchestrationSessionInfo {
-                    current,
-                    session_id: entry.session_id,
-                    session_name: entry.session_name,
-                    pid: entry.pid,
-                    socket_path: entry.socket_path,
-                    ipc_protocol_version: entry.ipc_protocol_version,
-                    user_data_dir: entry.user_data_dir,
-                });
-            }
-            let degraded_reason = if known_sessions.is_empty() {
-                Some("live_registry_empty".to_string())
-            } else if known_sessions.iter().any(|session| session.current) {
-                None
-            } else {
-                Some("current_session_missing_from_live_registry".to_string())
-            };
-            state
-                .set_orchestration_runtime(sequence, known_sessions, degraded_reason)
-                .await;
-        }
-        Err(error) => {
-            state
-                .mark_orchestration_runtime_degraded(
-                    sequence,
-                    format!("registry_read_failed:{error}"),
-                )
-                .await;
-        }
-    }
-}
-
-async fn load_registry_authority_snapshot(
-    rub_home: PathBuf,
-) -> Result<crate::session::RegistryAuthoritySnapshot, String> {
-    tokio::task::spawn_blocking(move || crate::session::registry_authority_snapshot(&rub_home))
-        .await
-        .map_err(|error| format!("registry_refresh_join_failed:{error}"))?
-        .map_err(|error| error.to_string())
-}
-
-pub(crate) async fn refresh_live_storage_runtime(
-    browser: &Arc<dyn BrowserPort>,
-    state: &Arc<SessionState>,
-) {
-    let selected_frame_id = state.selected_frame_id().await;
-    match browser
-        .storage_snapshot(selected_frame_id.as_deref(), None)
-        .await
-    {
-        Ok(snapshot) => {
-            state.set_storage_snapshot(snapshot).await;
-        }
-        Err(error) => {
-            state
-                .mark_storage_runtime_degraded(format!("storage_probe_failed:{error}"))
-                .await;
-        }
-    }
-}
-
-pub(crate) async fn refresh_live_trigger_runtime(
-    browser: &Arc<dyn BrowserPort>,
-    state: &Arc<SessionState>,
-) -> Result<Vec<TabInfo>, RubError> {
-    match browser.list_tabs().await {
-        Ok(tabs) => {
-            state.reconcile_trigger_runtime(&tabs).await;
-            state.clear_trigger_runtime_degraded().await;
-            Ok(tabs)
-        }
-        Err(error) => {
-            state
-                .mark_trigger_runtime_degraded(format!("tab_probe_failed:{error}"))
-                .await;
-            Err(error)
-        }
-    }
-}
-
-pub(crate) async fn refresh_live_interference_state(
-    browser: &Arc<dyn BrowserPort>,
-    state: &Arc<SessionState>,
-) -> Result<Vec<TabInfo>, RubError> {
-    let launch_policy = browser.launch_policy();
-    match browser.list_tabs().await {
-        Ok(tabs) => {
-            let runtime = state.classify_interference_runtime(&tabs).await;
-            apply_policy_driven_handoff(state, &runtime, &launch_policy).await;
-            Ok(tabs)
-        }
-        Err(error) => {
-            state
-                .mark_interference_runtime_degraded(format!("tab_probe_failed:{error}"))
-                .await;
-            Err(error)
-        }
-    }
-}
-
-pub(crate) async fn refresh_live_runtime_and_interference(
-    browser: &Arc<dyn BrowserPort>,
-    state: &Arc<SessionState>,
-) -> Result<Vec<TabInfo>, RubError> {
-    refresh_live_runtime_state(browser, state).await;
-    refresh_live_frame_runtime(browser, state).await;
-    refresh_live_storage_runtime(browser, state).await;
-    refresh_takeover_runtime(browser, state).await;
-    refresh_live_interference_state(browser, state).await
-}
-
-async fn apply_policy_driven_handoff(
-    state: &Arc<SessionState>,
-    runtime: &InterferenceRuntimeInfo,
-    launch_policy: &LaunchPolicyInfo,
-) {
-    let should_escalate = matches!(
-        runtime
-            .current_interference
-            .as_ref()
-            .map(|current| current.kind),
-        Some(InterferenceKind::HumanVerificationRequired)
-    ) && runtime
-        .active_policies
-        .iter()
-        .any(|policy| policy == "handoff_escalation");
-    if !should_escalate {
-        return;
-    }
-
-    let handoff = state.human_verification_handoff().await;
-    if matches!(
-        handoff.status,
-        HumanVerificationHandoffStatus::Available | HumanVerificationHandoffStatus::Completed
-    ) {
-        state.activate_handoff().await;
-        state.refresh_takeover_runtime(launch_policy).await;
-    }
-}
+#[cfg(test)]
+use interference::apply_policy_driven_handoff;
+pub(crate) use interference::{
+    refresh_live_interference_state, refresh_live_runtime_and_interference,
+};
+pub(crate) use orchestration::refresh_orchestration_runtime;
+pub(crate) use surfaces::{
+    refresh_live_dialog_runtime, refresh_live_frame_runtime, refresh_live_runtime_state,
+    refresh_live_storage_runtime, refresh_live_trigger_runtime, refresh_takeover_runtime,
+};
 
 #[cfg(test)]
 mod tests {
@@ -438,6 +248,13 @@ mod tests {
         );
         assert_eq!(runtime.known_sessions[0].session_id, state.session_id);
         assert!(runtime.known_sessions[0].current);
+        assert_eq!(
+            runtime.known_sessions[0]
+                .socket_path_state
+                .as_ref()
+                .map(|state| state.path_kind.as_str()),
+            Some("session_socket_reference")
+        );
 
         let _ = std::fs::remove_dir_all(home);
         fixture.join();
@@ -523,6 +340,13 @@ mod tests {
         assert_eq!(runtime.known_sessions.len(), 1);
         assert!(runtime.known_sessions[0].current);
         assert_eq!(runtime.known_sessions[0].session_id, state.session_id);
+        assert_eq!(
+            runtime.known_sessions[0]
+                .socket_path_state
+                .as_ref()
+                .map(|state| state.path_authority.as_str()),
+            Some("session.orchestration_runtime.known_sessions.socket_path")
+        );
 
         let _ = std::fs::remove_dir_all(home);
         fixture.join();

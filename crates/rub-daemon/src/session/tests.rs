@@ -10,8 +10,8 @@ use rub_core::model::{
     InterferenceRuntimeStatus, NetworkRequestLifecycle, NetworkRequestRecord, NetworkRuleSpec,
     NetworkRuleStatus, OrchestrationAddressInfo, OrchestrationExecutionPolicyInfo,
     OrchestrationMode, OrchestrationRuleInfo, OrchestrationRuleStatus, OrchestrationRuntimeStatus,
-    OrchestrationSessionInfo, OverlayState, ReadinessInfo, ReadinessStatus, RequestSummaryEvent,
-    RouteStability, RuntimeObservatoryStatus, RuntimeStateSnapshot, Snapshot, StateInspectorInfo,
+    OverlayState, ReadinessInfo, ReadinessStatus, RequestSummaryEvent, RouteStability,
+    RuntimeObservatoryStatus, RuntimeStateSnapshot, Snapshot, StateInspectorInfo,
     StateInspectorStatus, TriggerActionKind, TriggerActionSpec, TriggerConditionKind,
     TriggerConditionSpec,
 };
@@ -178,7 +178,14 @@ async fn session_flushes_post_commit_projection_into_history_and_workflow_captur
             "spec": "[]",
             "spec_source": {
                 "kind": "file",
-                "path": "/tmp/workflow.json"
+                "path": "/tmp/workflow.json",
+                "path_state": {
+                    "truth_level": "input_path_reference",
+                    "path_authority": "cli.pipe.spec_source.path",
+                    "upstream_truth": "cli_pipe_file_option",
+                    "path_kind": "workflow_spec_file",
+                    "control_role": "display_only"
+                }
             }
         }),
         30_000,
@@ -197,6 +204,9 @@ async fn session_flushes_post_commit_projection_into_history_and_workflow_captur
     assert_eq!(history.entries.len(), 1);
     assert_eq!(history.entries[0].command, "pipe");
     assert!(history.entries[0].summary.is_some());
+    assert_eq!(history.oldest_retained_sequence, Some(1));
+    assert_eq!(history.newest_retained_sequence, Some(1));
+    assert_eq!(history.dropped_before_retention, 0);
 
     let capture = state.workflow_capture(5).await;
     assert_eq!(capture.entries.len(), 1);
@@ -205,6 +215,10 @@ async fn session_flushes_post_commit_projection_into_history_and_workflow_captur
     assert_eq!(
         capture.entries[0].args["spec_source"]["path"],
         serde_json::json!("/tmp/workflow.json")
+    );
+    assert_eq!(
+        capture.entries[0].args["spec_source"]["path_state"]["path_authority"],
+        serde_json::json!("cli.pipe.spec_source.path")
     );
 }
 
@@ -243,6 +257,250 @@ async fn session_background_projection_drain_applies_pending_entries() {
     let capture = state.workflow_capture(5).await;
     assert_eq!(capture.entries.len(), 1);
     assert_eq!(capture.entries[0].command, "open");
+}
+
+#[tokio::test]
+async fn session_records_redacted_post_commit_journal_entry() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = std::env::temp_dir().join(format!(
+            "rub-post-commit-journal-redact-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+        let secrets = home.join("secrets.env");
+        std::fs::write(&secrets, "RUB_TOKEN=token-123\n").expect("write secrets");
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o600))
+            .expect("set permissions");
+
+        let state = SessionState::new("default", home.clone(), None);
+        let request = IpcRequest::new(
+            "type",
+            serde_json::json!({ "selector": "#password", "text": "token-123", "clear": true }),
+            1_000,
+        )
+        .with_command_id("cmd-1")
+        .expect("static command_id must be valid");
+        let response = rub_ipc::protocol::IpcResponse::success(
+            "req-1",
+            serde_json::json!({
+                "echo": "token-123",
+            }),
+        )
+        .with_command_id("cmd-1")
+        .expect("static command_id must be valid");
+
+        state
+            .record_post_commit_journal(&request, &response)
+            .await
+            .expect("journal append succeeds");
+        let journal = state
+            .read_post_commit_journal_entries_for_tests()
+            .expect("read journal");
+
+        assert_eq!(journal.len(), 1);
+        assert_eq!(
+            journal[0]["request"]["args"]["text"],
+            serde_json::json!("$RUB_TOKEN")
+        );
+        assert_eq!(
+            journal[0]["response"]["data"]["echo"],
+            serde_json::json!("$RUB_TOKEN")
+        );
+        assert_eq!(journal[0]["command_id"], serde_json::json!("cmd-1"));
+        assert_eq!(
+            journal[0]["request_redaction_lossy"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            journal[0]["response_redaction_lossy"],
+            serde_json::json!(false)
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+}
+
+#[tokio::test]
+async fn session_redacts_post_commit_journal_error_response_context() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = std::env::temp_dir().join(format!(
+            "rub-post-commit-journal-error-redact-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+        let secrets = home.join("secrets.env");
+        std::fs::write(&secrets, "RUB_TOKEN=token-123\n").expect("write secrets");
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o600))
+            .expect("set permissions");
+
+        let state = SessionState::new("default", home.clone(), None);
+        let request = IpcRequest::new("open", serde_json::json!({}), 1_000);
+        let response = rub_ipc::protocol::IpcResponse::error(
+            "req-err",
+            rub_core::error::ErrorEnvelope::new(
+                rub_core::error::ErrorCode::InvalidInput,
+                "token-123 is not allowed",
+            )
+            .with_context(serde_json::json!({
+                "secret": "token-123",
+            })),
+        );
+
+        state
+            .record_post_commit_journal(&request, &response)
+            .await
+            .expect("journal append succeeds");
+        let journal = state
+            .read_post_commit_journal_entries_for_tests()
+            .expect("read journal");
+
+        assert_eq!(journal.len(), 1);
+        assert_eq!(
+            journal[0]["response"]["error"]["message"],
+            serde_json::json!("$RUB_TOKEN is not allowed")
+        );
+        assert_eq!(
+            journal[0]["response"]["error"]["context"]["secret"],
+            serde_json::json!("$RUB_TOKEN")
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+}
+
+#[tokio::test]
+async fn session_tracks_post_commit_journal_append_failures() {
+    let home = std::env::temp_dir().join(format!(
+        "rub-post-commit-journal-failure-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let state = SessionState::new("default", home.clone(), None);
+    let request = IpcRequest::new(
+        "open",
+        serde_json::json!({ "url": "https://example.com" }),
+        1_000,
+    );
+    let response = rub_ipc::protocol::IpcResponse::success("req-1", serde_json::json!({}));
+
+    state.force_post_commit_journal_failure_once();
+    let error = state
+        .record_post_commit_journal(&request, &response)
+        .await
+        .expect_err("forced failure should surface");
+    assert!(
+        error
+            .to_string()
+            .contains("forced post-commit journal failure")
+    );
+    assert_eq!(state.post_commit_journal_failure_count(), 1);
+    assert!(
+        state
+            .read_post_commit_journal_entries_for_tests()
+            .expect("read journal")
+            .is_empty()
+    );
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[tokio::test]
+async fn session_reopens_same_session_id_and_appends_to_existing_journal() {
+    let home = std::env::temp_dir().join(format!(
+        "rub-post-commit-journal-reopen-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let session_id = "sess-fixed";
+    let first = SessionState::new_with_id("default", session_id, home.clone(), None);
+    let request_one = IpcRequest::new(
+        "open",
+        serde_json::json!({"url": "https://one.test"}),
+        1_000,
+    );
+    let response_one =
+        rub_ipc::protocol::IpcResponse::success("req-1", serde_json::json!({"ok": true}));
+    first
+        .record_post_commit_journal(&request_one, &response_one)
+        .await
+        .expect("first append succeeds");
+
+    let second = SessionState::new_with_id("default", session_id, home.clone(), None);
+    let request_two = IpcRequest::new(
+        "open",
+        serde_json::json!({"url": "https://two.test"}),
+        1_000,
+    );
+    let response_two =
+        rub_ipc::protocol::IpcResponse::success("req-2", serde_json::json!({"ok": true}));
+    second
+        .record_post_commit_journal(&request_two, &response_two)
+        .await
+        .expect("second append succeeds");
+
+    let journal = second
+        .read_post_commit_journal_entries_for_tests()
+        .expect("read journal");
+    assert_eq!(journal.len(), 2);
+    assert_eq!(journal[0]["request_id"], serde_json::json!("req-1"));
+    assert_eq!(journal[1]["request_id"], serde_json::json!("req-2"));
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[tokio::test]
+async fn session_ignores_torn_post_commit_journal_tail() {
+    let home = std::env::temp_dir().join(format!(
+        "rub-post-commit-journal-tail-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let state = SessionState::new("default", home.clone(), None);
+    let request = IpcRequest::new(
+        "open",
+        serde_json::json!({"url": "https://example.test"}),
+        1_000,
+    );
+    let response =
+        rub_ipc::protocol::IpcResponse::success("req-1", serde_json::json!({"ok": true}));
+    state
+        .record_post_commit_journal(&request, &response)
+        .await
+        .expect("append succeeds");
+
+    let journal_path = crate::rub_paths::RubPaths::new(&home)
+        .session_runtime(&state.session_name, &state.session_id)
+        .post_commit_journal_path();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&journal_path)
+        .expect("open journal");
+    use std::io::Write as _;
+    file.write_all(b"{\"command\":\"broken\"")
+        .expect("append torn tail");
+    file.sync_all().expect("sync torn tail");
+
+    let journal = state
+        .read_post_commit_journal_entries_for_tests()
+        .expect("read journal");
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0]["request_id"], serde_json::json!("req-1"));
+
+    let _ = std::fs::remove_dir_all(home);
 }
 
 #[tokio::test]
@@ -288,6 +546,7 @@ async fn history_and_workflow_capture_surface_dropped_post_commit_records() {
 
     let history = state.command_history(5).await;
     assert!(history.dropped_before_projection > 0);
+    assert!(history.dropped_before_retention > 0);
 
     let capture = state.workflow_capture(5).await;
     assert!(capture.dropped_before_projection > 0);
@@ -980,15 +1239,17 @@ async fn stale_orchestration_runtime_sequence_does_not_override_newer_projection
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
     let current_session_id = state.session_id.clone();
     let current_session_name = state.session_name.clone();
-    let newer_sessions = vec![OrchestrationSessionInfo {
-        current: true,
-        session_id: current_session_id.clone(),
-        session_name: current_session_name.clone(),
-        pid: 42,
-        socket_path: "/tmp/rub-current.sock".to_string(),
-        ipc_protocol_version: "1.0".to_string(),
-        user_data_dir: None,
-    }];
+    let newer_sessions = vec![
+        crate::orchestration_runtime::projected_orchestration_session(
+            current_session_id.clone(),
+            current_session_name.clone(),
+            42,
+            "/tmp/rub-current.sock".to_string(),
+            true,
+            "1.0".to_string(),
+            None,
+        ),
+    ];
 
     state
         .set_orchestration_runtime(2, newer_sessions.clone(), None)

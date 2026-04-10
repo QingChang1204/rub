@@ -3,20 +3,28 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Notify, Semaphore};
-use tokio::task::JoinHandle;
 use tracing::{error, info};
-use uuid::Uuid;
 
 use crate::router::DaemonRouter;
 use crate::session::{
     RegistryEntry, SessionState, authoritative_entry_by_session_name, cleanup_projections,
     deregister_session, ensure_rub_home, promote_session_authority, register_pending_session,
-    register_session_with_displaced, rfc3339_now,
+    rfc3339_now,
 };
 use rub_core::error::{ErrorCode, ErrorEnvelope};
-use rub_core::fs::{FileCommitOutcome, atomic_write_bytes, sync_parent_dir};
 use rub_ipc::codec::NdJsonCodec;
-use rub_ipc::protocol::{IPC_PROTOCOL_VERSION, IpcRequest};
+use rub_ipc::protocol::IPC_PROTOCOL_VERSION;
+
+mod io;
+mod projection;
+mod shutdown;
+
+use io::{handle_connection, protocol_read_failure_response};
+use projection::{
+    publish_pid_projection, publish_socket_projection, publish_startup_commit_marker,
+    restore_previous_authority, signal_ready, startup_ready_marker_path,
+};
+use shutdown::{wait_for_shutdown_signal, wait_for_transaction_drain, wait_for_worker_shutdown};
 
 const IPC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -238,371 +246,16 @@ pub async fn run_daemon(
     Ok(())
 }
 
-/// Handle a single IPC connection from a CLI client.
-async fn handle_connection(
-    stream: tokio::net::UnixStream,
-    router: Arc<DaemonRouter>,
-    state: Arc<SessionState>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    handle_connection_inner(stream, router, &state).await
-}
-
-async fn handle_connection_inner(
-    stream: tokio::net::UnixStream,
-    router: Arc<DaemonRouter>,
-    state: &Arc<SessionState>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (reader, mut writer) = stream.into_split();
-    let mut buf_reader = tokio::io::BufReader::new(reader);
-
-    // Read one request per connection
-    let request: Option<IpcRequest> =
-        match tokio::time::timeout(IPC_READ_TIMEOUT, NdJsonCodec::read(&mut buf_reader)).await {
-            Err(_) => {
-                let response = protocol_read_failure_response(
-                    ErrorEnvelope::new(
-                        ErrorCode::IpcTimeout,
-                        format!(
-                            "Timed out waiting for an NDJSON request commit fence after {}s",
-                            IPC_READ_TIMEOUT.as_secs()
-                        ),
-                    )
-                    .with_context(serde_json::json!({
-                        "phase": "ipc_read",
-                        "reason": "ipc_read_timeout",
-                    })),
-                );
-                let _ = NdJsonCodec::write(&mut writer, &response).await;
-                return Ok(());
-            }
-            Ok(Ok(request)) => request,
-            Ok(Err(error)) => {
-                let response = protocol_read_failure_response(read_failure_envelope(error));
-                let _ = NdJsonCodec::write(&mut writer, &response).await;
-                return Ok(());
-            }
-        };
-    let Some(request) = request else {
-        return Ok(()); // Client disconnected
-    };
-
-    let _connected_client = ConnectedClientGuard::new(state);
-    info!(command = %request.command, command_id = ?request.command_id, "Received request");
-
-    // Dispatch through router
-    let response = router.dispatch(request, state).await;
-
-    // Write response
-    NdJsonCodec::write(&mut writer, &response).await?;
-
-    Ok(())
-}
-
-struct ConnectedClientGuard<'a> {
-    state: &'a Arc<SessionState>,
-}
-
-impl<'a> ConnectedClientGuard<'a> {
-    fn new(state: &'a Arc<SessionState>) -> Self {
-        state
-            .connected_client_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self { state }
-    }
-}
-
-impl Drop for ConnectedClientGuard<'_> {
-    fn drop(&mut self) {
-        self.state
-            .connected_client_count
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-fn protocol_read_failure_response(envelope: ErrorEnvelope) -> rub_ipc::protocol::IpcResponse {
-    rub_ipc::protocol::IpcResponse::error(Uuid::now_v7().to_string(), envelope)
-}
-
-fn read_failure_envelope(error: Box<dyn std::error::Error + Send + Sync>) -> ErrorEnvelope {
-    match error.downcast::<std::io::Error>() {
-        Ok(io_error) => {
-            let reason = match io_error.kind() {
-                std::io::ErrorKind::UnexpectedEof => "partial_ndjson_frame",
-                std::io::ErrorKind::InvalidData
-                    if io_error
-                        .to_string()
-                        .contains("NDJSON frame exceeds maximum on-wire size") =>
-                {
-                    "oversized_ndjson_frame"
-                }
-                std::io::ErrorKind::InvalidData => "invalid_ndjson_frame",
-                _ => "ipc_read_failure",
-            };
-            ErrorEnvelope::new(
-                ErrorCode::IpcProtocolError,
-                format!("Invalid NDJSON request: {io_error}"),
-            )
-            .with_context(serde_json::json!({
-                "phase": "ipc_read",
-                "reason": reason,
-            }))
-        }
-        Err(error) => match error.downcast::<serde_json::Error>() {
-            Ok(json_error) => ErrorEnvelope::new(
-                ErrorCode::IpcProtocolError,
-                format!("Invalid JSON request body: {json_error}"),
-            )
-            .with_context(serde_json::json!({
-                "phase": "ipc_read",
-                "reason": "invalid_json_request",
-            })),
-            Err(error) => ErrorEnvelope::new(
-                ErrorCode::IpcProtocolError,
-                format!("Failed to parse IPC request: {error}"),
-            )
-            .with_context(serde_json::json!({
-                "phase": "ipc_read",
-                "reason": "ipc_read_failure",
-            })),
-        },
-    }
-}
-
-async fn wait_for_transaction_drain(state: &Arc<SessionState>) {
-    wait_for_transaction_drain_with_timeout(
-        state,
-        SHUTDOWN_DRAIN_TIMEOUT,
-        SHUTDOWN_DRAIN_POLL_INTERVAL,
-    )
-    .await;
-}
-
-async fn wait_for_transaction_drain_with_timeout(
-    state: &Arc<SessionState>,
-    timeout: std::time::Duration,
-    poll_interval: std::time::Duration,
-) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut timeout_logged = false;
-    loop {
-        let in_flight = state
-            .in_flight_count
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let connected = state
-            .connected_client_count
-            .load(std::sync::atomic::Ordering::SeqCst);
-        if in_flight == 0 && connected == 0 {
-            break;
-        }
-        if !timeout_logged && tokio::time::Instant::now() >= deadline {
-            error!(
-                in_flight_count = in_flight,
-                connected_client_count = connected,
-                "Shutdown drain exceeded the soft budget; continuing to wait because teardown must not cut an in-flight transaction"
-            );
-            timeout_logged = true;
-        }
-        tokio::time::sleep(poll_interval).await;
-    }
-
-    if state.pending_post_commit_projection_count() > 0 {
-        state.drain_post_commit_projections().await;
-    }
-}
-
-async fn wait_for_worker_shutdown(handle: JoinHandle<()>, worker_name: &str) {
-    wait_for_worker_shutdown_with_timeout(handle, worker_name, SHUTDOWN_DRAIN_TIMEOUT).await;
-}
-
-async fn wait_for_worker_shutdown_with_timeout(
-    mut handle: JoinHandle<()>,
-    worker_name: &str,
-    timeout: std::time::Duration,
-) {
-    match tokio::time::timeout(timeout, &mut handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            error!(worker = worker_name, error = %error, "Shutdown worker task exited with join error");
-        }
-        Err(_) => {
-            error!(
-                worker = worker_name,
-                "Shutdown worker exceeded the soft budget; continuing to wait because aborting it could drop an in-flight automation transaction guard"
-            );
-            match handle.await {
-                Ok(()) => {}
-                Err(error) => {
-                    error!(
-                        worker = worker_name,
-                        error = %error,
-                        "Shutdown worker task exited with join error after the soft budget"
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// Wait for SIGTERM or SIGINT.
-async fn wait_for_shutdown_signal() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = signal(SignalKind::terminate())?;
-        let mut sigint = signal(SignalKind::interrupt())?;
-        tokio::select! {
-            _ = sigterm.recv() => { info!("Received SIGTERM"); }
-            _ = sigint.recv() => { info!("Received SIGINT"); }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await?;
-        info!("Received Ctrl-C");
-    }
-    Ok(())
-}
-
-fn signal_ready() -> std::io::Result<()> {
-    if let Some(path) = std::env::var_os("RUB_DAEMON_READY_FILE") {
-        atomic_write_durable_bytes(Path::new(&path), b"ready", 0o600)?;
-    }
-    Ok(())
-}
-
-fn restore_previous_authority(home: &Path, entry: &RegistryEntry) -> std::io::Result<()> {
-    let _ = register_session_with_displaced(home, entry.clone())?;
-    restore_socket_projection(home, entry)?;
-    restore_pid_projection(home, entry)?;
-    restore_startup_commit_marker(home, entry)?;
-    Ok(())
-}
-
-fn startup_ready_marker_path() -> Option<PathBuf> {
-    std::env::var_os("RUB_DAEMON_READY_FILE").map(PathBuf::from)
-}
-
-fn publish_pid_projection(state: &SessionState, pid: u32) -> std::io::Result<()> {
-    let session_paths =
-        crate::rub_paths::RubPaths::new(&state.rub_home).session(&state.session_name);
-    std::fs::create_dir_all(session_paths.projection_dir())?;
-    atomic_write_durable_bytes(
-        &session_paths.canonical_pid_path(),
-        pid.to_string().as_bytes(),
-        0o600,
-    )?;
-
-    Ok(())
-}
-
-fn publish_startup_commit_marker(state: &SessionState) -> std::io::Result<()> {
-    let session_paths =
-        crate::rub_paths::RubPaths::new(&state.rub_home).session(&state.session_name);
-    if let Some(parent) = session_paths.startup_committed_path().parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    atomic_write_durable_bytes(
-        &session_paths.startup_committed_path(),
-        state.session_id.as_bytes(),
-        0o600,
-    )?;
-    Ok(())
-}
-
-fn restore_startup_commit_marker(home: &Path, entry: &RegistryEntry) -> std::io::Result<()> {
-    let session_paths = crate::rub_paths::RubPaths::new(home).session(&entry.session_name);
-    if let Some(parent) = session_paths.startup_committed_path().parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    atomic_write_durable_bytes(
-        &session_paths.startup_committed_path(),
-        entry.session_id.as_bytes(),
-        0o600,
-    )?;
-    Ok(())
-}
-
-fn restore_pid_projection(home: &Path, entry: &RegistryEntry) -> std::io::Result<()> {
-    let session_paths = crate::rub_paths::RubPaths::new(home).session(&entry.session_name);
-    std::fs::create_dir_all(session_paths.projection_dir())?;
-    atomic_write_durable_bytes(
-        &session_paths.canonical_pid_path(),
-        entry.pid.to_string().as_bytes(),
-        0o600,
-    )?;
-    Ok(())
-}
-
-fn publish_socket_projection(state: &SessionState) -> std::io::Result<()> {
-    let runtime_paths = crate::rub_paths::RubPaths::new(&state.rub_home)
-        .session_runtime(&state.session_name, &state.session_id);
-    let projection_paths =
-        crate::rub_paths::RubPaths::new(&state.rub_home).session(&state.session_name);
-    let actual_socket = runtime_paths.socket_path();
-    #[cfg(unix)]
-    {
-        let canonical_socket = projection_paths.canonical_socket_path();
-        atomic_replace_symlink(&actual_socket, &canonical_socket)?;
-    }
-
-    Ok(())
-}
-
-fn restore_socket_projection(home: &Path, entry: &RegistryEntry) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let canonical_socket = crate::rub_paths::RubPaths::new(home)
-            .session(&entry.session_name)
-            .canonical_socket_path();
-        atomic_replace_symlink(Path::new(&entry.socket_path), &canonical_socket)?;
-    }
-
-    Ok(())
-}
-
-fn atomic_write_durable_bytes(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
-    let outcome = atomic_write_bytes(path, contents, mode)?;
-    require_durable_projection_commit(path, outcome)
-}
-
-fn require_durable_projection_commit(
-    path: &Path,
-    outcome: FileCommitOutcome,
-) -> std::io::Result<()> {
-    if outcome.durability_confirmed() {
-        return Ok(());
-    }
-    Err(std::io::Error::other(format!(
-        "Projection commit for {} was published but durability was not confirmed",
-        path.display()
-    )))
-}
-
-#[cfg(unix)]
-fn atomic_replace_symlink(target: &Path, symlink_path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::symlink;
-
-    if let Some(parent) = symlink_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temp_symlink = symlink_path.with_extension(format!("tmp-link-{}", Uuid::now_v7()));
-    let _ = std::fs::remove_file(&temp_symlink);
-    symlink(target, &temp_symlink)?;
-    if let Err(error) = std::fs::rename(&temp_symlink, symlink_path) {
-        let _ = std::fs::remove_file(&temp_symlink);
-        return Err(error);
-    }
-    sync_parent_dir(symlink_path)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         StartupCommitGuard, protocol_read_failure_response, publish_pid_projection,
-        publish_socket_projection, publish_startup_commit_marker, read_failure_envelope,
-        signal_ready, wait_for_transaction_drain, wait_for_transaction_drain_with_timeout,
-        wait_for_worker_shutdown_with_timeout,
+        publish_socket_projection, publish_startup_commit_marker, signal_ready,
+        wait_for_transaction_drain,
+    };
+    use crate::daemon::io::read_failure_envelope;
+    use crate::daemon::shutdown::{
+        wait_for_transaction_drain_with_timeout, wait_for_worker_shutdown_with_timeout,
     };
     use crate::rub_paths::RubPaths;
     use crate::session::{RegistryEntry, SessionState, read_registry, write_registry};
@@ -698,6 +351,30 @@ mod tests {
         assert_eq!(
             response.error.as_ref().map(|error| error.code),
             Some(ErrorCode::IpcProtocolError)
+        );
+    }
+
+    #[test]
+    fn read_failure_envelope_preserves_request_contract_reason() {
+        let envelope =
+            read_failure_envelope(Box::new(rub_ipc::protocol::IpcProtocolDecodeError::new(
+                rub_ipc::protocol::IpcRequest::from_value_strict(serde_json::json!({
+                    "ipc_protocol_version": "1.0",
+                    "command": "doctor",
+                    "args": {},
+                    "timeout_ms": 1000,
+                    "unexpected": "field",
+                }))
+                .expect_err("strict decode should reject unknown fields"),
+            )));
+        assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("invalid_ipc_request_contract")
         );
     }
 

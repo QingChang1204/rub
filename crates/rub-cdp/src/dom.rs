@@ -17,6 +17,7 @@ use rub_core::model::{
     AXInfo, BoundingBox, ChangedElement, DiffElement, DiffResult, DiffSemanticKind, DiffSummary,
     Element, ElementTag, FieldChange, ScrollPosition, Snapshot,
 };
+use rub_core::port::DEFAULT_SNAPSHOT_LIMIT;
 
 /// JavaScript template to extract interactive elements from the page.
 ///
@@ -273,10 +274,7 @@ async fn build_snapshot_internal(
     };
 
     let total_count = raw_elements.elements.len() as u32;
-    let effective_limit = match limit {
-        Some(0) | None => usize::MAX,
-        Some(value) => value as usize,
-    };
+    let effective_limit = normalize_snapshot_limit(limit);
 
     let projection_resolution = crate::projection::resolve_backend_refs_for_frame(
         page,
@@ -359,6 +357,14 @@ async fn build_snapshot_internal(
         viewport_filtered: None,
         viewport_count: None,
     })
+}
+
+fn normalize_snapshot_limit(limit: Option<u32>) -> usize {
+    match limit {
+        None => DEFAULT_SNAPSHOT_LIMIT as usize,
+        Some(0) => usize::MAX,
+        Some(value) => value as usize,
+    }
 }
 
 async fn extract_raw_elements(
@@ -917,8 +923,12 @@ fn append_ax_change(
 
 #[cfg(test)]
 mod tests {
-    use super::{ExtractedElementsPayload, extract_elements_script, highlight_overlay_js};
+    use super::{
+        ExtractedElementsPayload, extract_elements_script, highlight_overlay_js,
+        normalize_snapshot_limit,
+    };
     use rub_core::model::{Element, ElementTag, FrameContextInfo, ScrollPosition, Snapshot};
+    use rub_core::port::DEFAULT_SNAPSHOT_LIMIT;
     use std::collections::HashMap;
 
     /// Contract test: the JSON payload emitted by EXTRACT_ELEMENTS_JS_TEMPLATE must
@@ -1063,5 +1073,23 @@ mod tests {
         assert!(!script.contains("innerHTML"));
         assert!(script.contains("while (shadow.firstChild)"));
         assert!(script.contains("document.createElement('div')"));
+    }
+
+    #[test]
+    fn snapshot_limit_defaults_to_documented_default() {
+        assert_eq!(
+            normalize_snapshot_limit(None),
+            DEFAULT_SNAPSHOT_LIMIT as usize
+        );
+    }
+
+    #[test]
+    fn snapshot_limit_zero_remains_unbounded() {
+        assert_eq!(normalize_snapshot_limit(Some(0)), usize::MAX);
+    }
+
+    #[test]
+    fn snapshot_limit_preserves_explicit_positive_value() {
+        assert_eq!(normalize_snapshot_limit(Some(17)), 17);
     }
 }

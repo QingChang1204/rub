@@ -8,6 +8,7 @@ mod harvest_ctl;
 mod internal_daemon;
 mod orchestration_assets;
 mod output;
+mod persisted_artifacts;
 mod session_policy;
 mod timeout_budget;
 mod workflow_assets;
@@ -18,7 +19,7 @@ use commands::{Cli, Commands, EffectiveCli};
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 use session_policy::{
     ConnectionRequest, materialize_connection_request, parse_connection_request,
-    requires_existing_session_validation, resolve_attachment_identity,
+    requested_attachment_identity, requires_existing_session_validation,
     validate_existing_session_connection_request,
 };
 use std::time::{Duration, Instant};
@@ -138,7 +139,6 @@ async fn main() {
                     "close",
                     session,
                     pretty,
-                    false,
                     output_trace_mode(&cli),
                 );
                 println!("{output}");
@@ -183,10 +183,7 @@ async fn main() {
         let output = output::format_cli_error(
             command_name.as_str(),
             session,
-            ErrorEnvelope::new(
-                ErrorCode::DaemonStartFailed,
-                format!("Cannot create RUB_HOME {}: {e}", rub_home.display()),
-            ),
+            rub_home_create_error(&rub_home, &e),
             pretty,
         );
         println!("{output}");
@@ -336,22 +333,10 @@ async fn main() {
     let command_deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
 
     let daemon_args = daemon_args(&cli, &connection_request);
-    let attachment_identity =
-        match resolve_attachment_identity(&cli, &connection_request, None).await {
-            Ok(identity) => identity,
-            Err(error) => {
-                println!(
-                    "{}",
-                    output::format_cli_error(
-                        command_name.as_str(),
-                        session,
-                        error.into_envelope(),
-                        pretty,
-                    )
-                );
-                std::process::exit(1);
-            }
-        };
+    // Existing-session validation must run before any live probe of an override
+    // target, otherwise an unreachable `--cdp-url` masks the real
+    // fail-closed error with a transport failure.
+    let attachment_identity = requested_attachment_identity(&cli, &connection_request);
     if daemon_ctl::remaining_budget_ms(command_deadline) == 0 {
         println!(
             "{}",
@@ -492,14 +477,25 @@ async fn main() {
                 );
                 std::process::exit(1);
             }
-            let output = output::format_response(
-                &response,
-                command_name.as_str(),
-                session,
-                pretty,
-                exec_raw_requested(&cli.command),
-                output_trace_mode(&cli),
-            );
+            let output = if exec_raw_requested(&cli.command) {
+                output::format_exec_raw_response(&response, pretty).unwrap_or_else(|| {
+                    output::format_response(
+                        &response,
+                        command_name.as_str(),
+                        session,
+                        pretty,
+                        output_trace_mode(&cli),
+                    )
+                })
+            } else {
+                output::format_response(
+                    &response,
+                    command_name.as_str(),
+                    session,
+                    pretty,
+                    output_trace_mode(&cli),
+                )
+            };
             println!("{output}");
             if response.status == rub_ipc::protocol::ResponseStatus::Error {
                 std::process::exit(1);
@@ -543,24 +539,48 @@ fn output_trace_mode(cli: &EffectiveCli) -> output::InteractionTraceMode {
     }
 }
 
-fn handle_sessions(
-    rub_home: &std::path::Path,
-    session: &str,
-    pretty: bool,
-) -> Result<(), rub_core::error::RubError> {
-    use rub_core::model::CommandResult;
+fn local_runtime_path_state(
+    path_authority: &str,
+    upstream_truth: &str,
+    path_kind: &str,
+) -> rub_core::model::PathReferenceState {
+    rub_core::model::PathReferenceState {
+        truth_level: "local_runtime_reference".to_string(),
+        path_authority: path_authority.to_string(),
+        upstream_truth: upstream_truth.to_string(),
+        path_kind: path_kind.to_string(),
+        control_role: "display_only".to_string(),
+    }
+}
 
-    let sessions_data = rub_daemon::session::active_registry_entries(rub_home)
-        .map_err(|error| {
-            rub_core::error::RubError::domain_with_context(
-                ErrorCode::DaemonNotRunning,
-                format!("Failed to read session registry: {error}"),
-                serde_json::json!({
-                    "rub_home": rub_home.display().to_string(),
-                    "reason": "session_registry_read_failed",
-                }),
-            )
-        })?
+fn rub_home_create_error(rub_home: &std::path::Path, error: &std::io::Error) -> ErrorEnvelope {
+    ErrorEnvelope::new(
+        ErrorCode::DaemonStartFailed,
+        format!("Cannot create RUB_HOME {}: {error}", rub_home.display()),
+    )
+    .with_context(serde_json::json!({
+        "rub_home": rub_home.display().to_string(),
+        "rub_home_state": local_runtime_path_state(
+            "cli.main.subject.rub_home",
+            "cli_rub_home",
+            "rub_home_directory",
+        ),
+        "reason": "rub_home_create_failed",
+    }))
+}
+
+fn local_session_path_state(
+    path_authority: &str,
+    path_kind: &str,
+) -> rub_core::model::PathReferenceState {
+    local_runtime_path_state(path_authority, "cli_sessions_projection", path_kind)
+}
+
+fn project_sessions_result(
+    rub_home: &std::path::Path,
+    entries: Vec<rub_daemon::session::RegistryEntry>,
+) -> serde_json::Value {
+    let items = entries
         .into_iter()
         .map(|entry| {
             let rub_daemon::session::RegistryEntry {
@@ -579,21 +599,61 @@ fn handle_sessions(
                 "name": session_name,
                 "pid": pid,
                 "socket": socket_path,
+                "socket_state": local_session_path_state(
+                    "cli.sessions.result.items.socket",
+                    "session_socket"
+                ),
                 "created_at": created_at,
                 "ipc_protocol_version": ipc_protocol_version,
                 "user_data_dir": user_data_dir,
+                "user_data_dir_state": user_data_dir.as_ref().map(|_| {
+                    local_session_path_state(
+                        "cli.sessions.result.items.user_data_dir",
+                        "session_user_data_dir",
+                    )
+                }),
             })
         })
         .collect::<Vec<_>>();
-    let sessions_data = serde_json::json!({
+
+    serde_json::json!({
         "subject": {
             "kind": "session_registry",
             "rub_home": rub_home.display().to_string(),
+            "rub_home_state": local_session_path_state(
+                "cli.sessions.subject.rub_home",
+                "session_registry_home",
+            ),
         },
         "result": {
-            "items": sessions_data,
+            "items": items,
         }
-    });
+    })
+}
+
+fn handle_sessions(
+    rub_home: &std::path::Path,
+    session: &str,
+    pretty: bool,
+) -> Result<(), rub_core::error::RubError> {
+    use rub_core::model::CommandResult;
+
+    let entries = rub_daemon::session::active_registry_entries(rub_home).map_err(|error| {
+        rub_core::error::RubError::domain_with_context(
+            ErrorCode::DaemonNotRunning,
+            format!("Failed to read session registry: {error}"),
+            serde_json::json!({
+                "rub_home": rub_home.display().to_string(),
+                "rub_home_state": local_runtime_path_state(
+                    "cli.sessions.subject.rub_home",
+                    "cli_rub_home",
+                    "session_registry_home",
+                ),
+                "reason": "session_registry_read_failed",
+            }),
+        )
+    })?;
+    let sessions_data = project_sessions_result(rub_home, entries);
 
     let result = CommandResult::success(
         "sessions",
@@ -658,6 +718,7 @@ pub(crate) fn daemon_args(cli: &EffectiveCli, request: &ConnectionRequest) -> Ve
 mod tests {
     use super::*;
     use rub_core::error::ErrorCode;
+    use rub_daemon::session::RegistryEntry;
 
     #[test]
     fn daemon_args_forward_v14_policy_flags() {
@@ -788,7 +849,61 @@ mod tests {
             context["reason"],
             serde_json::json!("session_registry_read_failed")
         );
+        assert_eq!(
+            context["rub_home_state"]["path_authority"],
+            "cli.sessions.subject.rub_home"
+        );
 
         let _ = std::fs::remove_file(temp);
+    }
+
+    #[test]
+    fn rub_home_create_error_marks_rub_home_state() {
+        let envelope = rub_home_create_error(
+            std::path::Path::new("/tmp/rub-home"),
+            &std::io::Error::other("boom"),
+        );
+        let context = envelope.context.expect("rub_home startup context");
+        assert_eq!(context["reason"], "rub_home_create_failed");
+        assert_eq!(
+            context["rub_home_state"]["path_authority"],
+            "cli.main.subject.rub_home"
+        );
+        assert_eq!(context["rub_home_state"]["upstream_truth"], "cli_rub_home");
+    }
+
+    #[test]
+    fn project_sessions_result_marks_local_runtime_paths() {
+        let projected = project_sessions_result(
+            std::path::Path::new("/tmp/rub-home"),
+            vec![RegistryEntry {
+                session_id: "sess-default".to_string(),
+                session_name: "default".to_string(),
+                pid: 4242,
+                socket_path: "/tmp/rub-home/default.sock".to_string(),
+                created_at: "2026-04-08T00:00:00Z".to_string(),
+                ipc_protocol_version: "1.0".to_string(),
+                user_data_dir: Some("/tmp/rub-home/browser/default".to_string()),
+                attachment_identity: None,
+                connection_target: None,
+            }],
+        );
+
+        assert_eq!(
+            projected["subject"]["rub_home_state"]["path_authority"],
+            "cli.sessions.subject.rub_home"
+        );
+        assert_eq!(
+            projected["result"]["items"][0]["socket_state"]["path_authority"],
+            "cli.sessions.result.items.socket"
+        );
+        assert_eq!(
+            projected["result"]["items"][0]["socket_state"]["truth_level"],
+            "local_runtime_reference"
+        );
+        assert_eq!(
+            projected["result"]["items"][0]["user_data_dir_state"]["path_authority"],
+            "cli.sessions.result.items.user_data_dir"
+        );
     }
 }

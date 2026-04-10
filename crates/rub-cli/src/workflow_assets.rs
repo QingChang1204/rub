@@ -1,382 +1,20 @@
-use crate::commands::{Commands, EffectiveCli};
-use rub_core::error::{ErrorCode, RubError};
-use rub_core::fs::atomic_write_bytes;
-use rub_daemon::rub_paths::RubPaths;
-use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+mod export;
+mod listing;
+mod write;
 
-struct PendingAssetWrite {
-    path: PathBuf,
-    contents: Vec<u8>,
-    artifact: Value,
-}
-
-struct CommittedAssetWrite {
-    path: PathBuf,
-    previous_state: PreviousAssetState,
-    committed_contents: Vec<u8>,
-}
-
-enum PreviousAssetState {
-    Absent,
-    Readable(Vec<u8>),
-}
-
+pub use export::persist_history_export_asset;
+pub use listing::list_workflows;
+pub(crate) use listing::local_workflow_asset_path_state;
 pub(crate) use rub_daemon::workflow_assets::{
-    normalize_workflow_name, resolve_named_workflow_path,
+    normalize_workflow_name, resolve_named_workflow_path, workflow_asset_path_state,
 };
-
-pub fn list_workflows(rub_home: &Path) -> Result<Value, RubError> {
-    let paths = RubPaths::new(rub_home);
-    let directory = paths.workflows_dir();
-    let mut workflows = Vec::new();
-
-    if directory.exists() {
-        let entries = std::fs::read_dir(&directory).map_err(|error| {
-            RubError::domain(
-                ErrorCode::InvalidInput,
-                format!(
-                    "Failed to read workflow directory {}: {error}",
-                    directory.display()
-                ),
-            )
-        })?;
-
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                RubError::domain(
-                    ErrorCode::InvalidInput,
-                    format!(
-                        "Failed to enumerate workflow directory {}: {error}",
-                        directory.display()
-                    ),
-                )
-            })?;
-            let path = entry.path();
-            if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("json")
-            {
-                continue;
-            }
-            let metadata = entry.metadata().map_err(|error| {
-                RubError::domain(
-                    ErrorCode::InvalidInput,
-                    format!("Failed to stat workflow file {}: {error}", path.display()),
-                )
-            })?;
-            let Some(name) = workflow_name_from_path(&path) else {
-                continue;
-            };
-            workflows.push(json!({
-                "name": name,
-                "path": path.display().to_string(),
-                "size_bytes": metadata.len(),
-            }));
-        }
-    }
-
-    workflows.sort_by(|left, right| {
-        left["name"]
-            .as_str()
-            .unwrap_or_default()
-            .cmp(right["name"].as_str().unwrap_or_default())
-    });
-
-    Ok(json!({
-        "subject": {
-            "kind": "workflow_asset_registry",
-            "directory": directory.display().to_string(),
-        },
-        "result": {
-            "items": workflows,
-        }
-    }))
-}
-
-pub fn persist_history_export_asset(cli: &EffectiveCli, data: &mut Value) -> Result<(), RubError> {
-    let Commands::History {
-        export_pipe,
-        export_script,
-        save_as,
-        output,
-        ..
-    } = &cli.command
-    else {
-        return Ok(());
-    };
-
-    if !(*export_pipe || *export_script) {
-        return Ok(());
-    }
-    if save_as.is_none() && output.is_none() {
-        return Ok(());
-    }
-
-    let object = data.as_object_mut().ok_or_else(|| {
-        RubError::domain(
-            ErrorCode::IpcProtocolError,
-            "history export response must be a JSON object",
-        )
-    })?;
-    let result = object
-        .get_mut("result")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| {
-            RubError::domain(
-                ErrorCode::IpcProtocolError,
-                "history export response missing result object",
-            )
-        })?;
-    let format = result
-        .get("format")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            RubError::domain(ErrorCode::IpcProtocolError, "history export missing format")
-        })?;
-    let mut persisted_artifacts = result
-        .get("persisted_artifacts")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut pending_writes = Vec::new();
-
-    if let Some(name) = save_as {
-        let path = resolve_named_workflow_path(&cli.rub_home, name)?;
-        let serialized = render_export_asset(result, true)?;
-        pending_writes.push(PendingAssetWrite {
-            path: path.clone(),
-            contents: serialized,
-            artifact: json!({
-            "kind": "workflow_asset",
-            "role": "output",
-            "path": path.display().to_string(),
-            "workflow_name": normalize_workflow_name(name)?,
-            }),
-        });
-    }
-
-    if let Some(output_path) = output {
-        let path = resolve_cli_path(output_path);
-        let serialized = render_export_asset(result, false)?;
-        pending_writes.push(PendingAssetWrite {
-            path: path.clone(),
-            contents: serialized,
-            artifact: json!({
-            "kind": "history_export_file",
-            "role": "output",
-            "path": path.display().to_string(),
-            "format": format,
-            }),
-        });
-    }
-
-    if !pending_writes.is_empty() {
-        persisted_artifacts.extend(commit_asset_writes(pending_writes)?);
-    }
-
-    if !persisted_artifacts.is_empty() {
-        result.insert(
-            "persisted_artifacts".to_string(),
-            Value::Array(persisted_artifacts),
-        );
-    }
-
-    Ok(())
-}
-
-fn render_export_asset(
-    result: &serde_json::Map<String, Value>,
-    for_named_workflow: bool,
-) -> Result<Vec<u8>, RubError> {
-    let format = result
-        .get("format")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            RubError::domain(ErrorCode::IpcProtocolError, "history export missing format")
-        })?;
-    match format {
-        "pipe" => {
-            let steps = result.get("entries").cloned().ok_or_else(|| {
-                RubError::domain(
-                    ErrorCode::IpcProtocolError,
-                    "history export pipe response missing entries",
-                )
-            })?;
-            serde_json::to_vec_pretty(&json!({ "steps": steps })).map_err(RubError::from)
-        }
-        "script" => {
-            if for_named_workflow {
-                return Err(RubError::domain(
-                    ErrorCode::InvalidInput,
-                    "--save-as is only supported with --export-pipe",
-                ));
-            }
-            let script = result
-                .get("export")
-                .and_then(Value::as_object)
-                .and_then(|export| export.get("content"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    RubError::domain(
-                        ErrorCode::IpcProtocolError,
-                        "history export script response missing export.content",
-                    )
-                })?;
-            Ok(script.as_bytes().to_vec())
-        }
-        other => Err(RubError::domain(
-            ErrorCode::IpcProtocolError,
-            format!("unknown history export format '{other}'"),
-        )),
-    }
-}
-
-fn commit_asset_writes(writes: Vec<PendingAssetWrite>) -> Result<Vec<Value>, RubError> {
-    let mut committed = Vec::new();
-    let mut artifacts = Vec::new();
-
-    for write in writes {
-        if committed
-            .iter()
-            .any(|existing: &CommittedAssetWrite| existing.path == write.path)
-        {
-            return Err(asset_write_error(
-                format!("Duplicate workflow export path {}", write.path.display()),
-                rollback_asset_writes(&committed).err(),
-            ));
-        }
-
-        let previous_state = match read_previous_asset_state(&write.path) {
-            Ok(state) => state,
-            Err(error) => {
-                return Err(asset_write_error(
-                    error.to_string(),
-                    rollback_asset_writes(&committed).err(),
-                ));
-            }
-        };
-        let commit_outcome = match atomic_write_bytes(&write.path, &write.contents, 0o600) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return Err(asset_write_error(
-                    format!(
-                        "Failed to write workflow asset {}: {error}",
-                        write.path.display()
-                    ),
-                    rollback_asset_writes(&committed).err(),
-                ));
-            }
-        };
-        let mut artifact = write.artifact;
-        if !commit_outcome.durability_confirmed()
-            && let Some(object) = artifact.as_object_mut()
-        {
-            object.insert("durability_confirmed".to_string(), Value::Bool(false));
-        }
-
-        committed.push(CommittedAssetWrite {
-            path: write.path,
-            previous_state,
-            committed_contents: write.contents,
-        });
-        artifacts.push(artifact);
-    }
-
-    Ok(artifacts)
-}
-
-fn read_previous_asset_state(path: &Path) -> Result<PreviousAssetState, RubError> {
-    match std::fs::read(path) {
-        Ok(previous) => Ok(PreviousAssetState::Readable(previous)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(PreviousAssetState::Absent)
-        }
-        Err(error) => Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            format!(
-                "Cannot safely overwrite workflow asset {} because the existing file is not readable for rollback: {error}",
-                path.display()
-            ),
-        )),
-    }
-}
-
-fn rollback_asset_writes(committed: &[CommittedAssetWrite]) -> Result<(), Vec<String>> {
-    let mut rollback_errors = Vec::new();
-    for write in committed.iter().rev() {
-        let rollback_result = match &write.previous_state {
-            PreviousAssetState::Readable(previous) => {
-                atomic_write_bytes(&write.path, previous, 0o600).map(|_| ())
-            }
-            PreviousAssetState::Absent => {
-                remove_newly_created_asset_if_matches(&write.path, &write.committed_contents)
-            }
-        };
-        if let Err(error) = rollback_result {
-            rollback_errors.push(format!(
-                "Failed to roll back workflow asset {}: {error}",
-                write.path.display()
-            ));
-        }
-    }
-    if rollback_errors.is_empty() {
-        Ok(())
-    } else {
-        Err(rollback_errors)
-    }
-}
-
-fn remove_newly_created_asset_if_matches(
-    path: &Path,
-    expected_contents: &[u8],
-) -> std::io::Result<()> {
-    match std::fs::read(path) {
-        Ok(current) if current == expected_contents => std::fs::remove_file(path),
-        Ok(_) => Err(std::io::Error::other(format!(
-            "rollback target {} no longer matches the file published by this export attempt",
-            path.display()
-        ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn asset_write_error(message: String, rollback_errors: Option<Vec<String>>) -> RubError {
-    match rollback_errors {
-        Some(errors) => RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            message,
-            json!({
-                "rollback_failed": true,
-                "rollback_errors": errors,
-            }),
-        ),
-        None => RubError::domain(ErrorCode::InvalidInput, message),
-    }
-}
-
-fn workflow_name_from_path(path: &Path) -> Option<String> {
-    path.file_stem()
-        .and_then(|value| value.to_str())
-        .map(str::to_string)
-}
-
-fn resolve_cli_path(path: &str) -> PathBuf {
-    let raw = Path::new(path);
-    if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(raw)
-    }
-}
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PendingAssetWrite, commit_asset_writes, list_workflows, persist_history_export_asset,
-        remove_newly_created_asset_if_matches, resolve_named_workflow_path,
+    use super::write::{
+        PendingAssetWrite, commit_asset_writes, remove_newly_created_asset_if_matches,
     };
+    use super::{list_workflows, persist_history_export_asset, resolve_named_workflow_path};
     use crate::commands::{Commands, EffectiveCli, RequestedLaunchPolicy};
     use rub_core::error::ErrorCode;
     use std::path::{Path, PathBuf};
@@ -441,7 +79,25 @@ mod tests {
             "result": {
                 "format": "pipe",
                 "entries": [
-                    { "command": "open", "args": { "url": "https://example.com" }, "source": { "sequence": 1 } }
+                    {
+                        "command": "pipe",
+                        "args": {
+                            "spec": "[]",
+                            "spec_source": {
+                                "kind": "workflow",
+                                "name": "login_flow",
+                                "path": "/tmp/rub-home/workflows/login_flow.json",
+                                "path_state": {
+                                    "truth_level": "input_path_reference",
+                                    "path_authority": "cli.pipe.spec_source.path",
+                                    "upstream_truth": "cli_pipe_workflow_option",
+                                    "path_kind": "workflow_asset_reference",
+                                    "control_role": "display_only"
+                                }
+                            }
+                        },
+                        "source": { "sequence": 1 }
+                    }
                 ],
                 "count": 1
             }
@@ -451,7 +107,12 @@ mod tests {
         let saved = home.join("workflows/login_flow.json");
         let contents = std::fs::read_to_string(&saved).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
-        assert_eq!(parsed["steps"][0]["command"], "open");
+        assert_eq!(parsed["steps"][0]["command"], "pipe");
+        assert!(parsed["steps"][0].get("source").is_none(), "{parsed}");
+        assert_eq!(
+            parsed["steps"][0]["args"]["spec_source"]["path_state"]["path_authority"],
+            "cli.pipe.spec_source.path"
+        );
         assert_eq!(
             data["result"]["persisted_artifacts"][0]["path"],
             serde_json::json!(saved.display().to_string())
@@ -460,9 +121,185 @@ mod tests {
             data["result"]["persisted_artifacts"][0]["workflow_name"],
             "login_flow"
         );
+        assert_eq!(
+            data["result"]["persisted_artifacts"][0]["projection_state"]["truth_level"],
+            "local_persistence_projection"
+        );
+        assert_eq!(
+            data["result"]["persisted_artifacts"][0]["projection_state"]["projection_kind"],
+            "cli_persisted_artifact"
+        );
+        assert_eq!(
+            data["result"]["persisted_artifacts"][0]["projection_state"]["projection_authority"],
+            "cli.history_export_asset_persistence"
+        );
+        assert_eq!(
+            data["result"]["persisted_artifacts"][0]["projection_state"]["upstream_commit_truth"],
+            "daemon_response_committed"
+        );
         assert!(data.get("saved_to").is_none(), "{data}");
         assert!(data.get("workflow_name").is_none(), "{data}");
         assert!(data.get("output_path").is_none(), "{data}");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn persist_history_export_asset_preserves_projection_truth_labels() {
+        let home =
+            std::env::temp_dir().join(format!("rub-workflow-projection-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let output_path = home.join("exports/history.json");
+        let cli = cli_with(
+            Commands::History {
+                last: 10,
+                from: None,
+                to: None,
+                export_pipe: true,
+                export_script: false,
+                include_observation: false,
+                save_as: None,
+                output: Some(output_path.display().to_string()),
+            },
+            home.clone(),
+        );
+
+        let mut data = serde_json::json!({
+            "subject": {
+                "kind": "command_history",
+                "selection": { "last": 10 }
+            },
+            "result": {
+                "format": "pipe",
+                "projection_state": {
+                    "projection_kind": "bounded_post_commit_projection",
+                    "projection_authority": "session.workflow_capture",
+                    "upstream_commit_truth": "daemon_response_committed",
+                    "lossy": false,
+                    "lossy_reasons": []
+                },
+                "entries": [
+                    {
+                        "command": "pipe",
+                        "args": {
+                            "spec": "[]",
+                            "spec_source": {
+                                "kind": "file",
+                                "path": "/tmp/workflow.json",
+                                "path_state": {
+                                    "truth_level": "input_path_reference",
+                                    "path_authority": "cli.pipe.spec_source.path",
+                                    "upstream_truth": "cli_pipe_file_option",
+                                    "path_kind": "workflow_spec_file",
+                                    "control_role": "display_only"
+                                }
+                            }
+                        },
+                        "source": { "sequence": 1 }
+                    }
+                ],
+                "count": 1
+            }
+        });
+        persist_history_export_asset(&cli, &mut data).unwrap();
+
+        let contents = std::fs::read_to_string(&output_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(parsed["steps"][0]["command"], "pipe");
+        assert!(parsed["steps"][0].get("source").is_none(), "{parsed}");
+        assert_eq!(
+            parsed["steps"][0]["args"]["spec_source"]["path_state"]["upstream_truth"],
+            "cli_pipe_file_option"
+        );
+        assert_eq!(
+            data["result"]["projection_state"]["projection_kind"],
+            "bounded_post_commit_projection"
+        );
+        assert_eq!(
+            data["result"]["projection_state"]["upstream_commit_truth"],
+            "daemon_response_committed"
+        );
+        assert_eq!(
+            data["result"]["persisted_artifacts"][0]["projection_state"]["projection_authority"],
+            "cli.history_export_asset_persistence"
+        );
+        assert_eq!(
+            data["result"]["persisted_artifacts"][0]["projection_state"]["durability"],
+            "durable"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn persist_history_export_asset_preserves_redacted_secret_placeholders() {
+        let home = std::env::temp_dir().join(format!("rub-workflow-secret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let output_path = home.join("exports/history.json");
+        let cli = cli_with(
+            Commands::History {
+                last: 10,
+                from: None,
+                to: None,
+                export_pipe: true,
+                export_script: false,
+                include_observation: false,
+                save_as: Some("secret_flow".to_string()),
+                output: Some(output_path.display().to_string()),
+            },
+            home.clone(),
+        );
+
+        let mut data = serde_json::json!({
+            "subject": {
+                "kind": "command_history",
+                "selection": { "last": 10 }
+            },
+            "result": {
+                "format": "pipe",
+                "entries": [
+                    {
+                        "command": "pipe",
+                        "args": {
+                            "spec": [{
+                                "command": "fill",
+                                "args": {
+                                    "selector": "#token",
+                                    "value": "$RUB_TOKEN"
+                                }
+                            }],
+                            "headers": {
+                                "authorization": "Bearer $RUB_TOKEN"
+                            }
+                        },
+                        "source": { "sequence": 1 }
+                    }
+                ],
+                "count": 1
+            }
+        });
+
+        persist_history_export_asset(&cli, &mut data).unwrap();
+
+        let named_output = home.join("workflows/secret_flow.json");
+        let named_contents = std::fs::read_to_string(&named_output).unwrap();
+        let file_contents = std::fs::read_to_string(&output_path).unwrap();
+
+        assert!(named_contents.contains("$RUB_TOKEN"), "{named_contents}");
+        assert!(file_contents.contains("$RUB_TOKEN"), "{file_contents}");
+        assert!(!named_contents.contains("token-123"), "{named_contents}");
+        assert!(!file_contents.contains("token-123"), "{file_contents}");
+
+        let named_parsed: serde_json::Value = serde_json::from_str(&named_contents).unwrap();
+        let file_parsed: serde_json::Value = serde_json::from_str(&file_contents).unwrap();
+        assert_eq!(
+            named_parsed["steps"][0]["args"]["headers"]["authorization"],
+            "Bearer $RUB_TOKEN"
+        );
+        assert_eq!(
+            file_parsed["steps"][0]["args"]["spec"][0]["args"]["value"],
+            "$RUB_TOKEN"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -486,7 +323,44 @@ mod tests {
         );
         assert_eq!(listed["result"]["items"][0]["name"], "a_flow");
         assert_eq!(listed["result"]["items"][1]["name"], "b_flow");
+        assert_eq!(
+            listed["subject"]["directory_state"]["path_authority"],
+            "cli.workflow_assets.directory"
+        );
+        assert_eq!(
+            listed["result"]["items"][0]["path_state"]["path_authority"],
+            "cli.workflow_assets.item.path"
+        );
+        assert_eq!(
+            listed["result"]["items"][0]["path_state"]["truth_level"],
+            "local_asset_reference"
+        );
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn list_workflows_read_failure_preserves_directory_state() {
+        let home = std::env::temp_dir().join(format!(
+            "rub-workflow-list-failure-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create rub_home");
+        let workflows_dir = rub_daemon::rub_paths::RubPaths::new(&home).workflows_dir();
+        std::fs::write(&workflows_dir, b"not-a-directory").expect("seed blocking file");
+
+        let envelope = list_workflows(&home)
+            .expect_err("workflow directory read should fail")
+            .into_envelope();
+        let context = envelope.context.expect("workflow listing context");
+        assert_eq!(context["reason"], "workflow_directory_read_failed");
+        assert_eq!(
+            context["directory_state"]["path_authority"],
+            "cli.workflow_assets.directory"
+        );
+
+        let _ = std::fs::remove_file(&workflows_dir);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -530,6 +404,10 @@ mod tests {
         assert_eq!(
             data["result"]["persisted_artifacts"][0]["path"],
             serde_json::json!(output_path.display().to_string())
+        );
+        assert_eq!(
+            data["result"]["persisted_artifacts"][0]["projection_state"]["projection_kind"],
+            "cli_persisted_artifact"
         );
         assert!(data.get("saved_to").is_none(), "{data}");
         assert!(data.get("workflow_name").is_none(), "{data}");
@@ -603,6 +481,12 @@ mod tests {
             envelope.message.contains("not readable for rollback"),
             "{envelope:?}"
         );
+        let context = envelope.context.expect("workflow asset error context");
+        assert_eq!(context["reason"], "workflow_asset_unreadable_for_rollback");
+        assert_eq!(
+            context["path_state"]["path_authority"],
+            "cli.workflow_assets.write.path"
+        );
         assert!(unreadable.is_dir(), "existing target must remain untouched");
 
         let _ = std::fs::remove_dir_all(root);
@@ -627,6 +511,84 @@ mod tests {
             b"other-writer"
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_asset_writes_rejects_duplicate_export_path_with_path_state() {
+        let root = std::env::temp_dir().join(format!(
+            "rub-workflow-assets-duplicate-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let duplicate = root.join("workflow.json");
+
+        let error = commit_asset_writes(vec![
+            PendingAssetWrite {
+                path: duplicate.clone(),
+                contents: br#"{"steps":[1]}"#.to_vec(),
+                artifact: serde_json::json!({
+                    "path": duplicate.display().to_string(),
+                }),
+            },
+            PendingAssetWrite {
+                path: duplicate.clone(),
+                contents: br#"{"steps":[2]}"#.to_vec(),
+                artifact: serde_json::json!({
+                    "path": duplicate.display().to_string(),
+                }),
+            },
+        ])
+        .expect_err("duplicate export path should be rejected");
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::InvalidInput);
+        let context = envelope.context.expect("duplicate path context");
+        assert_eq!(context["reason"], "workflow_asset_duplicate_export_path");
+        assert_eq!(
+            context["path_state"]["path_authority"],
+            "cli.workflow_assets.write.path"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_asset_writes_preserves_path_state_on_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "rub-workflow-assets-write-failure-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let locked_parent = root.join("locked-parent");
+        std::fs::create_dir_all(&locked_parent).expect("create locked parent");
+        std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o500))
+            .expect("lock parent permissions");
+        let target = locked_parent.join("workflow.json");
+
+        let error = commit_asset_writes(vec![PendingAssetWrite {
+            path: target.clone(),
+            contents: br#"{"steps":[]}"#.to_vec(),
+            artifact: serde_json::json!({
+                "path": target.display().to_string(),
+            }),
+        }])
+        .expect_err("write into locked parent should fail");
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::InvalidInput);
+        let context = envelope.context.expect("write failure context");
+        assert_eq!(context["reason"], "workflow_asset_write_failed");
+        assert_eq!(
+            context["path_state"]["path_authority"],
+            "cli.workflow_assets.write.path"
+        );
+
+        std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o700))
+            .expect("restore parent permissions");
         let _ = std::fs::remove_dir_all(root);
     }
 }

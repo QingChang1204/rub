@@ -1,0 +1,303 @@
+use super::observatory_ingress::{
+    NETWORK_REQUEST_INGRESS_LIMIT, OBSERVATORY_INGRESS_LIMIT, ObservatoryMutation,
+    enqueue_network_request_record, enqueue_observatory_mutation,
+};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+pub(super) async fn install_browser_callbacks(
+    browser_manager: &Arc<rub_cdp::browser::BrowserManager>,
+    state: &Arc<rub_daemon::session::SessionState>,
+    browser_event_sink: &rub_daemon::session::BrowserSessionEventSink,
+) {
+    install_observatory_callbacks(browser_manager, state).await;
+    install_runtime_state_callbacks(browser_manager, state).await;
+    install_dialog_callbacks(browser_manager, state, browser_event_sink).await;
+    install_download_callbacks(browser_manager, state, browser_event_sink).await;
+
+    let state_for_callback = state.clone();
+    browser_manager
+        .set_epoch_callback(Box::new(move || {
+            let _ = state_for_callback.observe_external_dom_change();
+        }))
+        .await;
+}
+
+async fn install_observatory_callbacks(
+    browser_manager: &Arc<rub_cdp::browser::BrowserManager>,
+    state: &Arc<rub_daemon::session::SessionState>,
+) {
+    let (observatory_tx, mut observatory_rx) =
+        tokio::sync::mpsc::channel::<ObservatoryMutation>(OBSERVATORY_INGRESS_LIMIT);
+    let (network_request_tx, mut network_request_rx) = tokio::sync::mpsc::channel::<
+        Box<rub_core::model::NetworkRequestRecord>,
+    >(NETWORK_REQUEST_INGRESS_LIMIT);
+    let observatory_state = state.clone();
+    tokio::spawn(async move {
+        while let Some(mutation) = observatory_rx.recv().await {
+            match mutation {
+                ObservatoryMutation::ConsoleError(event) => {
+                    observatory_state.record_console_error(event).await;
+                }
+                ObservatoryMutation::PageError(event) => {
+                    observatory_state.record_page_error(event).await;
+                }
+                ObservatoryMutation::NetworkFailure(event) => {
+                    observatory_state.record_network_failure(event).await;
+                }
+                ObservatoryMutation::RequestSummary(event) => {
+                    observatory_state.record_request_summary(event).await;
+                }
+            }
+        }
+    });
+    let request_record_state = state.clone();
+    tokio::spawn(async move {
+        while let Some(record) = network_request_rx.recv().await {
+            request_record_state
+                .upsert_network_request_record(*record)
+                .await;
+        }
+    });
+    let observatory_overflowed = Arc::new(AtomicBool::new(false));
+    let network_request_overflowed = Arc::new(AtomicBool::new(false));
+    if let Err(error) = browser_manager
+        .set_observatory_callbacks(rub_cdp::runtime_observatory::ObservatoryCallbacks {
+            on_console_error: Some(std::sync::Arc::new({
+                let observatory_tx = observatory_tx.clone();
+                let observatory_state = state.clone();
+                let observatory_overflowed = observatory_overflowed.clone();
+                move |event| {
+                    enqueue_observatory_mutation(
+                        &observatory_tx,
+                        ObservatoryMutation::ConsoleError(event),
+                        &observatory_state,
+                        &observatory_overflowed,
+                    );
+                }
+            })),
+            on_page_error: Some(std::sync::Arc::new({
+                let observatory_tx = observatory_tx.clone();
+                let observatory_state = state.clone();
+                let observatory_overflowed = observatory_overflowed.clone();
+                move |event| {
+                    enqueue_observatory_mutation(
+                        &observatory_tx,
+                        ObservatoryMutation::PageError(event),
+                        &observatory_state,
+                        &observatory_overflowed,
+                    );
+                }
+            })),
+            on_network_failure: Some(std::sync::Arc::new({
+                let observatory_tx = observatory_tx.clone();
+                let observatory_state = state.clone();
+                let observatory_overflowed = observatory_overflowed.clone();
+                move |event| {
+                    enqueue_observatory_mutation(
+                        &observatory_tx,
+                        ObservatoryMutation::NetworkFailure(event),
+                        &observatory_state,
+                        &observatory_overflowed,
+                    );
+                }
+            })),
+            on_request_summary: Some(std::sync::Arc::new({
+                let observatory_tx = observatory_tx.clone();
+                let observatory_state = state.clone();
+                let observatory_overflowed = observatory_overflowed.clone();
+                move |event| {
+                    enqueue_observatory_mutation(
+                        &observatory_tx,
+                        ObservatoryMutation::RequestSummary(event),
+                        &observatory_state,
+                        &observatory_overflowed,
+                    );
+                }
+            })),
+            on_request_record: Some(std::sync::Arc::new({
+                let observatory_state = state.clone();
+                let network_request_tx = network_request_tx.clone();
+                let network_request_overflowed = network_request_overflowed.clone();
+                move |record| {
+                    enqueue_network_request_record(
+                        &network_request_tx,
+                        record,
+                        &observatory_state,
+                        &network_request_overflowed,
+                    );
+                }
+            })),
+            on_runtime_degraded: Some(std::sync::Arc::new({
+                let observatory_state = state.clone();
+                move |reason| {
+                    let observatory_state = observatory_state.clone();
+                    tokio::spawn(async move {
+                        observatory_state.mark_observatory_degraded(reason).await;
+                    });
+                }
+            })),
+        })
+        .await
+    {
+        state
+            .mark_observatory_degraded(format!("observatory_callback_install_failed:{error}"))
+            .await;
+    }
+}
+
+async fn install_runtime_state_callbacks(
+    browser_manager: &Arc<rub_cdp::browser::BrowserManager>,
+    state: &Arc<rub_daemon::session::SessionState>,
+) {
+    let runtime_state = state.clone();
+    let runtime_sequence_state = state.clone();
+    if let Err(error) = browser_manager
+        .set_runtime_state_callbacks(rub_cdp::runtime_state::RuntimeStateCallbacks {
+            allocate_sequence: Some(std::sync::Arc::new(move || {
+                runtime_sequence_state.allocate_runtime_state_sequence()
+            })),
+            on_snapshot: Some(std::sync::Arc::new(move |sequence, snapshot| {
+                let state = runtime_state.clone();
+                tokio::spawn(async move {
+                    state
+                        .publish_runtime_state_snapshot(sequence, snapshot)
+                        .await;
+                });
+            })),
+        })
+        .await
+    {
+        let sequence = state.allocate_runtime_state_sequence();
+        state
+            .mark_runtime_state_probe_degraded(
+                sequence,
+                format!("runtime_state_callback_install_failed:{error}"),
+            )
+            .await;
+    }
+}
+
+async fn install_dialog_callbacks(
+    browser_manager: &Arc<rub_cdp::browser::BrowserManager>,
+    state: &Arc<rub_daemon::session::SessionState>,
+    browser_event_sink: &rub_daemon::session::BrowserSessionEventSink,
+) {
+    let runtime_state = state.clone();
+    let opened_state = state.clone();
+    let closed_state = state.clone();
+    let runtime_event_sink = browser_event_sink.clone();
+    let opened_event_sink = browser_event_sink.clone();
+    let closed_event_sink = browser_event_sink.clone();
+    if let Err(error) = browser_manager
+        .set_dialog_callbacks(rub_cdp::dialogs::DialogCallbacks {
+            on_runtime: Some(std::sync::Arc::new(move |runtime| {
+                let browser_sequence = runtime_state.allocate_browser_event_sequence();
+                runtime_event_sink.enqueue(
+                    rub_daemon::session::BrowserSessionEvent::DialogRuntime {
+                        browser_sequence,
+                        generation: runtime.generation,
+                        status: runtime.runtime.status,
+                        degraded_reason: runtime.runtime.degraded_reason,
+                    },
+                );
+            })),
+            on_opened: Some(std::sync::Arc::new(move |event| {
+                let browser_sequence = opened_state.allocate_browser_event_sequence();
+                opened_event_sink.enqueue(rub_daemon::session::BrowserSessionEvent::DialogOpened {
+                    browser_sequence,
+                    generation: event.generation,
+                    kind: event.kind,
+                    message: event.message,
+                    url: event.url,
+                    tab_target_id: event.tab_target_id,
+                    frame_id: event.frame_id,
+                    default_prompt: event.default_prompt,
+                    has_browser_handler: event.has_browser_handler,
+                });
+            })),
+            on_closed: Some(std::sync::Arc::new(move |event| {
+                let browser_sequence = closed_state.allocate_browser_event_sequence();
+                closed_event_sink.enqueue(rub_daemon::session::BrowserSessionEvent::DialogClosed {
+                    browser_sequence,
+                    generation: event.generation,
+                    accepted: event.accepted,
+                    user_input: event.user_input,
+                });
+            })),
+        })
+        .await
+    {
+        state
+            .mark_dialog_runtime_degraded(
+                browser_manager.current_listener_generation(),
+                format!("dialog_callback_install_failed:{error}"),
+            )
+            .await;
+    }
+}
+
+async fn install_download_callbacks(
+    browser_manager: &Arc<rub_cdp::browser::BrowserManager>,
+    state: &Arc<rub_daemon::session::SessionState>,
+    browser_event_sink: &rub_daemon::session::BrowserSessionEventSink,
+) {
+    let runtime_state = state.clone();
+    let started_state = state.clone();
+    let progress_state = state.clone();
+    let runtime_event_sink = browser_event_sink.clone();
+    let started_event_sink = browser_event_sink.clone();
+    let progress_event_sink = browser_event_sink.clone();
+    if let Err(error) = browser_manager
+        .set_download_callbacks(rub_cdp::downloads::DownloadCallbacks {
+            on_runtime: Some(std::sync::Arc::new(move |runtime| {
+                let browser_sequence = runtime_state.allocate_browser_event_sequence();
+                runtime_event_sink.enqueue(
+                    rub_daemon::session::BrowserSessionEvent::DownloadRuntime {
+                        browser_sequence,
+                        generation: runtime.generation,
+                        status: runtime.runtime.status,
+                        mode: runtime.runtime.mode,
+                        download_dir: runtime.runtime.download_dir,
+                        degraded_reason: runtime.runtime.degraded_reason,
+                    },
+                );
+            })),
+            on_started: Some(std::sync::Arc::new(move |event| {
+                let browser_sequence = started_state.allocate_browser_event_sequence();
+                started_event_sink.enqueue(
+                    rub_daemon::session::BrowserSessionEvent::DownloadStarted {
+                        browser_sequence,
+                        generation: event.generation,
+                        guid: event.guid,
+                        url: event.url,
+                        suggested_filename: event.suggested_filename,
+                        frame_id: event.frame_id,
+                    },
+                );
+            })),
+            on_progress: Some(std::sync::Arc::new(move |event| {
+                let browser_sequence = progress_state.allocate_browser_event_sequence();
+                progress_event_sink.enqueue(
+                    rub_daemon::session::BrowserSessionEvent::DownloadProgress {
+                        browser_sequence,
+                        generation: event.generation,
+                        guid: event.guid,
+                        state: event.state,
+                        received_bytes: event.received_bytes,
+                        total_bytes: event.total_bytes,
+                        final_path: event.final_path,
+                    },
+                );
+            })),
+        })
+        .await
+    {
+        state
+            .mark_download_runtime_degraded(
+                browser_manager.current_listener_generation(),
+                format!("download_callback_install_failed:{error}"),
+            )
+            .await;
+    }
+}

@@ -1,8 +1,30 @@
 use crate::commands::EffectiveCli;
-use crate::daemon_ctl;
-use rub_core::error::{ErrorCode, RubError};
-use rub_core::model::{ConnectionTarget, LaunchPolicyInfo};
-use std::path::{Component, Path, PathBuf};
+
+#[cfg(test)]
+use std::path::PathBuf;
+
+mod identity;
+mod projection;
+mod request;
+mod validation;
+
+pub(crate) use self::identity::{
+    effective_attachment_identity, requested_attachment_identity, requested_user_data_dir,
+};
+pub(crate) use self::request::{materialize_connection_request, parse_connection_request};
+pub(crate) use self::validation::{
+    compatibility_launch_policy, requires_existing_session_validation,
+    validate_existing_session_connection_request,
+};
+
+#[cfg(test)]
+use self::identity::{normalize_identity_path, request_needs_live_attachment_resolution};
+#[cfg(test)]
+use self::projection::{requested_connection_projection, requested_session_policy_projection};
+#[cfg(test)]
+use self::request::materialized_auto_discover_request;
+#[cfg(test)]
+use self::validation::{attachment_identity_matches_request, launch_policy_matches_session_policy};
 
 #[cfg(test)]
 use crate::commands::Commands;
@@ -24,391 +46,11 @@ pub(crate) enum ConnectionRequest {
     },
 }
 
-pub(crate) fn parse_connection_request(
-    cli: &EffectiveCli,
-) -> Result<ConnectionRequest, rub_core::error::RubError> {
-    let connect_flag_count = [cli.cdp_url.is_some(), cli.connect, cli.profile.is_some()]
-        .into_iter()
-        .filter(|flag| *flag)
-        .count();
-    if connect_flag_count > 1 {
-        return Err(rub_core::error::RubError::domain(
-            ErrorCode::ConflictingConnectOptions,
-            "Use only one of --cdp-url, --connect, or --profile per command",
-        ));
-    }
-
-    if cli.profile.is_some() && cli.requested_launch_policy.user_data_dir.is_some() {
-        return Err(rub_core::error::RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            "Use either --profile or --user-data-dir, not both",
-            serde_json::json!({
-                "profile": cli.profile,
-                "user_data_dir": cli.user_data_dir,
-                "reason": "profile_user_data_dir_conflict",
-            }),
-        ));
-    }
-
-    if let Some(url) = &cli.cdp_url {
-        return Ok(ConnectionRequest::CdpUrl {
-            url: normalize_cdp_identity(url),
-        });
-    }
-    if cli.connect {
-        return Ok(ConnectionRequest::AutoDiscover);
-    }
-    if let Some(name) = &cli.profile {
-        let profile = rub_cdp::profile::resolve_profile(name)?;
-        let user_data_root = profile
-            .path
-            .parent()
-            .ok_or_else(|| {
-                rub_core::error::RubError::domain(
-                    ErrorCode::ProfileNotFound,
-                    format!(
-                        "Resolved profile path {} has no parent user data directory",
-                        profile.path.display()
-                    ),
-                )
-            })?
-            .display()
-            .to_string();
-        return Ok(ConnectionRequest::Profile {
-            name: name.clone(),
-            dir_name: profile.dir_name,
-            resolved_path: profile.path.display().to_string(),
-            user_data_root,
-        });
-    }
-
-    Ok(ConnectionRequest::None)
-}
-
-fn materialized_auto_discover_request(
-    candidate: &rub_cdp::attachment::CdpCandidate,
-) -> ConnectionRequest {
-    ConnectionRequest::CdpUrl {
-        url: rub_cdp::attachment::normalize_external_connect_url(&candidate.ws_url),
-    }
-}
-
-pub(crate) async fn materialize_connection_request(
-    request: &ConnectionRequest,
-) -> Result<ConnectionRequest, rub_core::error::RubError> {
-    match request {
-        // `--connect` must resolve to one concrete external browser authority
-        // for locking, validation, bootstrap argv, and final attach. Re-running
-        // local discovery later would let those layers drift onto different
-        // browsers under concurrent startups or short-lived local Chrome churn.
-        ConnectionRequest::AutoDiscover => {
-            let candidate = rub_cdp::attachment::resolve_unique_local_cdp_candidate().await?;
-            Ok(materialized_auto_discover_request(&candidate))
-        }
-        _ => Ok(request.clone()),
-    }
-}
-
-pub(crate) fn requested_user_data_dir(
-    cli: &EffectiveCli,
-    request: &ConnectionRequest,
-) -> Option<String> {
-    match request {
-        ConnectionRequest::Profile { user_data_root, .. } => Some(user_data_root.clone()),
-        // Only managed sessions own a local user-data-dir authority. External
-        // CDP attachment must not inherit local profile state from config
-        // defaults because that would pollute shutdown/profile ownership.
-        ConnectionRequest::None => cli.user_data_dir.clone(),
-        ConnectionRequest::CdpUrl { .. } | ConnectionRequest::AutoDiscover => None,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn requested_attachment_identity(
-    cli: &EffectiveCli,
-    request: &ConnectionRequest,
-) -> Option<String> {
-    match request {
-        ConnectionRequest::Profile { resolved_path, .. } => {
-            Some(format!("profile:{resolved_path}"))
-        }
-        ConnectionRequest::CdpUrl { url } => Some(format!("cdp:{}", normalize_cdp_identity(url))),
-        ConnectionRequest::AutoDiscover => Some("auto_discover:local_cdp".to_string()),
-        ConnectionRequest::None => requested_user_data_dir(cli, request)
-            .map(|path| format!("user_data_dir:{}", normalize_identity_path(&path))),
-    }
-}
-
-pub(crate) async fn resolve_attachment_identity(
-    cli: &EffectiveCli,
-    request: &ConnectionRequest,
-    effective_user_data_dir: Option<&str>,
-) -> Result<Option<String>, RubError> {
-    match request {
-        ConnectionRequest::Profile { resolved_path, .. } => {
-            Ok(Some(format!("profile:{resolved_path}")))
-        }
-        ConnectionRequest::CdpUrl { url } => Ok(Some(format!(
-            "cdp:{}",
-            rub_cdp::attachment::canonical_external_browser_identity(url).await?
-        ))),
-        ConnectionRequest::AutoDiscover => {
-            let candidate = rub_cdp::attachment::resolve_unique_local_cdp_candidate().await?;
-            Ok(Some(format!(
-                "cdp:{}",
-                rub_cdp::attachment::canonical_external_browser_identity(&candidate.ws_url).await?
-            )))
-        }
-        ConnectionRequest::None => {
-            let effective_path = effective_user_data_dir
-                .map(str::to_string)
-                .or_else(|| requested_user_data_dir(cli, request));
-            Ok(effective_path
-                .as_deref()
-                .map(|path| format!("user_data_dir:{}", normalize_identity_path(path))))
-        }
-    }
-}
-
-pub(crate) async fn effective_attachment_identity(
-    cli: &EffectiveCli,
-    request: &ConnectionRequest,
-    effective_user_data_dir: Option<&str>,
-) -> Result<Option<String>, RubError> {
-    match request {
-        ConnectionRequest::None => Ok(effective_user_data_dir
-            .map(|path| format!("user_data_dir:{}", normalize_identity_path(path)))),
-        _ => resolve_attachment_identity(cli, request, effective_user_data_dir).await,
-    }
-}
-
-pub(crate) async fn validate_existing_session_connection_request(
-    cli: &EffectiveCli,
-    request: &ConnectionRequest,
-) -> Result<(), rub_core::error::RubError> {
-    if !requires_existing_session_validation(true, request, cli) {
-        return Ok(());
-    }
-
-    let launch_policy =
-        daemon_ctl::fetch_launch_policy_for_session(&cli.rub_home, &cli.session).await?;
-    let current_attachment_identity =
-        rub_daemon::session::authoritative_entry_by_session_name(&cli.rub_home, &cli.session)
-            .map_err(|error| {
-                RubError::domain(
-                    ErrorCode::InternalError,
-                    format!(
-                        "Failed to read current session authority for '{}': {error}",
-                        cli.session
-                    ),
-                )
-            })?
-            .and_then(|entry| entry.attachment_identity);
-    let requested_attachment_identity = resolve_attachment_identity(cli, request, None).await?;
-    if attachment_identity_matches_request(
-        &current_attachment_identity,
-        requested_attachment_identity.as_deref(),
-        launch_policy.connection_target.as_ref(),
-        request,
-    ) && launch_policy_matches_session_policy(&launch_policy, request, cli)
-    {
-        return Ok(());
-    }
-
-    Err(rub_core::error::RubError::domain_with_context(
-        ErrorCode::InvalidInput,
-        format!(
-            "Session '{}' is already running with a different browser attachment policy. Use a different --session or close the existing daemon first.",
-            cli.session
-        ),
-        serde_json::json!({
-            "requested_attachment_identity": requested_attachment_identity,
-            "current_attachment_identity": current_attachment_identity,
-            "requested_connection": requested_connection_projection(request),
-            "requested_session_policy": requested_session_policy_projection(request, cli),
-            "current_launch_policy": launch_policy,
-        }),
-    ))
-}
-
-pub(crate) fn requires_existing_session_validation(
-    connected_to_existing_daemon: bool,
-    request: &ConnectionRequest,
-    cli: &EffectiveCli,
-) -> bool {
-    connected_to_existing_daemon
-        && (!matches!(request, ConnectionRequest::None)
-            || compatibility_launch_policy(cli, request).has_any())
-}
-
-fn attachment_identity_matches_request(
-    current_attachment_identity: &Option<String>,
-    requested_attachment_identity: Option<&str>,
-    _current_target: Option<&ConnectionTarget>,
-    request: &ConnectionRequest,
-) -> bool {
-    match request {
-        ConnectionRequest::None => true,
-        ConnectionRequest::CdpUrl { .. } | ConnectionRequest::Profile { .. } => {
-            current_attachment_identity.as_deref() == requested_attachment_identity
-        }
-        ConnectionRequest::AutoDiscover => requested_attachment_identity
-            .is_some_and(|identity| current_attachment_identity.as_deref() == Some(identity)),
-    }
-}
-
-fn requested_connection_projection(request: &ConnectionRequest) -> serde_json::Value {
-    match request {
-        ConnectionRequest::None => serde_json::Value::Null,
-        ConnectionRequest::CdpUrl { url } => serde_json::json!({
-            "source": "cdp_url",
-            "url": url,
-        }),
-        ConnectionRequest::AutoDiscover => serde_json::json!({
-            "source": "auto_discover",
-        }),
-        ConnectionRequest::Profile {
-            name,
-            resolved_path,
-            ..
-        } => serde_json::json!({
-            "source": "profile",
-            "name": name,
-            "resolved_path": resolved_path,
-        }),
-    }
-}
-
-fn launch_policy_matches_session_policy(
-    launch_policy: &LaunchPolicyInfo,
-    request: &ConnectionRequest,
-    cli: &EffectiveCli,
-) -> bool {
-    let requested = compatibility_launch_policy(cli, request);
-    let requested_user_data_dir = requested.user_data_dir.clone();
-
-    (!requested.headed || !launch_policy.headless)
-        && (!requested.ignore_cert_errors || launch_policy.ignore_cert_errors)
-        && (!requested.show_infobars || !launch_policy.hide_infobars)
-        && requested_user_data_dir
-            .as_deref()
-            .is_none_or(|requested_dir: &str| {
-                launch_policy
-                    .user_data_dir
-                    .as_deref()
-                    .map(normalize_identity_path)
-                    .as_deref()
-                    == Some(requested_dir)
-            })
-        && (!requested.no_stealth || !launch_policy.stealth_default_enabled.unwrap_or(true))
-        && (!requested.humanize || launch_policy.humanize_enabled.unwrap_or(false))
-        && requested
-            .humanize_speed
-            .as_deref()
-            .is_none_or(|speed: &str| launch_policy.humanize_speed.as_deref() == Some(speed))
-}
-
-fn compatibility_launch_policy(
-    cli: &EffectiveCli,
-    request: &ConnectionRequest,
-) -> crate::commands::RequestedLaunchPolicy {
-    let mut requested = cli.effective_launch_policy.clone();
-    requested.user_data_dir = match request {
-        ConnectionRequest::Profile { user_data_root, .. } => {
-            Some(normalize_identity_path(user_data_root))
-        }
-        ConnectionRequest::None => requested.user_data_dir,
-        ConnectionRequest::CdpUrl { .. } | ConnectionRequest::AutoDiscover => None,
-    };
-    if !requested.humanize {
-        requested.humanize_speed = None;
-    }
-    requested
-}
-
-fn requested_session_policy_projection(
-    request: &ConnectionRequest,
-    cli: &EffectiveCli,
-) -> serde_json::Value {
-    let compatibility = compatibility_launch_policy(cli, request);
-    serde_json::json!({
-        "headed": cli.effective_launch_policy.headed,
-        "ignore_cert_errors": cli.effective_launch_policy.ignore_cert_errors,
-        "show_infobars": cli.effective_launch_policy.show_infobars,
-        "user_data_dir": cli.effective_launch_policy.user_data_dir,
-        "stealth_disabled": cli.effective_launch_policy.no_stealth,
-        "humanize_enabled": cli.effective_launch_policy.humanize,
-        "humanize_speed": cli.effective_launch_policy.humanize_speed,
-        "effective_user_data_dir": requested_user_data_dir(cli, request),
-        "compatibility_policy": {
-            "headed": compatibility.headed,
-            "ignore_cert_errors": compatibility.ignore_cert_errors,
-            "show_infobars": compatibility.show_infobars,
-            "user_data_dir": compatibility.user_data_dir,
-            "stealth_disabled": compatibility.no_stealth,
-            "humanize_enabled": compatibility.humanize,
-            "humanize_speed": compatibility.humanize_speed,
-        },
-        "explicit_request": {
-            "headed": cli.requested_launch_policy.headed,
-            "ignore_cert_errors": cli.requested_launch_policy.ignore_cert_errors,
-            "show_infobars": cli.requested_launch_policy.show_infobars,
-            "user_data_dir": cli.requested_launch_policy.user_data_dir,
-            "stealth_disabled": cli.requested_launch_policy.no_stealth,
-            "humanize_enabled": cli.requested_launch_policy.humanize,
-            "humanize_speed": cli.requested_launch_policy.humanize_speed,
-        },
-    })
-}
-
-pub(crate) fn normalize_identity_path(path: impl AsRef<Path>) -> String {
-    let path = path.as_ref();
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    };
-    if let Ok(canonical) = absolute.canonicalize() {
-        return canonical.to_string_lossy().into_owned();
-    }
-
-    let mut normalized = if absolute.is_absolute() {
-        PathBuf::from("/")
-    } else {
-        PathBuf::new()
-    };
-    for component in absolute.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => {}
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    normalized.to_string_lossy().into_owned()
-}
-
-fn normalize_cdp_identity(url: &str) -> String {
-    let trimmed = url.trim().trim_end_matches('/').to_string();
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        if trimmed.ends_with("/json/version") {
-            trimmed
-        } else {
-            format!("{trimmed}/json/version")
-        }
-    } else {
-        trimmed
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rub_core::error::ErrorCode;
+    use rub_core::model::{ConnectionTarget, LaunchPolicyInfo};
 
     fn cli_with(command: Commands) -> EffectiveCli {
         EffectiveCli {
@@ -565,6 +207,12 @@ mod tests {
 
         let error = parse_connection_request(&cli).unwrap_err().into_envelope();
         assert_eq!(error.code, ErrorCode::InvalidInput);
+        let context = error.context.expect("conflict context");
+        assert_eq!(context["reason"], "profile_user_data_dir_conflict");
+        assert_eq!(
+            context["user_data_dir_state"]["path_authority"],
+            "cli.session_policy.requested.user_data_dir"
+        );
     }
 
     #[test]
@@ -754,6 +402,31 @@ mod tests {
     }
 
     #[test]
+    fn live_attachment_resolution_only_runs_for_existing_cdp_authority() {
+        assert!(request_needs_live_attachment_resolution(
+            Some("cdp:ws://127.0.0.1:9222/devtools/browser/current"),
+            &ConnectionRequest::CdpUrl {
+                url: "http://127.0.0.1:9222".to_string(),
+            },
+        ));
+        assert!(!request_needs_live_attachment_resolution(
+            Some("user_data_dir:/tmp/rub-profile"),
+            &ConnectionRequest::CdpUrl {
+                url: "http://127.0.0.1:9222".to_string(),
+            },
+        ));
+        assert!(!request_needs_live_attachment_resolution(
+            Some("profile:/tmp/profile"),
+            &ConnectionRequest::Profile {
+                name: "Default".to_string(),
+                dir_name: "Default".to_string(),
+                resolved_path: "/tmp/profile".to_string(),
+                user_data_root: "/tmp".to_string(),
+            },
+        ));
+    }
+
+    #[test]
     fn materialized_auto_discover_uses_concrete_cdp_url_authority() {
         let candidate = rub_cdp::attachment::CdpCandidate {
             port: 9222,
@@ -861,6 +534,47 @@ mod tests {
                 "user_data_dir:{}",
                 normalize_identity_path("/tmp/rub-managed-profile")
             ))
+        );
+    }
+
+    #[test]
+    fn requested_connection_projection_marks_profile_path_state() {
+        let projection = requested_connection_projection(&ConnectionRequest::Profile {
+            name: "Default".to_string(),
+            dir_name: "Default".to_string(),
+            resolved_path: "/tmp/profile-root/Default".to_string(),
+            user_data_root: "/tmp/profile-root".to_string(),
+        });
+        assert_eq!(projection["resolved_path"], "/tmp/profile-root/Default");
+        assert_eq!(
+            projection["resolved_path_state"]["path_authority"],
+            "cli.session_policy.requested_connection.resolved_path"
+        );
+    }
+
+    #[test]
+    fn requested_session_policy_projection_marks_user_data_dir_states() {
+        let mut cli = cli_with(Commands::Doctor);
+        cli.user_data_dir = Some("/tmp/profile-root".to_string());
+        cli.effective_launch_policy.user_data_dir = Some("/tmp/profile-root".to_string());
+        cli.requested_launch_policy.user_data_dir = Some("/tmp/profile-root".to_string());
+
+        let projection = requested_session_policy_projection(&ConnectionRequest::None, &cli);
+        assert_eq!(
+            projection["user_data_dir_state"]["path_authority"],
+            "cli.session_policy.effective.user_data_dir"
+        );
+        assert_eq!(
+            projection["effective_user_data_dir_state"]["path_authority"],
+            "cli.session_policy.effective_user_data_dir"
+        );
+        assert_eq!(
+            projection["compatibility_policy"]["user_data_dir_state"]["path_authority"],
+            "cli.session_policy.compatibility.user_data_dir"
+        );
+        assert_eq!(
+            projection["explicit_request"]["user_data_dir_state"]["path_authority"],
+            "cli.session_policy.explicit_request.user_data_dir"
         );
     }
 }
