@@ -1525,8 +1525,7 @@ fn t260_261_select_and_upload_grouped_scenario() {
         "{json}"
     );
     assert_eq!(
-        json["data"]["interaction"]["confirmation_details"]["after_page"]["context_replaced"],
-        true,
+        json["data"]["interaction"]["confirmation_details"]["after_page"]["context_replaced"], true,
         "{json}"
     );
     assert_eq!(

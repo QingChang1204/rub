@@ -1736,7 +1736,10 @@ fn t437i_l_trigger_source_vars_storage_blocked_and_removed_grouped_scenario() {
             .all(|entry| entry["id"].as_u64() != Some(trigger_id)),
         "{listed}"
     );
-    assert!(listed["data"]["runtime"]["last_trigger_result"].is_null(), "{listed}");
+    assert!(
+        listed["data"]["runtime"]["last_trigger_result"].is_null(),
+        "{listed}"
+    );
     let trace = parse_json(
         &session
             .cmd()
