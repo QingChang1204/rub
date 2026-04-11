@@ -1,6 +1,7 @@
 use super::SessionState;
 use rub_core::model::{
-    DialogKind, DialogRuntimeStatus, DownloadMode, DownloadRuntimeStatus, DownloadState,
+    DialogKind, DialogRuntimeStatus, DownloadEvent, DownloadMode, DownloadRuntimeStatus,
+    DownloadState,
 };
 use rub_ipc::codec::MAX_FRAME_BYTES;
 use std::collections::{HashMap, VecDeque};
@@ -12,6 +13,9 @@ pub(crate) const REPLAY_CACHE_LIMIT_BYTES: usize = MAX_FRAME_BYTES * 8;
 pub(crate) const POST_COMMIT_PROJECTION_LIMIT: usize = 256;
 pub(crate) const POST_COMMIT_PROJECTION_LIMIT_BYTES: usize = MAX_FRAME_BYTES * 4;
 pub(crate) const BROWSER_EVENT_PROGRESS_INGRESS_LIMIT: usize = 1_024;
+pub(crate) const BROWSER_EVENT_CRITICAL_SOFT_LIMIT: u32 = 256;
+pub(crate) const DOWNLOAD_PROGRESS_OVERFLOW_REASON: &str =
+    "browser_event_ingress_overflow:download_progress";
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReplayCacheEntry {
@@ -159,6 +163,13 @@ pub struct BrowserSessionEventSink {
     pub(crate) progress_overflow_latched_sequence: Arc<AtomicU64>,
     pub(crate) progress_overflow_reopen_generation: Arc<AtomicU64>,
     pub(crate) progress_overflow_reopen_sequence: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DownloadEventWindow {
+    pub(crate) events: Vec<DownloadEvent>,
+    pub(crate) authoritative: bool,
+    pub(crate) degraded_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]

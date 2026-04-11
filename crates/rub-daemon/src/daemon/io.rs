@@ -150,9 +150,7 @@ pub(super) fn read_failure_envelope(
                 let reason = match io_error.kind() {
                     std::io::ErrorKind::UnexpectedEof => "partial_ndjson_frame",
                     std::io::ErrorKind::InvalidData
-                        if io_error
-                            .to_string()
-                            .contains("NDJSON frame exceeds maximum on-wire size") =>
+                        if rub_ipc::codec::is_oversized_frame_io_error(io_error.as_ref()) =>
                     {
                         "oversized_ndjson_frame"
                     }

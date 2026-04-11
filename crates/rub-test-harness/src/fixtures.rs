@@ -1,5 +1,8 @@
 //! HTML fixture generators for test scenarios.
 
+pub use crate::download_fixture::DownloadFixtureServer;
+pub use crate::network_fixture::NetworkInspectionFixtureServer;
+
 /// A simple page with a title and links.
 pub fn simple_page() -> &'static str {
     r##"<!DOCTYPE html>

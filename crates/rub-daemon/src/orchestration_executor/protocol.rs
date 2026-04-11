@@ -97,6 +97,11 @@ pub(crate) async fn dispatch_remote_orchestration_request(
     request: IpcRequest,
     contract: RemoteDispatchContract,
 ) -> Result<IpcResponse, ErrorEnvelope> {
+    // Replay is only safe once the caller has bound this transport request to a
+    // stable command_id. The remote daemon owns the commit fence and can return
+    // a cached committed response for that same request identity. Without a
+    // wrapper command_id we fail closed after transport loss instead of
+    // attempting a best-effort resend.
     ensure_orchestration_session_protocol(session, role)?;
     let mut client = IpcClient::connect(Path::new(&session.socket_path))
         .await
@@ -709,6 +714,93 @@ mod tests {
 
         assert_eq!(response.status, ResponseStatus::Success);
         assert_eq!(response.command_id.as_deref(), Some("cmd-1"));
+
+        server.await.expect("server join");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn remote_dispatch_fails_closed_after_partial_response_without_command_id() {
+        let socket_path =
+            std::path::PathBuf::from(format!("/tmp/rub-orch-{}.sock", uuid::Uuid::now_v7()));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind listener");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept first");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let request: IpcRequest = NdJsonCodec::read(&mut reader)
+                .await
+                .expect("read request")
+                .expect("request");
+            assert_eq!(request.daemon_session_id.as_deref(), Some("daemon-b"));
+            assert_eq!(request.command_id, None);
+            writer
+                .write_all(br#"{"ipc_protocol_version":"1.0","request_id":"req-1""#)
+                .await
+                .expect("write partial response");
+            writer.shutdown().await.expect("shutdown partial writer");
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "non-replayable orchestration dispatch must not reconnect for replay"
+            );
+        });
+
+        let session = projected_orchestration_session(
+            "daemon-b".to_string(),
+            "remote".to_string(),
+            42,
+            socket_path.display().to_string(),
+            false,
+            rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+            None,
+        );
+        let request = IpcRequest::new("tabs", serde_json::json!({}), 1_000);
+
+        let error = dispatch_remote_orchestration_request(
+            &session,
+            "target",
+            request,
+            RemoteDispatchContract {
+                dispatch_subject: "request",
+                unreachable_reason: "orchestration_target_session_unreachable",
+                transport_failure_reason: "orchestration_target_dispatch_transport_failed",
+                protocol_failure_reason: "orchestration_target_dispatch_protocol_failed",
+                missing_error_message:
+                    "remote orchestration dispatch returned an error without an envelope",
+            },
+        )
+        .await
+        .expect_err("partial response without command_id must fail closed");
+
+        assert_eq!(error.code, ErrorCode::IpcProtocolError);
+        assert_eq!(
+            error
+                .context
+                .as_ref()
+                .and_then(|context| context.get("reason")),
+            Some(&serde_json::json!(
+                "orchestration_target_dispatch_transport_failed"
+            ))
+        );
+        assert_eq!(
+            error
+                .context
+                .as_ref()
+                .and_then(|context| context.get("retry_reason")),
+            None
+        );
+        assert_eq!(
+            error
+                .context
+                .as_ref()
+                .and_then(|context| context.get("replay_phase")),
+            None
+        );
 
         server.await.expect("server join");
         let _ = std::fs::remove_file(&socket_path);

@@ -85,11 +85,15 @@ pub trait BrowserPort: Send + Sync {
     ///
     /// The CDP listener task consumes this immediately when a dialog opens,
     /// calling `Page.handleJavaScriptDialog` before Chrome's auto-handler fires.
-    /// Default is a no-op (only meaningful for real browser implementations).
-    fn set_dialog_intercept(&self, _policy: crate::model::DialogInterceptPolicy) {}
+    /// Implementations must return an error rather than silently no-op.
+    fn set_dialog_intercept(
+        &self,
+        policy: crate::model::DialogInterceptPolicy,
+    ) -> Result<(), RubError>;
 
     /// Cancel any pending one-shot dialog intercept policy.
-    fn clear_dialog_intercept(&self) {}
+    /// Implementations must return an error rather than silently no-op.
+    fn clear_dialog_intercept(&self) -> Result<(), RubError>;
 
     /// Scroll the viewport.
     async fn scroll(

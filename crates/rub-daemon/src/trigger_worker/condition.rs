@@ -367,7 +367,7 @@ pub(super) fn storage_snapshot_matches(
         )
     })?;
     let expected_value = trigger.condition.value.as_deref();
-    let area = parse_storage_area(trigger.condition.storage_area.as_deref())?;
+    let area = trigger.condition.storage_area;
 
     let areas = match area {
         Some(StorageArea::Local) => [&snapshot.local_storage, &std::collections::BTreeMap::new()],
@@ -387,18 +387,5 @@ pub(super) fn storage_snapshot_matches(
             return Ok(true);
         }
     }
-
     Ok(false)
-}
-
-pub(super) fn parse_storage_area(area: Option<&str>) -> Result<Option<StorageArea>, RubError> {
-    match area.map(|value| value.trim().to_ascii_lowercase()) {
-        None => Ok(None),
-        Some(value) if value == "local" => Ok(Some(StorageArea::Local)),
-        Some(value) if value == "session" => Ok(Some(StorageArea::Session)),
-        Some(other) => Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            format!("Unsupported trigger storage area '{other}'; use 'local' or 'session'"),
-        )),
-    }
 }

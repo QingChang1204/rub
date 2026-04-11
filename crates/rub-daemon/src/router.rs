@@ -431,6 +431,8 @@ mod tests {
                 network_authoritative: true,
                 network_degraded_reason: None,
                 download_events: &[],
+                download_authoritative: true,
+                download_degraded_reason: None,
             },
         );
 
@@ -483,6 +485,8 @@ mod tests {
                 network_authoritative: true,
                 network_degraded_reason: None,
                 download_events: &[],
+                download_authoritative: true,
+                download_degraded_reason: None,
             },
         );
 
@@ -587,6 +591,8 @@ mod tests {
                 network_authoritative: true,
                 network_degraded_reason: None,
                 download_events: &[],
+                download_authoritative: true,
+                download_degraded_reason: None,
             },
         );
 
@@ -646,6 +652,8 @@ mod tests {
                 network_authoritative: true,
                 network_degraded_reason: None,
                 download_events: &[],
+                download_authoritative: true,
+                download_degraded_reason: None,
             },
         );
 
@@ -712,6 +720,8 @@ mod tests {
                 network_authoritative: true,
                 network_degraded_reason: None,
                 download_events: &[],
+                download_authoritative: true,
+                download_degraded_reason: None,
             },
         );
 
@@ -809,6 +819,8 @@ mod tests {
                 network_authoritative: true,
                 network_degraded_reason: None,
                 download_events: &[],
+                download_authoritative: true,
+                download_degraded_reason: None,
             },
         );
 
@@ -881,6 +893,8 @@ mod tests {
                 network_authoritative: true,
                 network_degraded_reason: None,
                 download_events: &[],
+                download_authoritative: true,
+                download_degraded_reason: None,
             },
         );
 

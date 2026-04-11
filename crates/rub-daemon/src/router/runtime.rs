@@ -296,6 +296,14 @@ mod tests {
             upgrade["automation_scheduler"]["authority_inventory"]["shutdown_drain_fence"],
             "daemon.shutdown.wait_for_transaction_drain"
         );
+        assert_eq!(
+            handshake["browser_event_ingress"]["critical"]["mode"],
+            "lossless_metered_unbounded"
+        );
+        assert_eq!(
+            upgrade["browser_event_ingress"]["progress"]["mode"],
+            "bounded_drop_with_degraded_marker"
+        );
     }
 
     #[tokio::test]
@@ -318,6 +326,10 @@ mod tests {
         assert_eq!(
             payload["result"]["automation_scheduler"]["authority_inventory"]["automation_reservation_fence"],
             "router.begin_automation_transaction_until_shutdown_owned"
+        );
+        assert_eq!(
+            payload["result"]["browser_event_ingress"]["critical"]["mode"],
+            "lossless_metered_unbounded"
         );
     }
 

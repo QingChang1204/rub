@@ -244,7 +244,10 @@ pub(super) async fn cmd_select(
 #[cfg(test)]
 mod tests {
     use super::args::{ClickArgs, TextEntryArgs, UploadArgs};
-    use super::projection::collect_post_interaction_projection;
+    use super::projection::{
+        InteractionObservationBaseline, collect_post_interaction_projection,
+        collect_stable_post_interaction_projection,
+    };
     use crate::router::request_args::parse_json_args;
     use crate::session::SessionState;
     use rub_core::model::{
@@ -254,6 +257,7 @@ mod tests {
     };
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn post_interaction_projection_reads_refreshed_runtime_and_frame_state() {
@@ -359,6 +363,150 @@ mod tests {
         assert_eq!(projection.runtime_after, refreshed_runtime);
         assert_eq!(projection.frame_runtime, refreshed_frame);
         assert_eq!(projection.interference_after, refreshed_interference);
+    }
+
+    #[tokio::test]
+    async fn stable_post_interaction_projection_waits_for_browser_quiescence_before_sampling() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-interaction-stable-test"),
+            None,
+        ));
+        let runtime_before = RuntimeStateSnapshot {
+            state_inspector: StateInspectorInfo {
+                status: StateInspectorStatus::Inactive,
+                ..StateInspectorInfo::default()
+            },
+            readiness_state: ReadinessInfo {
+                status: ReadinessStatus::Inactive,
+                ..ReadinessInfo::default()
+            },
+        };
+        let interference_before = InterferenceRuntimeInfo {
+            status: InterferenceRuntimeStatus::Inactive,
+            ..InterferenceRuntimeInfo::default()
+        };
+        state
+            .publish_runtime_state_snapshot(0, runtime_before.clone())
+            .await;
+        state
+            .set_frame_runtime(FrameRuntimeInfo {
+                status: FrameContextStatus::Top,
+                current_frame: Some(FrameContextInfo {
+                    frame_id: "frame-before".to_string(),
+                    name: None,
+                    parent_frame_id: None,
+                    target_id: None,
+                    url: Some("https://before.example".to_string()),
+                    depth: 0,
+                    same_origin_accessible: Some(true),
+                }),
+                primary_frame: None,
+                frame_lineage: vec!["frame-before".to_string()],
+                degraded_reason: None,
+            })
+            .await;
+        state
+            .set_interference_runtime(interference_before.clone())
+            .await;
+
+        let baseline = InteractionObservationBaseline {
+            observatory_cursor: state.observatory_cursor().await,
+            observatory_drop_count: state.observatory().await.dropped_event_count,
+            request_cursor: state.network_request_cursor().await,
+            network_request_drop_count: state.network_request_drop_count().await,
+            download_cursor: state.download_cursor().await,
+            download_drop_count: state.download_event_drop_count(),
+            browser_event_cursor: state.browser_event_cursor(),
+            runtime_before: Some(runtime_before),
+            interference_before,
+        };
+
+        let refreshed_runtime = RuntimeStateSnapshot {
+            state_inspector: StateInspectorInfo {
+                status: StateInspectorStatus::Active,
+                cookie_count: 3,
+                ..StateInspectorInfo::default()
+            },
+            readiness_state: ReadinessInfo {
+                status: ReadinessStatus::Active,
+                route_stability: RouteStability::Stable,
+                ..ReadinessInfo::default()
+            },
+        };
+        let refreshed_frame = FrameRuntimeInfo {
+            status: FrameContextStatus::Child,
+            current_frame: Some(FrameContextInfo {
+                frame_id: "frame-after".to_string(),
+                name: Some("child".to_string()),
+                parent_frame_id: Some("frame-root".to_string()),
+                target_id: Some("target-after".to_string()),
+                url: Some("https://after.example/frame".to_string()),
+                depth: 1,
+                same_origin_accessible: Some(true),
+            }),
+            primary_frame: Some(FrameContextInfo {
+                frame_id: "frame-root".to_string(),
+                name: None,
+                parent_frame_id: None,
+                target_id: Some("target-after".to_string()),
+                url: Some("https://after.example".to_string()),
+                depth: 0,
+                same_origin_accessible: Some(true),
+            }),
+            frame_lineage: vec!["frame-root".to_string(), "frame-after".to_string()],
+            degraded_reason: None,
+        };
+        let refreshed_interference = InterferenceRuntimeInfo {
+            status: InterferenceRuntimeStatus::Active,
+            ..InterferenceRuntimeInfo::default()
+        };
+
+        let delayed = state.clone();
+        let refreshed_runtime_for_task = refreshed_runtime.clone();
+        let refreshed_frame_for_task = refreshed_frame.clone();
+        let refreshed_interference_for_task = refreshed_interference.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let browser_sequence = delayed.allocate_browser_event_sequence();
+            delayed
+                .publish_runtime_state_snapshot(1, refreshed_runtime_for_task)
+                .await;
+            delayed.set_frame_runtime(refreshed_frame_for_task).await;
+            delayed
+                .set_interference_runtime(refreshed_interference_for_task)
+                .await;
+            delayed
+                .record_download_started_sequenced(
+                    1,
+                    1,
+                    "guid-after".to_string(),
+                    "https://after.example/file.txt".to_string(),
+                    "file.txt".to_string(),
+                    Some("frame-after".to_string()),
+                )
+                .await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            delayed.record_browser_event_commit(browser_sequence);
+        });
+
+        let stable =
+            collect_stable_post_interaction_projection(&state, &baseline, || async {}).await;
+
+        assert_eq!(stable.projection_state.runtime_after, refreshed_runtime);
+        assert_eq!(stable.projection_state.frame_runtime, refreshed_frame);
+        assert_eq!(
+            stable.projection_state.interference_after,
+            refreshed_interference
+        );
+        assert_eq!(stable.trace_windows.download_events.len(), 1);
+        assert_eq!(
+            stable.trace_windows.download_events[0]
+                .download
+                .suggested_filename
+                .as_deref(),
+            Some("file.txt")
+        );
     }
 
     #[test]

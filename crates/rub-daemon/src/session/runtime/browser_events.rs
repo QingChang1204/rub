@@ -1,12 +1,13 @@
 use super::*;
 use crate::dialogs;
 use crate::dialogs::DialogOpenedEvent;
+use crate::session::protocol::{
+    BROWSER_EVENT_CRITICAL_SOFT_LIMIT, DOWNLOAD_PROGRESS_OVERFLOW_REASON,
+};
 use rub_core::model::PendingDialogInfo;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use tokio::time::{Duration, Instant, sleep};
-
-const DOWNLOAD_PROGRESS_OVERFLOW_REASON: &str = "browser_event_ingress_overflow:download_progress";
 
 impl BrowserSessionEventSink {
     pub fn new(state: &Arc<SessionState>) -> Self {
@@ -140,6 +141,26 @@ impl BrowserSessionEventSink {
         }
     }
 
+    #[cfg(test)]
+    pub fn metered_critical_for_test(state: &Arc<SessionState>) -> Self {
+        let (critical_tx, critical_rx) =
+            tokio::sync::mpsc::unbounded_channel::<BrowserSessionEvent>();
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<BrowserSessionEvent>(1);
+        std::mem::forget(critical_rx);
+        drop(progress_rx);
+        Self {
+            state: state.clone(),
+            critical_tx,
+            progress_tx,
+            progress_overflow_coordination: Arc::new(std::sync::Mutex::new(())),
+            progress_overflow_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            progress_overflow_latched_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            progress_overflow_latched_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            progress_overflow_reopen_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            progress_overflow_reopen_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
     pub fn enqueue(&self, event: BrowserSessionEvent) {
         let coordination_guard = requires_download_progress_coordination(&event).then(|| {
             self.progress_overflow_coordination
@@ -252,6 +273,7 @@ impl BrowserSessionEventSink {
             } if degraded_reason.is_none() => Some((*generation, *browser_sequence)),
             _ => None,
         };
+        let mut critical_enqueue_recorded = false;
         if event.uses_bounded_progress_ingress() {
             let generation = match &event {
                 BrowserSessionEvent::DownloadProgress { generation, .. } => *generation,
@@ -317,6 +339,16 @@ impl BrowserSessionEventSink {
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
             }
         } else if let Some((generation, browser_sequence)) = runtime_clear_reopen {
+            // Critical ingress policy:
+            // 1. Dialog/runtime/degraded-marker events remain lossless at the channel boundary;
+            //    we meter pending depth instead of dropping them under pressure.
+            // 2. The pending-depth telemetry is authoritative only for the unbounded critical
+            //    channel backlog. Once the worker receives an event, that pressure is discharged
+            //    from this metric even though the event may still wait in the ordered pending map.
+            // 3. The only accepted drop on this path is channel closure during shutdown, and that
+            //    closure still commits the browser_sequence so quiescence cannot stall.
+            self.state.record_critical_browser_event_enqueued();
+            critical_enqueue_recorded = true;
             let _coordination = (!coordination_already_held).then(|| {
                 self.progress_overflow_coordination
                     .lock()
@@ -329,8 +361,15 @@ impl BrowserSessionEventSink {
             if self.critical_tx.send(event).is_ok() {
                 return;
             }
-        } else if self.critical_tx.send(event).is_ok() {
-            return;
+        } else {
+            self.state.record_critical_browser_event_enqueued();
+            critical_enqueue_recorded = true;
+            if self.critical_tx.send(event).is_ok() {
+                return;
+            }
+        }
+        if critical_enqueue_recorded {
+            self.state.record_critical_browser_event_dequeued();
         }
 
         if let Some((generation, browser_sequence)) = runtime_clear_reopen {
@@ -410,7 +449,10 @@ async fn run_browser_event_worker(
                     std::future::pending().await
                 }
             } => match event {
-                Some(event) => insert_pending_browser_event(&state, &mut pending, event),
+                Some(event) => {
+                    state.record_critical_browser_event_dequeued();
+                    insert_pending_browser_event(&state, &mut pending, event)
+                }
                 None => critical_open = false,
             },
             event = async {
@@ -503,6 +545,82 @@ fn should_emit_progress_overflow_marker(
 }
 
 impl SessionState {
+    fn record_critical_browser_event_enqueued(&self) {
+        let pending = self
+            .browser_event_ingress_telemetry
+            .critical_pending_count
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        atomic_max_u32(
+            &self
+                .browser_event_ingress_telemetry
+                .critical_max_pending_count,
+            pending,
+        );
+        if pending > BROWSER_EVENT_CRITICAL_SOFT_LIMIT
+            && !self
+                .browser_event_ingress_telemetry
+                .critical_pressure_active
+                .swap(true, Ordering::SeqCst)
+        {
+            self.browser_event_ingress_telemetry
+                .critical_soft_limit_cross_count
+                .fetch_add(1, Ordering::SeqCst);
+            self.browser_event_ingress_telemetry
+                .last_critical_soft_limit_cross_uptime_ms
+                .store(self.uptime_millis(), Ordering::SeqCst);
+        }
+    }
+
+    fn record_critical_browser_event_dequeued(&self) {
+        let remaining = atomic_saturating_decrement_u32(
+            &self.browser_event_ingress_telemetry.critical_pending_count,
+        );
+        if remaining <= BROWSER_EVENT_CRITICAL_SOFT_LIMIT {
+            self.browser_event_ingress_telemetry
+                .critical_pressure_active
+                .store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub async fn browser_event_ingress_metrics(&self) -> serde_json::Value {
+        let uptime_ms = self.uptime_millis();
+        let last_critical_soft_limit_cross_uptime_ms = self
+            .browser_event_ingress_telemetry
+            .last_critical_soft_limit_cross_uptime_ms
+            .load(Ordering::SeqCst);
+        serde_json::json!({
+            "critical": {
+                "mode": "lossless_metered_unbounded",
+                "soft_limit": BROWSER_EVENT_CRITICAL_SOFT_LIMIT,
+                "pending_count": self
+                    .browser_event_ingress_telemetry
+                    .critical_pending_count
+                    .load(Ordering::SeqCst),
+                "max_pending_count": self
+                    .browser_event_ingress_telemetry
+                    .critical_max_pending_count
+                    .load(Ordering::SeqCst),
+                "pressure_active": self
+                    .browser_event_ingress_telemetry
+                    .critical_pressure_active
+                    .load(Ordering::SeqCst),
+                "soft_limit_cross_count": self
+                    .browser_event_ingress_telemetry
+                    .critical_soft_limit_cross_count
+                    .load(Ordering::SeqCst),
+                "last_soft_limit_cross_uptime_ms": nonzero_u64(last_critical_soft_limit_cross_uptime_ms),
+                "last_soft_limit_cross_age_ms": age_from_uptime(uptime_ms, last_critical_soft_limit_cross_uptime_ms),
+            },
+            "progress": {
+                "mode": "bounded_drop_with_degraded_marker",
+                "capacity": BROWSER_EVENT_PROGRESS_INGRESS_LIMIT,
+                "drop_count": self.browser_event_ingress_drop_count(),
+                "drop_reason": DOWNLOAD_PROGRESS_OVERFLOW_REASON,
+            }
+        })
+    }
+
     fn next_dialog_event_sequence(&self) -> u64 {
         self.next_dialog_event_sequence
             .fetch_add(1, Ordering::SeqCst)
@@ -686,17 +804,18 @@ impl SessionState {
         let deadline = Instant::now() + timeout;
         loop {
             let observed = self.browser_event_cursor();
-            if observed <= baseline_cursor {
-                return;
-            }
-            if !self
-                .wait_for_browser_event_commit_until(observed, deadline)
-                .await
+            if observed > baseline_cursor
+                && !self
+                    .wait_for_browser_event_commit_until(observed, deadline)
+                    .await
             {
                 return;
             }
-            sleep(quiet_period).await;
-            if self.browser_event_cursor() == observed {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return;
+            };
+            sleep(quiet_period.min(remaining)).await;
+            if self.browser_event_cursor() <= observed {
                 return;
             }
         }
@@ -822,6 +941,39 @@ impl SessionState {
     /// Sequenced download runtime events recorded after the given cursor.
     pub async fn download_events_after(&self, cursor: u64) -> Vec<DownloadEvent> {
         self.downloads.read().await.events_after(cursor)
+    }
+
+    /// Current download-ingress drop count for interaction window authority checks.
+    pub fn download_event_drop_count(&self) -> u64 {
+        self.browser_event_ingress_drop_count()
+    }
+
+    /// Windowed download evidence after one interaction baseline.
+    ///
+    /// The current browser-event ingress only drops bounded in-progress download
+    /// progress events. That means a delta in `download_event_drop_count()`
+    /// invalidates the download window for this interaction even if some sequenced
+    /// events were still published successfully.
+    pub(crate) async fn download_event_window_after(
+        &self,
+        cursor: u64,
+        last_observed_drop_count: u64,
+    ) -> crate::session::protocol::DownloadEventWindow {
+        let events = self.download_events_after(cursor).await;
+        let current_drop_count = self.download_event_drop_count();
+        let authoritative = current_drop_count == last_observed_drop_count;
+        let degraded_reason = if authoritative {
+            None
+        } else {
+            self.download_runtime().await.degraded_reason.or_else(|| {
+                Some(crate::session::protocol::DOWNLOAD_PROGRESS_OVERFLOW_REASON.to_string())
+            })
+        };
+        crate::session::protocol::DownloadEventWindow {
+            events,
+            authoritative,
+            degraded_reason,
+        }
     }
 
     /// Return a projected download entry by GUID when present.
@@ -955,14 +1107,50 @@ impl SessionState {
     }
 }
 
+fn nonzero_u64(value: u64) -> Option<u64> {
+    (value != 0).then_some(value)
+}
+
+fn age_from_uptime(current_uptime_ms: u64, event_uptime_ms: u64) -> Option<u64> {
+    (event_uptime_ms != 0).then_some(current_uptime_ms.saturating_sub(event_uptime_ms))
+}
+
+fn atomic_max_u32(target: &std::sync::atomic::AtomicU32, candidate: u32) {
+    let mut current = target.load(Ordering::SeqCst);
+    while candidate > current {
+        match target.compare_exchange(current, candidate, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn atomic_saturating_decrement_u32(target: &std::sync::atomic::AtomicU32) -> u32 {
+    let mut current = target.load(Ordering::SeqCst);
+    loop {
+        if current == 0 {
+            return 0;
+        }
+        match target.compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return current - 1,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserSessionEvent, BrowserSessionEventSink, DOWNLOAD_PROGRESS_OVERFLOW_REASON,
-        drain_ready_browser_events, should_emit_progress_overflow_marker,
+        BrowserSessionEvent, BrowserSessionEventSink, drain_ready_browser_events,
+        should_emit_progress_overflow_marker,
     };
     use crate::session::SessionState;
-    use rub_core::model::{DownloadMode, DownloadRuntimeStatus, DownloadState};
+    use crate::session::protocol::{
+        BROWSER_EVENT_CRITICAL_SOFT_LIMIT, DOWNLOAD_PROGRESS_OVERFLOW_REASON,
+    };
+    use rub_core::model::{
+        DialogKind, DialogRuntimeStatus, DownloadMode, DownloadRuntimeStatus, DownloadState,
+    };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -1314,6 +1502,118 @@ mod tests {
         assert_eq!(
             state.download_runtime().await.degraded_reason.as_deref(),
             Some(DOWNLOAD_PROGRESS_OVERFLOW_REASON)
+        );
+    }
+
+    #[tokio::test]
+    async fn critical_ingress_pressure_resets_after_queue_drains_below_soft_limit() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-browser-event-critical-meter"),
+            None,
+        ));
+
+        for _ in 0..=BROWSER_EVENT_CRITICAL_SOFT_LIMIT {
+            state.record_critical_browser_event_enqueued();
+        }
+        assert!(
+            state
+                .browser_event_ingress_telemetry
+                .critical_pressure_active
+                .load(Ordering::SeqCst)
+        );
+
+        state.record_critical_browser_event_dequeued();
+
+        assert!(
+            !state
+                .browser_event_ingress_telemetry
+                .critical_pressure_active
+                .load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            state
+                .browser_event_ingress_telemetry
+                .critical_pending_count
+                .load(Ordering::SeqCst),
+            BROWSER_EVENT_CRITICAL_SOFT_LIMIT
+        );
+    }
+
+    #[tokio::test]
+    async fn metered_critical_test_sink_tracks_pending_depth_without_worker() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-browser-event-critical-pending"),
+            None,
+        ));
+        let sink = BrowserSessionEventSink::metered_critical_for_test(&state);
+
+        sink.enqueue(BrowserSessionEvent::DialogRuntime {
+            browser_sequence: state.allocate_browser_event_sequence(),
+            generation: 1,
+            status: DialogRuntimeStatus::Active,
+            degraded_reason: None,
+        });
+
+        let metrics = state.browser_event_ingress_metrics().await;
+        assert_eq!(metrics["critical"]["pending_count"], serde_json::json!(1));
+        assert_eq!(
+            metrics["critical"]["max_pending_count"],
+            serde_json::json!(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn dialog_events_preserve_browser_sequence_order_across_arrival_reordering() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-browser-event-dialog-order"),
+            None,
+        ));
+        let sink = BrowserSessionEventSink::new(&state);
+        let opened_sequence = state.allocate_browser_event_sequence();
+        let closed_sequence = state.allocate_browser_event_sequence();
+
+        sink.enqueue(BrowserSessionEvent::DialogClosed {
+            browser_sequence: closed_sequence,
+            generation: 3,
+            accepted: true,
+            user_input: String::new(),
+        });
+        sink.enqueue(BrowserSessionEvent::DialogOpened {
+            browser_sequence: opened_sequence,
+            generation: 3,
+            kind: DialogKind::Alert,
+            message: "Hello".to_string(),
+            url: "https://example.test/dialog".to_string(),
+            tab_target_id: Some("tab-1".to_string()),
+            frame_id: Some("frame-1".to_string()),
+            default_prompt: None,
+            has_browser_handler: true,
+        });
+
+        state
+            .wait_for_browser_event_quiescence_since(
+                opened_sequence.saturating_sub(1),
+                Duration::from_millis(100),
+                Duration::from_millis(5),
+            )
+            .await;
+
+        let runtime = state.dialog_runtime().await;
+        assert_eq!(runtime.status, DialogRuntimeStatus::Inactive);
+        assert!(runtime.pending_dialog.is_none());
+        assert_eq!(
+            runtime
+                .last_dialog
+                .as_ref()
+                .map(|dialog| dialog.message.as_str()),
+            Some("Hello")
+        );
+        assert_eq!(
+            runtime.last_result.as_ref().map(|result| result.accepted),
+            Some(true)
         );
     }
 }

@@ -623,16 +623,51 @@ impl BrowserManager {
     /// When a `Page.javascriptDialogOpening` event fires, the CDP listener
     /// task consumes this policy and immediately calls `Page.handleJavaScriptDialog`
     /// — before Chrome's built-in handler auto-dismisses the dialog.
-    pub fn set_dialog_intercept(&self, policy: rub_core::model::DialogInterceptPolicy) {
-        if let Ok(mut guard) = self.dialog_intercept.lock() {
-            *guard = Some(policy);
-        }
+    pub fn set_dialog_intercept(
+        &self,
+        policy: rub_core::model::DialogInterceptPolicy,
+    ) -> Result<(), RubError> {
+        let mut guard = self.dialog_intercept.lock().map_err(|_| {
+            RubError::domain_with_context(
+                ErrorCode::InternalError,
+                "dialog intercept state lock poisoned",
+                serde_json::json!({
+                    "operation": "set_dialog_intercept",
+                }),
+            )
+        })?;
+        *guard = Some(policy);
+        Ok(())
     }
 
     /// Cancel any pending one-shot dialog intercept policy.
-    pub fn clear_dialog_intercept(&self) {
-        if let Ok(mut guard) = self.dialog_intercept.lock() {
-            *guard = None;
+    pub fn clear_dialog_intercept(&self) -> Result<(), RubError> {
+        let mut guard = self.dialog_intercept.lock().map_err(|_| {
+            RubError::domain_with_context(
+                ErrorCode::InternalError,
+                "dialog intercept state lock poisoned",
+                serde_json::json!({
+                    "operation": "clear_dialog_intercept",
+                }),
+            )
+        })?;
+        *guard = None;
+        Ok(())
+    }
+
+    fn recover_dialog_intercept_after_authority_reset(&self) {
+        match self.dialog_intercept.lock() {
+            Ok(mut guard) => {
+                *guard = None;
+            }
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = None;
+                self.dialog_intercept.clear_poison();
+                tracing::warn!(
+                    "Recovered poisoned dialog intercept state during browser authority reset"
+                );
+            }
         }
     }
 
@@ -1059,7 +1094,7 @@ impl BrowserManager {
         *self.dialog_runtime.write().await = Default::default();
         // Clear any pending one-shot intercept: a stale intercept must not
         // survive a browser authority reset and fire on the next session.
-        self.clear_dialog_intercept();
+        self.recover_dialog_intercept_after_authority_reset();
     }
 
     async fn snapshot_current_browser_authority(&self) -> Option<BrowserAuthoritySnapshot> {
@@ -1641,6 +1676,53 @@ mod tests {
             download_error.into_envelope().code,
             ErrorCode::InternalError
         );
+    }
+
+    #[test]
+    fn dialog_intercept_mutation_surfaces_poisoned_lock() {
+        let manager = BrowserManager::new(options());
+        let poisoned = manager.dialog_intercept.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned.lock().expect("dialog intercept lock");
+            panic!("poison dialog intercept lock");
+        });
+
+        let set_error = manager
+            .set_dialog_intercept(rub_core::model::DialogInterceptPolicy {
+                accept: true,
+                prompt_text: None,
+                target_tab_id: Some("tab-1".to_string()),
+            })
+            .expect_err("poisoned dialog intercept should fail closed");
+        assert_eq!(set_error.into_envelope().code, ErrorCode::InternalError);
+
+        let clear_error = manager
+            .clear_dialog_intercept()
+            .expect_err("poisoned dialog intercept clear should fail closed");
+        assert_eq!(clear_error.into_envelope().code, ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn authority_reset_recovers_poisoned_dialog_intercept_state() {
+        let manager = BrowserManager::new(options());
+        let poisoned = manager.dialog_intercept.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned.lock().expect("dialog intercept lock");
+            panic!("poison dialog intercept lock");
+        });
+
+        manager.clear_local_browser_authority().await;
+
+        manager
+            .set_dialog_intercept(rub_core::model::DialogInterceptPolicy {
+                accept: true,
+                prompt_text: None,
+                target_tab_id: Some("tab-1".to_string()),
+            })
+            .expect("authority reset should recover dialog intercept state");
+        manager
+            .clear_dialog_intercept()
+            .expect("recovered dialog intercept state should clear cleanly");
     }
 
     #[tokio::test]

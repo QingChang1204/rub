@@ -57,7 +57,7 @@ pub(super) async fn cmd_dialog(
                 prompt_text,
                 target_tab_id: Some(target_tab_id.clone()),
             };
-            router.browser.set_dialog_intercept(policy.clone());
+            router.browser.set_dialog_intercept(policy.clone())?;
             Ok(serde_json::json!({
                 "subject": {
                     "kind": "dialog_intercept",
@@ -72,7 +72,7 @@ pub(super) async fn cmd_dialog(
         }
 
         "cancel_intercept" => {
-            router.browser.clear_dialog_intercept();
+            router.browser.clear_dialog_intercept()?;
             Ok(serde_json::json!({
                 "subject": {
                     "kind": "dialog_intercept",

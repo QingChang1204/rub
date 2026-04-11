@@ -510,9 +510,7 @@ fn abort_pending_trigger_reservations(
 
 #[cfg(test)]
 mod tests {
-    use super::condition::{
-        network_request_matches, parse_storage_area, readiness_matches, storage_snapshot_matches,
-    };
+    use super::condition::{network_request_matches, readiness_matches, storage_snapshot_matches};
     use super::outcome::classify_trigger_error_status;
     use super::{
         PendingTriggerConditionPolicy, PendingTriggerReservation, TriggerReservationCompletion,
@@ -599,7 +597,7 @@ mod tests {
                 readiness_state: Some("stable".to_string()),
                 method: Some("POST".to_string()),
                 status_code: Some(200),
-                storage_area: Some("local".to_string()),
+                storage_area: Some(StorageArea::Local),
                 key: Some("token".to_string()),
                 value: Some("abc".to_string()),
             },
@@ -726,19 +724,6 @@ mod tests {
         };
 
         assert!(storage_snapshot_matches(&snapshot, &trigger).expect("storage match"));
-    }
-
-    #[test]
-    fn parse_storage_area_accepts_local_and_session() {
-        assert_eq!(
-            parse_storage_area(Some("local")).expect("local"),
-            Some(StorageArea::Local)
-        );
-        assert_eq!(
-            parse_storage_area(Some("session")).expect("session"),
-            Some(StorageArea::Session)
-        );
-        assert_eq!(parse_storage_area(None).expect("none"), None);
     }
 
     #[test]

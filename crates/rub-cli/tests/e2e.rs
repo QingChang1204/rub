@@ -2,9 +2,8 @@
 //! These tests require Chrome to be installed.
 //! Run with: cargo test --test e2e -- --ignored
 
-mod support;
-
 use rub_daemon::rub_paths::RubPaths;
+use rub_test_harness::fixtures::{DownloadFixtureServer, NetworkInspectionFixtureServer};
 use rub_test_harness::server::TestServer;
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -19,8 +18,6 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::Duration;
-use support::download_fixture::DownloadFixtureServer;
-use support::network_fixture::NetworkInspectionFixtureServer;
 
 static HOME_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CLEANUP_HOOK: Once = Once::new();

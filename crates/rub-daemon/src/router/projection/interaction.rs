@@ -18,6 +18,8 @@ pub(crate) struct ProjectionSignals<'a> {
     pub network_authoritative: bool,
     pub network_degraded_reason: Option<&'a str>,
     pub download_events: &'a [DownloadEvent],
+    pub download_authoritative: bool,
+    pub download_degraded_reason: Option<&'a str>,
 }
 
 pub(crate) fn attach_interaction_projection(
@@ -52,7 +54,12 @@ pub(crate) fn attach_interaction_projection(
         signals.network_authoritative,
         signals.network_degraded_reason,
     );
-    attach_download_events(data, signals.download_events);
+    attach_download_events(
+        data,
+        signals.download_events,
+        signals.download_authoritative,
+        signals.download_degraded_reason,
+    );
     attach_observed_effects(data);
 }
 
@@ -88,7 +95,12 @@ pub(crate) fn attach_select_projection(
         signals.network_authoritative,
         signals.network_degraded_reason,
     );
-    attach_download_events(data, signals.download_events);
+    attach_download_events(
+        data,
+        signals.download_events,
+        signals.download_authoritative,
+        signals.download_degraded_reason,
+    );
     attach_observed_effects(data);
 }
 
@@ -285,8 +297,13 @@ fn attach_runtime_observatory_events(
     }
 }
 
-fn attach_download_events(data: &mut serde_json::Value, download_events: &[DownloadEvent]) {
-    if download_events.is_empty() {
+fn attach_download_events(
+    data: &mut serde_json::Value,
+    download_events: &[DownloadEvent],
+    authoritative: bool,
+    degraded_reason: Option<&str>,
+) {
+    if download_events.is_empty() && authoritative {
         return;
     }
 
@@ -306,6 +323,8 @@ fn attach_download_events(data: &mut serde_json::Value, download_events: &[Downl
         serde_json::json!({
             "events": download_events,
             "last_download": last_download,
+            "authoritative": authoritative,
+            "degraded_reason": degraded_reason,
         }),
     );
 }
@@ -556,4 +575,85 @@ fn attach_interaction_metadata(
         "interaction".to_string(),
         serde_json::Value::Object(interaction),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{attach_download_events, attach_observed_effects};
+    use rub_core::model::{DownloadEntry, DownloadEvent, DownloadEventKind, DownloadState};
+
+    fn sample_download_event() -> DownloadEvent {
+        DownloadEvent {
+            sequence: 7,
+            kind: DownloadEventKind::Completed,
+            download: DownloadEntry {
+                guid: "guid-1".to_string(),
+                state: DownloadState::Completed,
+                url: Some("https://example.test/report.csv".to_string()),
+                suggested_filename: Some("report.csv".to_string()),
+                final_path: Some("/tmp/rub-downloads/guid-1".to_string()),
+                mime_hint: None,
+                received_bytes: 128,
+                total_bytes: Some(128),
+                started_at: "2026-04-11T00:00:00Z".to_string(),
+                completed_at: Some("2026-04-11T00:00:01Z".to_string()),
+                frame_id: Some("frame-main".to_string()),
+                trigger_command_id: None,
+            },
+        }
+    }
+
+    #[test]
+    fn download_surface_truth_labels_propagate_into_observed_effects() {
+        let mut data = serde_json::json!({
+            "interaction": {}
+        });
+
+        attach_download_events(&mut data, &[sample_download_event()], true, None);
+        attach_observed_effects(&mut data);
+
+        assert_eq!(data["interaction"]["downloads"]["authoritative"], true);
+        assert_eq!(
+            data["interaction"]["downloads"]["degraded_reason"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            data["interaction"]["observed_effects"]["downloads"]["authoritative"],
+            true
+        );
+        assert_eq!(
+            data["interaction"]["observed_effects"]["downloads"]["last_download"]["suggested_filename"],
+            "report.csv"
+        );
+    }
+
+    #[test]
+    fn non_authoritative_empty_download_window_still_projects_degraded_surface() {
+        let mut data = serde_json::json!({
+            "interaction": {}
+        });
+
+        attach_download_events(
+            &mut data,
+            &[],
+            false,
+            Some("browser_event_ingress_overflow:download_progress"),
+        );
+        attach_observed_effects(&mut data);
+
+        assert_eq!(data["interaction"]["downloads"]["authoritative"], false);
+        assert_eq!(
+            data["interaction"]["downloads"]["degraded_reason"],
+            "browser_event_ingress_overflow:download_progress"
+        );
+        assert_eq!(
+            data["interaction"]["observed_effects"]["downloads"]["authoritative"],
+            false
+        );
+        assert!(
+            data["interaction"]["observed_effects"]["downloads"]["events"]
+                .as_array()
+                .is_some_and(|events| events.is_empty())
+        );
+    }
 }

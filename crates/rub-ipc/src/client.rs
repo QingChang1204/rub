@@ -5,7 +5,7 @@ use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::time::{Duration, timeout};
 
-use crate::codec::NdJsonCodec;
+use crate::codec::{NdJsonCodec, is_oversized_frame_io_error};
 use crate::protocol::{IPC_PROTOCOL_VERSION, IpcProtocolDecodeError, IpcRequest, IpcResponse};
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 
@@ -63,9 +63,7 @@ impl IpcClientError {
                     | std::io::ErrorKind::WouldBlock
                     | std::io::ErrorKind::BrokenPipe => Self::Transport(*io_error),
                     std::io::ErrorKind::InvalidData
-                        if io_error
-                            .to_string()
-                            .contains("NDJSON frame exceeds maximum on-wire size") =>
+                        if is_oversized_frame_io_error(io_error.as_ref()) =>
                     {
                         Self::Protocol(
                             ErrorEnvelope::new(
@@ -298,7 +296,7 @@ impl IpcClient {
 #[cfg(test)]
 mod tests {
     use super::IpcClient;
-    use crate::codec::NdJsonCodec;
+    use crate::codec::{MAX_FRAME_BYTES, NdJsonCodec};
     use crate::protocol::{IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse, ResponseStatus};
     use rub_core::error::{ErrorCode, ErrorEnvelope};
     use tokio::io::AsyncWriteExt;
@@ -668,5 +666,27 @@ mod tests {
         server.await.expect("server join");
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_dir_all(&socket_dir);
+    }
+
+    #[tokio::test]
+    async fn client_classifies_oversized_response_frame_without_string_matching() {
+        let oversized = format!("{{\"payload\":\"{}\"}}\n", "a".repeat(MAX_FRAME_BYTES));
+        let mut reader = BufReader::new(oversized.as_bytes());
+        let decode_error = NdJsonCodec::read::<serde_json::Value, _>(&mut reader)
+            .await
+            .expect_err("oversized response frame should fail");
+        let error = super::IpcClientError::response_read_error(decode_error);
+        let envelope = error
+            .protocol_envelope()
+            .expect("oversized response should be protocol-scoped");
+        assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("oversized_ndjson_frame")
+        );
     }
 }

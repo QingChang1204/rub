@@ -95,13 +95,26 @@ fn take_matching_intercept_policy(
     intercept: &SharedDialogIntercept,
     tab_target_id: &str,
 ) -> Option<DialogInterceptPolicy> {
-    if let Ok(mut guard) = intercept.lock() {
-        let should_consume = guard
-            .as_ref()
-            .is_some_and(|p| intercept_policy_matches(p, tab_target_id));
-        if should_consume { guard.take() } else { None }
-    } else {
-        None
+    match intercept.lock() {
+        Ok(mut guard) => {
+            let should_consume = guard
+                .as_ref()
+                .is_some_and(|p| intercept_policy_matches(p, tab_target_id));
+            if should_consume { guard.take() } else { None }
+        }
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            let should_consume = guard
+                .as_ref()
+                .is_some_and(|p| intercept_policy_matches(p, tab_target_id));
+            let taken = if should_consume { guard.take() } else { None };
+            drop(guard);
+            intercept.clear_poison();
+            tracing::warn!(
+                "Recovered poisoned dialog intercept state while consuming opening event"
+            );
+            taken
+        }
     }
 }
 
@@ -462,7 +475,7 @@ mod tests {
 
 #[cfg(test)]
 mod intercept_policy_tests {
-    use super::intercept_policy_matches;
+    use super::{intercept_policy_matches, take_matching_intercept_policy};
     use rub_core::model::DialogInterceptPolicy;
 
     fn policy(accept: bool, target_tab_id: Option<&str>) -> DialogInterceptPolicy {
@@ -541,6 +554,27 @@ mod intercept_policy_tests {
         assert!(
             taken_again.is_none(),
             "one-shot: second take must be None — policy must not repeat"
+        );
+    }
+
+    #[test]
+    fn poisoned_intercept_lock_is_recovered_during_take() {
+        use super::SharedDialogIntercept;
+        use std::sync::{Arc, Mutex};
+
+        let intercept: SharedDialogIntercept =
+            Arc::new(Mutex::new(Some(policy(true, Some("tab-A")))));
+        let poisoned = intercept.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned.lock().expect("dialog intercept lock");
+            panic!("poison dialog intercept lock");
+        });
+
+        let taken = take_matching_intercept_policy(&intercept, "tab-A");
+        assert!(taken.is_some(), "poisoned intercept should still recover");
+        assert!(
+            intercept.lock().is_ok(),
+            "take should clear the poison flag after recovery"
         );
     }
 }

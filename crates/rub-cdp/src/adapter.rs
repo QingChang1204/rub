@@ -166,12 +166,15 @@ impl BrowserPort for ChromiumAdapter {
         Ok(self.manager.dialog_runtime().read().await.clone())
     }
 
-    fn set_dialog_intercept(&self, policy: rub_core::model::DialogInterceptPolicy) {
-        self.manager.set_dialog_intercept(policy);
+    fn set_dialog_intercept(
+        &self,
+        policy: rub_core::model::DialogInterceptPolicy,
+    ) -> Result<(), RubError> {
+        self.manager.set_dialog_intercept(policy)
     }
 
-    fn clear_dialog_intercept(&self) {
-        self.manager.clear_dialog_intercept();
+    fn clear_dialog_intercept(&self) -> Result<(), RubError> {
+        self.manager.clear_dialog_intercept()
     }
 
     async fn screenshot(&self, full_page: bool) -> Result<Vec<u8>, RubError> {

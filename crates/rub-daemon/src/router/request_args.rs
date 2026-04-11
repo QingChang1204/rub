@@ -21,6 +21,7 @@ mod tests {
     use rub_core::error::RubError;
     use rub_core::locator::{CanonicalLocator, LocatorSelection};
     use rub_core::model::{OrchestrationRegistrationSpec, TriggerRegistrationSpec};
+    use rub_core::storage::StorageArea;
 
     #[test]
     fn locator_json_emits_canonical_locator_shape() {
@@ -223,5 +224,87 @@ mod tests {
             .expect("pipe action should preserve args");
         assert_eq!(args["_trigger"]["trigger_id"], "trg-123");
         assert_eq!(args["_trigger"]["watch_revision"], 7);
+    }
+
+    #[test]
+    fn parse_json_spec_normalizes_storage_area_at_model_fence() {
+        let spec = parse_json_spec::<TriggerRegistrationSpec>(
+            r#"{
+                "source_tab": 0,
+                "target_tab": 1,
+                "condition": {
+                    "kind": "storage_value",
+                    "storage_area": " Session ",
+                    "key": "reply_state"
+                },
+                "action": {
+                    "kind": "browser_command",
+                    "command": "click",
+                    "payload": {}
+                }
+            }"#,
+            "trigger add",
+        )
+        .expect("registration spec should parse");
+
+        assert_eq!(spec.condition.storage_area, Some(StorageArea::Session));
+    }
+
+    #[test]
+    fn parse_json_spec_normalizes_storage_area_for_orchestration_rules() {
+        let spec = parse_json_spec::<OrchestrationRegistrationSpec>(
+            r#"{
+                "source": { "session_id": "source" },
+                "target": { "session_id": "target" },
+                "condition": {
+                    "kind": "storage_value",
+                    "storage_area": " Local ",
+                    "key": "reply_state"
+                },
+                "actions": [
+                    {
+                        "kind": "browser_command",
+                        "command": "click",
+                        "payload": {}
+                    }
+                ]
+            }"#,
+            "orchestration add",
+        )
+        .expect("registration spec should parse");
+
+        assert_eq!(spec.condition.storage_area, Some(StorageArea::Local));
+    }
+
+    #[test]
+    fn parse_json_spec_rejects_unsupported_storage_area_before_runtime() {
+        let error = parse_json_spec::<TriggerRegistrationSpec>(
+            r#"{
+                "source_tab": 0,
+                "target_tab": 1,
+                "condition": {
+                    "kind": "storage_value",
+                    "storage_area": "cookie",
+                    "key": "reply_state"
+                },
+                "action": {
+                    "kind": "browser_command",
+                    "command": "click",
+                    "payload": {}
+                }
+            }"#,
+            "trigger add",
+        )
+        .expect_err("unsupported storage area should fail");
+
+        match error {
+            RubError::Domain(domain) => {
+                assert!(matches!(domain.code, ErrorCode::InvalidInput));
+                assert!(domain.message.contains("storage area"));
+                assert!(domain.message.contains("local"));
+                assert!(domain.message.contains("session"));
+            }
+            other => panic!("expected domain error, got {other:?}"),
+        }
     }
 }

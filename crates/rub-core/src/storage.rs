@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
 /// Browser storage area.
@@ -7,6 +7,36 @@ use std::collections::BTreeMap;
 pub enum StorageArea {
     Local,
     Session,
+}
+
+impl StorageArea {
+    fn parse_normalized(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local" => Some(Self::Local),
+            "session" => Some(Self::Session),
+            _ => None,
+        }
+    }
+}
+
+pub fn deserialize_optional_storage_area<'de, D>(
+    deserializer: D,
+) -> Result<Option<StorageArea>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    match raw {
+        None => Ok(None),
+        Some(raw) => StorageArea::parse_normalized(&raw)
+            .map(Some)
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "unsupported storage area '{}'; use 'local' or 'session'",
+                    raw.trim()
+                ))
+            }),
+    }
 }
 
 /// Session-scoped runtime status of the storage surface.

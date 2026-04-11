@@ -2,6 +2,7 @@ use super::{
     BrowserSessionEvent, BrowserSessionEventSink, ReplayCommandClaim, ReplayFenceState,
     SessionState,
 };
+use crate::session::protocol::BROWSER_EVENT_CRITICAL_SOFT_LIMIT;
 use rub_core::model::{
     AuthState, ConsoleErrorEvent, DownloadMode, DownloadRuntimeStatus, DownloadState,
     FrameContextStatus, HumanVerificationHandoffInfo, HumanVerificationHandoffStatus,
@@ -22,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio::sync::oneshot;
 
 fn sample_orchestration_rule(id: u32) -> OrchestrationRuleInfo {
     OrchestrationRuleInfo {
@@ -247,6 +249,62 @@ async fn automation_scheduler_metrics_track_queue_pressure_and_shutdown_drain() 
     assert_eq!(
         metrics["shutdown_drain"]["max_observed_pre_request_response_fence_count"],
         serde_json::json!(5)
+    );
+}
+
+#[tokio::test]
+async fn browser_event_ingress_metrics_track_metered_critical_pressure() {
+    let state = Arc::new(SessionState::new(
+        "default",
+        PathBuf::from("/tmp/rub-test"),
+        None,
+    ));
+    let sink = BrowserSessionEventSink::metered_critical_for_test(&state);
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    for _ in 0..=BROWSER_EVENT_CRITICAL_SOFT_LIMIT {
+        sink.enqueue(BrowserSessionEvent::DialogRuntime {
+            browser_sequence: state.allocate_browser_event_sequence(),
+            generation: 1,
+            status: rub_core::model::DialogRuntimeStatus::Active,
+            degraded_reason: None,
+        });
+    }
+
+    let metrics = state.browser_event_ingress_metrics().await;
+
+    assert_eq!(
+        metrics["critical"]["mode"],
+        serde_json::json!("lossless_metered_unbounded")
+    );
+    assert_eq!(
+        metrics["critical"]["soft_limit"],
+        serde_json::json!(BROWSER_EVENT_CRITICAL_SOFT_LIMIT)
+    );
+    assert_eq!(
+        metrics["critical"]["pending_count"],
+        serde_json::json!(BROWSER_EVENT_CRITICAL_SOFT_LIMIT + 1)
+    );
+    assert_eq!(
+        metrics["critical"]["max_pending_count"],
+        serde_json::json!(BROWSER_EVENT_CRITICAL_SOFT_LIMIT + 1)
+    );
+    assert_eq!(
+        metrics["critical"]["pressure_active"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        metrics["critical"]["soft_limit_cross_count"],
+        serde_json::json!(1)
+    );
+    assert!(
+        metrics["critical"]["last_soft_limit_cross_uptime_ms"]
+            .as_u64()
+            .is_some()
+    );
+    assert_eq!(
+        metrics["progress"]["mode"],
+        serde_json::json!("bounded_drop_with_degraded_marker")
     );
 }
 
@@ -867,6 +925,37 @@ async fn browser_event_quiescence_waits_for_committed_callbacks() {
 }
 
 #[tokio::test]
+async fn browser_event_quiescence_waits_for_late_arriving_callbacks_within_quiet_period() {
+    let state = Arc::new(SessionState::new(
+        "default",
+        PathBuf::from("/tmp/rub-test"),
+        None,
+    ));
+    let baseline = state.browser_event_cursor();
+    let delayed = state.clone();
+    let (sequence_tx, sequence_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let sequence = delayed.allocate_browser_event_sequence();
+        let _ = sequence_tx.send(sequence);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        delayed.record_browser_event_commit(sequence);
+    });
+
+    state
+        .wait_for_browser_event_quiescence_since(
+            baseline,
+            Duration::from_millis(100),
+            Duration::from_millis(25),
+        )
+        .await;
+
+    let sequence = sequence_rx.await.expect("late browser event sequence");
+    assert!(state.committed_browser_event_cursor() >= sequence);
+}
+
+#[tokio::test]
 async fn browser_event_enqueue_failure_commits_dropped_sequence() {
     let state = Arc::new(SessionState::new(
         "default",
@@ -1065,6 +1154,13 @@ async fn browser_event_progress_overflow_commits_sequence_and_marks_download_run
         state.download_runtime().await.degraded_reason.as_deref(),
         Some("browser_event_ingress_overflow:download_progress")
     );
+    let window = state.download_event_window_after(0, 0).await;
+    assert!(!window.authoritative);
+    assert_eq!(
+        window.degraded_reason.as_deref(),
+        Some("browser_event_ingress_overflow:download_progress")
+    );
+    assert!(window.events.is_empty());
 }
 
 #[test]

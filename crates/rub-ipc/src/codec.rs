@@ -10,6 +10,23 @@ pub struct NdJsonCodec;
 /// Maximum on-wire NDJSON frame size, including the trailing newline commit fence.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
+#[derive(Debug)]
+struct NdJsonFrameTooLargeError {
+    max_frame_bytes: usize,
+}
+
+impl std::fmt::Display for NdJsonFrameTooLargeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "NDJSON frame exceeds maximum on-wire size of {} bytes",
+            self.max_frame_bytes
+        )
+    }
+}
+
+impl std::error::Error for NdJsonFrameTooLargeError {}
+
 pub fn encoded_frame_len_from_payload_len(payload_json_len: usize) -> usize {
     payload_json_len.saturating_add(1)
 }
@@ -18,6 +35,21 @@ pub fn encoded_frame_len<T: Serialize>(value: &T) -> Result<usize, serde_json::E
     Ok(encoded_frame_len_from_payload_len(
         serde_json::to_vec(value)?.len(),
     ))
+}
+
+pub fn oversized_frame_io_error(max_frame_bytes: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        NdJsonFrameTooLargeError { max_frame_bytes },
+    )
+}
+
+pub fn is_oversized_frame_io_error(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::InvalidData
+        && error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<NdJsonFrameTooLargeError>())
+            .is_some()
 }
 
 impl NdJsonCodec {
@@ -147,13 +179,7 @@ impl NdJsonCodec {
 
 fn ensure_payload_within_limit(payload_json_len: usize) -> Result<(), std::io::Error> {
     if encoded_frame_len_from_payload_len(payload_json_len) > MAX_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "NDJSON frame exceeds maximum on-wire size of {} bytes",
-                MAX_FRAME_BYTES
-            ),
-        ));
+        return Err(oversized_frame_io_error(MAX_FRAME_BYTES));
     }
     Ok(())
 }
@@ -248,12 +274,10 @@ mod tests {
         let error = NdJsonCodec::read::<TestMsg, _>(&mut reader)
             .await
             .expect_err("oversized frame should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("NDJSON frame exceeds maximum on-wire size"),
-            "{error}"
-        );
+        let io_error = error
+            .downcast::<std::io::Error>()
+            .expect("oversized frame should surface io error");
+        assert!(is_oversized_frame_io_error(&io_error), "{io_error}");
     }
 
     #[tokio::test]
@@ -284,10 +308,9 @@ mod tests {
             MAX_FRAME_BYTES + 1
         );
         let error = NdJsonCodec::encode(&msg).expect_err("oversized encode should fail");
+        assert_eq!(error.io_error_kind(), Some(std::io::ErrorKind::InvalidData));
         assert!(
-            error
-                .to_string()
-                .contains("NDJSON frame exceeds maximum on-wire size"),
+            error.to_string().contains("maximum on-wire size"),
             "{error}"
         );
     }
@@ -307,11 +330,9 @@ mod tests {
 
         let error = NdJsonCodec::read_blocking::<TestMsg, _>(&mut reader)
             .expect_err("oversized blocking frame should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("NDJSON frame exceeds maximum on-wire size"),
-            "{error}"
-        );
+        let io_error = error
+            .downcast::<std::io::Error>()
+            .expect("oversized blocking frame should surface io error");
+        assert!(is_oversized_frame_io_error(&io_error), "{io_error}");
     }
 }

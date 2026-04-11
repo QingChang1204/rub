@@ -460,6 +460,10 @@ fn orchestration_target_dispatch_request(
     request: IpcRequest,
 ) -> IpcRequest {
     let timeout_ms = request.timeout_ms;
+    // The outer wrapper owns transport replay authority for the cross-session
+    // dispatch itself. It derives a dedicated command_id from the inner step
+    // command_id so the remote daemon can replay the wrapper request without
+    // conflating it with the nested browser/action command.
     let command_id = orchestration_target_dispatch_command_id(address, &request);
     let request = IpcRequest::new(
         "_orchestration_target_dispatch",
@@ -682,6 +686,23 @@ mod tests {
                 .and_then(|value| value.get("command_id"))
                 .and_then(|value| value.as_str()),
             Some("step-cmd")
+        );
+    }
+
+    #[test]
+    fn target_dispatch_wrapper_stays_non_replayable_without_inner_command_id() {
+        let address = target_address();
+        let inner = IpcRequest::new("click", serde_json::json!({ "selector": "#go" }), 1_000);
+
+        let wrapped = orchestration_target_dispatch_request(&address, inner.clone());
+
+        assert_eq!(wrapped.command_id, None);
+        assert_eq!(
+            wrapped
+                .args
+                .get("request")
+                .and_then(|value| value.get("command_id")),
+            None
         );
     }
 

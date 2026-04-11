@@ -29,6 +29,7 @@ pub(crate) async fn cmd_doctor(
     );
     let detection_risks = detection_risks(&launch_policy);
     let automation_scheduler = state.automation_scheduler_metrics().await;
+    let browser_event_ingress = state.browser_event_ingress_metrics().await;
     let mut result = serde_json::json!({
         "browser": {
             "found": report.browser_found,
@@ -61,6 +62,7 @@ pub(crate) async fn cmd_doctor(
         "dom_epoch": state.current_epoch(),
         "detection_risks": detection_risks,
         "automation_scheduler": automation_scheduler,
+        "browser_event_ingress": browser_event_ingress,
     });
     annotate_doctor_operator_path_states(&mut result);
 

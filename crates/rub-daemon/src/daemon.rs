@@ -351,6 +351,21 @@ mod tests {
     }
 
     #[test]
+    fn read_failure_envelope_classifies_oversized_frames_as_protocol_errors() {
+        let error = rub_ipc::codec::oversized_frame_io_error(rub_ipc::codec::MAX_FRAME_BYTES);
+        let envelope = read_failure_envelope(Box::new(error));
+        assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("oversized_ndjson_frame")
+        );
+    }
+
+    #[test]
     fn protocol_read_failure_response_wraps_structured_error_envelope() {
         let response =
             protocol_read_failure_response(read_failure_envelope(Box::new(serde_json::Error::io(

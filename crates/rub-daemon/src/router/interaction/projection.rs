@@ -21,18 +21,27 @@ pub(super) struct InteractionObservationBaseline {
     pub(super) request_cursor: u64,
     pub(super) network_request_drop_count: u64,
     pub(super) download_cursor: u64,
+    pub(super) download_drop_count: u64,
     pub(super) browser_event_cursor: u64,
     pub(super) runtime_before: Option<RuntimeStateSnapshot>,
     pub(super) interference_before: InterferenceRuntimeInfo,
 }
 
-struct InteractionTraceWindows {
-    observatory_events: Vec<rub_core::model::RuntimeObservatoryEvent>,
-    observatory_authoritative: bool,
-    observatory_degraded_reason: Option<String>,
-    network_requests: Vec<rub_core::model::NetworkRequestRecord>,
-    network_authoritative: bool,
-    network_degraded_reason: Option<String>,
+pub(super) struct InteractionTraceWindows {
+    pub(super) observatory_events: Vec<rub_core::model::RuntimeObservatoryEvent>,
+    pub(super) observatory_authoritative: bool,
+    pub(super) observatory_degraded_reason: Option<String>,
+    pub(super) network_requests: Vec<rub_core::model::NetworkRequestRecord>,
+    pub(super) network_authoritative: bool,
+    pub(super) network_degraded_reason: Option<String>,
+    pub(super) download_events: Vec<DownloadEvent>,
+    pub(super) download_authoritative: bool,
+    pub(super) download_degraded_reason: Option<String>,
+}
+
+pub(super) struct StableInteractionProjection {
+    pub(super) projection_state: InteractionProjectionState,
+    pub(super) trace_windows: InteractionTraceWindows,
 }
 
 pub(super) struct InteractionProjectionState {
@@ -54,6 +63,7 @@ pub(super) async fn capture_interaction_baseline(
         request_cursor: state.network_request_cursor().await,
         network_request_drop_count: state.network_request_drop_count().await,
         download_cursor: state.download_cursor().await,
+        download_drop_count: state.download_event_drop_count(),
         browser_event_cursor: state.browser_event_cursor(),
         runtime_before: crate::interaction_trace::probe_runtime_state(&router.browser).await,
         interference_before: state.interference_runtime().await,
@@ -73,6 +83,9 @@ async fn capture_interaction_trace_windows(
     let network_window = state
         .network_request_window_after(baseline.request_cursor, baseline.network_request_drop_count)
         .await;
+    let download_window = state
+        .download_event_window_after(baseline.download_cursor, baseline.download_drop_count)
+        .await;
     InteractionTraceWindows {
         observatory_events: observatory_window.events,
         observatory_authoritative: observatory_window.authoritative,
@@ -80,6 +93,9 @@ async fn capture_interaction_trace_windows(
         network_requests: network_window.records,
         network_authoritative: network_window.authoritative,
         network_degraded_reason: network_window.degraded_reason,
+        download_events: download_window.events,
+        download_authoritative: download_window.authoritative,
+        download_degraded_reason: download_window.degraded_reason,
     }
 }
 
@@ -90,7 +106,7 @@ pub(super) async fn finalize_interaction_projection(
     outcome: &InteractionOutcome,
     baseline: &InteractionObservationBaseline,
 ) {
-    let projection_state = collect_post_interaction_projection(state, || async {
+    let stable_projection = collect_stable_post_interaction_projection(state, baseline, || async {
         refresh_live_runtime_state(&router.browser, state).await;
         refresh_live_frame_runtime(&router.browser, state).await;
         let _ = refresh_live_interference_state(&router.browser, state).await;
@@ -102,32 +118,33 @@ pub(super) async fn finalize_interaction_projection(
         }
     })
     .await;
-    state
-        .wait_for_browser_event_quiescence_since(
-            baseline.browser_event_cursor,
-            INTERACTION_BROWSER_EVENT_FENCE_TIMEOUT,
-            INTERACTION_BROWSER_EVENT_QUIET_PERIOD,
-        )
-        .await;
-    let trace_windows = capture_interaction_trace_windows(state, baseline).await;
-    let download_events: Vec<DownloadEvent> =
-        state.download_events_after(baseline.download_cursor).await;
     attach_interaction_projection(
         data,
         outcome,
         crate::router::projection::ProjectionSignals {
-            frame_runtime: &projection_state.frame_runtime,
+            frame_runtime: &stable_projection.projection_state.frame_runtime,
             runtime_before: baseline.runtime_before.as_ref(),
-            runtime_after: Some(&projection_state.runtime_after),
+            runtime_after: Some(&stable_projection.projection_state.runtime_after),
             interference_before: Some(&baseline.interference_before),
-            interference_after: Some(&projection_state.interference_after),
-            observatory_events: &trace_windows.observatory_events,
-            observatory_authoritative: trace_windows.observatory_authoritative,
-            observatory_degraded_reason: trace_windows.observatory_degraded_reason.as_deref(),
-            network_requests: &trace_windows.network_requests,
-            network_authoritative: trace_windows.network_authoritative,
-            network_degraded_reason: trace_windows.network_degraded_reason.as_deref(),
-            download_events: &download_events,
+            interference_after: Some(&stable_projection.projection_state.interference_after),
+            observatory_events: &stable_projection.trace_windows.observatory_events,
+            observatory_authoritative: stable_projection.trace_windows.observatory_authoritative,
+            observatory_degraded_reason: stable_projection
+                .trace_windows
+                .observatory_degraded_reason
+                .as_deref(),
+            network_requests: &stable_projection.trace_windows.network_requests,
+            network_authoritative: stable_projection.trace_windows.network_authoritative,
+            network_degraded_reason: stable_projection
+                .trace_windows
+                .network_degraded_reason
+                .as_deref(),
+            download_events: &stable_projection.trace_windows.download_events,
+            download_authoritative: stable_projection.trace_windows.download_authoritative,
+            download_degraded_reason: stable_projection
+                .trace_windows
+                .download_degraded_reason
+                .as_deref(),
         },
     );
 }
@@ -158,12 +175,52 @@ pub(super) async fn finalize_select_projection(
     outcome: &rub_core::model::SelectOutcome,
     baseline: &InteractionObservationBaseline,
 ) {
-    let projection_state = collect_post_interaction_projection(state, || async {
+    let stable_projection = collect_stable_post_interaction_projection(state, baseline, || async {
         refresh_live_runtime_state(&router.browser, state).await;
         refresh_live_frame_runtime(&router.browser, state).await;
         let _ = refresh_live_interference_state(&router.browser, state).await;
     })
     .await;
+    attach_select_projection(
+        data,
+        outcome,
+        crate::router::projection::ProjectionSignals {
+            frame_runtime: &stable_projection.projection_state.frame_runtime,
+            runtime_before: baseline.runtime_before.as_ref(),
+            runtime_after: Some(&stable_projection.projection_state.runtime_after),
+            interference_before: Some(&baseline.interference_before),
+            interference_after: Some(&stable_projection.projection_state.interference_after),
+            observatory_events: &stable_projection.trace_windows.observatory_events,
+            observatory_authoritative: stable_projection.trace_windows.observatory_authoritative,
+            observatory_degraded_reason: stable_projection
+                .trace_windows
+                .observatory_degraded_reason
+                .as_deref(),
+            network_requests: &stable_projection.trace_windows.network_requests,
+            network_authoritative: stable_projection.trace_windows.network_authoritative,
+            network_degraded_reason: stable_projection
+                .trace_windows
+                .network_degraded_reason
+                .as_deref(),
+            download_events: &stable_projection.trace_windows.download_events,
+            download_authoritative: stable_projection.trace_windows.download_authoritative,
+            download_degraded_reason: stable_projection
+                .trace_windows
+                .download_degraded_reason
+                .as_deref(),
+        },
+    );
+}
+
+pub(super) async fn collect_stable_post_interaction_projection<F, Fut>(
+    state: &Arc<SessionState>,
+    baseline: &InteractionObservationBaseline,
+    refresh: F,
+) -> StableInteractionProjection
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ()>,
+{
     state
         .wait_for_browser_event_quiescence_since(
             baseline.browser_event_cursor,
@@ -171,26 +228,12 @@ pub(super) async fn finalize_select_projection(
             INTERACTION_BROWSER_EVENT_QUIET_PERIOD,
         )
         .await;
+    let projection_state = collect_post_interaction_projection(state, refresh).await;
     let trace_windows = capture_interaction_trace_windows(state, baseline).await;
-    let download_events = state.download_events_after(baseline.download_cursor).await;
-    attach_select_projection(
-        data,
-        outcome,
-        crate::router::projection::ProjectionSignals {
-            frame_runtime: &projection_state.frame_runtime,
-            runtime_before: baseline.runtime_before.as_ref(),
-            runtime_after: Some(&projection_state.runtime_after),
-            interference_before: Some(&baseline.interference_before),
-            interference_after: Some(&projection_state.interference_after),
-            observatory_events: &trace_windows.observatory_events,
-            observatory_authoritative: trace_windows.observatory_authoritative,
-            observatory_degraded_reason: trace_windows.observatory_degraded_reason.as_deref(),
-            network_requests: &trace_windows.network_requests,
-            network_authoritative: trace_windows.network_authoritative,
-            network_degraded_reason: trace_windows.network_degraded_reason.as_deref(),
-            download_events: &download_events,
-        },
-    );
+    StableInteractionProjection {
+        projection_state,
+        trace_windows,
+    }
 }
 
 pub(super) async fn collect_post_interaction_projection<F, Fut>(

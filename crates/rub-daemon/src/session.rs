@@ -109,6 +109,15 @@ pub(crate) struct ShutdownDrainTelemetry {
     pub(crate) max_observed_pre_request_response_fence_count: AtomicU32,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct BrowserEventIngressTelemetry {
+    pub(crate) critical_pending_count: AtomicU32,
+    pub(crate) critical_max_pending_count: AtomicU32,
+    pub(crate) critical_soft_limit_cross_count: AtomicU64,
+    pub(crate) critical_pressure_active: AtomicBool,
+    pub(crate) last_critical_soft_limit_cross_uptime_ms: AtomicU64,
+}
+
 /// Per-session in-memory state. Authority for session lifecycle.
 pub struct SessionState {
     pub session_id: String,
@@ -123,6 +132,7 @@ pub struct SessionState {
     orchestration_worker_telemetry: AutomationWorkerTelemetry,
     queue_pressure_telemetry: QueuePressureTelemetry,
     shutdown_drain_telemetry: ShutdownDrainTelemetry,
+    browser_event_ingress_telemetry: BrowserEventIngressTelemetry,
     replay: StdMutex<ReplayProtocolState>,
     post_commit_projections: StdMutex<PostCommitProjectionQueue>,
     post_commit_projection_drain: Mutex<()>,
@@ -200,6 +210,7 @@ impl SessionState {
             orchestration_worker_telemetry: AutomationWorkerTelemetry::default(),
             queue_pressure_telemetry: QueuePressureTelemetry::default(),
             shutdown_drain_telemetry: ShutdownDrainTelemetry::default(),
+            browser_event_ingress_telemetry: BrowserEventIngressTelemetry::default(),
             replay: StdMutex::new(ReplayProtocolState::default()),
             post_commit_projections: StdMutex::new(PostCommitProjectionQueue::default()),
             post_commit_projection_drain: Mutex::new(()),
