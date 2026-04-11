@@ -117,6 +117,36 @@ pub(super) fn orphan_temp_browser_pids_for_roots(
     orphan_pids
 }
 
+pub(super) fn orphan_temp_browser_roots(snapshot: &[ProcessInfo]) -> HashSet<PathBuf> {
+    let mut roots = HashSet::new();
+    for process in snapshot {
+        if let Some(root) = extract_temp_browser_root(&process.command) {
+            roots.insert(root);
+        }
+    }
+
+    for temp_root in temp_roots() {
+        let Ok(entries) = std::fs::read_dir(&temp_root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(pid) = temp_browser_root_authority_pid(&path) else {
+                continue;
+            };
+            if is_process_alive(pid) {
+                continue;
+            }
+            roots.insert(path);
+        }
+    }
+
+    roots
+}
+
 pub(super) fn root_has_live_browser_process(snapshot: &[ProcessInfo], root: &Path) -> bool {
     snapshot.iter().any(|process| {
         extract_temp_browser_root(&process.command)
@@ -185,6 +215,16 @@ pub(super) fn extract_temp_browser_root(command: &str) -> Option<PathBuf> {
         return Some(user_data_dir);
     }
     None
+}
+
+pub(super) fn temp_browser_root_authority_pid(root: &Path) -> Option<u32> {
+    let file_name = root.file_name()?.to_str()?;
+    let pid = file_name.strip_prefix("rub-chrome-")?;
+    temp_roots()
+        .into_iter()
+        .any(|temp_root| root.starts_with(temp_root))
+        .then_some(pid.parse::<u32>().ok())
+        .flatten()
 }
 
 pub(super) fn cleanup_temp_daemon_registry_state(daemon: &TempDaemonProcess) {

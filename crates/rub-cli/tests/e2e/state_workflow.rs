@@ -1521,25 +1521,25 @@ fn t260_261_select_and_upload_grouped_scenario() {
         "selection_applied"
     );
     assert_eq!(
-        json["data"]["interaction"]["confirmation_details"]["context_changed"], true,
+        json["data"]["interaction"]["confirmation_details"]["context_changed"], false,
         "{json}"
     );
     assert_eq!(
         json["data"]["interaction"]["confirmation_details"]["after_page"]["context_replaced"],
-        false,
+        true,
         "{json}"
     );
     assert_eq!(
-        json["data"]["interaction"]["context_turnover"]["context_changed"], true,
+        json["data"]["interaction"]["context_turnover"]["context_changed"], false,
         "{json}"
     );
     assert_eq!(
-        json["data"]["interaction"]["context_turnover"]["context_replaced"], false,
+        json["data"]["interaction"]["context_turnover"]["context_replaced"], true,
         "{json}"
     );
     assert_eq!(
         json["data"]["interaction"]["observed_effects"]["context_turnover"]["context_replaced"],
-        false,
+        true,
         "{json}"
     );
     let title_json = parse_json(&session.cmd().args(["get", "title"]).output().unwrap());

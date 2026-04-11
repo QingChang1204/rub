@@ -140,6 +140,41 @@ async fn current_page_summary(page: &Arc<Page>) -> Result<RubPage, RubError> {
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct RuntimePageSummaryProbe {
+    url: String,
+    title: String,
+}
+
+async fn current_page_summary_from_runtime(page: &Arc<Page>) -> Result<RubPage, RubError> {
+    let result = page
+        .evaluate(
+            r#"
+            JSON.stringify({
+                url: window.location.href,
+                title: document.title
+            })
+        "#,
+        )
+        .await
+        .map_err(|e| RubError::Internal(format!("Cannot capture runtime page summary: {e}")))?;
+    let json_str = result.into_value::<String>().map_err(|e| {
+        RubError::Internal(format!(
+            "Runtime page summary returned non-string payload: {e}"
+        ))
+    })?;
+    let summary: RuntimePageSummaryProbe = serde_json::from_str(&json_str)
+        .map_err(|e| RubError::Internal(format!("Parse runtime page summary failed: {e}")))?;
+
+    Ok(RubPage {
+        url: summary.url.clone(),
+        title: summary.title,
+        http_status: None,
+        final_url: summary.url,
+        navigation_warning: None,
+    })
+}
+
 /// Capture a viewport screenshot as PNG bytes.
 pub async fn screenshot(page: &Arc<Page>, full_page: bool) -> Result<Vec<u8>, RubError> {
     if full_page {
@@ -412,14 +447,15 @@ async fn current_page_summary_after_history_commit(
     }
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        match current_page_summary(page).await {
+        match current_page_summary_from_runtime(page).await {
             Ok(summary) => return Ok(summary),
             Err(error) if tokio::time::Instant::now() < deadline => {
                 let message = error.to_string();
                 if !message.contains(
-                    "Cannot get title: Error -32000: Cannot find context with specified id",
-                ) && !message
-                    .contains("Cannot get URL: Error -32000: Cannot find context with specified id")
+                    "Cannot capture runtime page summary: Error -32000: Cannot find context with specified id",
+                ) && !message.contains(
+                    "Cannot capture runtime page summary: Error -32000: Execution context was destroyed.",
+                )
                 {
                     return Err(error);
                 }

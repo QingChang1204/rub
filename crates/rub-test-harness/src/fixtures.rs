@@ -1,6 +1,14 @@
 //! HTML fixture generators for test scenarios.
 
+/// Browser-backed download fixture owner used by E2E tests.
+///
+/// The server lifecycle is bound to the Rust value so grouped scenarios can
+/// share one authority and release it deterministically during teardown.
 pub use crate::download_fixture::DownloadFixtureServer;
+/// Browser-backed network observation fixture owner used by E2E tests.
+///
+/// This is the harness authority for deterministic request traces and should be
+/// preferred over ad hoc HTTP helpers inside individual test files.
 pub use crate::network_fixture::NetworkInspectionFixtureServer;
 
 /// A simple page with a title and links.

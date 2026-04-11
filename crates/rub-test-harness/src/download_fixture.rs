@@ -8,6 +8,8 @@ const REQUEST_HEAD_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_REQUEST_HEAD_BYTES: usize = 8192;
 
+/// Lightweight loopback HTTP fixture that serves deterministic browser-backed
+/// download scenarios for E2E tests.
 pub struct DownloadFixtureServer {
     addr: SocketAddr,
     shutdown_tx: Option<mpsc::Sender<()>>,
@@ -15,6 +17,8 @@ pub struct DownloadFixtureServer {
 }
 
 impl DownloadFixtureServer {
+    /// Start a loopback HTTP server that owns deterministic download fixtures
+    /// for the lifetime of this value.
     pub fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("download fixture bind");
         listener
@@ -46,6 +50,7 @@ impl DownloadFixtureServer {
         }
     }
 
+    /// Base URL for this fixture authority.
     pub fn url(&self) -> String {
         format!("http://{}", self.addr)
     }

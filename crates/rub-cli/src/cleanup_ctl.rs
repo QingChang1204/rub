@@ -74,7 +74,7 @@ mod tests {
     use super::temp_runtime::{
         TempDaemonProcess, cleanup_temp_daemon_registry_state, daemon_process_matches_authority,
         extract_temp_browser_root, is_rub_daemon_command, is_temp_rub_home,
-        revalidated_temp_daemon_tree, temp_daemon_processes,
+        orphan_temp_browser_roots, revalidated_temp_daemon_tree, temp_daemon_processes,
     };
     use super::upgrade_probe::{cleanup_upgrade_status_error, fetch_upgrade_status_for_session};
     use rub_core::error::ErrorCode;
@@ -401,6 +401,21 @@ mod tests {
             extract_temp_browser_root(&command),
             Some(std::env::temp_dir().join("rub-chrome-321"))
         );
+    }
+
+    #[test]
+    fn orphan_temp_browser_roots_include_residual_profile_dirs_without_live_daemon_owner() {
+        let root = std::env::temp_dir().join("rub-chrome-424242");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let orphan_roots = orphan_temp_browser_roots(&[]);
+        assert!(
+            orphan_roots.contains(&root),
+            "cleanup sweep should discover residual managed browser profile directories even after all browser processes are gone"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

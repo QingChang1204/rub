@@ -12,12 +12,21 @@ use crate::observation::ObservationScope;
 use crate::storage::{StorageArea, StorageSnapshot};
 use std::collections::HashMap;
 
+/// Default snapshot element cap used when callers omit an explicit limit.
 pub const DEFAULT_SNAPSHOT_LIMIT: u32 = 500;
 
 /// Infrastructure boundary for browser control.
 /// Implemented by `rub-cdp::ChromiumAdapter`.
 /// Defined in `rub-core` so the daemon can depend on the trait
 /// without depending on the CDP implementation (hexagonal architecture).
+///
+/// Contract notes:
+/// - frame-scoped methods must fail closed for explicit unavailable frames
+///   rather than silently degrading to a tab-wide/top-frame probe
+/// - one-shot dialog intercept methods must return an error instead of
+///   pretending success
+/// - query helpers are read-only authorities and must not mutate active-tab
+///   ownership as a side effect
 #[async_trait]
 pub trait BrowserPort: Send + Sync {
     /// Navigate to URL with the specified load strategy.

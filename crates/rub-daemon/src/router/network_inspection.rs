@@ -105,6 +105,26 @@ async fn cmd_network_wait(
         started,
     };
 
+    if let Some(request) = find_matching_network_wait_record(
+        state,
+        request_id,
+        url_match,
+        method,
+        status,
+        desired_state,
+    )
+    .await
+    {
+        return Ok(network_payload(
+            network_wait_subject(request_id, url_match, method, status, desired_state),
+            serde_json::json!({
+                "matched": true,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+                "request": request,
+            }),
+        ));
+    }
+
     loop {
         let notified = notify.notified();
         let window = state
@@ -168,6 +188,33 @@ async fn cmd_network_wait(
             return Err(network_wait_timeout_error(error_context));
         }
     }
+}
+
+async fn find_matching_network_wait_record(
+    state: &Arc<SessionState>,
+    request_id: Option<&str>,
+    url_match: Option<&str>,
+    method: Option<&str>,
+    status: Option<u16>,
+    desired_state: NetworkRequestWaitState,
+) -> Option<rub_core::model::NetworkRequestRecord> {
+    if let Some(request_id) = request_id {
+        let request = state.network_request_record(request_id).await?;
+        return desired_state.matches(request.lifecycle).then_some(request);
+    }
+
+    let requests = state
+        .network_request_records(
+            None,
+            url_match,
+            method,
+            status,
+            desired_state.actual_filter(),
+        )
+        .await;
+    filter_requests_by_wait_state(requests, Some(desired_state))
+        .into_iter()
+        .next()
 }
 
 fn network_wait_timeout_error(context: NetworkWaitErrorContext<'_>) -> RubError {
@@ -293,6 +340,57 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("observatory_ingress_overflow")
         );
+    }
+
+    #[tokio::test]
+    async fn network_wait_matches_existing_terminal_record_before_waiting() {
+        let state = Arc::new(crate::session::SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-test"),
+            None,
+        ));
+        state
+            .upsert_network_request_record(NetworkRequestRecord {
+                request_id: "req-existing".to_string(),
+                sequence: 1,
+                lifecycle: NetworkRequestLifecycle::Completed,
+                url: "https://example.com/api/delayed?order=7".to_string(),
+                method: "POST".to_string(),
+                tab_target_id: Some("tab-1".to_string()),
+                status: Some(200),
+                request_headers: BTreeMap::new(),
+                response_headers: BTreeMap::new(),
+                request_body: None,
+                response_body: None,
+                original_url: None,
+                rewritten_url: None,
+                applied_rule_effects: Vec::new(),
+                error_text: None,
+                frame_id: Some("frame-1".to_string()),
+                resource_type: Some("Fetch".to_string()),
+                mime_type: Some("application/json".to_string()),
+            })
+            .await;
+
+        let result = cmd_network_wait(
+            NetworkTimelineArgs {
+                wait: true,
+                id: None,
+                last: None,
+                url_match: Some("/api/delayed".to_string()),
+                method: Some("POST".to_string()),
+                status: None,
+                lifecycle: Some("terminal".to_string()),
+                timeout_ms: Some(5_000),
+            },
+            &state,
+        )
+        .await
+        .expect("existing terminal request should satisfy wait immediately");
+
+        assert_eq!(result["result"]["matched"], true);
+        assert_eq!(result["result"]["request"]["request_id"], "req-existing");
+        assert_eq!(result["subject"]["lifecycle"], "terminal");
     }
 
     #[test]

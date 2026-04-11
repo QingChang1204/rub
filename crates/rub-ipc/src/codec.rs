@@ -5,6 +5,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 ///
 /// Framing: each message is a single JSON object followed by `\n`.
 /// No length prefix. Parser reads until `\n`, then deserializes.
+///
+/// The trailing newline is the transport commit fence. A payload that never
+/// reaches `\n` must be treated as incomplete transport state rather than a
+/// successfully framed protocol message.
 pub struct NdJsonCodec;
 
 /// Maximum on-wire NDJSON frame size, including the trailing newline commit fence.
@@ -27,16 +31,21 @@ impl std::fmt::Display for NdJsonFrameTooLargeError {
 
 impl std::error::Error for NdJsonFrameTooLargeError {}
 
+/// Compute the on-wire frame size for an already serialized JSON payload.
 pub fn encoded_frame_len_from_payload_len(payload_json_len: usize) -> usize {
     payload_json_len.saturating_add(1)
 }
 
+/// Compute the on-wire NDJSON frame size for a serializable value, including
+/// the newline commit fence.
 pub fn encoded_frame_len<T: Serialize>(value: &T) -> Result<usize, serde_json::Error> {
     Ok(encoded_frame_len_from_payload_len(
         serde_json::to_vec(value)?.len(),
     ))
 }
 
+/// Construct the canonical typed IO error used when a frame exceeds the codec's
+/// maximum on-wire budget.
 pub fn oversized_frame_io_error(max_frame_bytes: usize) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -44,6 +53,7 @@ pub fn oversized_frame_io_error(max_frame_bytes: usize) -> std::io::Error {
     )
 }
 
+/// Detect whether an IO error came from this codec's oversized-frame fence.
 pub fn is_oversized_frame_io_error(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::InvalidData
         && error

@@ -1403,13 +1403,11 @@ fn t416_417_424_425_frame_runtime_inventory_and_stale_grouped_scenario() {
     assert_eq!(get_text["success"], false, "{get_text}");
     assert_eq!(get_text["error"]["code"], "STALE_SNAPSHOT", "{get_text}");
     assert_eq!(
-        get_text["error"]["context"]["snapshot_frame_id"],
-        top_state["data"]["result"]["snapshot"]["frame_context"]["frame_id"],
+        get_text["error"]["context"]["snapshot_id"], snapshot_id,
         "{get_text}"
     );
     assert_eq!(
-        get_text["error"]["context"]["current_frame_id"],
-        switched["data"]["result"]["current_frame"]["frame_id"],
+        get_text["error"]["context"]["authority_state"], "selected_frame_context_drifted",
         "{get_text}"
     );
 

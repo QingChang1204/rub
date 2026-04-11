@@ -7,6 +7,8 @@ use std::time::Duration;
 const REQUEST_HEAD_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_REQUEST_HEAD_BYTES: usize = 8192;
 
+/// Lightweight loopback HTTP fixture that owns deterministic request/response
+/// traces for browser-backed network observation tests.
 pub struct NetworkInspectionFixtureServer {
     addr: SocketAddr,
     shutdown_tx: Option<mpsc::Sender<()>>,
@@ -14,6 +16,7 @@ pub struct NetworkInspectionFixtureServer {
 }
 
 impl NetworkInspectionFixtureServer {
+    /// Start a loopback HTTP server for request-observation scenarios.
     pub fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("network fixture bind");
         listener
@@ -45,10 +48,13 @@ impl NetworkInspectionFixtureServer {
         }
     }
 
+    /// Base URL for this fixture authority.
     pub fn url(&self) -> String {
         format!("http://{}", self.addr)
     }
 
+    /// Resolve an absolute fixture URL for a route, accepting either relative
+    /// or already rooted paths.
     pub fn url_for(&self, path: &str) -> String {
         format!("http://{}{}", self.addr, normalize_url_path(path))
     }

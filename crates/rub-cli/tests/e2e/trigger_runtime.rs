@@ -126,7 +126,7 @@ fn t437_trigger_text_present_fires_cross_tab_click() {
         "{fired}"
     );
     assert_eq!(
-        fired["data"]["last_trigger_result"]["status"], "fired",
+        fired["data"]["runtime"]["last_trigger_result"]["status"], "fired",
         "{fired}"
     );
 
@@ -305,7 +305,7 @@ fn t437b_trigger_records_blocked_outcome_when_target_action_fails() {
         "{blocked}"
     );
     assert_eq!(
-        blocked["data"]["last_trigger_result"]["status"], "blocked",
+        blocked["data"]["runtime"]["last_trigger_result"]["status"], "blocked",
         "{blocked}"
     );
 
@@ -857,7 +857,7 @@ fn t437e_trigger_trace_projects_recent_lifecycle_and_outcome_events() {
 
     let fired = wait_for_trigger_status(&home, trigger_id, "fired");
     assert_eq!(
-        fired["data"]["last_trigger_result"]["status"], "fired",
+        fired["data"]["runtime"]["last_trigger_result"]["status"], "fired",
         "{fired}"
     );
 
@@ -1076,7 +1076,7 @@ fn t437f_trigger_degrades_when_target_selected_frame_becomes_stale() {
         "{degraded}"
     );
     assert_eq!(
-        degraded["data"]["last_trigger_result"]["status"], "degraded",
+        degraded["data"]["runtime"]["last_trigger_result"]["status"], "degraded",
         "{degraded}"
     );
 
@@ -1736,7 +1736,7 @@ fn t437i_l_trigger_source_vars_storage_blocked_and_removed_grouped_scenario() {
             .all(|entry| entry["id"].as_u64() != Some(trigger_id)),
         "{listed}"
     );
-    assert!(listed["data"]["last_trigger_result"].is_null(), "{listed}");
+    assert!(listed["data"]["runtime"]["last_trigger_result"].is_null(), "{listed}");
     let trace = parse_json(
         &session
             .cmd()

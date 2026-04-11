@@ -2005,19 +2005,21 @@ fn t414i_state_and_observe_support_compact_projection_and_depth() {
     );
     assert_eq!(
         compact_state["data"]["result"]["snapshot"]["observation_projection"]["depth_count"],
-        1
+        2
     );
     let entries = compact_state["data"]["result"]["snapshot"]["entries"]
         .as_array()
         .unwrap();
-    assert_eq!(entries.len(), 1, "{compact_state}");
+    assert_eq!(entries.len(), 2, "{compact_state}");
     assert_eq!(entries[0]["depth"], 1, "{compact_state}");
     assert_eq!(entries[0]["label"], "Top Action", "{compact_state}");
+    assert_eq!(entries[1]["depth"], 2, "{compact_state}");
+    assert_eq!(entries[1]["label"], "Docs", "{compact_state}");
     let compact_text = compact_state["data"]["result"]["snapshot"]["compact_text"]
         .as_str()
         .unwrap();
     assert!(compact_text.contains("Top Action"), "{compact_state}");
-    assert!(!compact_text.contains("Docs"), "{compact_state}");
+    assert!(compact_text.contains("Docs"), "{compact_state}");
     assert!(!compact_text.contains("Deep Action"), "{compact_state}");
     assert!(!compact_text.contains("Outside"), "{compact_state}");
     assert!(
@@ -2051,7 +2053,7 @@ fn t414i_state_and_observe_support_compact_projection_and_depth() {
     );
     assert_eq!(
         compact_observe["data"]["result"]["snapshot"]["observation_projection"]["depth_count"],
-        2
+        3
     );
     assert_eq!(
         compact_observe["data"]["result"]["snapshot"]["summary"]["format"],
@@ -2066,15 +2068,15 @@ fn t414i_state_and_observe_support_compact_projection_and_depth() {
     );
     assert_eq!(
         compact_observe["data"]["result"]["snapshot"]["compact_lines"],
-        2
+        3
     );
     assert_eq!(
         compact_observe["data"]["result"]["snapshot"]["summary"]["line_count"],
-        2
+        3
     );
     assert!(summary.contains("Top Action"), "{compact_observe}");
     assert!(summary.contains("Docs"), "{compact_observe}");
-    assert!(!summary.contains("Deep Action"), "{compact_observe}");
+    assert!(summary.contains("Deep Action"), "{compact_observe}");
     assert!(
         summary.lines().all(|line| !line.starts_with("  ")),
         "{compact_observe}"
@@ -2087,9 +2089,10 @@ fn t414i_state_and_observe_support_compact_projection_and_depth() {
     let map = compact_observe["data"]["result"]["snapshot"]["element_map"]
         .as_array()
         .unwrap();
-    assert_eq!(map.len(), 2, "{compact_observe}");
+    assert_eq!(map.len(), 3, "{compact_observe}");
     assert_eq!(map[0]["depth"], 1, "{compact_observe}");
     assert_eq!(map[1]["depth"], 2, "{compact_observe}");
+    assert_eq!(map[2]["depth"], 3, "{compact_observe}");
 }
 
 /// T414d: `extract` supports repeated collection rows with typed child postprocessing.

@@ -701,10 +701,38 @@ fn cleanup_impl(home: &str) {
     if !std::path::Path::new(home).exists() {
         return;
     }
-    kill_home_process_tree(home);
+    // Prefer the daemon-owned shutdown fence so managed browser profile release
+    // can commit before we fall back to process reaping.
+    let _ = request_graceful_close_all(home, Duration::from_secs(5));
+    let _ = request_cleanup_runtime(home, Duration::from_secs(5));
     if wait_for_home_processes_to_exit(home, Duration::from_secs(5)) {
+        let _ = request_cleanup_runtime(home, Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(home);
+        return;
+    }
+
+    kill_home_process_tree(home);
+    let _ = request_cleanup_runtime(home, Duration::from_secs(5));
+    if wait_for_home_processes_to_exit(home, Duration::from_secs(5)) {
+        let _ = request_cleanup_runtime(home, Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(home);
     }
+}
+
+fn request_graceful_close_all(home: &str, timeout: Duration) -> bool {
+    let timeout_ms = timeout.as_millis().to_string();
+    let output = rub_cmd(home)
+        .args(["--timeout", &timeout_ms, "close", "--all"])
+        .output();
+    matches!(output, Ok(result) if result.status.success())
+}
+
+fn request_cleanup_runtime(home: &str, timeout: Duration) -> bool {
+    let timeout_ms = timeout.as_millis().to_string();
+    let output = rub_cmd(home)
+        .args(["--timeout", &timeout_ms, "cleanup"])
+        .output();
+    matches!(output, Ok(result) if result.status.success())
 }
 
 fn observe_home_cleanup(home: &str) -> HomeCleanupObservation {

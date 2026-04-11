@@ -1,9 +1,9 @@
 use super::CleanupResult;
 use super::temp_runtime::{
     cleanup_temp_daemon_registry_state, extract_temp_browser_root, is_rub_daemon_command,
-    is_temp_rub_home, orphan_temp_browser_pids_for_roots, process_snapshot,
-    root_has_live_browser_process, temp_daemon_processes, temp_roots, terminate_process_tree,
-    terminate_revalidated_temp_daemon,
+    is_temp_rub_home, orphan_temp_browser_pids_for_roots, orphan_temp_browser_roots,
+    process_snapshot, root_has_live_browser_process, temp_daemon_processes, temp_roots,
+    terminate_process_tree, terminate_revalidated_temp_daemon,
 };
 use super::upgrade_probe::{fetch_upgrade_status_for_session, wait_for_shutdown_paths};
 use crate::daemon_ctl::send_existing_request_with_replay_recovery;
@@ -107,17 +107,17 @@ pub(super) async fn sweep_orphan_temp_browsers(
         .map(|process| process.pid)
         .collect();
     let mut orphan_pids = HashSet::new();
-    let mut orphan_roots = HashSet::new();
+    let mut orphan_roots = orphan_temp_browser_roots(snapshot);
 
     for process in snapshot {
         let Some(root) = extract_temp_browser_root(&process.command) else {
             continue;
         };
         if process_has_ancestor(snapshot, process.pid, &daemon_pids) {
+            orphan_roots.remove(&root);
             continue;
         }
         orphan_pids.insert(process.pid);
-        orphan_roots.insert(root);
     }
 
     if !orphan_pids.is_empty() {
