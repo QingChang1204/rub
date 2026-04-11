@@ -3,7 +3,7 @@
 use rub_core::error::ErrorEnvelope;
 use rub_core::model::CommandResult;
 use rub_ipc::protocol::IpcResponse;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 const POST_COMMIT_LOCAL_FAILURE_STATE: &str = "daemon_committed_local_followup_failed";
 
@@ -140,13 +140,31 @@ fn annotate_post_commit_local_failure_data(data: &Value) -> Value {
                 "commit_state".to_string(),
                 Value::String(POST_COMMIT_LOCAL_FAILURE_STATE.to_string()),
             );
+            annotated.insert(
+                "post_commit_followup_state".to_string(),
+                post_commit_followup_state_json(),
+            );
             Value::Object(annotated)
         }
-        other => serde_json::json!({
+        other => json!({
             "commit_state": POST_COMMIT_LOCAL_FAILURE_STATE,
+            "post_commit_followup_state": post_commit_followup_state_json(),
             "daemon_response": other,
         }),
     }
+}
+
+fn post_commit_followup_state_json() -> Value {
+    json!({
+        "surface": "cli_post_commit_followup_failure",
+        "truth_level": "operator_projection",
+        "projection_kind": "cli_post_commit_followup_failure",
+        "projection_authority": "cli.post_commit_followup",
+        "upstream_commit_truth": "daemon_response_committed",
+        "control_role": "display_only",
+        "durability": "best_effort",
+        "recovery_contract": "no_public_recovery_contract",
+    })
 }
 
 /// Format a CLI-side success result when no IPC response exists yet.
@@ -543,6 +561,38 @@ mod tests {
             value["data"]["commit_state"],
             POST_COMMIT_LOCAL_FAILURE_STATE
         );
+        assert_eq!(
+            value["data"]["post_commit_followup_state"]["surface"],
+            "cli_post_commit_followup_failure"
+        );
+        assert_eq!(
+            value["data"]["post_commit_followup_state"]["truth_level"],
+            "operator_projection"
+        );
+        assert_eq!(
+            value["data"]["post_commit_followup_state"]["projection_kind"],
+            "cli_post_commit_followup_failure"
+        );
+        assert_eq!(
+            value["data"]["post_commit_followup_state"]["projection_authority"],
+            "cli.post_commit_followup"
+        );
+        assert_eq!(
+            value["data"]["post_commit_followup_state"]["upstream_commit_truth"],
+            "daemon_response_committed"
+        );
+        assert_eq!(
+            value["data"]["post_commit_followup_state"]["control_role"],
+            "display_only"
+        );
+        assert_eq!(
+            value["data"]["post_commit_followup_state"]["durability"],
+            "best_effort"
+        );
+        assert_eq!(
+            value["data"]["post_commit_followup_state"]["recovery_contract"],
+            "no_public_recovery_contract"
+        );
         assert_eq!(value["data"]["result"]["ok"], true);
         assert_eq!(
             value["error"]["message"],
@@ -577,6 +627,10 @@ mod tests {
         assert_eq!(
             value["data"]["commit_state"],
             POST_COMMIT_LOCAL_FAILURE_STATE
+        );
+        assert_eq!(
+            value["data"]["post_commit_followup_state"]["truth_level"],
+            "operator_projection"
         );
         assert_eq!(value["data"]["daemon_response"], "done");
     }

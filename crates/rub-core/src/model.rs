@@ -1320,6 +1320,8 @@ pub enum TriggerActionKind {
 pub struct TriggerTabBindingInfo {
     pub index: u32,
     pub target_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<String>,
     pub url: String,
     pub title: String,
 }
@@ -1355,6 +1357,10 @@ pub struct TriggerConditionSpec {
 pub struct TriggerRegistrationSpec {
     pub source_tab: u32,
     pub target_tab: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_frame_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_frame_id: Option<String>,
     #[serde(default = "default_trigger_mode")]
     pub mode: TriggerMode,
     pub condition: TriggerConditionSpec,

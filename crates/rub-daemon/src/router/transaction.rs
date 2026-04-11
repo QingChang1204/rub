@@ -227,11 +227,31 @@ pub(super) fn preflight_rejection_response(
     request: &IpcRequest,
     preflight: &RequestPreflight,
     state: &Arc<SessionState>,
+    in_process_dispatch: bool,
 ) -> Option<IpcResponse> {
     if !preflight.internal_command && request.ipc_protocol_version != IPC_PROTOCOL_VERSION {
         return Some(protocol_version_mismatch_response(
             &preflight.request_id,
             request,
+        ));
+    }
+    if preflight.internal_command
+        && dispatch::is_in_process_only_command(request.command.as_str())
+        && !in_process_dispatch
+    {
+        return Some(IpcResponse::error(
+            &preflight.request_id,
+            ErrorEnvelope::new(
+                ErrorCode::IpcProtocolError,
+                format!(
+                    "Command '{}' is reserved for in-process dispatch only",
+                    request.command
+                ),
+            )
+            .with_context(serde_json::json!({
+                "command": request.command,
+                "reason": "in_process_only_internal_command",
+            })),
         ));
     }
     if !preflight.internal_command
@@ -599,7 +619,7 @@ pub(crate) fn attach_response_metadata(
 
 #[cfg(test)]
 mod tests {
-    use super::finalize_response;
+    use super::{finalize_response, preflight_rejection_response, prepare_request_preflight};
     use crate::session::SessionState;
     use rub_ipc::protocol::{IpcRequest, IpcResponse};
     use std::path::PathBuf;
@@ -652,6 +672,14 @@ mod tests {
             assert_eq!(committed.command_id.as_deref(), Some("cmd-1"));
             assert_eq!(history.entries.len(), 1);
             assert_eq!(journal.len(), 1);
+            assert_eq!(
+                journal[0]["journal_state"]["commit_relation"],
+                serde_json::json!("downstream_of_daemon_commit_fence")
+            );
+            assert_eq!(
+                journal[0]["journal_state"]["durability"],
+                serde_json::json!("durable")
+            );
             assert_eq!(journal[0]["command"], serde_json::json!("type"));
             assert_eq!(journal[0]["command_id"], serde_json::json!("cmd-1"));
             assert_eq!(
@@ -703,5 +731,33 @@ mod tests {
         assert_eq!(history.entries[0].command, "open");
 
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn external_preflight_rejects_in_process_only_internal_commands() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            unique_home("in-process-only"),
+            None,
+        ));
+        let request = IpcRequest::new("_trigger_pipe", serde_json::json!({ "spec": "[]" }), 1_000);
+        let preflight = prepare_request_preflight(&request);
+
+        let external = preflight_rejection_response(&request, &preflight, &state, false)
+            .expect("external dispatch should reject in-process-only command");
+        assert_eq!(
+            external
+                .error
+                .as_ref()
+                .and_then(|error| error.context.as_ref())
+                .and_then(|context| context.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("in_process_only_internal_command")
+        );
+
+        assert!(
+            preflight_rejection_response(&request, &preflight, &state, true).is_none(),
+            "in-process dispatch should retain authority to call reserved trigger wrappers"
+        );
     }
 }

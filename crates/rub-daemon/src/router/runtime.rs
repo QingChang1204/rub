@@ -66,9 +66,9 @@ mod tests {
     };
     use super::takeover::{takeover_continuity_failure, takeover_resume_repaused_error};
     use super::{
-        cmd_cookies, cmd_doctor, cmd_handoff, cmd_runtime, intercept_payload,
-        intercept_registry_subject, intercept_rule_id_subject, intercept_rule_subject,
-        parse_json_args, project_network_rule,
+        cmd_cookies, cmd_doctor, cmd_handoff, cmd_handshake, cmd_runtime, cmd_upgrade_check,
+        intercept_payload, intercept_registry_subject, intercept_rule_id_subject,
+        intercept_rule_subject, parse_json_args, project_network_rule,
     };
     use crate::router::runtime::projection::{
         annotate_doctor_operator_path_states, runtime_projection_state,
@@ -251,6 +251,73 @@ mod tests {
         assert_eq!(
             payload["runtime_projection_state"]["truth_level"],
             "operator_projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn handshake_and_upgrade_check_expose_automation_scheduler_inventory() {
+        let router = test_router();
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-test"),
+            None,
+        ));
+
+        let handshake = cmd_handshake(&router, &state)
+            .await
+            .expect("handshake should succeed");
+        let upgrade = cmd_upgrade_check(&state)
+            .await
+            .expect("upgrade check should succeed");
+
+        assert_eq!(
+            handshake["automation_scheduler"]["slice"],
+            "shared_fifo_scheduler_policy"
+        );
+        assert_eq!(
+            handshake["automation_scheduler"]["authority_inventory"]["queue_owner"],
+            "router.exec_semaphore"
+        );
+        assert_eq!(
+            handshake["automation_scheduler"]["reservation_wait_policy"]["worker_cycle"]["mode"],
+            "persistent_queue_contender"
+        );
+        assert_eq!(
+            handshake["automation_scheduler"]["reservation_wait_policy"]["active_orchestration_step"]
+                ["mode"],
+            "action_timeout_budget"
+        );
+        assert_eq!(
+            handshake["automation_scheduler"]["reservation_wait_policy"]["active_orchestration_step"]
+                ["timeout_authority"],
+            "orchestration_action_request.timeout_ms"
+        );
+        assert_eq!(
+            upgrade["automation_scheduler"]["authority_inventory"]["shutdown_drain_fence"],
+            "daemon.shutdown.wait_for_transaction_drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_includes_automation_scheduler_metrics() {
+        let router = test_router();
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-test"),
+            None,
+        ));
+
+        let payload = cmd_doctor(&router, &state)
+            .await
+            .expect("doctor should succeed");
+
+        assert_eq!(
+            payload["result"]["automation_scheduler"]["slice"],
+            "shared_fifo_scheduler_policy"
+        );
+        assert_eq!(
+            payload["result"]["automation_scheduler"]["authority_inventory"]["automation_reservation_fence"],
+            "router.begin_automation_transaction_until_shutdown_owned"
         );
     }
 

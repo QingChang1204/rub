@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rub_core::error::{ErrorCode, ErrorEnvelope};
@@ -19,8 +18,9 @@ use crate::orchestration_executor::{
 use crate::orchestration_probe::{
     dispatch_remote_orchestration_probe, evaluate_orchestration_probe_for_tab,
 };
-use crate::router::{DaemonRouter, RouterTransactionGuard};
+use crate::router::{DaemonRouter, OwnedRouterTransactionGuard};
 use crate::runtime_refresh::refresh_orchestration_runtime;
+use crate::scheduler_policy::AUTOMATION_WORKER_POLL_INTERVAL;
 use crate::session::SessionState;
 
 mod condition;
@@ -31,8 +31,7 @@ use condition::{
     should_persist_orchestration_evidence_latch, skip_latched_orchestration_evidence,
 };
 
-const ORCHESTRATION_WORKER_INTERVAL: Duration = Duration::from_millis(500);
-const ORCHESTRATION_AUTOMATION_TRANSACTION_TIMEOUT_MS: u64 = 100;
+const ORCHESTRATION_WORKER_INTERVAL: Duration = AUTOMATION_WORKER_POLL_INTERVAL;
 
 #[derive(Debug, Clone)]
 struct OrchestrationWorkerEntry {
@@ -61,19 +60,39 @@ enum OrchestrationConditionState {
     Triggered(TriggeredOrchestrationCondition),
 }
 
+#[derive(Clone)]
 struct TriggeredOrchestrationCondition {
     evidence: TriggerEvidenceInfo,
     evidence_key: String,
     network_progress: Option<OrchestrationNetworkProgress>,
 }
 
-struct ReservedOrchestrationExecution<'a> {
+struct ReservedOrchestrationExecution {
     runtime: OrchestrationRuntimeInfo,
     rule: OrchestrationRuleInfo,
     evidence: TriggerEvidenceInfo,
     evidence_key: String,
     network_progress: Option<OrchestrationNetworkProgress>,
-    _transaction: Option<RouterTransactionGuard<'a>>,
+    _transaction: Option<OwnedRouterTransactionGuard>,
+}
+
+struct CompletedOrchestrationReservation {
+    rule_id: u32,
+    attempt_id: u64,
+    result: Result<OwnedRouterTransactionGuard, ErrorEnvelope>,
+}
+
+struct PendingOrchestrationConditionPolicy {
+    preserved_triggered: Option<TriggeredOrchestrationCondition>,
+    requires_revalidation_after_queue: bool,
+    rule_semantics_fingerprint: String,
+}
+
+struct PendingOrchestrationReservation {
+    attempt_id: u64,
+    fallback_network_progress: Option<OrchestrationNetworkProgress>,
+    condition_policy: PendingOrchestrationConditionPolicy,
+    task: JoinHandle<()>,
 }
 
 pub(crate) fn spawn_orchestration_worker(
@@ -85,18 +104,44 @@ pub(crate) fn spawn_orchestration_worker(
         let mut ticker = tokio::time::interval(ORCHESTRATION_WORKER_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut worker_state = HashMap::<u32, OrchestrationWorkerEntry>::new();
+        let (reservation_tx, mut reservation_rx) =
+            tokio::sync::mpsc::unbounded_channel::<CompletedOrchestrationReservation>();
+        let mut pending_reservations = HashMap::<u32, PendingOrchestrationReservation>::new();
+        let mut next_reservation_attempt_id = 0_u64;
 
         loop {
             if state.is_shutdown_requested() {
+                abort_pending_orchestration_reservations(&mut pending_reservations);
                 break;
             }
             tokio::select! {
-                _ = shutdown.notified() => break,
+                _ = shutdown.notified() => {
+                    abort_pending_orchestration_reservations(&mut pending_reservations);
+                    break;
+                }
                 _ = ticker.tick() => {
                     if state.is_shutdown_requested() {
+                        abort_pending_orchestration_reservations(&mut pending_reservations);
                         break;
                     }
-                    run_orchestration_cycle(&router, &state, &mut worker_state).await;
+                    run_orchestration_cycle(
+                        &router,
+                        &state,
+                        &mut worker_state,
+                        &mut pending_reservations,
+                        &mut reservation_rx,
+                        &reservation_tx,
+                        &mut next_reservation_attempt_id,
+                    ).await;
+                }
+                Some(completion) = reservation_rx.recv() => {
+                    handle_orchestration_reservation_completion(
+                        &router,
+                        &state,
+                        &mut worker_state,
+                        &mut pending_reservations,
+                        completion,
+                    ).await;
                 }
             }
         }
@@ -107,17 +152,23 @@ async fn run_orchestration_cycle(
     router: &Arc<DaemonRouter>,
     state: &Arc<SessionState>,
     worker_state: &mut HashMap<u32, OrchestrationWorkerEntry>,
+    pending_reservations: &mut HashMap<u32, PendingOrchestrationReservation>,
+    reservation_rx: &mut tokio::sync::mpsc::UnboundedReceiver<CompletedOrchestrationReservation>,
+    reservation_tx: &tokio::sync::mpsc::UnboundedSender<CompletedOrchestrationReservation>,
+    next_reservation_attempt_id: &mut u64,
 ) {
-    if state.in_flight_count.load(Ordering::SeqCst) > 0 {
-        return;
-    }
+    // Queue admission is the authoritative fairness boundary; orchestration work
+    // should contend there instead of being pre-emptively gated by in_flight_count.
+    state.record_orchestration_worker_cycle_started();
 
     refresh_orchestration_runtime(state).await;
     let runtime = state.orchestration_runtime().await;
     if !runtime.execution_supported {
+        abort_pending_orchestration_reservations(pending_reservations);
         return;
     }
     if runtime.rules.is_empty() {
+        abort_pending_orchestration_reservations(pending_reservations);
         worker_state.clear();
         return;
     }
@@ -131,19 +182,79 @@ async fn run_orchestration_cycle(
         observatory_drop_count,
         &state.session_id,
     );
+    reconcile_pending_orchestration_reservations(&runtime.rules, pending_reservations);
+    drain_orchestration_reservation_completions(
+        router,
+        state,
+        worker_state,
+        pending_reservations,
+        reservation_rx,
+    )
+    .await;
 
     for rule in runtime.rules.clone() {
+        drain_orchestration_reservation_completions(
+            router,
+            state,
+            worker_state,
+            pending_reservations,
+            reservation_rx,
+        )
+        .await;
         if !matches!(rule.status, OrchestrationRuleStatus::Armed)
             || rule.unavailable_reason.is_some()
             || orchestration_rule_in_cooldown(&rule)
         {
+            cancel_pending_orchestration_reservation(pending_reservations, rule.id);
             continue;
         }
 
         let Some(worker_entry) = worker_state.get_mut(&rule.id) else {
             continue;
         };
-        process_orchestration_rule(router, state, rule, worker_entry).await;
+        process_orchestration_rule(
+            router,
+            state,
+            rule,
+            worker_entry,
+            pending_reservations,
+            reservation_tx,
+            next_reservation_attempt_id,
+        )
+        .await;
+        drain_orchestration_reservation_completions(
+            router,
+            state,
+            worker_state,
+            pending_reservations,
+            reservation_rx,
+        )
+        .await;
+    }
+}
+
+async fn drain_orchestration_reservation_completions(
+    router: &Arc<DaemonRouter>,
+    state: &Arc<SessionState>,
+    worker_state: &mut HashMap<u32, OrchestrationWorkerEntry>,
+    pending_reservations: &mut HashMap<u32, PendingOrchestrationReservation>,
+    reservation_rx: &mut tokio::sync::mpsc::UnboundedReceiver<CompletedOrchestrationReservation>,
+) {
+    loop {
+        match reservation_rx.try_recv() {
+            Ok(completion) => {
+                handle_orchestration_reservation_completion(
+                    router,
+                    state,
+                    worker_state,
+                    pending_reservations,
+                    completion,
+                )
+                .await;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
+        }
     }
 }
 
@@ -151,12 +262,48 @@ fn orchestration_condition_requires_revalidation_after_queue(rule: &Orchestratio
     !matches!(rule.condition.kind, TriggerConditionKind::NetworkRequest)
 }
 
+fn orchestration_rule_semantics_fingerprint(rule: &OrchestrationRuleInfo) -> String {
+    serde_json::json!({
+        "source": {
+            "session_id": rule.source.session_id,
+            "tab_target_id": rule.source.tab_target_id,
+            "frame_id": rule.source.frame_id,
+        },
+        "target": {
+            "session_id": rule.target.session_id,
+            "tab_target_id": rule.target.tab_target_id,
+            "frame_id": rule.target.frame_id,
+        },
+        "mode": rule.mode,
+        "execution_policy": rule.execution_policy,
+        "condition": rule.condition,
+        "actions": rule.actions,
+        "correlation_key": rule.correlation_key,
+        "idempotency_key": rule.idempotency_key,
+    })
+    .to_string()
+}
+
 async fn process_orchestration_rule(
     router: &Arc<DaemonRouter>,
     state: &Arc<SessionState>,
     rule: OrchestrationRuleInfo,
     worker_entry: &mut OrchestrationWorkerEntry,
+    pending_reservations: &mut HashMap<u32, PendingOrchestrationReservation>,
+    reservation_tx: &tokio::sync::mpsc::UnboundedSender<CompletedOrchestrationReservation>,
+    next_reservation_attempt_id: &mut u64,
 ) {
+    let requires_revalidation = orchestration_condition_requires_revalidation_after_queue(&rule);
+    let rule_semantics_fingerprint = orchestration_rule_semantics_fingerprint(&rule);
+    if let Some(pending) = pending_reservations.get(&rule.id)
+        && !requires_revalidation
+    {
+        if pending.condition_policy.rule_semantics_fingerprint == rule_semantics_fingerprint {
+            return;
+        }
+        cancel_pending_orchestration_reservation(pending_reservations, rule.id);
+    }
+
     let condition =
         match load_orchestration_condition_state(router, state, &rule, worker_entry).await {
             Ok(condition) => condition,
@@ -178,6 +325,7 @@ async fn process_orchestration_rule(
                     .await;
             }
             commit_orchestration_network_progress(worker_entry, network_progress);
+            cancel_pending_orchestration_reservation(pending_reservations, rule.id);
             return;
         }
         OrchestrationConditionState::Triggered(triggered) => triggered,
@@ -191,20 +339,125 @@ async fn process_orchestration_rule(
         return;
     }
 
-    let reserved = match reserve_orchestration_execution(
-        router,
-        state,
-        &rule,
-        worker_entry,
-        triggered,
-    )
-    .await
-    {
-        Ok(Some(reserved)) => reserved,
-        Ok(None) => return,
+    if pending_reservations.contains_key(&rule.id) {
+        return;
+    }
+
+    *next_reservation_attempt_id = next_reservation_attempt_id.saturating_add(1);
+    pending_reservations.insert(
+        rule.id,
+        spawn_orchestration_reservation(
+            router.clone(),
+            state.clone(),
+            rule.id,
+            *next_reservation_attempt_id,
+            triggered.network_progress,
+            PendingOrchestrationConditionPolicy {
+                preserved_triggered: (!requires_revalidation).then_some(triggered.clone()),
+                requires_revalidation_after_queue: requires_revalidation,
+                rule_semantics_fingerprint,
+            },
+            reservation_tx.clone(),
+        ),
+    );
+}
+
+fn spawn_orchestration_reservation(
+    router: Arc<DaemonRouter>,
+    state: Arc<SessionState>,
+    rule_id: u32,
+    attempt_id: u64,
+    fallback_network_progress: Option<OrchestrationNetworkProgress>,
+    condition_policy: PendingOrchestrationConditionPolicy,
+    reservation_tx: tokio::sync::mpsc::UnboundedSender<CompletedOrchestrationReservation>,
+) -> PendingOrchestrationReservation {
+    let task = tokio::spawn(async move {
+        let result = router
+            .begin_automation_transaction_until_shutdown_owned(&state, "orchestration_worker")
+            .await;
+        let _ = reservation_tx.send(CompletedOrchestrationReservation {
+            rule_id,
+            attempt_id,
+            result,
+        });
+    });
+    PendingOrchestrationReservation {
+        attempt_id,
+        fallback_network_progress,
+        condition_policy,
+        task,
+    }
+}
+
+async fn handle_orchestration_reservation_completion(
+    router: &Arc<DaemonRouter>,
+    state: &Arc<SessionState>,
+    worker_state: &mut HashMap<u32, OrchestrationWorkerEntry>,
+    pending_reservations: &mut HashMap<u32, PendingOrchestrationReservation>,
+    completion: CompletedOrchestrationReservation,
+) {
+    let Some(pending) = pending_reservations.remove(&completion.rule_id) else {
+        if let Ok(transaction) = completion.result {
+            drop(transaction);
+        }
+        return;
+    };
+    if pending.attempt_id != completion.attempt_id {
+        if let Ok(transaction) = completion.result {
+            drop(transaction);
+        }
+        return;
+    }
+
+    let Some(worker_entry) = worker_state.get_mut(&completion.rule_id) else {
+        if let Ok(transaction) = completion.result {
+            drop(transaction);
+        }
+        return;
+    };
+
+    let reserved = match completion.result {
+        Ok(transaction) => match complete_orchestration_reservation(
+            router,
+            state,
+            completion.rule_id,
+            worker_entry,
+            transaction,
+            pending.fallback_network_progress,
+            pending.condition_policy,
+        )
+        .await
+        {
+            Ok(Some(reserved)) => reserved,
+            Ok(None) => return,
+            Err(envelope) => {
+                if let Some(rule) = state
+                    .orchestration_runtime()
+                    .await
+                    .rules
+                    .into_iter()
+                    .find(|candidate| candidate.id == completion.rule_id)
+                {
+                    record_orchestration_probe_failure(state, &rule, envelope).await;
+                    refresh_orchestration_runtime(state).await;
+                }
+                return;
+            }
+        },
         Err(envelope) => {
-            record_orchestration_probe_failure(state, &rule, envelope).await;
-            refresh_orchestration_runtime(state).await;
+            if state.is_shutdown_requested() {
+                return;
+            }
+            if let Some(rule) = state
+                .orchestration_runtime()
+                .await
+                .rules
+                .into_iter()
+                .find(|candidate| candidate.id == completion.rule_id)
+            {
+                record_orchestration_probe_failure(state, &rule, envelope).await;
+                refresh_orchestration_runtime(state).await;
+            }
             return;
         }
     };
@@ -213,31 +466,21 @@ async fn process_orchestration_rule(
     commit_orchestration_execution(state, worker_entry, reserved, result).await;
 }
 
-async fn reserve_orchestration_execution<'a>(
-    router: &'a Arc<DaemonRouter>,
-    state: &'a Arc<SessionState>,
-    rule: &OrchestrationRuleInfo,
+async fn complete_orchestration_reservation(
+    router: &Arc<DaemonRouter>,
+    state: &Arc<SessionState>,
+    rule_id: u32,
     worker_entry: &mut OrchestrationWorkerEntry,
-    triggered: TriggeredOrchestrationCondition,
-) -> Result<Option<ReservedOrchestrationExecution<'a>>, ErrorEnvelope> {
-    let transaction = match router
-        .begin_automation_transaction(
-            state,
-            ORCHESTRATION_AUTOMATION_TRANSACTION_TIMEOUT_MS,
-            "orchestration_worker",
-        )
-        .await
-    {
-        Ok(transaction) => transaction,
-        Err(_) => return Ok(None),
-    };
-
+    transaction: OwnedRouterTransactionGuard,
+    fallback_network_progress: Option<OrchestrationNetworkProgress>,
+    condition_policy: PendingOrchestrationConditionPolicy,
+) -> Result<Option<ReservedOrchestrationExecution>, ErrorEnvelope> {
     refresh_orchestration_runtime(state).await;
     let latest_runtime = state.orchestration_runtime().await;
     let Some(latest_rule) = latest_runtime
         .rules
         .iter()
-        .find(|candidate| candidate.id == rule.id)
+        .find(|candidate| candidate.id == rule_id)
         .cloned()
     else {
         drop(transaction);
@@ -251,20 +494,39 @@ async fn reserve_orchestration_execution<'a>(
         return Ok(None);
     }
 
-    let mut triggered = triggered;
-    if orchestration_condition_requires_revalidation_after_queue(&latest_rule) {
-        triggered =
-            match load_orchestration_condition_state(router, state, &latest_rule, worker_entry)
-                .await?
-            {
-                OrchestrationConditionState::Triggered(triggered) => triggered,
-                OrchestrationConditionState::NotTriggered { .. } => {
-                    worker_entry.latched_evidence_key = None;
-                    drop(transaction);
-                    return Ok(None);
-                }
-            };
+    let live_requires_revalidation =
+        orchestration_condition_requires_revalidation_after_queue(&latest_rule);
+    if live_requires_revalidation != condition_policy.requires_revalidation_after_queue {
+        drop(transaction);
+        return Ok(None);
     }
+    if !live_requires_revalidation
+        && orchestration_rule_semantics_fingerprint(&latest_rule)
+            != condition_policy.rule_semantics_fingerprint
+    {
+        drop(transaction);
+        return Ok(None);
+    }
+
+    let triggered = if live_requires_revalidation {
+        match load_orchestration_condition_state(router, state, &latest_rule, worker_entry).await? {
+            OrchestrationConditionState::Triggered(triggered) => triggered,
+            OrchestrationConditionState::NotTriggered { .. } => {
+                worker_entry.latched_evidence_key = None;
+                drop(transaction);
+                return Ok(None);
+            }
+        }
+    } else {
+        let Some(preserved_triggered) = condition_policy.preserved_triggered else {
+            drop(transaction);
+            return Err(ErrorEnvelope::new(
+                ErrorCode::InternalError,
+                "orchestration reservation lost preserved network_request evidence before queue completion",
+            ));
+        };
+        preserved_triggered
+    };
 
     let target_is_local = latest_rule.target.session_id == state.session_id;
     Ok(Some(ReservedOrchestrationExecution {
@@ -272,7 +534,7 @@ async fn reserve_orchestration_execution<'a>(
         rule: latest_rule,
         evidence: triggered.evidence,
         evidence_key: triggered.evidence_key,
-        network_progress: triggered.network_progress,
+        network_progress: triggered.network_progress.or(fallback_network_progress),
         _transaction: target_is_local.then_some(transaction),
     }))
 }
@@ -280,7 +542,7 @@ async fn reserve_orchestration_execution<'a>(
 async fn commit_orchestration_execution(
     state: &Arc<SessionState>,
     worker_entry: &mut OrchestrationWorkerEntry,
-    reserved: ReservedOrchestrationExecution<'_>,
+    reserved: ReservedOrchestrationExecution,
     result: rub_core::model::OrchestrationResultInfo,
 ) {
     state
@@ -298,13 +560,61 @@ async fn commit_orchestration_execution(
     refresh_orchestration_runtime(state).await;
 }
 
+fn cancel_pending_orchestration_reservation(
+    pending_reservations: &mut HashMap<u32, PendingOrchestrationReservation>,
+    rule_id: u32,
+) {
+    if let Some(pending) = pending_reservations.remove(&rule_id) {
+        pending.task.abort();
+    }
+}
+
+fn reconcile_pending_orchestration_reservations(
+    rules: &[OrchestrationRuleInfo],
+    pending_reservations: &mut HashMap<u32, PendingOrchestrationReservation>,
+) {
+    let live_fingerprints = rules
+        .iter()
+        .filter(|rule| matches!(rule.status, OrchestrationRuleStatus::Armed))
+        .filter(|rule| rule.unavailable_reason.is_none())
+        .filter(|rule| !orchestration_rule_in_cooldown(rule))
+        .map(|rule| (rule.id, orchestration_rule_semantics_fingerprint(rule)))
+        .collect::<std::collections::HashMap<_, _>>();
+    pending_reservations.retain(|rule_id, pending| {
+        let keep = live_fingerprints.get(rule_id).is_some_and(|fingerprint| {
+            pending.condition_policy.requires_revalidation_after_queue
+                || pending.condition_policy.rule_semantics_fingerprint == *fingerprint
+        });
+        if keep {
+            return true;
+        }
+        pending.task.abort();
+        false
+    });
+}
+
+fn abort_pending_orchestration_reservations(
+    pending_reservations: &mut HashMap<u32, PendingOrchestrationReservation>,
+) {
+    for (_, pending) in pending_reservations.drain() {
+        pending.task.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::condition::{
         orchestration_evidence_key, persisted_latched_orchestration_evidence_key,
         reconcile_worker_state, skip_latched_orchestration_evidence,
     };
-    use super::{OrchestrationNetworkProgress, OrchestrationWorkerEntry};
+    use super::{
+        CompletedOrchestrationReservation, OrchestrationNetworkProgress, OrchestrationWorkerEntry,
+        PendingOrchestrationConditionPolicy, PendingOrchestrationReservation,
+        TriggeredOrchestrationCondition, complete_orchestration_reservation,
+        drain_orchestration_reservation_completions, orchestration_rule_semantics_fingerprint,
+        process_orchestration_rule, reconcile_pending_orchestration_reservations,
+        run_orchestration_cycle,
+    };
     use rub_core::model::{
         OrchestrationAddressInfo, OrchestrationExecutionPolicyInfo, OrchestrationMode,
         OrchestrationRuleInfo, OrchestrationRuleStatus, TriggerConditionKind, TriggerConditionSpec,
@@ -312,6 +622,43 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use uuid::Uuid;
+
+    use crate::router::DaemonRouter;
+    use crate::session::SessionState;
+
+    fn test_router() -> Arc<DaemonRouter> {
+        let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
+            rub_cdp::browser::BrowserLaunchOptions {
+                headless: true,
+                ignore_cert_errors: false,
+                user_data_dir: None,
+                download_dir: None,
+                profile_directory: None,
+                hide_infobars: true,
+                stealth: true,
+            },
+        ));
+        let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
+            manager,
+            Arc::new(AtomicU64::new(0)),
+            rub_cdp::humanize::HumanizeConfig {
+                enabled: false,
+                speed: rub_cdp::humanize::HumanizeSpeed::Normal,
+            },
+        ));
+        Arc::new(DaemonRouter::new(adapter))
+    }
+
+    fn temp_home(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rub-orchestration-worker-{label}-{}",
+            Uuid::now_v7()
+        ))
+    }
 
     fn rule(id: u32, status: OrchestrationRuleStatus) -> OrchestrationRuleInfo {
         OrchestrationRuleInfo {
@@ -489,5 +836,236 @@ mod tests {
             entry.latched_evidence_key.as_deref(),
             Some("source_tab_text_present:Ready::Ready")
         );
+    }
+
+    #[tokio::test]
+    async fn orchestration_cycle_uses_queue_authority_even_with_foreground_in_flight() {
+        let router = test_router();
+        let state = Arc::new(SessionState::new("default", temp_home("fairness"), None));
+        state
+            .in_flight_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let mut worker_state = HashMap::new();
+        let mut pending_reservations = HashMap::new();
+        let (reservation_tx, mut reservation_rx) =
+            tokio::sync::mpsc::unbounded_channel::<CompletedOrchestrationReservation>();
+        let mut next_reservation_attempt_id = 0_u64;
+
+        run_orchestration_cycle(
+            &router,
+            &state,
+            &mut worker_state,
+            &mut pending_reservations,
+            &mut reservation_rx,
+            &reservation_tx,
+            &mut next_reservation_attempt_id,
+        )
+        .await;
+
+        let metrics = state.automation_scheduler_metrics().await;
+        assert_eq!(
+            metrics["orchestration_worker"]["metrics"]["cycle_count"],
+            json!(1)
+        );
+        assert_eq!(
+            metrics["authority_inventory"]["orchestration_worker_pre_queue_gate"],
+            json!("none")
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_orchestration_reservation_completion_releases_idle_queue_permit() {
+        let router = test_router();
+        let state = Arc::new(SessionState::new(
+            "default",
+            temp_home("reservation-completion-release"),
+            None,
+        ));
+        let reserved = router
+            .begin_automation_transaction_until_shutdown_owned(&state, "queued_orchestration")
+            .await
+            .expect("queued orchestration reservation should acquire immediately in test");
+        let mut worker_state = HashMap::new();
+        let mut pending_reservations = HashMap::from([(
+            7_u32,
+            PendingOrchestrationReservation {
+                attempt_id: 1,
+                fallback_network_progress: None,
+                condition_policy: PendingOrchestrationConditionPolicy {
+                    preserved_triggered: None,
+                    requires_revalidation_after_queue: true,
+                    rule_semantics_fingerprint: String::new(),
+                },
+                task: tokio::spawn(async {}),
+            },
+        )]);
+        let (reservation_tx, mut reservation_rx) =
+            tokio::sync::mpsc::unbounded_channel::<CompletedOrchestrationReservation>();
+        reservation_tx
+            .send(CompletedOrchestrationReservation {
+                rule_id: 7,
+                attempt_id: 1,
+                result: Ok(reserved),
+            })
+            .expect("reservation completion should enqueue");
+
+        drain_orchestration_reservation_completions(
+            &router,
+            &state,
+            &mut worker_state,
+            &mut pending_reservations,
+            &mut reservation_rx,
+        )
+        .await;
+
+        assert!(pending_reservations.is_empty());
+        let foreground = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            router.begin_automation_transaction_with_wait_budget(
+                &state,
+                "foreground_after_completion",
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(5),
+            ),
+        )
+        .await
+        .expect("foreground request should not remain blocked behind drained completion")
+        .expect("foreground request should acquire after drained completion");
+        drop(foreground);
+    }
+
+    #[tokio::test]
+    async fn pending_network_request_orchestration_is_not_re_evaluated_during_queue_wait() {
+        let router = test_router();
+        let state = Arc::new(SessionState::new(
+            "default",
+            temp_home("pending-network-request"),
+            None,
+        ));
+        let mut worker_entry = OrchestrationWorkerEntry {
+            last_status: OrchestrationRuleStatus::Armed,
+            network_cursor: 0,
+            network_cursor_primed: true,
+            observatory_drop_count: 0,
+            latched_evidence_key: None,
+        };
+        let mut network_rule = rule(7, OrchestrationRuleStatus::Armed);
+        network_rule.condition.kind = TriggerConditionKind::NetworkRequest;
+        let mut pending_reservations = HashMap::from([(
+            7_u32,
+            PendingOrchestrationReservation {
+                attempt_id: 1,
+                fallback_network_progress: None,
+                condition_policy: PendingOrchestrationConditionPolicy {
+                    preserved_triggered: None,
+                    requires_revalidation_after_queue: false,
+                    rule_semantics_fingerprint: orchestration_rule_semantics_fingerprint(
+                        &network_rule,
+                    ),
+                },
+                task: tokio::spawn(async {}),
+            },
+        )]);
+        let (reservation_tx, _reservation_rx) =
+            tokio::sync::mpsc::unbounded_channel::<CompletedOrchestrationReservation>();
+        let mut next_reservation_attempt_id = 0_u64;
+
+        process_orchestration_rule(
+            &router,
+            &state,
+            network_rule.clone(),
+            &mut worker_entry,
+            &mut pending_reservations,
+            &reservation_tx,
+            &mut next_reservation_attempt_id,
+        )
+        .await;
+
+        assert!(pending_reservations.contains_key(&network_rule.id));
+        assert_eq!(next_reservation_attempt_id, 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_pending_network_request_orchestration_drops_semantics_drift() {
+        let mut stale_rule = rule(7, OrchestrationRuleStatus::Armed);
+        stale_rule.condition.kind = TriggerConditionKind::NetworkRequest;
+        stale_rule.condition.url_pattern = Some("/old".to_string());
+        let mut live_rule = stale_rule.clone();
+        live_rule.condition.url_pattern = Some("/new".to_string());
+
+        let mut pending_reservations = HashMap::from([(
+            live_rule.id,
+            PendingOrchestrationReservation {
+                attempt_id: 1,
+                fallback_network_progress: None,
+                condition_policy: PendingOrchestrationConditionPolicy {
+                    preserved_triggered: None,
+                    requires_revalidation_after_queue: false,
+                    rule_semantics_fingerprint: orchestration_rule_semantics_fingerprint(
+                        &stale_rule,
+                    ),
+                },
+                task: tokio::spawn(async {}),
+            },
+        )]);
+
+        reconcile_pending_orchestration_reservations(&[live_rule], &mut pending_reservations);
+
+        assert!(pending_reservations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn complete_network_request_orchestration_reservation_fails_closed_on_semantics_drift() {
+        let router = test_router();
+        let state = Arc::new(SessionState::new(
+            "default",
+            temp_home("reservation-semantics-drift"),
+            None,
+        ));
+        let mut live_rule = rule(7, OrchestrationRuleStatus::Armed);
+        live_rule.condition.kind = TriggerConditionKind::NetworkRequest;
+        live_rule.condition.url_pattern = Some("/new".to_string());
+        let live_rule = state
+            .register_orchestration_rule(live_rule)
+            .await
+            .expect("rule should register");
+        let transaction = router
+            .begin_automation_transaction_until_shutdown_owned(&state, "queued_orchestration")
+            .await
+            .expect("reservation should acquire");
+        let mut worker_entry = OrchestrationWorkerEntry {
+            last_status: OrchestrationRuleStatus::Armed,
+            network_cursor: 0,
+            network_cursor_primed: true,
+            observatory_drop_count: 0,
+            latched_evidence_key: None,
+        };
+        let mut stale_rule = live_rule.clone();
+        stale_rule.condition.url_pattern = Some("/old".to_string());
+
+        let reserved = complete_orchestration_reservation(
+            &router,
+            &state,
+            live_rule.id,
+            &mut worker_entry,
+            transaction,
+            None,
+            PendingOrchestrationConditionPolicy {
+                preserved_triggered: Some(TriggeredOrchestrationCondition {
+                    evidence: TriggerEvidenceInfo {
+                        summary: "network_request_matched:req-1".to_string(),
+                        fingerprint: Some("req-1".to_string()),
+                    },
+                    evidence_key: "network_request_matched:req-1::req-1".to_string(),
+                    network_progress: None,
+                }),
+                requires_revalidation_after_queue: false,
+                rule_semantics_fingerprint: orchestration_rule_semantics_fingerprint(&stale_rule),
+            },
+        )
+        .await
+        .expect("reservation completion should fail closed, not error");
+
+        assert!(reserved.is_none());
     }
 }

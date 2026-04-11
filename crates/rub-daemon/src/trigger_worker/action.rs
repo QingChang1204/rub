@@ -69,6 +69,7 @@ async fn fire_browser_command_trigger(
         .payload
         .clone()
         .unwrap_or_else(|| serde_json::json!({}));
+    apply_trigger_frame_override(&mut payload, trigger.target_tab.frame_id.as_deref());
     let object = payload.as_object_mut().ok_or_else(|| {
         ErrorEnvelope::new(
             ErrorCode::InvalidInput,
@@ -84,8 +85,13 @@ async fn fire_browser_command_trigger(
         .dispatch_within_active_transaction(
             {
                 let args = serde_json::Value::Object(object.clone());
+                let dispatch_command = if command == "fill" {
+                    "_trigger_fill"
+                } else {
+                    command
+                };
                 IpcRequest::new(
-                    command,
+                    dispatch_command,
                     args.clone(),
                     trigger_action_timeout_ms(command, &args),
                 )
@@ -130,7 +136,7 @@ async fn fire_workflow_trigger(
     let parameterized = resolve_trigger_workflow_parameterization(
         &router.browser_port(),
         &trigger.source_tab.target_id,
-        None,
+        trigger.source_tab.frame_id.as_deref(),
         object,
         &raw_spec,
     )
@@ -143,15 +149,16 @@ async fn fire_workflow_trigger(
         );
     }
 
-    let args = serde_json::json!({
+    let mut args = serde_json::json!({
         "spec": parameterized.resolved_spec,
         "spec_source": spec_source,
         "_trigger": trigger_request_meta(trigger, evidence, "action"),
     });
+    apply_trigger_frame_override(&mut args, trigger.target_tab.frame_id.as_deref());
     let response = router
         .dispatch_within_active_transaction(
             IpcRequest::new(
-                "pipe",
+                "_trigger_pipe",
                 args.clone(),
                 trigger_action_timeout_ms("pipe", &args),
             )
@@ -374,6 +381,25 @@ fn trigger_action_timeout_ms(command: &str, args: &serde_json::Value) -> u64 {
     )
 }
 
+fn apply_trigger_frame_override(args: &mut serde_json::Value, frame_id: Option<&str>) {
+    let Some(frame_id) = frame_id else {
+        return;
+    };
+    let Some(object) = args.as_object_mut() else {
+        return;
+    };
+    let orchestration = object
+        .entry("_orchestration".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !orchestration.is_object() {
+        *orchestration = serde_json::json!({});
+    }
+    let orchestration_object = orchestration
+        .as_object_mut()
+        .expect("trigger frame override must normalize orchestration metadata to an object");
+    orchestration_object.insert("frame_id".to_string(), serde_json::json!(frame_id));
+}
+
 pub(super) fn trigger_action_command_id(
     trigger: &TriggerInfo,
     evidence: &TriggerEvidenceInfo,
@@ -494,8 +520,44 @@ fn trigger_request_meta(
         "id": trigger.id,
         "phase": phase,
         "source_tab_target_id": trigger.source_tab.target_id,
+        "source_frame_id": trigger.source_tab.frame_id,
         "target_tab_target_id": trigger.target_tab.target_id,
+        "target_frame_id": trigger.target_tab.frame_id,
         "condition_kind": trigger.condition.kind,
         "evidence": evidence,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_trigger_frame_override;
+    use serde_json::json;
+
+    #[test]
+    fn trigger_frame_override_overwrites_conflicting_frame_id() {
+        let mut args = json!({
+            "selector": "#send",
+            "_orchestration": {
+                "frame_id": "child-frame",
+                "command_id": "step-command"
+            }
+        });
+
+        apply_trigger_frame_override(&mut args, Some("target-frame"));
+
+        assert_eq!(args["_orchestration"]["frame_id"], "target-frame");
+        assert_eq!(args["_orchestration"]["command_id"], "step-command");
+    }
+
+    #[test]
+    fn trigger_frame_override_normalizes_non_object_metadata() {
+        let mut args = json!({
+            "selector": "#send",
+            "_orchestration": "bad-shape"
+        });
+
+        apply_trigger_frame_override(&mut args, Some("target-frame"));
+
+        assert_eq!(args["_orchestration"]["frame_id"], "target-frame");
+    }
 }

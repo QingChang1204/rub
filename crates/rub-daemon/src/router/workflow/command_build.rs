@@ -3,13 +3,8 @@ use super::*;
 use crate::router::addressing::resolve_element;
 use crate::router::request_args::{LocatorRequestArgs, locator_json};
 
-pub(super) async fn build_fill_step_command(
-    router: &DaemonRouter,
-    state: &Arc<SessionState>,
-    deadline: TransactionDeadline,
-    step: &FillStepSpec,
-) -> Result<(&'static str, serde_json::Value), RubError> {
-    let locator_args = locator_json(LocatorRequestArgs {
+pub(super) fn build_fill_step_locator_args(step: &FillStepSpec) -> serde_json::Value {
+    locator_json(LocatorRequestArgs {
         index: step.index,
         element_ref: step.element_ref.clone(),
         selector: step.selector.clone(),
@@ -20,8 +15,17 @@ pub(super) async fn build_fill_step_command(
         first: step.first,
         last: step.last,
         nth: step.nth,
-    });
-    let resolved = resolve_element(router, &locator_args, state, deadline, "fill").await?;
+    })
+}
+
+pub(super) async fn build_fill_step_command(
+    router: &DaemonRouter,
+    state: &Arc<SessionState>,
+    deadline: TransactionDeadline,
+    step: &FillStepSpec,
+    locator_args: &serde_json::Value,
+) -> Result<(&'static str, serde_json::Value), RubError> {
+    let resolved = resolve_element(router, locator_args, state, deadline, "fill").await?;
 
     if let Some(value) = &step.value {
         return match resolved.element.tag {

@@ -31,16 +31,16 @@ pub(crate) use outcome::{
 };
 use outcome::{successful_cooldown_until_ms, successful_next_status};
 pub(crate) use protocol::{
-    bind_orchestration_daemon_authority, decode_orchestration_success_payload,
-    decode_orchestration_success_payload_field, decode_orchestration_success_result_items,
-    dispatch_remote_orchestration_request, ensure_orchestration_success_response,
+    RemoteDispatchContract, bind_orchestration_daemon_authority,
+    decode_orchestration_success_payload, decode_orchestration_success_payload_field,
+    decode_orchestration_success_result_items, dispatch_remote_orchestration_request,
+    ensure_orchestration_success_response,
 };
 use target::resolve_target_session;
 
 const ORCHESTRATION_ACTION_BASE_TIMEOUT_MS: u64 = 30_000;
 const ORCHESTRATION_TRANSIENT_RETRY_LIMIT: u32 = 3;
 const ORCHESTRATION_TRANSIENT_RETRY_DELAY_MS: u64 = 100;
-const ORCHESTRATION_SOURCE_MATERIALIZATION_TIMEOUT_MS: u64 = 100;
 
 struct OrchestrationActionFailure {
     action: Option<OrchestrationActionExecutionInfo>,
@@ -160,7 +160,7 @@ pub(crate) async fn execute_orchestration_rule(
 #[cfg(test)]
 mod tests {
     use super::{
-        OrchestrationFailureInput, action_requires_source_materialization,
+        OrchestrationFailureInput, RemoteDispatchContract, action_requires_source_materialization,
         bind_orchestration_daemon_authority, classify_orchestration_error_status,
         decode_orchestration_success_payload_field, decode_orchestration_success_result_items,
         dispatch_remote_orchestration_request, orchestration_action_execution_info,
@@ -375,10 +375,13 @@ mod tests {
             &session,
             "target",
             IpcRequest::new("tabs", serde_json::json!({}), 1_000),
-            "target command",
-            "orchestration_target_session_unreachable",
-            "orchestration_target_dispatch_failed",
-            "remote dispatch returned an error without an envelope",
+            RemoteDispatchContract {
+                dispatch_subject: "target command",
+                unreachable_reason: "orchestration_target_session_unreachable",
+                transport_failure_reason: "orchestration_target_dispatch_transport_failed",
+                protocol_failure_reason: "orchestration_target_dispatch_protocol_failed",
+                missing_error_message: "remote dispatch returned an error without an envelope",
+            },
         )
         .await
         .expect_err("missing socket should fail closed");

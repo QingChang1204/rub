@@ -238,7 +238,7 @@ fn t214_wait_does_not_block_queue() {
 #[serial]
 fn t215_concurrent_first_command_serializes_startup() {
     let home = unique_home();
-    cleanup(&home);
+    prepare_home(&home);
 
     let home_a = home.clone();
     let home_b = home.clone();
@@ -710,8 +710,16 @@ fn t233e_i_history_export_grouped_scenario() {
     assert_eq!(exported["success"], true, "{exported}");
     assert_eq!(exported["data"]["result"]["format"], "pipe", "{exported}");
     assert_eq!(
+        exported["data"]["result"]["projection_state"]["surface"], "workflow_capture_export",
+        "{exported}"
+    );
+    assert_eq!(
         exported["data"]["result"]["projection_state"]["projection_kind"],
         "bounded_post_commit_projection",
+        "{exported}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["projection_state"]["truth_level"], "operator_projection",
         "{exported}"
     );
     assert_eq!(
@@ -722,6 +730,14 @@ fn t233e_i_history_export_grouped_scenario() {
     assert_eq!(
         exported["data"]["result"]["projection_state"]["upstream_commit_truth"],
         "daemon_response_committed",
+        "{exported}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["projection_state"]["control_role"], "display_only",
+        "{exported}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["projection_state"]["durability"], "best_effort",
         "{exported}"
     );
     assert_eq!(
@@ -757,10 +773,80 @@ fn t233e_i_history_export_grouped_scenario() {
         "{exported}"
     );
 
+    let failing_output_dir = std::env::temp_dir().join(format!(
+        "rub-history-export-followup-failure-{}",
+        uuid::Uuid::now_v7()
+    ));
+    std::fs::create_dir_all(&failing_output_dir).unwrap();
+    let post_commit_failure = parse_json(
+        &session
+            .cmd()
+            .args([
+                "history",
+                "--last",
+                "2",
+                "--export-pipe",
+                "--output",
+                failing_output_dir.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap(),
+    );
+    let _ = std::fs::remove_dir_all(&failing_output_dir);
+    assert_eq!(
+        post_commit_failure["success"], false,
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["commit_state"], "daemon_committed_local_followup_failed",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["post_commit_followup_state"]["surface"],
+        "cli_post_commit_followup_failure",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["post_commit_followup_state"]["truth_level"],
+        "operator_projection",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["post_commit_followup_state"]["projection_authority"],
+        "cli.post_commit_followup",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["post_commit_followup_state"]["control_role"], "display_only",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["post_commit_followup_state"]["durability"], "best_effort",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["post_commit_followup_state"]["recovery_contract"],
+        "no_public_recovery_contract",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["result"]["projection_state"]["surface"],
+        "workflow_capture_export",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["error"]["context"]["reason"], "post_commit_history_export_failed",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["error"]["context"]["daemon_request_committed"], true,
+        "{post_commit_failure}"
+    );
+
     let spec =
         serde_json::to_string(exported["data"]["result"]["steps"].as_array().unwrap()).unwrap();
     let replay_home = unique_home();
-    cleanup(&replay_home);
+    prepare_home(&replay_home);
     let (_rt2, server2) = start_test_server(vec![(
         "/history-export",
         "text/html",
@@ -807,13 +893,34 @@ fn t233e_i_history_export_grouped_scenario() {
     );
     assert_eq!(observe_export["success"], true, "{observe_export}");
     assert_eq!(
+        observe_export["data"]["result"]["projection_state"]["surface"], "workflow_capture_export",
+        "{observe_export}"
+    );
+    assert_eq!(
         observe_export["data"]["result"]["projection_state"]["projection_kind"],
         "bounded_post_commit_projection",
         "{observe_export}"
     );
     assert_eq!(
+        observe_export["data"]["result"]["projection_state"]["truth_level"], "operator_projection",
+        "{observe_export}"
+    );
+    assert_eq!(
         observe_export["data"]["result"]["projection_state"]["projection_authority"],
         "session.workflow_capture",
+        "{observe_export}"
+    );
+    assert_eq!(
+        observe_export["data"]["result"]["projection_state"]["upstream_commit_truth"],
+        "daemon_response_committed",
+        "{observe_export}"
+    );
+    assert_eq!(
+        observe_export["data"]["result"]["projection_state"]["control_role"], "display_only",
+        "{observe_export}"
+    );
+    assert_eq!(
+        observe_export["data"]["result"]["projection_state"]["durability"], "best_effort",
         "{observe_export}"
     );
     assert_eq!(
@@ -866,13 +973,34 @@ fn t233e_i_history_export_grouped_scenario() {
         "{script_export}"
     );
     assert_eq!(
+        script_export["data"]["result"]["projection_state"]["surface"], "workflow_capture_export",
+        "{script_export}"
+    );
+    assert_eq!(
         script_export["data"]["result"]["projection_state"]["projection_kind"],
         "bounded_post_commit_projection",
         "{script_export}"
     );
     assert_eq!(
+        script_export["data"]["result"]["projection_state"]["truth_level"], "operator_projection",
+        "{script_export}"
+    );
+    assert_eq!(
         script_export["data"]["result"]["projection_state"]["projection_authority"],
         "session.workflow_capture",
+        "{script_export}"
+    );
+    assert_eq!(
+        script_export["data"]["result"]["projection_state"]["upstream_commit_truth"],
+        "daemon_response_committed",
+        "{script_export}"
+    );
+    assert_eq!(
+        script_export["data"]["result"]["projection_state"]["control_role"], "display_only",
+        "{script_export}"
+    );
+    assert_eq!(
+        script_export["data"]["result"]["projection_state"]["durability"], "best_effort",
         "{script_export}"
     );
     assert_eq!(
@@ -884,7 +1012,7 @@ fn t233e_i_history_export_grouped_scenario() {
         .unwrap();
 
     let replay_home = unique_home();
-    cleanup(&replay_home);
+    prepare_home(&replay_home);
     let script_path = std::env::temp_dir().join(format!(
         "rub-history-export-script-{}.sh",
         uuid::Uuid::now_v7()
@@ -971,6 +1099,10 @@ fn t233e_i_history_export_grouped_scenario() {
         "{saved_export}"
     );
     assert_eq!(
+        saved_export["data"]["result"]["projection_state"]["truth_level"], "operator_projection",
+        "{saved_export}"
+    );
+    assert_eq!(
         saved_export["data"]["result"]["projection_state"]["projection_authority"],
         "session.workflow_capture",
         "{saved_export}"
@@ -978,6 +1110,14 @@ fn t233e_i_history_export_grouped_scenario() {
     assert_eq!(
         saved_export["data"]["result"]["projection_state"]["upstream_commit_truth"],
         "daemon_response_committed",
+        "{saved_export}"
+    );
+    assert_eq!(
+        saved_export["data"]["result"]["projection_state"]["control_role"], "display_only",
+        "{saved_export}"
+    );
+    assert_eq!(
+        saved_export["data"]["result"]["projection_state"]["durability"], "best_effort",
         "{saved_export}"
     );
     assert_eq!(
@@ -1866,7 +2006,7 @@ fn t310_311_external_attach_lifecycle_grouped_scenario() {
         return;
     };
     let home = unique_home();
-    cleanup(&home);
+    prepare_home(&home);
 
     let state = parse_json(
         &rub_cmd(&home)
@@ -1911,8 +2051,7 @@ fn t310_311_external_attach_lifecycle_grouped_scenario() {
         "external CDP port should still accept connections after rub close"
     );
 
-    terminate_external_chrome(&mut chrome);
-    let _ = std::fs::remove_dir_all(profile_dir);
+    terminate_external_chrome(&mut chrome, &profile_dir);
     cleanup(&home);
 }
 
@@ -1995,8 +2134,7 @@ fn t310a_external_attach_rejects_ambiguous_page_authority() {
     let message = state["error"]["message"].as_str().unwrap_or_default();
     assert!(message.contains("attachable page authority"), "{state}");
 
-    terminate_external_chrome(&mut chrome);
-    let _ = std::fs::remove_dir_all(profile_dir);
+    terminate_external_chrome(&mut chrome, &profile_dir);
 }
 
 /// T310b: failed external attach must not leave a startup daemon residue behind.
@@ -2088,6 +2226,7 @@ fn t320_profile_resolve() {
 #[serial]
 fn t330_333_close_and_cleanup_grouped_scenario() {
     let session = ManagedBrowserSession::new();
+    let home = session.home().to_string();
     let (_rt, server) = start_standard_site_fixture();
 
     let open_default = || {
@@ -2229,6 +2368,16 @@ fn t330_333_close_and_cleanup_grouped_scenario() {
     );
     let doctor = parse_json(&session.cmd().arg("doctor").output().unwrap());
     assert_eq!(doctor["success"], true, "{doctor}");
+
+    let cleanup_observation = observe_home_cleanup(&home);
+    drop(session);
+    wait_until(Duration::from_secs(5), || {
+        daemon_processes_for_home(&home).is_empty() && !std::path::Path::new(&home).exists()
+    });
+    assert_eq!(
+        verify_home_cleanup_complete(&home, &cleanup_observation),
+        Ok(CleanupVerification::Verified)
+    );
 }
 
 /// T350: `RUB_SESSION` sets the default session, but explicit `--session` overrides it.

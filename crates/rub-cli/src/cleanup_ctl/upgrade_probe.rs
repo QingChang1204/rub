@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use rub_core::error::{ErrorCode, RubError};
 use rub_daemon::rub_paths::SessionPaths;
-use rub_ipc::client::IpcClient;
+use rub_ipc::client::{IpcClient, IpcClientError};
 use rub_ipc::protocol::{IpcRequest, ResponseStatus};
 
 pub(super) fn cleanup_upgrade_status_error(
@@ -59,25 +59,10 @@ pub(super) async fn fetch_upgrade_status_for_session(
             Err(_) => continue,
         };
         let request = IpcRequest::new("_upgrade_check", serde_json::json!({}), 3_000);
-        let response = client.send(&request).await.map_err(|error| {
-            if let Some(envelope) = error.protocol_envelope() {
-                cleanup_upgrade_status_error(
-                    envelope.code,
-                    format!("Failed to fetch upgrade status: {}", envelope.message),
-                    &socket_path,
-                    envelope.context.clone(),
-                    "cleanup_upgrade_check_protocol_failed",
-                )
-            } else {
-                cleanup_upgrade_status_error(
-                    ErrorCode::IpcProtocolError,
-                    error.to_string(),
-                    &socket_path,
-                    None,
-                    "cleanup_upgrade_check_transport_failed",
-                )
-            }
-        })?;
+        let response = client
+            .send(&request)
+            .await
+            .map_err(|error| cleanup_upgrade_probe_send_error(&socket_path, error))?;
         if response.status == ResponseStatus::Error {
             continue;
         }
@@ -90,6 +75,36 @@ pub(super) async fn fetch_upgrade_status_for_session(
         )));
     }
     Ok(None)
+}
+
+fn cleanup_upgrade_probe_send_error(socket_path: &Path, error: IpcClientError) -> RubError {
+    match error {
+        IpcClientError::Protocol(envelope) => cleanup_upgrade_status_error(
+            envelope.code,
+            format!("Failed to fetch upgrade status: {}", envelope.message),
+            socket_path,
+            envelope.context,
+            "cleanup_upgrade_check_protocol_failed",
+        ),
+        IpcClientError::Transport(io_error) => {
+            let mut context = serde_json::Map::new();
+            if let Some(transport_reason) =
+                crate::connection_hardening::classify_io_transient(&io_error)
+            {
+                context.insert(
+                    "transport_reason".to_string(),
+                    serde_json::json!(transport_reason),
+                );
+            }
+            cleanup_upgrade_status_error(
+                ErrorCode::IpcProtocolError,
+                io_error.to_string(),
+                socket_path,
+                Some(serde_json::Value::Object(context)),
+                "cleanup_upgrade_check_transport_failed",
+            )
+        }
+    }
 }
 
 pub(super) async fn wait_for_shutdown_paths(socket_paths: &[PathBuf]) {

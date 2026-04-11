@@ -242,52 +242,37 @@ async fn install_download_callbacks(
     state: &Arc<rub_daemon::session::SessionState>,
     browser_event_sink: &rub_daemon::session::BrowserSessionEventSink,
 ) {
-    let runtime_state = state.clone();
-    let started_state = state.clone();
-    let progress_state = state.clone();
     let runtime_event_sink = browser_event_sink.clone();
     let started_event_sink = browser_event_sink.clone();
     let progress_event_sink = browser_event_sink.clone();
     if let Err(error) = browser_manager
         .set_download_callbacks(rub_cdp::downloads::DownloadCallbacks {
             on_runtime: Some(std::sync::Arc::new(move |runtime| {
-                let browser_sequence = runtime_state.allocate_browser_event_sequence();
-                runtime_event_sink.enqueue(
-                    rub_daemon::session::BrowserSessionEvent::DownloadRuntime {
-                        browser_sequence,
-                        generation: runtime.generation,
-                        status: runtime.runtime.status,
-                        mode: runtime.runtime.mode,
-                        download_dir: runtime.runtime.download_dir,
-                        degraded_reason: runtime.runtime.degraded_reason,
-                    },
+                runtime_event_sink.enqueue_download_runtime(
+                    runtime.generation,
+                    runtime.runtime.status,
+                    runtime.runtime.mode,
+                    runtime.runtime.download_dir,
+                    runtime.runtime.degraded_reason,
                 );
             })),
             on_started: Some(std::sync::Arc::new(move |event| {
-                let browser_sequence = started_state.allocate_browser_event_sequence();
-                started_event_sink.enqueue(
-                    rub_daemon::session::BrowserSessionEvent::DownloadStarted {
-                        browser_sequence,
-                        generation: event.generation,
-                        guid: event.guid,
-                        url: event.url,
-                        suggested_filename: event.suggested_filename,
-                        frame_id: event.frame_id,
-                    },
+                started_event_sink.enqueue_download_started(
+                    event.generation,
+                    event.guid,
+                    event.url,
+                    event.suggested_filename,
+                    event.frame_id,
                 );
             })),
             on_progress: Some(std::sync::Arc::new(move |event| {
-                let browser_sequence = progress_state.allocate_browser_event_sequence();
-                progress_event_sink.enqueue(
-                    rub_daemon::session::BrowserSessionEvent::DownloadProgress {
-                        browser_sequence,
-                        generation: event.generation,
-                        guid: event.guid,
-                        state: event.state,
-                        received_bytes: event.received_bytes,
-                        total_bytes: event.total_bytes,
-                        final_path: event.final_path,
-                    },
+                progress_event_sink.enqueue_download_progress(
+                    event.generation,
+                    event.guid,
+                    event.state,
+                    event.received_bytes,
+                    event.total_bytes,
+                    event.final_path,
                 );
             })),
         })

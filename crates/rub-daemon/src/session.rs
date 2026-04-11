@@ -10,6 +10,7 @@ mod lifecycle;
 mod protocol;
 mod registry;
 mod runtime;
+mod scheduler;
 
 use crate::dialogs::DialogRuntimeState;
 use crate::downloads::DownloadRuntimeState;
@@ -67,9 +68,10 @@ use rub_core::storage::{StorageArea, StorageMutationKind, StorageRuntimeInfo, St
 pub(crate) use self::registry::{ensure_rub_home, rfc3339_now};
 const SNAPSHOT_CACHE_LIMIT: usize = 128;
 pub(crate) use self::protocol::{
-    POST_COMMIT_PROJECTION_LIMIT, POST_COMMIT_PROJECTION_LIMIT_BYTES, PostCommitProjection,
-    PostCommitProjectionQueue, REPLAY_CACHE_LIMIT, REPLAY_CACHE_LIMIT_BYTES, ReplayCacheEntry,
-    ReplayInFlightEntry, ReplayProtocolState,
+    BROWSER_EVENT_PROGRESS_INGRESS_LIMIT, POST_COMMIT_PROJECTION_LIMIT,
+    POST_COMMIT_PROJECTION_LIMIT_BYTES, PostCommitProjection, PostCommitProjectionQueue,
+    REPLAY_CACHE_LIMIT, REPLAY_CACHE_LIMIT_BYTES, ReplayCacheEntry, ReplayInFlightEntry,
+    ReplayProtocolState,
 };
 
 /// Combined snapshot cache: LRU map + insertion order in one lock.
@@ -81,6 +83,32 @@ pub(crate) struct SnapshotCache {
     pub(crate) order: VecDeque<String>,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct AutomationWorkerTelemetry {
+    pub(crate) cycle_count: AtomicU64,
+    pub(crate) last_cycle_uptime_ms: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct QueuePressureTelemetry {
+    pub(crate) queue_timeout_count: AtomicU64,
+    pub(crate) last_queue_timeout_uptime_ms: AtomicU64,
+    pub(crate) max_in_flight_count: AtomicU32,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ShutdownDrainTelemetry {
+    pub(crate) wait_loop_count: AtomicU64,
+    pub(crate) soft_timeout_count: AtomicU64,
+    pub(crate) connected_only_soft_release_count: AtomicU64,
+    pub(crate) last_wait_uptime_ms: AtomicU64,
+    pub(crate) last_soft_timeout_uptime_ms: AtomicU64,
+    pub(crate) last_connected_only_soft_release_uptime_ms: AtomicU64,
+    pub(crate) max_observed_in_flight_count: AtomicU32,
+    pub(crate) max_observed_connected_client_count: AtomicU32,
+    pub(crate) max_observed_pre_request_response_fence_count: AtomicU32,
+}
+
 /// Per-session in-memory state. Authority for session lifecycle.
 pub struct SessionState {
     pub session_id: String,
@@ -90,6 +118,11 @@ pub struct SessionState {
     shutdown_requested: AtomicBool,
     pub in_flight_count: AtomicU32,
     pub connected_client_count: AtomicU32,
+    pub(crate) pre_request_response_fence_count: AtomicU32,
+    trigger_worker_telemetry: AutomationWorkerTelemetry,
+    orchestration_worker_telemetry: AutomationWorkerTelemetry,
+    queue_pressure_telemetry: QueuePressureTelemetry,
+    shutdown_drain_telemetry: ShutdownDrainTelemetry,
     replay: StdMutex<ReplayProtocolState>,
     post_commit_projections: StdMutex<PostCommitProjectionQueue>,
     post_commit_projection_drain: Mutex<()>,
@@ -116,6 +149,7 @@ pub struct SessionState {
     browser_event_notify: Arc<Notify>,
     observatory_drop_count: AtomicU64,
     network_request_ingress_drop_count: AtomicU64,
+    browser_event_ingress_drop_count: AtomicU64,
     next_browser_event_sequence: AtomicU64,
     committed_browser_event_sequence: AtomicU64,
     committed_browser_event_backlog: StdMutex<BTreeSet<u64>>,
@@ -161,6 +195,11 @@ impl SessionState {
             shutdown_requested: AtomicBool::new(false),
             in_flight_count: AtomicU32::new(0),
             connected_client_count: AtomicU32::new(0),
+            pre_request_response_fence_count: AtomicU32::new(0),
+            trigger_worker_telemetry: AutomationWorkerTelemetry::default(),
+            orchestration_worker_telemetry: AutomationWorkerTelemetry::default(),
+            queue_pressure_telemetry: QueuePressureTelemetry::default(),
+            shutdown_drain_telemetry: ShutdownDrainTelemetry::default(),
             replay: StdMutex::new(ReplayProtocolState::default()),
             post_commit_projections: StdMutex::new(PostCommitProjectionQueue::default()),
             post_commit_projection_drain: Mutex::new(()),
@@ -187,6 +226,7 @@ impl SessionState {
             browser_event_notify: Arc::new(Notify::new()),
             observatory_drop_count: AtomicU64::new(0),
             network_request_ingress_drop_count: AtomicU64::new(0),
+            browser_event_ingress_drop_count: AtomicU64::new(0),
             next_browser_event_sequence: AtomicU64::new(0),
             committed_browser_event_sequence: AtomicU64::new(0),
             committed_browser_event_backlog: StdMutex::new(BTreeSet::new()),

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::FrameInventoryEntry;
+use rub_core::port::BrowserPort;
 
 use crate::session::SessionState;
 
@@ -74,6 +75,60 @@ pub(super) async fn ensure_request_frame_available(
             )
         })?;
     ensure_frame_switchable(entry)
+}
+
+pub(super) async fn ensure_tab_frame_available(
+    browser: &Arc<dyn BrowserPort>,
+    target_id: &str,
+    frame_id: &str,
+    role: &str,
+) -> Result<(), RubError> {
+    let frames = browser
+        .list_frames_for_tab(target_id)
+        .await
+        .map_err(|error| {
+            RubError::domain_with_context(
+                ErrorCode::BrowserCrashed,
+                format!("Unable to inspect frame inventory for trigger {role} tab: {error}"),
+                serde_json::json!({
+                    "reason": format!("trigger_{}_frame_inventory_unavailable", role),
+                    "tab_target_id": target_id,
+                    "frame_id": frame_id,
+                }),
+            )
+        })?;
+
+    let entry = frames
+        .iter()
+        .find(|entry| entry.frame.frame_id == frame_id)
+        .ok_or_else(|| {
+            RubError::domain_with_context(
+                ErrorCode::InvalidInput,
+                format!("Trigger {role} frame '{frame_id}' is not present in tab '{target_id}'"),
+                serde_json::json!({
+                    "reason": format!("trigger_{}_frame_missing", role),
+                    "tab_target_id": target_id,
+                    "frame_id": frame_id,
+                }),
+            )
+        })?;
+    ensure_frame_switchable(entry).map_err(|error| {
+        let envelope = error.into_envelope();
+        RubError::domain_with_context(
+            ErrorCode::InvalidInput,
+            format!(
+                "Trigger {role} frame '{frame_id}' is not same-origin accessible for trigger execution"
+            ),
+            serde_json::json!({
+                "reason": format!("trigger_{}_frame_unavailable", role),
+                "tab_target_id": target_id,
+                "frame_id": frame_id,
+                "same_origin_accessible": entry.frame.same_origin_accessible,
+                "index": entry.index,
+                "cause": envelope.message,
+            }),
+        )
+    })
 }
 
 fn ensure_frame_switchable(entry: &FrameInventoryEntry) -> Result<(), RubError> {

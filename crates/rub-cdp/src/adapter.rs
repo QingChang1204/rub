@@ -447,10 +447,16 @@ impl BrowserPort for ChromiumAdapter {
     async fn probe_runtime_state_for_tab(
         &self,
         target_id: &str,
-        _frame_id: Option<&str>,
+        frame_id: Option<&str>,
     ) -> Result<RuntimeStateSnapshot, RubError> {
         let page = self.manager.page_for_target_id(target_id).await?;
-        Ok(crate::runtime_state::capture_runtime_state(&page).await)
+        match frame_id {
+            Some(frame_id) => {
+                crate::runtime_state::capture_runtime_state_for_explicit_frame(&page, frame_id)
+                    .await
+            }
+            None => Ok(crate::runtime_state::capture_runtime_state(&page).await),
+        }
     }
 
     async fn tab_has_text(
@@ -703,6 +709,14 @@ impl BrowserPort for ChromiumAdapter {
 
     async fn list_frames(&self) -> Result<Vec<FrameInventoryEntry>, RubError> {
         let page = self.manager.page().await?;
+        crate::frame_runtime::list_frame_inventory(&page).await
+    }
+
+    async fn list_frames_for_tab(
+        &self,
+        target_id: &str,
+    ) -> Result<Vec<FrameInventoryEntry>, RubError> {
+        let page = self.manager.page_for_target_id(target_id).await?;
         crate::frame_runtime::list_frame_inventory(&page).await
     }
 

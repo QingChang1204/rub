@@ -6,7 +6,7 @@ use super::*;
 #[serial]
 fn t437_trigger_text_present_fires_cross_tab_click() {
     let home = unique_home();
-    cleanup(&home);
+    prepare_home(&home);
 
     let (_rt, server) = start_test_server(vec![
         (
@@ -160,7 +160,7 @@ fn t437_trigger_text_present_fires_cross_tab_click() {
 #[serial]
 fn t437b_trigger_records_blocked_outcome_when_target_action_fails() {
     let home = unique_home();
-    cleanup(&home);
+    prepare_home(&home);
 
     let (_rt, server) = start_test_server(vec![
         (
@@ -318,7 +318,7 @@ fn t437b_trigger_records_blocked_outcome_when_target_action_fails() {
 #[serial]
 fn t437c_trigger_resume_ignores_stale_network_evidence_and_fires_on_new_request() {
     let home = unique_home();
-    cleanup(&home);
+    prepare_home(&home);
 
     let (_rt, server) = start_test_server(vec![
         (
@@ -581,7 +581,7 @@ fn t437c_trigger_resume_ignores_stale_network_evidence_and_fires_on_new_request(
 #[serial]
 fn t437d_trigger_reports_target_missing_and_does_not_fire() {
     let home = unique_home();
-    cleanup(&home);
+    prepare_home(&home);
 
     let (_rt, server) = start_test_server(vec![
         (
@@ -748,7 +748,7 @@ fn t437d_trigger_reports_target_missing_and_does_not_fire() {
 #[serial]
 fn t437e_trigger_trace_projects_recent_lifecycle_and_outcome_events() {
     let home = unique_home();
-    cleanup(&home);
+    prepare_home(&home);
 
     let (_rt, server) = start_test_server(vec![
         (
@@ -889,7 +889,7 @@ fn t437e_trigger_trace_projects_recent_lifecycle_and_outcome_events() {
 #[serial]
 fn t437f_trigger_degrades_when_target_selected_frame_becomes_stale() {
     let home = unique_home();
-    cleanup(&home);
+    prepare_home(&home);
 
     let (_rt, server) = start_test_server(vec![
         (

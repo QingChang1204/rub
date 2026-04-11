@@ -303,7 +303,8 @@ pub trait BrowserPort: Send + Sync {
 
     /// Capture a live runtime-state snapshot directly from one tab identified
     /// by stable `target_id`, without mutating the current active-tab
-    /// authority.
+    /// authority. Explicit `frame_id` requests must fail closed when the frame
+    /// context cannot be resolved truthfully.
     async fn probe_runtime_state_for_tab(
         &self,
         target_id: &str,
@@ -510,6 +511,13 @@ pub trait BrowserPort: Send + Sync {
 
     /// List the live frame inventory for the active page context.
     async fn list_frames(&self) -> Result<Vec<FrameInventoryEntry>, RubError>;
+
+    /// List the live frame inventory for one tab identified by stable `target_id`,
+    /// without mutating the current active-tab authority.
+    async fn list_frames_for_tab(
+        &self,
+        target_id: &str,
+    ) -> Result<Vec<FrameInventoryEntry>, RubError>;
 
     /// Cancel an in-progress browser download by GUID.
     async fn cancel_download(&self, guid: &str) -> Result<(), RubError>;

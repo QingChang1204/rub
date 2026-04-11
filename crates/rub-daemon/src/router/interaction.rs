@@ -243,7 +243,7 @@ pub(super) async fn cmd_select(
 
 #[cfg(test)]
 mod tests {
-    use super::args::{ClickArgs, UploadArgs};
+    use super::args::{ClickArgs, TextEntryArgs, UploadArgs};
     use super::projection::collect_post_interaction_projection;
     use crate::router::request_args::parse_json_args;
     use crate::session::SessionState;
@@ -380,11 +380,28 @@ mod tests {
             &serde_json::json!({
                 "selector": "#submit",
                 "wait_after": {"text":"Saved"},
+                "_trigger": {"kind": "trigger_action"},
             }),
             "click",
         )
         .expect("click payload should accept post-wait compatibility field");
         assert!(parsed._wait_after.is_some());
+        assert!(parsed._trigger.is_some());
+    }
+
+    #[test]
+    fn typed_type_payload_accepts_trigger_metadata() {
+        let parsed = parse_json_args::<TextEntryArgs>(
+            &serde_json::json!({
+                "selector": "#message",
+                "text": "Ada",
+                "_trigger": {"kind": "trigger_action"},
+            }),
+            "type",
+        )
+        .expect("type payload should accept trigger metadata");
+        assert_eq!(parsed.text, "Ada");
+        assert!(parsed._trigger.is_some());
     }
 
     #[test]

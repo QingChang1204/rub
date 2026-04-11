@@ -1,6 +1,5 @@
 use super::*;
 use crate::runtime_refresh::refresh_live_frame_runtime;
-use rub_core::error::ErrorCode;
 use rub_core::model::FrameInventoryEntry;
 
 #[derive(Debug, Clone, serde::Deserialize)]

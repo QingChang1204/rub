@@ -17,6 +17,8 @@ pub(super) struct ExecArgs {
     pub(super) code: String,
     #[serde(default, rename = "raw")]
     pub(super) _raw: bool,
+    #[serde(default, rename = "_trigger")]
+    pub(super) _trigger: Option<serde_json::Value>,
     #[serde(default, rename = "_orchestration")]
     pub(super) _orchestration: Option<serde_json::Value>,
 }

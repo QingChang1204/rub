@@ -22,6 +22,7 @@ pub mod router;
 pub mod rub_paths;
 mod runtime_refresh;
 mod runtime_state_projection;
+mod scheduler_policy;
 pub mod session;
 pub mod state_inspector;
 pub mod storage_runtime;

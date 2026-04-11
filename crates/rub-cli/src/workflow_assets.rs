@@ -172,9 +172,13 @@ mod tests {
             "result": {
                 "format": "pipe",
                 "projection_state": {
+                    "surface": "workflow_capture_export",
+                    "truth_level": "operator_projection",
                     "projection_kind": "bounded_post_commit_projection",
                     "projection_authority": "session.workflow_capture",
                     "upstream_commit_truth": "daemon_response_committed",
+                    "control_role": "display_only",
+                    "durability": "best_effort",
                     "lossy": false,
                     "lossy_reasons": []
                 },
@@ -212,12 +216,28 @@ mod tests {
             "cli_pipe_file_option"
         );
         assert_eq!(
+            data["result"]["projection_state"]["surface"],
+            "workflow_capture_export"
+        );
+        assert_eq!(
             data["result"]["projection_state"]["projection_kind"],
             "bounded_post_commit_projection"
         );
         assert_eq!(
+            data["result"]["projection_state"]["truth_level"],
+            "operator_projection"
+        );
+        assert_eq!(
             data["result"]["projection_state"]["upstream_commit_truth"],
             "daemon_response_committed"
+        );
+        assert_eq!(
+            data["result"]["projection_state"]["control_role"],
+            "display_only"
+        );
+        assert_eq!(
+            data["result"]["projection_state"]["durability"],
+            "best_effort"
         );
         assert_eq!(
             data["result"]["persisted_artifacts"][0]["projection_state"]["projection_authority"],

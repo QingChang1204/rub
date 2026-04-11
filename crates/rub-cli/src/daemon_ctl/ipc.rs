@@ -151,3 +151,21 @@ fn ipc_classified_error(
         serde_json::Value::Object(context),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::replay_recoverable_transport_reason;
+    use rub_ipc::client::IpcClientError;
+
+    #[test]
+    fn replay_recovery_recognizes_partial_response_transport_failures() {
+        let error = IpcClientError::Transport(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "partial NDJSON frame",
+        ));
+        assert_eq!(
+            replay_recoverable_transport_reason(&error),
+            Some("unexpected_eof")
+        );
+    }
+}

@@ -203,10 +203,12 @@ mod tests {
             &json!({
                 "code": "document.title",
                 "raw": true,
+                "_trigger": {"kind": "trigger_action"},
             }),
             "exec",
         )
         .expect("exec payload should accept raw compatibility flag");
         assert!(parsed._raw);
+        assert!(parsed._trigger.is_some());
     }
 }

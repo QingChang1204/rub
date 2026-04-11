@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{
-    OrchestrationAddressInfo, OrchestrationAddressSpec, OrchestrationSessionInfo, TabInfo,
+    FrameInventoryEntry, OrchestrationAddressInfo, OrchestrationAddressSpec,
+    OrchestrationSessionInfo, TabInfo,
 };
+use rub_core::port::BrowserPort;
 use rub_ipc::client::IpcClient;
 use rub_ipc::protocol::{IpcRequest, ResponseStatus};
 
@@ -56,6 +58,19 @@ pub(super) async fn resolve_orchestration_address(
     } else {
         (None, None)
     };
+    if let (Some(tab_target_id), Some(frame_id)) =
+        (tab_target_id.as_deref(), spec.frame_id.as_deref())
+    {
+        ensure_orchestration_address_frame_available(
+            router,
+            state,
+            session,
+            tab_target_id,
+            frame_id,
+            role,
+        )
+        .await?;
+    }
 
     Ok(OrchestrationAddressInfo {
         session_id: session.session_id.clone(),
@@ -214,10 +229,194 @@ pub(super) fn resolve_orchestration_tab_binding<'a>(
     })
 }
 
+async fn ensure_orchestration_address_frame_available(
+    router: &DaemonRouter,
+    state: &Arc<SessionState>,
+    session: &OrchestrationSessionInfo,
+    tab_target_id: &str,
+    frame_id: &str,
+    role: &str,
+) -> Result<(), RubError> {
+    let frames = if session.session_id == state.session_id {
+        let browser = router.browser_port();
+        list_local_orchestration_frames_for_tab(&browser, tab_target_id, frame_id, role).await?
+    } else {
+        list_remote_orchestration_frames_for_tab(session, tab_target_id, frame_id, role).await?
+    };
+    validate_orchestration_frame_inventory(&frames, tab_target_id, frame_id, role)
+}
+
+async fn list_local_orchestration_frames_for_tab(
+    browser: &Arc<dyn BrowserPort>,
+    tab_target_id: &str,
+    frame_id: &str,
+    role: &str,
+) -> Result<Vec<FrameInventoryEntry>, RubError> {
+    browser
+        .list_frames_for_tab(tab_target_id)
+        .await
+        .map_err(|error| {
+            RubError::domain_with_context(
+                ErrorCode::BrowserCrashed,
+                format!("Unable to inspect orchestration {role} frame inventory: {error}"),
+                serde_json::json!({
+                    "reason": format!("orchestration_{}_frame_inventory_unavailable", role),
+                    "tab_target_id": tab_target_id,
+                    "frame_id": frame_id,
+                }),
+            )
+        })
+}
+
+async fn list_remote_orchestration_frames_for_tab(
+    session: &OrchestrationSessionInfo,
+    tab_target_id: &str,
+    frame_id: &str,
+    role: &str,
+) -> Result<Vec<FrameInventoryEntry>, RubError> {
+    let mut client = IpcClient::connect(std::path::Path::new(&session.socket_path))
+        .await
+        .map_err(|error| {
+            let mut context = serde_json::json!({
+                "reason": format!("orchestration_{}_session_unreachable", role),
+                "session_id": session.session_id,
+                "session_name": session.session_name,
+            });
+            extend_orchestration_session_path_context(&mut context, session);
+            RubError::domain_with_context(
+                ErrorCode::DaemonNotRunning,
+                format!(
+                    "Unable to reach orchestration {role} session '{}' at {}: {error}",
+                    session.session_name, session.socket_path
+                ),
+                context,
+            )
+        })?;
+    let response = client
+        .send(
+            &bind_orchestration_daemon_authority(
+                IpcRequest::new(
+                    "_orchestration_tab_frames",
+                    serde_json::json!({ "tab_target_id": tab_target_id }),
+                    ORCHESTRATION_ADDRESS_TIMEOUT_MS,
+                ),
+                session,
+                role,
+            )
+            .map_err(RubError::Domain)?,
+        )
+        .await
+        .map_err(|error| {
+            let mut context = serde_json::json!({
+                "reason": format!("orchestration_{}_frame_inventory_query_failed", role),
+                "session_id": session.session_id,
+                "session_name": session.session_name,
+                "tab_target_id": tab_target_id,
+                "frame_id": frame_id,
+            });
+            extend_orchestration_session_path_context(&mut context, session);
+            RubError::domain_with_context(
+                ErrorCode::IpcProtocolError,
+                format!(
+                    "Failed to query orchestration {role} session '{}' frame inventory: {error}",
+                    session.session_name
+                ),
+                context,
+            )
+        })?;
+
+    match response.status {
+        ResponseStatus::Success => {
+            let missing_reason = format!("orchestration_{}_frames_payload_missing", role);
+            let invalid_reason = format!("orchestration_{}_frames_payload_invalid", role);
+            let missing_message = format!(
+                "Orchestration {role} session '{}' returned frames without a result.items payload",
+                session.session_name
+            );
+            decode_orchestration_success_result_items::<FrameInventoryEntry>(
+                response,
+                session,
+                &missing_reason,
+                &missing_message,
+                &invalid_reason,
+                "orchestration frame inventory payload",
+            )
+            .map_err(RubError::Domain)
+        }
+        ResponseStatus::Error => {
+            let envelope = response.error.unwrap_or_else(|| {
+                rub_core::error::ErrorEnvelope::new(
+                    ErrorCode::IpcProtocolError,
+                    "remote frames request returned an error without an envelope",
+                )
+            });
+            Err(RubError::domain_with_context(
+                envelope.code,
+                format!(
+                    "Orchestration {role} session '{}' rejected frame inventory query: {}",
+                    session.session_name, envelope.message
+                ),
+                serde_json::json!({
+                    "reason": format!("orchestration_{}_frame_inventory_query_rejected", role),
+                    "session_id": session.session_id,
+                    "session_name": session.session_name,
+                    "tab_target_id": tab_target_id,
+                    "frame_id": frame_id,
+                    "remote_error_code": envelope.code,
+                }),
+            ))
+        }
+    }
+}
+
+fn validate_orchestration_frame_inventory(
+    frames: &[FrameInventoryEntry],
+    tab_target_id: &str,
+    frame_id: &str,
+    role: &str,
+) -> Result<(), RubError> {
+    let entry = frames
+        .iter()
+        .find(|entry| entry.frame.frame_id == frame_id)
+        .ok_or_else(|| {
+            RubError::domain_with_context(
+                ErrorCode::InvalidInput,
+                format!(
+                    "Orchestration {role} frame '{frame_id}' is not present in tab '{tab_target_id}'"
+                ),
+                serde_json::json!({
+                    "reason": format!("orchestration_{}_frame_missing", role),
+                    "tab_target_id": tab_target_id,
+                    "frame_id": frame_id,
+                }),
+            )
+        })?;
+    if entry.is_primary || matches!(entry.frame.same_origin_accessible, Some(true)) {
+        return Ok(());
+    }
+
+    Err(RubError::domain_with_context(
+        ErrorCode::InvalidInput,
+        format!(
+            "Orchestration {role} frame '{frame_id}' is not same-origin accessible for frame-scoped execution"
+        ),
+        serde_json::json!({
+            "reason": format!("orchestration_{}_frame_unavailable", role),
+            "tab_target_id": tab_target_id,
+            "frame_id": frame_id,
+            "same_origin_accessible": entry.frame.same_origin_accessible,
+            "index": entry.index,
+        }),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_orchestration_tab_binding;
-    use rub_core::model::{OrchestrationAddressSpec, TabInfo};
+    use super::{resolve_orchestration_tab_binding, validate_orchestration_frame_inventory};
+    use rub_core::error::ErrorCode;
+    use rub_core::model::{
+        FrameContextInfo, FrameInventoryEntry, OrchestrationAddressSpec, TabInfo,
+    };
 
     #[test]
     fn resolve_orchestration_tab_binding_prefers_target_id_when_present() {
@@ -277,5 +476,71 @@ mod tests {
             .expect("active tab fallback should resolve");
         assert_eq!(resolved.index, 3);
         assert_eq!(resolved.target_id, "tab-b");
+    }
+
+    fn frame_inventory_entry(
+        frame_id: &str,
+        index: u32,
+        same_origin_accessible: Option<bool>,
+        is_primary: bool,
+    ) -> FrameInventoryEntry {
+        FrameInventoryEntry {
+            index,
+            is_current: false,
+            is_primary,
+            frame: FrameContextInfo {
+                frame_id: frame_id.to_string(),
+                name: Some(frame_id.to_string()),
+                parent_frame_id: None,
+                target_id: Some("tab-a".to_string()),
+                url: Some(format!("https://example.test/{frame_id}")),
+                depth: if is_primary { 0 } else { 1 },
+                same_origin_accessible,
+            },
+        }
+    }
+
+    #[test]
+    fn orchestration_frame_inventory_rejects_missing_frame() {
+        let error = validate_orchestration_frame_inventory(
+            &[frame_inventory_entry("frame-a", 0, Some(true), true)],
+            "tab-a",
+            "frame-b",
+            "target",
+        )
+        .expect_err("missing frame should fail");
+
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::InvalidInput);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("orchestration_target_frame_missing")
+        );
+    }
+
+    #[test]
+    fn orchestration_frame_inventory_rejects_cross_origin_child_frames() {
+        let error = validate_orchestration_frame_inventory(
+            &[frame_inventory_entry("frame-a", 2, Some(false), false)],
+            "tab-a",
+            "frame-a",
+            "source",
+        )
+        .expect_err("non-switchable frame should fail");
+
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::InvalidInput);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("orchestration_source_frame_unavailable")
+        );
     }
 }

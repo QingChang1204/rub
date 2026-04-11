@@ -5,11 +5,13 @@ use rub_core::model::{
 use rub_ipc::codec::MAX_FRAME_BYTES;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 pub(crate) const REPLAY_CACHE_LIMIT: usize = 1000;
 pub(crate) const REPLAY_CACHE_LIMIT_BYTES: usize = MAX_FRAME_BYTES * 8;
 pub(crate) const POST_COMMIT_PROJECTION_LIMIT: usize = 256;
 pub(crate) const POST_COMMIT_PROJECTION_LIMIT_BYTES: usize = MAX_FRAME_BYTES * 4;
+pub(crate) const BROWSER_EVENT_PROGRESS_INGRESS_LIMIT: usize = 1_024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReplayCacheEntry {
@@ -84,6 +86,11 @@ pub enum BrowserSessionEvent {
         download_dir: Option<String>,
         degraded_reason: Option<String>,
     },
+    DownloadRuntimeDegradedMarker {
+        browser_sequence: u64,
+        generation: u64,
+        reason: String,
+    },
     DownloadStarted {
         browser_sequence: u64,
         generation: u64,
@@ -118,6 +125,9 @@ impl BrowserSessionEvent {
             | Self::DownloadRuntime {
                 browser_sequence, ..
             }
+            | Self::DownloadRuntimeDegradedMarker {
+                browser_sequence, ..
+            }
             | Self::DownloadStarted {
                 browser_sequence, ..
             }
@@ -126,12 +136,29 @@ impl BrowserSessionEvent {
             } => *browser_sequence,
         }
     }
+
+    pub fn uses_bounded_progress_ingress(&self) -> bool {
+        matches!(
+            self,
+            Self::DownloadProgress {
+                state: DownloadState::InProgress,
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Clone)]
 pub struct BrowserSessionEventSink {
     pub(crate) state: Arc<SessionState>,
-    pub(crate) tx: tokio::sync::mpsc::UnboundedSender<BrowserSessionEvent>,
+    pub(crate) critical_tx: tokio::sync::mpsc::UnboundedSender<BrowserSessionEvent>,
+    pub(crate) progress_tx: tokio::sync::mpsc::Sender<BrowserSessionEvent>,
+    pub(crate) progress_overflow_coordination: Arc<std::sync::Mutex<()>>,
+    pub(crate) progress_overflow_latched: Arc<AtomicBool>,
+    pub(crate) progress_overflow_latched_generation: Arc<AtomicU64>,
+    pub(crate) progress_overflow_latched_sequence: Arc<AtomicU64>,
+    pub(crate) progress_overflow_reopen_generation: Arc<AtomicU64>,
+    pub(crate) progress_overflow_reopen_sequence: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]

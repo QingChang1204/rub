@@ -1,4 +1,6 @@
 use chromiumoxide::Page;
+use chromiumoxide::cdp::js_protocol::runtime::ExecutionContextId;
+use rub_core::error::RubError;
 use rub_core::model::{
     AuthState, OverlayState, ReadinessInfo, ReadinessStatus, RouteStability, RuntimeStateSnapshot,
     StateInspectorInfo, StateInspectorStatus,
@@ -249,10 +251,58 @@ pub async fn probe_page_runtime_state(page: Arc<Page>, callbacks: RuntimeStateCa
 }
 
 pub async fn capture_runtime_state(page: &Arc<Page>) -> RuntimeStateSnapshot {
-    let document_before = probe_document_fence(page).await;
-    let mut state_inspector = probe_state_inspector(page).await;
-    let mut readiness_state = probe_readiness(page).await;
-    let document_after = probe_document_fence(page).await;
+    capture_runtime_state_for_current_frame(page)
+        .await
+        .unwrap_or_else(frame_context_unavailable_snapshot)
+}
+
+pub async fn capture_runtime_state_for_current_frame(
+    page: &Arc<Page>,
+) -> Result<RuntimeStateSnapshot, RubError> {
+    capture_runtime_state_for_frame_context(page, None).await
+}
+
+pub async fn capture_runtime_state_for_explicit_frame(
+    page: &Arc<Page>,
+    frame_id: &str,
+) -> Result<RuntimeStateSnapshot, RubError> {
+    capture_runtime_state_for_frame_context(page, Some(frame_id)).await
+}
+
+async fn capture_runtime_state_for_frame_context(
+    page: &Arc<Page>,
+    frame_id: Option<&str>,
+) -> Result<RuntimeStateSnapshot, RubError> {
+    let context_id = crate::frame_runtime::resolve_frame_context(page, frame_id)
+        .await?
+        .execution_context_id;
+
+    Ok(capture_runtime_state_in_context(page, context_id).await)
+}
+
+fn frame_context_unavailable_snapshot(error: RubError) -> RuntimeStateSnapshot {
+    RuntimeStateSnapshot {
+        state_inspector: StateInspectorInfo {
+            status: StateInspectorStatus::Degraded,
+            degraded_reason: Some(format!("frame_context_unavailable:{error}")),
+            ..StateInspectorInfo::default()
+        },
+        readiness_state: ReadinessInfo {
+            status: ReadinessStatus::Degraded,
+            degraded_reason: Some(format!("frame_context_unavailable:{error}")),
+            ..ReadinessInfo::default()
+        },
+    }
+}
+
+async fn capture_runtime_state_in_context(
+    page: &Arc<Page>,
+    context_id: Option<ExecutionContextId>,
+) -> RuntimeStateSnapshot {
+    let document_before = probe_document_fence(page, context_id).await;
+    let mut state_inspector = probe_state_inspector(page, context_id).await;
+    let mut readiness_state = probe_readiness(page, context_id).await;
+    let document_after = probe_document_fence(page, context_id).await;
 
     if let Some(reason) =
         runtime_document_fence_failure_reason(document_before.as_ref(), document_after.as_ref())
@@ -270,26 +320,28 @@ pub async fn capture_runtime_state(page: &Arc<Page>) -> RuntimeStateSnapshot {
     }
 }
 
-async fn probe_document_fence(page: &Arc<Page>) -> Option<DocumentFenceProbe> {
-    match tokio::time::timeout(
-        RUNTIME_PROBE_TIMEOUT,
-        page.evaluate(DOCUMENT_FENCE_PROBE_JS),
+async fn probe_document_fence(
+    page: &Arc<Page>,
+    context_id: Option<ExecutionContextId>,
+) -> Option<DocumentFenceProbe> {
+    probe_json_in_context(
+        page,
+        context_id,
+        DOCUMENT_FENCE_PROBE_JS,
+        parse_document_fence_probe_json,
     )
     .await
-    {
-        Ok(Ok(result)) => parse_document_fence_probe_result(result).ok(),
-        Ok(Err(error)) => {
-            warn!(error = %error, "Runtime document fence probe failed");
-            None
-        }
-        Err(_) => {
-            warn!("Runtime document fence probe timed out");
-            None
-        }
-    }
+    .map_err(|reason| {
+        warn!(reason = %reason, "Runtime document fence probe failed");
+        reason
+    })
+    .ok()
 }
 
-async fn probe_state_inspector(page: &Arc<Page>) -> StateInspectorInfo {
+async fn probe_state_inspector(
+    page: &Arc<Page>,
+    context_id: Option<ExecutionContextId>,
+) -> StateInspectorInfo {
     let mut degraded_reasons = Vec::new();
 
     let cookie_count = match page.get_cookies().await {
@@ -302,22 +354,12 @@ async fn probe_state_inspector(page: &Arc<Page>) -> StateInspectorInfo {
     };
 
     let storage =
-        match tokio::time::timeout(RUNTIME_PROBE_TIMEOUT, page.evaluate(STORAGE_PROBE_JS)).await {
-            Ok(Ok(result)) => match parse_storage_probe_result(result) {
-                Ok(storage) => storage,
-                Err(reason) => {
-                    degraded_reasons.push(reason);
-                    StorageProbe::default()
-                }
-            },
-            Ok(Err(error)) => {
-                degraded_reasons.push("storage_probe_failed".to_string());
-                warn!(error = %error, "State inspector failed to query storage keys");
-                StorageProbe::default()
-            }
-            Err(_) => {
-                degraded_reasons.push("storage_probe_timeout".to_string());
-                warn!("State inspector storage probe timed out");
+        match probe_json_in_context(page, context_id, STORAGE_PROBE_JS, parse_storage_probe_json)
+            .await
+        {
+            Ok(storage) => storage,
+            Err(reason) => {
+                degraded_reasons.push(reason);
                 StorageProbe::default()
             }
         };
@@ -345,20 +387,19 @@ async fn probe_state_inspector(page: &Arc<Page>) -> StateInspectorInfo {
     }
 }
 
-async fn probe_readiness(page: &Arc<Page>) -> ReadinessInfo {
-    match tokio::time::timeout(RUNTIME_PROBE_TIMEOUT, page.evaluate(READINESS_PROBE_JS)).await {
-        Ok(Ok(result)) => {
-            let probe = match parse_readiness_probe_result(result) {
-                Ok(probe) => probe,
-                Err(reason) => {
-                    warn!(reason = %reason, "Readiness probe returned malformed payload");
-                    return ReadinessInfo {
-                        status: ReadinessStatus::Degraded,
-                        degraded_reason: Some(reason),
-                        ..ReadinessInfo::default()
-                    };
-                }
-            };
+async fn probe_readiness(
+    page: &Arc<Page>,
+    context_id: Option<ExecutionContextId>,
+) -> ReadinessInfo {
+    match probe_json_in_context(
+        page,
+        context_id,
+        READINESS_PROBE_JS,
+        parse_readiness_probe_json,
+    )
+    .await
+    {
+        Ok(probe) => {
             let route_stability = parse_route_stability(&probe.route_stability);
             let overlay_state = parse_overlay_state(&probe.overlay_state);
             ReadinessInfo {
@@ -378,50 +419,51 @@ async fn probe_readiness(page: &Arc<Page>) -> ReadinessInfo {
                 degraded_reason: None,
             }
         }
-        Ok(Err(error)) => {
-            warn!(error = %error, "Readiness probe failed");
-            ReadinessInfo {
-                status: ReadinessStatus::Degraded,
-                degraded_reason: Some("probe_failed".to_string()),
-                ..ReadinessInfo::default()
-            }
-        }
-        Err(_) => {
-            warn!("Readiness probe timed out");
-            ReadinessInfo {
-                status: ReadinessStatus::Degraded,
-                degraded_reason: Some("probe_timeout".to_string()),
-                ..ReadinessInfo::default()
-            }
-        }
+        Err(reason) => ReadinessInfo {
+            status: ReadinessStatus::Degraded,
+            degraded_reason: Some(reason),
+            ..ReadinessInfo::default()
+        },
     }
 }
 
-fn parse_storage_probe_result(
-    result: chromiumoxide::js::EvaluationResult,
-) -> Result<StorageProbe, String> {
-    let json = result
-        .into_value::<String>()
-        .map_err(|_| "storage_probe_malformed".to_string())?;
-    serde_json::from_str::<StorageProbe>(&json).map_err(|_| "storage_probe_malformed".to_string())
+async fn probe_json_in_context<T>(
+    page: &Arc<Page>,
+    context_id: Option<ExecutionContextId>,
+    expression: &str,
+    parser: fn(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    let evaluated = tokio::time::timeout(
+        RUNTIME_PROBE_TIMEOUT,
+        crate::js::evaluate_returning_string_in_context(page, context_id, expression),
+    )
+    .await;
+
+    let payload = match evaluated {
+        Ok(Ok(payload)) => payload,
+        Ok(Err(error)) => {
+            warn!(error = %error, "Runtime probe failed");
+            return Err("probe_failed".to_string());
+        }
+        Err(_) => {
+            warn!("Runtime probe timed out");
+            return Err("probe_timeout".to_string());
+        }
+    };
+
+    parser(&payload)
 }
 
-fn parse_readiness_probe_result(
-    result: chromiumoxide::js::EvaluationResult,
-) -> Result<ReadinessProbe, String> {
-    let json = result
-        .into_value::<String>()
-        .map_err(|_| "probe_malformed".to_string())?;
-    serde_json::from_str::<ReadinessProbe>(&json).map_err(|_| "probe_malformed".to_string())
+fn parse_storage_probe_json(json: &str) -> Result<StorageProbe, String> {
+    serde_json::from_str::<StorageProbe>(json).map_err(|_| "storage_probe_malformed".to_string())
 }
 
-fn parse_document_fence_probe_result(
-    result: chromiumoxide::js::EvaluationResult,
-) -> Result<DocumentFenceProbe, String> {
-    let json = result
-        .into_value::<String>()
-        .map_err(|_| "document_fence_probe_malformed".to_string())?;
-    serde_json::from_str::<DocumentFenceProbe>(&json)
+fn parse_readiness_probe_json(json: &str) -> Result<ReadinessProbe, String> {
+    serde_json::from_str::<ReadinessProbe>(json).map_err(|_| "probe_malformed".to_string())
+}
+
+fn parse_document_fence_probe_json(json: &str) -> Result<DocumentFenceProbe, String> {
+    serde_json::from_str::<DocumentFenceProbe>(json)
         .map_err(|_| "document_fence_probe_malformed".to_string())
 }
 
@@ -568,45 +610,34 @@ fn infer_blocking_signals(
 mod tests {
     use super::{
         DocumentFenceProbe, append_degraded_reason, document_fence_is_authoritative,
-        infer_auth_signals, infer_auth_state, infer_blocking_signals,
-        normalize_document_ready_state, parse_document_fence_probe_result, parse_overlay_state,
-        parse_readiness_probe_result, parse_route_stability, parse_storage_probe_result,
-        runtime_document_fence_failure_reason,
+        frame_context_unavailable_snapshot, infer_auth_signals, infer_auth_state,
+        infer_blocking_signals, normalize_document_ready_state, parse_document_fence_probe_json,
+        parse_overlay_state, parse_readiness_probe_json, parse_route_stability,
+        parse_storage_probe_json, runtime_document_fence_failure_reason,
     };
-    use chromiumoxide::cdp::js_protocol::runtime::{RemoteObject, RemoteObjectType};
-    use chromiumoxide::js::EvaluationResult;
-    use rub_core::model::{AuthState, OverlayState, RouteStability};
-
-    fn evaluation_result(value: serde_json::Value) -> EvaluationResult {
-        EvaluationResult::new(
-            RemoteObject::builder()
-                .r#type(RemoteObjectType::String)
-                .value(value)
-                .build()
-                .expect("remote object"),
-        )
-    }
+    use rub_core::error::RubError;
+    use rub_core::model::{
+        AuthState, OverlayState, ReadinessStatus, RouteStability, StateInspectorStatus,
+    };
 
     #[test]
     fn malformed_storage_probe_result_is_rejected() {
-        let result = evaluation_result(serde_json::json!("not-json"));
-        let error = parse_storage_probe_result(result).expect_err("malformed payload should fail");
+        let error =
+            parse_storage_probe_json("not-json").expect_err("malformed payload should fail");
         assert_eq!(error, "storage_probe_malformed");
     }
 
     #[test]
     fn malformed_readiness_probe_result_is_rejected() {
-        let result = evaluation_result(serde_json::json!("{\"overlay_state\":"));
-        let error =
-            parse_readiness_probe_result(result).expect_err("malformed payload should fail");
+        let error = parse_readiness_probe_json("{\"overlay_state\":")
+            .expect_err("malformed payload should fail");
         assert_eq!(error, "probe_malformed");
     }
 
     #[test]
     fn malformed_document_fence_probe_result_is_rejected() {
-        let result = evaluation_result(serde_json::json!("not-json"));
         let error =
-            parse_document_fence_probe_result(result).expect_err("malformed payload should fail");
+            parse_document_fence_probe_json("not-json").expect_err("malformed payload should fail");
         assert_eq!(error, "document_fence_probe_malformed");
     }
 
@@ -749,6 +780,32 @@ mod tests {
                 RouteStability::Stable,
             ),
             vec!["overlay:user_blocking".to_string()]
+        );
+    }
+
+    #[test]
+    fn frame_context_unavailable_snapshot_marks_both_surfaces_degraded() {
+        let snapshot =
+            frame_context_unavailable_snapshot(RubError::Internal("frame missing".to_string()));
+
+        assert_eq!(
+            snapshot.state_inspector.status,
+            StateInspectorStatus::Degraded
+        );
+        assert_eq!(snapshot.readiness_state.status, ReadinessStatus::Degraded);
+        assert!(
+            snapshot
+                .state_inspector
+                .degraded_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("frame_context_unavailable"))
+        );
+        assert!(
+            snapshot
+                .readiness_state
+                .degraded_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("frame_context_unavailable"))
         );
     }
 }

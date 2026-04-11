@@ -9,6 +9,8 @@ use rub_core::model::{
 pub(super) fn validate_trigger_registration_spec(
     spec: &mut TriggerRegistrationSpec,
 ) -> Result<(), RubError> {
+    normalize_optional_key(&mut spec.source_frame_id, "source_frame_id")?;
+    normalize_optional_key(&mut spec.target_frame_id, "target_frame_id")?;
     validate_trigger_condition(&spec.condition)?;
     validate_trigger_action(&mut spec.action)
 }
@@ -82,6 +84,7 @@ fn validate_browser_command_trigger_action(action: &mut TriggerActionSpec) -> Re
 
     match action.payload.take() {
         Some(payload) if payload.is_object() => {
+            reject_reserved_trigger_metadata_keys(payload.as_object().expect("validated object"))?;
             action.payload = Some(payload);
         }
         Some(_) => {
@@ -128,6 +131,7 @@ fn validate_workflow_trigger_action(action: &mut TriggerActionSpec) -> Result<()
             "workflow trigger payload was not a JSON object after validation",
         )
     })?;
+    reject_reserved_trigger_metadata_keys(object)?;
     let has_name = object
         .get("workflow_name")
         .and_then(|value| value.as_str())
@@ -217,6 +221,22 @@ fn is_valid_workflow_var_name(key: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
+fn reject_reserved_trigger_metadata_keys(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), RubError> {
+    for key in ["_trigger", "_orchestration"] {
+        if object.contains_key(key) {
+            return Err(RubError::domain(
+                ErrorCode::InvalidInput,
+                format!(
+                    "trigger action payload must not include reserved internal metadata key '{key}'"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn browser_trigger_command_allowed(command: &str) -> bool {
     matches!(
         command,
@@ -234,4 +254,18 @@ fn require_non_empty<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str,
                 format!("trigger requires non-empty {field}"),
             )
         })
+}
+
+fn normalize_optional_key(key: &mut Option<String>, field: &str) -> Result<(), RubError> {
+    if let Some(value) = key {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(RubError::domain(
+                ErrorCode::InvalidInput,
+                format!("trigger requires non-empty {field}"),
+            ));
+        }
+        *value = trimmed.to_string();
+    }
+    Ok(())
 }

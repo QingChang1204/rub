@@ -75,20 +75,46 @@ fn unregister_external_chrome(pid: u32) {
     entries.retain(|(existing_pid, _)| *existing_pid != pid);
 }
 
+#[derive(Clone, Debug)]
+struct HomeCleanupObservation {
+    daemon_root_pids: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanupVerification {
+    Verified,
+    SkippedDuringPanic,
+}
+
 fn cleanup_registered_artifacts() {
+    if std::thread::panicking() {
+        return;
+    }
+
     let homes = registered_homes().lock().unwrap().clone();
+    let mut failed_homes = Vec::new();
     for home in homes {
-        cleanup_impl(&home);
+        match try_cleanup_home(&home) {
+            Ok(CleanupVerification::Verified) => {}
+            Ok(CleanupVerification::SkippedDuringPanic) | Err(_) => {
+                failed_homes.push(home);
+            }
+        }
     }
 
     let external = registered_external_chromes().lock().unwrap().clone();
+    let mut failed_external = Vec::new();
     for (pid, profile_dir) in external {
-        kill_process_tree_from_roots(&[pid]);
-        let _ = std::fs::remove_dir_all(profile_dir);
+        match try_cleanup_external_chrome(pid, &profile_dir) {
+            Ok(CleanupVerification::Verified) => {}
+            Ok(CleanupVerification::SkippedDuringPanic) | Err(_) => {
+                failed_external.push((pid, profile_dir));
+            }
+        }
     }
 
-    registered_homes().lock().unwrap().clear();
-    registered_external_chromes().lock().unwrap().clear();
+    *registered_homes().lock().unwrap() = failed_homes;
+    *registered_external_chromes().lock().unwrap() = failed_external;
 }
 
 #[cfg(unix)]
@@ -197,7 +223,7 @@ impl ManagedBrowserSession {
     fn new() -> Self {
         let browser_lock = acquire_managed_browser_lock();
         let home = unique_home();
-        cleanup(&home);
+        prepare_home(&home);
         Self {
             home,
             _browser_lock: browser_lock,
@@ -215,7 +241,7 @@ impl ManagedBrowserSession {
 
 impl Drop for ManagedBrowserSession {
     fn drop(&mut self) {
-        cleanup_impl(&self.home);
+        cleanup(&self.home);
     }
 }
 
@@ -638,10 +664,6 @@ where
         .to_string()
 }
 
-fn cleanup(home: &str) {
-    cleanup_impl(home);
-}
-
 fn default_session_pid_path(home: &str) -> PathBuf {
     RubPaths::new(home).session("default").pid_path()
 }
@@ -650,8 +672,35 @@ fn session_pid_path(home: &str, session: &str) -> PathBuf {
     RubPaths::new(home).session(session).pid_path()
 }
 
+fn cleanup(home: &str) {
+    match try_cleanup_home(home) {
+        Ok(CleanupVerification::Verified) => {}
+        Ok(CleanupVerification::SkippedDuringPanic) => {}
+        Err(message) => panic!("{message}"),
+    }
+}
+
+fn prepare_home(home: &str) {
+    if let Err(message) = try_prepare_home(home) {
+        panic!("{message}");
+    }
+}
+
+fn try_prepare_home(home: &str) -> Result<CleanupVerification, String> {
+    let observed = observe_home_cleanup(home);
+    cleanup_impl(home);
+    verify_home_cleanup_complete(home, &observed)
+}
+
+fn try_cleanup_home(home: &str) -> Result<CleanupVerification, String> {
+    let verification = try_prepare_home(home)?;
+    if matches!(verification, CleanupVerification::Verified) {
+        unregister_home(home);
+    }
+    Ok(verification)
+}
+
 fn cleanup_impl(home: &str) {
-    unregister_home(home);
     if !std::path::Path::new(home).exists() {
         return;
     }
@@ -661,21 +710,15 @@ fn cleanup_impl(home: &str) {
     }
 }
 
-fn wait_for_home_processes_to_exit(home: &str, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        kill_home_process_tree(home);
-        if daemon_processes_for_home(home).is_empty() {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+fn observe_home_cleanup(home: &str) -> HomeCleanupObservation {
+    let mut daemon_root_pids = daemon_root_pids_for_home(home);
+    daemon_root_pids.extend(home_artifact_daemon_root_pids(home));
+    daemon_root_pids.sort_unstable();
+    daemon_root_pids.dedup();
+    HomeCleanupObservation { daemon_root_pids }
 }
 
-fn kill_home_process_tree(home: &str) {
+fn home_artifact_daemon_root_pids(home: &str) -> Vec<u32> {
     let mut roots = Vec::new();
     let registry_path = format!("{home}/registry.json");
     if let Ok(contents) = std::fs::read_to_string(&registry_path)
@@ -696,6 +739,117 @@ fn kill_home_process_tree(home: &str) {
         roots.push(pid);
     }
 
+    collect_pid_file_values(Path::new(home), &mut roots);
+
+    roots
+}
+
+fn collect_pid_file_values(root: &Path, pids: &mut Vec<u32>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_pid_file_values(&path, pids);
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("pid") {
+            continue;
+        }
+        if let Ok(contents) = std::fs::read_to_string(&path)
+            && let Ok(pid) = contents.trim().parse::<u32>()
+        {
+            pids.push(pid);
+        }
+    }
+}
+
+fn verify_home_cleanup_complete(
+    home: &str,
+    observed: &HomeCleanupObservation,
+) -> Result<CleanupVerification, String> {
+    if std::thread::panicking() {
+        return Ok(CleanupVerification::SkippedDuringPanic);
+    }
+
+    let residues = daemon_processes_for_home(home);
+    if !residues.is_empty() {
+        return Err(format!(
+            "cleanup must not leave daemon residue for home {home}: {:#?}",
+            residues
+        ));
+    }
+
+    let managed_browser_authority_pids = observed_managed_browser_authority_pids(home, observed);
+    let browser_residue = managed_browser_authority_pids
+        .iter()
+        .filter_map(|daemon_pid| {
+            let residue = browser_processes_for_daemon_pid(*daemon_pid);
+            (!residue.is_empty()).then_some((*daemon_pid, residue))
+        })
+        .collect::<Vec<_>>();
+    if !browser_residue.is_empty() {
+        return Err(format!(
+            "cleanup must not leave managed browser residue for home {home}: {browser_residue:#?}"
+        ));
+    }
+
+    let managed_profile_residue = managed_browser_authority_pids
+        .iter()
+        .map(|daemon_pid| managed_browser_profile_dir_for_daemon(*daemon_pid))
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    if !managed_profile_residue.is_empty() {
+        return Err(format!(
+            "cleanup must remove managed browser profile residue for home {home}: {managed_profile_residue:#?}"
+        ));
+    }
+
+    if Path::new(home).exists() {
+        return Err(format!("cleanup must remove test home directory {home}"));
+    }
+
+    Ok(CleanupVerification::Verified)
+}
+
+fn observed_managed_browser_authority_pids(
+    home: &str,
+    observed: &HomeCleanupObservation,
+) -> Vec<u32> {
+    let daemon_snapshot = process_command_snapshot();
+    observed
+        .daemon_root_pids
+        .iter()
+        .copied()
+        .filter(|daemon_pid| {
+            daemon_pid_matches_home_in_snapshot(&daemon_snapshot, *daemon_pid, home)
+                || !browser_processes_for_daemon_pid(*daemon_pid).is_empty()
+                || managed_browser_profile_dir_for_daemon(*daemon_pid).exists()
+        })
+        .collect()
+}
+
+fn managed_browser_profile_dir_for_daemon(daemon_pid: u32) -> PathBuf {
+    std::env::temp_dir().join(format!("rub-chrome-{daemon_pid}"))
+}
+
+fn wait_for_home_processes_to_exit(home: &str, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        kill_home_process_tree(home);
+        if daemon_processes_for_home(home).is_empty() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn kill_home_process_tree(home: &str) {
+    let mut roots = home_artifact_daemon_root_pids(home);
     // Startup can fail before the registry or pid file commits. Fall back to
     // the live process table so interrupted tests still reclaim detached
     // daemons for the owning RUB_HOME.
@@ -781,7 +935,7 @@ fn sweep_stale_test_homes() {
             if owner_pid.is_none() && !daemon_root_pids_for_home(path_str.as_ref()).is_empty() {
                 continue;
             }
-            cleanup_impl(path.to_string_lossy().as_ref());
+            prepare_home(path.to_string_lossy().as_ref());
         }
     }
 }
@@ -895,6 +1049,65 @@ fn browser_processes_for_daemon_pid(daemon_pid: u32) -> Vec<u32> {
             let mut parts = trimmed.split_whitespace();
             let pid = parts.next()?.parse::<u32>().ok()?;
             Some(pid)
+        })
+        .collect()
+}
+
+fn try_cleanup_external_chrome(
+    pid: u32,
+    profile_dir: &Path,
+) -> Result<CleanupVerification, String> {
+    kill_process_tree_from_roots(&[pid]);
+    let _ = std::fs::remove_dir_all(profile_dir);
+    verify_external_chrome_cleanup_complete(pid, profile_dir)
+}
+
+fn verify_external_chrome_cleanup_complete(
+    pid: u32,
+    profile_dir: &Path,
+) -> Result<CleanupVerification, String> {
+    if std::thread::panicking() {
+        return Ok(CleanupVerification::SkippedDuringPanic);
+    }
+    if process_alive(pid) {
+        return Err(format!(
+            "cleanup must not leave external Chrome process residue: pid {pid} still appears alive"
+        ));
+    }
+    let process_residue = external_chrome_processes_for_profile(profile_dir);
+    if !process_residue.is_empty() {
+        return Err(format!(
+            "cleanup must not leave external Chrome process residue for profile {}: {process_residue:#?}",
+            profile_dir.display()
+        ));
+    }
+    if profile_dir.exists() {
+        return Err(format!(
+            "cleanup must remove external Chrome profile directory {}",
+            profile_dir.display()
+        ));
+    }
+    Ok(CleanupVerification::Verified)
+}
+
+fn external_chrome_processes_for_profile(profile_dir: &Path) -> Vec<String> {
+    let profile_token = profile_dir.display().to_string();
+    let Ok(output) = Command::new("ps")
+        .args(["-Ao", "pid=,command="])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .contains(&profile_token)
+                .then_some(trimmed.to_string())
         })
         .collect()
 }
@@ -1061,6 +1274,122 @@ fn daemon_pid_match_rejects_reused_pid_for_other_home() {
 }
 
 #[test]
+#[serial]
+fn prepare_home_preserves_registered_cleanup_authority() {
+    let home = unique_home();
+    prepare_home(&home);
+    assert!(
+        registered_homes()
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|existing| existing == &home),
+        "prepare_home should not unregister the active test home"
+    );
+    unregister_home(&home);
+}
+
+#[test]
+#[serial]
+fn cleanup_registered_artifacts_retains_unverified_entries_during_panic_unwind() {
+    struct CleanupDuringPanic;
+
+    impl Drop for CleanupDuringPanic {
+        fn drop(&mut self) {
+            cleanup_registered_artifacts();
+        }
+    }
+
+    let home = unique_home();
+    std::fs::create_dir_all(&home).unwrap();
+    let _ = std::panic::catch_unwind(|| {
+        let _guard = CleanupDuringPanic;
+        panic!("trigger cleanup while panicking");
+    });
+
+    assert!(
+        registered_homes()
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|existing| existing == &home),
+        "panic-path cleanup should retain the home for atexit retry authority"
+    );
+    assert!(
+        Path::new(&home).exists(),
+        "panic-path cleanup must not destructively remove registered homes during unwind"
+    );
+
+    unregister_home(&home);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn observe_home_cleanup_includes_pid_file_residue_when_daemon_is_already_gone() {
+    let home = std::env::temp_dir().join(format!(
+        "rub-e2e-observe-home-cleanup-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let pid_path = RubPaths::new(&home)
+        .session_runtime("default", "sess-dead")
+        .pid_path();
+    if let Some(parent) = pid_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&pid_path, "4242\n").unwrap();
+
+    let observed = observe_home_cleanup(home.to_string_lossy().as_ref());
+
+    assert!(
+        observed.daemon_root_pids.contains(&4242),
+        "cleanup observation should keep artifact-based daemon pid authority even after the live daemon is gone"
+    );
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn verify_home_cleanup_ignores_unrelated_pid_artifacts_without_browser_authority() {
+    let home = std::env::temp_dir().join(format!(
+        "rub-e2e-cleanup-false-positive-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let home_string = home.to_string_lossy().to_string();
+    let observed = HomeCleanupObservation {
+        daemon_root_pids: vec![9_999_991],
+    };
+
+    let verification = verify_home_cleanup_complete(&home_string, &observed)
+        .expect("unrelated pid should not fail cleanup verification");
+    assert_eq!(verification, CleanupVerification::Verified);
+}
+
+#[test]
+fn verify_home_cleanup_complete_detects_managed_profile_residue_for_observed_daemon() {
+    let fake_pid = 424_242u32;
+    let home = format!("/tmp/rub-e2e-cleanup-residue-{fake_pid}");
+    let profile_dir = managed_browser_profile_dir_for_daemon(fake_pid);
+    let _ = std::fs::remove_dir_all(&profile_dir);
+    std::fs::create_dir_all(&profile_dir).unwrap();
+
+    let result = verify_home_cleanup_complete(
+        &home,
+        &HomeCleanupObservation {
+            daemon_root_pids: vec![fake_pid],
+        },
+    );
+
+    assert!(
+        result
+            .err()
+            .is_some_and(|message| message.contains("managed browser profile residue")),
+        "cleanup verification should fail closed when a managed profile directory remains"
+    );
+
+    let _ = std::fs::remove_dir_all(profile_dir);
+}
+
+#[test]
 fn probe_cdp_http_ready_once_times_out_on_half_open_response() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
     let addr = listener.local_addr().expect("listener addr");
@@ -1077,6 +1406,251 @@ fn probe_cdp_http_ready_once_times_out_on_half_open_response() {
     server.join().expect("server thread should join");
     assert!(!ready);
     assert!(elapsed < Duration::from_millis(250));
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct E2eSourceFunction {
+    module: String,
+    name: String,
+    body: String,
+}
+
+fn parse_top_level_functions(module: &str, source: &str) -> Vec<E2eSourceFunction> {
+    let starts = std::iter::once(0usize)
+        .chain(
+            source
+                .match_indices('\n')
+                .map(|(index, _)| index + 1)
+                .filter(|start| *start < source.len()),
+        )
+        .filter(|start| source[*start..].starts_with("fn "))
+        .collect::<Vec<_>>();
+
+    starts
+        .iter()
+        .enumerate()
+        .map(|(index, start)| {
+            let end = starts.get(index + 1).copied().unwrap_or(source.len());
+            let body = &source[*start..end];
+            let after_fn = &body["fn ".len()..];
+            let name_end = after_fn
+                .find('(')
+                .unwrap_or_else(|| panic!("function signature should include '(' in {module}"));
+            let name = &after_fn[..name_end];
+            E2eSourceFunction {
+                module: module.to_string(),
+                name: name.to_string(),
+                body: body.to_string(),
+            }
+        })
+        .collect()
+}
+
+fn browser_backed_e2e_functions() -> Vec<E2eSourceFunction> {
+    let e2e_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/e2e");
+    let mut modules = std::fs::read_dir(&e2e_dir)
+        .unwrap_or_else(|error| panic!("failed to enumerate {}: {error}", e2e_dir.display()))
+        .map(|entry| entry.expect("e2e module entry should be readable").path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("rs"))
+        .collect::<Vec<_>>();
+    modules.sort();
+
+    modules
+        .into_iter()
+        .flat_map(|path| {
+            let module = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_else(|| {
+                    panic!("e2e module path must have a valid stem: {}", path.display())
+                })
+                .to_string();
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+            parse_top_level_functions(&module, &source)
+        })
+        .collect()
+}
+
+fn qualified_function_name(function: &E2eSourceFunction) -> String {
+    format!("{}::{}", function.module, function.name)
+}
+
+fn expected_function_set(entries: &[(&str, &str)]) -> std::collections::BTreeSet<String> {
+    entries
+        .iter()
+        .map(|(module, name)| format!("{module}::{name}"))
+        .collect()
+}
+
+#[test]
+fn browser_backed_unique_home_usage_matches_exception_whitelist() {
+    let expected = expected_function_set(&[
+        ("foundation", "t382_humanize_click_reports_delay_in_timing"),
+        (
+            "state_workflow",
+            "t215_concurrent_first_command_serializes_startup",
+        ),
+        ("state_workflow", "t233e_i_history_export_grouped_scenario"),
+        (
+            "state_workflow",
+            "t310_311_external_attach_lifecycle_grouped_scenario",
+        ),
+        (
+            "trigger_runtime",
+            "t437_trigger_text_present_fires_cross_tab_click",
+        ),
+        (
+            "trigger_runtime",
+            "t437b_trigger_records_blocked_outcome_when_target_action_fails",
+        ),
+        (
+            "trigger_runtime",
+            "t437c_trigger_resume_ignores_stale_network_evidence_and_fires_on_new_request",
+        ),
+        (
+            "trigger_runtime",
+            "t437d_trigger_reports_target_missing_and_does_not_fire",
+        ),
+        (
+            "trigger_runtime",
+            "t437e_trigger_trace_projects_recent_lifecycle_and_outcome_events",
+        ),
+        (
+            "trigger_runtime",
+            "t437f_trigger_degrades_when_target_selected_frame_becomes_stale",
+        ),
+    ]);
+    let actual = browser_backed_e2e_functions()
+        .into_iter()
+        .filter(|function| function.body.contains("unique_home()"))
+        .map(|function| qualified_function_name(&function))
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(
+        actual, expected,
+        "browser-backed E2E must only use unique_home() in explicit authority-isolated exceptions"
+    );
+}
+
+#[test]
+fn browser_backed_external_attach_usage_matches_exception_whitelist() {
+    let expected = expected_function_set(&[
+        (
+            "runtime_integration",
+            "t388_389c_external_handoff_and_takeover_grouped_scenario",
+        ),
+        (
+            "state_workflow",
+            "t310_311_external_attach_lifecycle_grouped_scenario",
+        ),
+        (
+            "state_workflow",
+            "t310a_external_attach_rejects_ambiguous_page_authority",
+        ),
+        (
+            "state_workflow",
+            "t310b_failed_external_attach_does_not_leave_daemon_residue",
+        ),
+        ("state_workflow", "t360_mutual_exclusion"),
+        (
+            "state_workflow",
+            "t361_existing_session_rejects_connection_override",
+        ),
+        (
+            "state_workflow",
+            "t362_new_session_invalid_cdp_url_reports_connection_failure",
+        ),
+    ]);
+    let actual = browser_backed_e2e_functions()
+        .into_iter()
+        .filter(|function| {
+            function.body.contains("spawn_external_chrome(")
+                || function.body.contains("\"--cdp-url\"")
+        })
+        .map(|function| qualified_function_name(&function))
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(
+        actual, expected,
+        "browser-backed E2E must keep external Chrome and external attach coverage inside the explicit exception whitelist"
+    );
+}
+
+#[test]
+fn trigger_runtime_unique_home_usage_matches_authority_isolated_whitelist() {
+    let expected = expected_function_set(&[
+        (
+            "trigger_runtime",
+            "t437_trigger_text_present_fires_cross_tab_click",
+        ),
+        (
+            "trigger_runtime",
+            "t437b_trigger_records_blocked_outcome_when_target_action_fails",
+        ),
+        (
+            "trigger_runtime",
+            "t437c_trigger_resume_ignores_stale_network_evidence_and_fires_on_new_request",
+        ),
+        (
+            "trigger_runtime",
+            "t437d_trigger_reports_target_missing_and_does_not_fire",
+        ),
+        (
+            "trigger_runtime",
+            "t437e_trigger_trace_projects_recent_lifecycle_and_outcome_events",
+        ),
+        (
+            "trigger_runtime",
+            "t437f_trigger_degrades_when_target_selected_frame_becomes_stale",
+        ),
+    ]);
+    let actual = parse_top_level_functions(
+        "trigger_runtime",
+        &std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/trigger_runtime.rs"),
+        )
+        .expect("trigger_runtime source should be readable"),
+    )
+    .into_iter()
+    .filter(|function| function.body.contains("unique_home()"))
+    .map(|function| qualified_function_name(&function))
+    .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(
+        actual, expected,
+        "trigger_runtime should only bypass the grouped browser template for the authority-isolated trigger cases"
+    );
+}
+
+#[test]
+fn grouped_browser_scenarios_default_to_one_managed_session() {
+    let zero_managed_session_exceptions = expected_function_set(&[(
+        "state_workflow",
+        "t310_311_external_attach_lifecycle_grouped_scenario",
+    )]);
+
+    for function in browser_backed_e2e_functions()
+        .into_iter()
+        .filter(|function| function.name.contains("_grouped_"))
+    {
+        let managed_session_count = function
+            .body
+            .matches("ManagedBrowserSession::new()")
+            .count();
+        let qualified = qualified_function_name(&function);
+        if zero_managed_session_exceptions.contains(&qualified) {
+            assert_eq!(
+                managed_session_count, 0,
+                "{qualified} is a whitelisted external-attach scenario and must not bootstrap a managed browser"
+            );
+            continue;
+        }
+        assert_eq!(
+            managed_session_count, 1,
+            "{qualified} must reuse exactly one managed browser session so grouped scenarios keep a single cold start by default"
+        );
+    }
 }
 
 fn prepare_fake_profile_env() -> (PathBuf, PathBuf, Vec<(String, String)>) {
@@ -1196,7 +1770,7 @@ fn spawn_external_chrome(
     }
 }
 
-fn terminate_external_chrome(child: &mut std::process::Child) {
+fn terminate_external_chrome(child: &mut std::process::Child, profile_dir: &Path) {
     let pid = child.id();
     let _ = child.kill();
     for _ in 0..20 {
@@ -1206,7 +1780,12 @@ fn terminate_external_chrome(child: &mut std::process::Child) {
             Err(_) => break,
         }
     }
-    unregister_external_chrome(pid);
+    let _ = std::fs::remove_dir_all(profile_dir);
+    match verify_external_chrome_cleanup_complete(pid, profile_dir) {
+        Ok(CleanupVerification::Verified) => unregister_external_chrome(pid),
+        Ok(CleanupVerification::SkippedDuringPanic) => {}
+        Err(message) => panic!("{message}"),
+    }
 }
 
 #[path = "e2e/foundation.rs"]

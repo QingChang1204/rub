@@ -8,6 +8,8 @@ pub(super) struct OpenArgs {
     pub(super) load_strategy: Option<String>,
     #[serde(default, rename = "wait_after")]
     pub(super) _wait_after: Option<serde_json::Value>,
+    #[serde(default, rename = "_trigger")]
+    pub(super) _trigger: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -65,6 +67,8 @@ pub(super) struct ReloadArgs {
     pub(super) load_strategy: Option<String>,
     #[serde(default, rename = "wait_after")]
     pub(super) _wait_after: Option<serde_json::Value>,
+    #[serde(default, rename = "_trigger")]
+    pub(super) _trigger: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize)]

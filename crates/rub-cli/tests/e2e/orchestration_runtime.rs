@@ -1220,8 +1220,112 @@ fn t437aa_ab_orchestration_assets_and_embedded_watch_grouped_scenario() {
         "{exported}"
     );
     assert_eq!(
+        exported["data"]["result"]["rule_identity_projection"]["surface"],
+        "orchestration_rule_identity",
+        "{exported}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["rule_identity_projection"]["truth_level"],
+        "operator_projection",
+        "{exported}"
+    );
+    assert_eq!(
         exported["data"]["result"]["rule_identity_projection"]["projection_kind"],
         "live_rule_identity",
+        "{exported}"
+    );
+
+    let failing_output_dir = std::env::temp_dir().join(format!(
+        "rub-orchestration-export-followup-failure-{}",
+        uuid::Uuid::now_v7()
+    ));
+    std::fs::create_dir_all(&failing_output_dir).unwrap();
+    let post_commit_failure = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "source",
+                "orchestration",
+                "export",
+                "1",
+                "--output",
+                failing_output_dir.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap(),
+    );
+    let _ = std::fs::remove_dir_all(&failing_output_dir);
+    assert_eq!(
+        post_commit_failure["success"], false,
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["commit_state"], "daemon_committed_local_followup_failed",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["post_commit_followup_state"]["surface"],
+        "cli_post_commit_followup_failure",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["post_commit_followup_state"]["truth_level"],
+        "operator_projection",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["post_commit_followup_state"]["projection_kind"],
+        "cli_post_commit_followup_failure",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["post_commit_followup_state"]["projection_authority"],
+        "cli.post_commit_followup",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["post_commit_followup_state"]["upstream_commit_truth"],
+        "daemon_response_committed",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["post_commit_followup_state"]["control_role"], "display_only",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["post_commit_followup_state"]["durability"], "best_effort",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["data"]["post_commit_followup_state"]["recovery_contract"],
+        "no_public_recovery_contract",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["error"]["context"]["reason"],
+        "post_commit_orchestration_export_failed",
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["error"]["context"]["daemon_request_committed"], true,
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["rule_identity_projection"]["projection_authority"],
+        "session.orchestration_runtime.rules",
+        "{exported}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["rule_identity_projection"]["upstream_truth"],
+        "session_orchestration_rule",
+        "{exported}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["rule_identity_projection"]["control_role"], "display_only",
+        "{exported}"
+    );
+    assert_eq!(
+        exported["data"]["result"]["rule_identity_projection"]["durability"], "best_effort",
         "{exported}"
     );
     assert_eq!(

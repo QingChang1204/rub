@@ -4,6 +4,29 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 impl DownloadRuntimeState {
+    fn backfill_timeline_metadata(
+        &mut self,
+        guid: &str,
+        url: &str,
+        suggested_filename: &str,
+        frame_id: Option<&str>,
+    ) {
+        for event in &mut self.timeline {
+            if event.download.guid != guid {
+                continue;
+            }
+            if event.download.url.is_none() {
+                event.download.url = Some(url.to_string());
+            }
+            if event.download.suggested_filename.is_none() {
+                event.download.suggested_filename = Some(suggested_filename.to_string());
+            }
+            if event.download.frame_id.is_none() {
+                event.download.frame_id = frame_id.map(str::to_string);
+            }
+        }
+    }
+
     fn effective_generation(&self, generation: u64) -> u64 {
         if generation == 0 {
             self.current_generation
@@ -20,6 +43,7 @@ impl DownloadRuntimeState {
         if generation > self.current_generation {
             self.current_generation = generation;
             self.next_sequence = 0;
+            self.runtime_event_sequence = 0;
             self.projection = DownloadRuntimeInfo::default();
             self.entries.clear();
             self.entry_event_sequence.clear();
@@ -30,6 +54,24 @@ impl DownloadRuntimeState {
         true
     }
 
+    fn prepare_runtime_event_order(
+        &mut self,
+        generation: u64,
+        browser_sequence: Option<u64>,
+    ) -> bool {
+        if !self.prepare_generation(generation) {
+            return false;
+        }
+        let Some(browser_sequence) = browser_sequence.filter(|sequence| *sequence > 0) else {
+            return true;
+        };
+        if browser_sequence <= self.runtime_event_sequence {
+            return false;
+        }
+        self.runtime_event_sequence = browser_sequence;
+        true
+    }
+
     pub fn set_runtime(
         &mut self,
         generation: u64,
@@ -37,14 +79,56 @@ impl DownloadRuntimeState {
         mode: DownloadMode,
         download_dir: Option<String>,
     ) -> DownloadRuntimeInfo {
-        if !self.prepare_generation(generation) {
-            return self.projection();
+        self.apply_runtime_event(generation, None, status, mode, download_dir, None)
+            .projection
+    }
+
+    pub fn apply_runtime_event_sequenced(
+        &mut self,
+        generation: u64,
+        browser_sequence: u64,
+        status: DownloadRuntimeStatus,
+        mode: DownloadMode,
+        download_dir: Option<String>,
+        degraded_reason: Option<String>,
+    ) -> DownloadRuntimeMutationOutcome {
+        self.apply_runtime_event(
+            generation,
+            Some(browser_sequence),
+            status,
+            mode,
+            download_dir,
+            degraded_reason,
+        )
+    }
+
+    fn apply_runtime_event(
+        &mut self,
+        generation: u64,
+        browser_sequence: Option<u64>,
+        status: DownloadRuntimeStatus,
+        mode: DownloadMode,
+        download_dir: Option<String>,
+        degraded_reason: Option<String>,
+    ) -> DownloadRuntimeMutationOutcome {
+        if !self.prepare_runtime_event_order(generation, browser_sequence) {
+            return DownloadRuntimeMutationOutcome {
+                projection: self.projection(),
+                applied: false,
+            };
         }
-        self.projection.status = status;
+        self.projection.status = if degraded_reason.is_some() {
+            DownloadRuntimeStatus::Degraded
+        } else {
+            status
+        };
         self.projection.mode = mode;
         self.projection.download_dir = download_dir;
-        self.projection.degraded_reason = None;
-        self.projection()
+        self.projection.degraded_reason = degraded_reason;
+        DownloadRuntimeMutationOutcome {
+            projection: self.projection(),
+            applied: true,
+        }
     }
 
     pub fn mark_degraded(
@@ -52,12 +136,38 @@ impl DownloadRuntimeState {
         generation: u64,
         reason: impl Into<String>,
     ) -> DownloadRuntimeInfo {
-        if !self.prepare_generation(generation) {
-            return self.projection();
+        self.mark_degraded_sequenced(generation, None, reason)
+            .projection
+    }
+
+    pub fn mark_degraded_browser_event(
+        &mut self,
+        generation: u64,
+        browser_sequence: u64,
+        reason: impl Into<String>,
+    ) -> DownloadRuntimeInfo {
+        self.mark_degraded_sequenced(generation, Some(browser_sequence), reason)
+            .projection
+    }
+
+    fn mark_degraded_sequenced(
+        &mut self,
+        generation: u64,
+        browser_sequence: Option<u64>,
+        reason: impl Into<String>,
+    ) -> DownloadRuntimeMutationOutcome {
+        if !self.prepare_runtime_event_order(generation, browser_sequence) {
+            return DownloadRuntimeMutationOutcome {
+                projection: self.projection(),
+                applied: false,
+            };
         }
         self.projection.status = DownloadRuntimeStatus::Degraded;
         self.projection.degraded_reason = Some(reason.into());
-        self.projection()
+        DownloadRuntimeMutationOutcome {
+            projection: self.projection(),
+            applied: true,
+        }
     }
 
     pub fn record_started(
@@ -91,12 +201,8 @@ impl DownloadRuntimeState {
         }
         let started_at = rfc3339_now();
         let last_sequence = self.entry_event_sequence.get(&guid).copied().unwrap_or(0);
-        if sequence <= last_sequence
-            || self
-                .entries
-                .get(&guid)
-                .is_some_and(|entry| is_terminal(entry.state))
-        {
+        let existing_state = self.entries.get(&guid).map(|entry| entry.state);
+        if sequence <= last_sequence {
             return self
                 .entries
                 .get(&guid)
@@ -115,6 +221,36 @@ impl DownloadRuntimeState {
                     frame_id: frame_id.clone(),
                     trigger_command_id: None,
                 });
+        }
+        if existing_state.is_some_and(|state| !matches!(state, DownloadState::Started)) {
+            {
+                let entry = self
+                    .entries
+                    .get_mut(&guid)
+                    .expect("existing download entry should remain available");
+                entry.url = Some(url.clone());
+                entry.suggested_filename = Some(suggested_filename.clone());
+                entry.frame_id = frame_id.clone();
+                if entry.started_at.is_empty() {
+                    entry.started_at = started_at;
+                }
+            }
+            self.entry_event_sequence.insert(guid.clone(), sequence);
+            self.backfill_timeline_metadata(&guid, &url, &suggested_filename, frame_id.as_deref());
+            let snapshot = self
+                .entries
+                .get(&guid)
+                .cloned()
+                .expect("existing download entry should remain available");
+            if self
+                .projection
+                .last_download
+                .as_ref()
+                .is_some_and(|download| download.guid == guid)
+            {
+                self.projection.last_download = Some(snapshot.clone());
+            }
+            return snapshot;
         }
         let entry = self
             .entries

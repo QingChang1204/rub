@@ -1,17 +1,21 @@
 use std::sync::Arc;
 
+use rub_core::command::CommandName;
+
 use super::PendingExternalDomCommit;
 use crate::session::SessionState;
 
 pub(super) fn command_allowed_during_handoff(command: &str) -> bool {
+    if CommandName::parse(command).is_some_and(|name| {
+        let metadata = name.metadata();
+        metadata.internal && !metadata.in_process_only
+    }) {
+        return true;
+    }
+
     matches!(
         command,
-        "_handshake"
-            | "_upgrade_check"
-            | "_orchestration_probe"
-            | "_orchestration_target_dispatch"
-            | "_orchestration_workflow_source_vars"
-            | "doctor"
+        "doctor"
             | "runtime"
             | "frames"
             | "history"
@@ -42,7 +46,10 @@ pub(super) fn response_dom_epoch(
             state.clear_pending_external_dom_change();
         }
         Some(state.increment_epoch())
-    } else if matches!(command, "scroll" | "fill" | "pipe") {
+    } else if matches!(
+        command,
+        "scroll" | "fill" | "pipe" | "_trigger_fill" | "_trigger_pipe"
+    ) {
         Some(state.current_epoch())
     } else {
         None
@@ -86,7 +93,10 @@ mod tests {
     /// These are multi-step commands that need epoch context for
     /// downstream snapshot association but do not themselves mutate the DOM.
     fn command_reads_epoch(command: &str) -> bool {
-        matches!(command, "scroll" | "fill" | "pipe")
+        matches!(
+            command,
+            "scroll" | "fill" | "pipe" | "_trigger_fill" | "_trigger_pipe"
+        )
     }
 
     /// Commands classified as pure query: no epoch interaction.
@@ -311,12 +321,23 @@ mod tests {
             "_handshake",
             "_upgrade_check",
             "_orchestration_probe",
+            "_orchestration_tab_frames",
             "_orchestration_target_dispatch",
             "_orchestration_workflow_source_vars",
         ] {
             assert!(
                 command_allowed_during_handoff(cmd),
                 "Internal command '{cmd}' should always be allowed during handoff"
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_internal_workflow_commands_remain_blocked_during_handoff() {
+        for cmd in ["_trigger_fill", "_trigger_pipe"] {
+            assert!(
+                !command_allowed_during_handoff(cmd),
+                "Trigger workflow command '{cmd}' should inherit automation handoff blocking"
             );
         }
     }

@@ -1,6 +1,7 @@
 use rub_core::model::{OrchestrationSessionInfo, TriggerActionKind, TriggerActionSpec};
 use rub_ipc::protocol::IpcRequest;
 
+use super::protocol::RemoteDispatchContract;
 use super::*;
 use crate::trigger_workflow_bridge::{
     resolve_trigger_workflow_source_bindings, trigger_workflow_source_var_keys,
@@ -12,7 +13,11 @@ use crate::workflow_assets::{
 use crate::workflow_params::{
     parse_workflow_json_parameter_bindings, resolve_workflow_binding_map,
 };
+use serde_json::Value;
 use std::path::Path;
+
+const SOURCE_MATERIALIZATION_TIMEOUT_SENTINEL: &str =
+    "__rub_source_materialization_timeout_sentinel__";
 
 pub(super) async fn build_orchestration_action_request(
     context: OrchestrationExecutionContext<'_>,
@@ -137,6 +142,186 @@ fn orchestration_action_timeout_ms(command: &str, args: &serde_json::Value) -> u
     ORCHESTRATION_ACTION_BASE_TIMEOUT_MS.saturating_add(
         rub_core::automation_timeout::command_additional_timeout_ms(command, args),
     )
+}
+
+fn source_materialization_timeout_authority_error(path: &str) -> ErrorEnvelope {
+    ErrorEnvelope::new(
+        ErrorCode::InvalidInput,
+        "orchestration source_vars cannot drive timeout-sensitive workflow fields during source materialization",
+    )
+    .with_context(serde_json::json!({
+        "reason": "orchestration_source_materialization_timeout_authority_ambiguous",
+        "path": path,
+    }))
+}
+
+fn inspect_timeout_sensitive_value(value: Option<&Value>, path: &str) -> Result<(), ErrorEnvelope> {
+    if let Some(text) = value.and_then(Value::as_str)
+        && text.contains(SOURCE_MATERIALIZATION_TIMEOUT_SENTINEL)
+    {
+        return Err(source_materialization_timeout_authority_error(path));
+    }
+    Ok(())
+}
+
+fn inspect_fill_workflow_timeout_authority(spec: &str, scope: &str) -> Result<(), ErrorEnvelope> {
+    if !spec.contains(SOURCE_MATERIALIZATION_TIMEOUT_SENTINEL) {
+        return Ok(());
+    }
+
+    let steps = serde_json::from_str::<Value>(spec)
+        .map_err(|_| source_materialization_timeout_authority_error(scope))?;
+    let Some(steps) = steps.as_array() else {
+        return Err(source_materialization_timeout_authority_error(scope));
+    };
+
+    for (index, step) in steps.iter().enumerate() {
+        inspect_timeout_sensitive_value(
+            step.get("wait_after")
+                .and_then(|wait| wait.get("timeout_ms")),
+            &format!("{scope}[{index}].wait_after.timeout_ms"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn inspect_pipe_workflow_timeout_authority(spec: &str, scope: &str) -> Result<(), ErrorEnvelope> {
+    if !spec.contains(SOURCE_MATERIALIZATION_TIMEOUT_SENTINEL) {
+        return Ok(());
+    }
+
+    let workflow = serde_json::from_str::<Value>(spec)
+        .map_err(|_| source_materialization_timeout_authority_error(scope))?;
+    let (steps, steps_scope) = if let Some(steps) = workflow.as_array() {
+        (steps, scope.to_string())
+    } else if let Some(steps) = workflow.get("steps").and_then(Value::as_array) {
+        (steps, format!("{scope}.steps"))
+    } else {
+        return Err(source_materialization_timeout_authority_error(scope));
+    };
+
+    for (index, step) in steps.iter().enumerate() {
+        let step_scope = format!("{steps_scope}[{index}]");
+        inspect_timeout_sensitive_value(step.get("command"), &format!("{step_scope}.command"))?;
+        let command = step
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let args = step.get("args").unwrap_or(&Value::Null);
+        inspect_timeout_sensitive_value(
+            args.get("wait_after")
+                .and_then(|wait| wait.get("timeout_ms")),
+            &format!("{step_scope}.args.wait_after.timeout_ms"),
+        )?;
+        match command {
+            "wait" => inspect_timeout_sensitive_value(
+                args.get("timeout_ms"),
+                &format!("{step_scope}.args.timeout_ms"),
+            )?,
+            "fill" => {
+                if let Some(spec) = args.get("spec").and_then(Value::as_str) {
+                    inspect_fill_workflow_timeout_authority(
+                        spec,
+                        &format!("{step_scope}.args.spec"),
+                    )?;
+                }
+            }
+            "pipe" => {
+                if let Some(spec) = args.get("spec").and_then(Value::as_str) {
+                    inspect_pipe_workflow_timeout_authority(
+                        spec,
+                        &format!("{step_scope}.args.spec"),
+                    )?;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_static_source_materialization_timeout_authority(
+    resolved_spec: &str,
+) -> Result<(), ErrorEnvelope> {
+    inspect_pipe_workflow_timeout_authority(resolved_spec, "$")
+}
+
+pub(super) fn orchestration_source_materialization_wait_budget_ms(
+    action: &TriggerActionSpec,
+    rub_home: &Path,
+) -> Result<u64, ErrorEnvelope> {
+    match action.kind {
+        TriggerActionKind::BrowserCommand => {
+            let command = action.command.as_deref().ok_or_else(|| {
+                ErrorEnvelope::new(
+                    ErrorCode::InvalidInput,
+                    "orchestration browser_command action is missing action.command",
+                )
+            })?;
+            let payload = action
+                .payload
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let args = payload.as_object().ok_or_else(|| {
+                ErrorEnvelope::new(
+                    ErrorCode::InvalidInput,
+                    "orchestration browser_command action payload must be a JSON object",
+                )
+            })?;
+            Ok(orchestration_action_timeout_ms(
+                command,
+                &Value::Object(args.clone()),
+            ))
+        }
+        TriggerActionKind::Workflow => {
+            let payload = action.payload.as_ref().ok_or_else(|| {
+                ErrorEnvelope::new(
+                    ErrorCode::InvalidInput,
+                    "orchestration workflow action is missing action.payload",
+                )
+            })?;
+            let object = payload.as_object().ok_or_else(|| {
+                ErrorEnvelope::new(
+                    ErrorCode::InvalidInput,
+                    "orchestration workflow action payload must be a JSON object",
+                )
+            })?;
+            let (raw_spec, _) = resolve_orchestration_workflow_spec(object, rub_home)?;
+            let explicit = object
+                .get("vars")
+                .and_then(|value| value.as_object())
+                .map(parse_workflow_json_parameter_bindings)
+                .transpose()
+                .map_err(|error| error.into_envelope())?;
+            let mut bindings = explicit.unwrap_or_default();
+            for key in
+                trigger_workflow_source_var_keys(object).map_err(|error| error.into_envelope())?
+            {
+                bindings
+                    .entry(key)
+                    .or_insert_with(|| SOURCE_MATERIALIZATION_TIMEOUT_SENTINEL.to_string());
+            }
+            let parameterized = resolve_workflow_binding_map(&raw_spec, &bindings)
+                .map_err(|error| error.into_envelope())?;
+            ensure_static_source_materialization_timeout_authority(&parameterized.resolved_spec)?;
+            let args = serde_json::json!({
+                "spec": parameterized.resolved_spec,
+            });
+            Ok(orchestration_action_timeout_ms("pipe", &args))
+        }
+        TriggerActionKind::Provider | TriggerActionKind::Script | TriggerActionKind::Webhook => {
+            Err(ErrorEnvelope::new(
+                ErrorCode::InvalidInput,
+                "orchestration action.kind is not yet executable in this runtime slice",
+            )
+            .with_context(serde_json::json!({
+                "reason": "orchestration_action_kind_not_supported",
+                "kind": action.kind,
+            })))
+        }
+    }
 }
 
 async fn resolve_orchestration_workflow_parameterization(
@@ -270,10 +455,14 @@ async fn dispatch_to_source_session_for_workflow_bindings(
             }),
             ORCHESTRATION_ACTION_BASE_TIMEOUT_MS,
         ),
-        "workflow source vars",
-        "orchestration_source_session_unreachable",
-        "orchestration_source_var_dispatch_failed",
-        "remote orchestration workflow source vars returned an error without an envelope",
+        RemoteDispatchContract {
+            dispatch_subject: "workflow source vars",
+            unreachable_reason: "orchestration_source_session_unreachable",
+            transport_failure_reason: "orchestration_source_var_dispatch_transport_failed",
+            protocol_failure_reason: "orchestration_source_var_dispatch_protocol_failed",
+            missing_error_message:
+                "remote orchestration workflow source vars returned an error without an envelope",
+        },
     )
     .await?;
 
@@ -480,5 +669,146 @@ pub(super) fn orchestration_action_label(action: &OrchestrationActionExecutionIn
         TriggerActionKind::Provider => "provider action".to_string(),
         TriggerActionKind::Script => "script action".to_string(),
         TriggerActionKind::Webhook => "webhook action".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::orchestration_source_materialization_wait_budget_ms;
+    use super::*;
+    use rub_core::error::ErrorCode;
+
+    #[test]
+    fn source_materialization_wait_budget_tracks_declared_workflow_timeout() {
+        let home = std::env::temp_dir().join(format!(
+            "rub-orchestration-timeout-budget-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let workflows = home.join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(
+            workflows.join("delayed_rule.json"),
+            serde_json::to_string(&serde_json::json!({
+                "steps": [
+                    {
+                        "command": "click",
+                        "args": {
+                            "selector": "#apply",
+                            "wait_after": {
+                                "text": "ready",
+                                "timeout_ms": 12_000
+                            }
+                        }
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let action = TriggerActionSpec {
+            kind: TriggerActionKind::Workflow,
+            command: None,
+            payload: Some(serde_json::json!({
+                "workflow_name": "delayed_rule",
+                "source_vars": {
+                    "greeting": {
+                        "kind": "text",
+                        "selector": "#hero"
+                    }
+                }
+            })),
+        };
+
+        let budget = orchestration_source_materialization_wait_budget_ms(&action, &home)
+            .expect("static workflow wait budget should project");
+
+        assert_eq!(budget, ORCHESTRATION_ACTION_BASE_TIMEOUT_MS + 12_000);
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn source_materialization_wait_budget_rejects_timeout_sensitive_source_var_paths() {
+        let home = std::env::temp_dir().join(format!(
+            "rub-orchestration-timeout-authority-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(home.join("workflows")).unwrap();
+
+        let action = TriggerActionSpec {
+            kind: TriggerActionKind::Workflow,
+            command: None,
+            payload: Some(serde_json::json!({
+                "steps": [
+                    {
+                        "command": "wait",
+                        "args": {
+                            "timeout_ms": "{{dynamic_timeout}}"
+                        }
+                    }
+                ],
+                "source_vars": {
+                    "dynamic_timeout": {
+                        "kind": "text",
+                        "selector": "#hero"
+                    }
+                }
+            })),
+        };
+
+        let error = orchestration_source_materialization_wait_budget_ms(&action, &home)
+            .expect_err("timeout-sensitive source vars should fail closed");
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        let context = error.context.expect("timeout authority context");
+        assert_eq!(
+            context["reason"],
+            "orchestration_source_materialization_timeout_authority_ambiguous"
+        );
+        assert_eq!(context["path"], "$[0].args.timeout_ms");
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn source_materialization_wait_budget_rejects_dynamic_commands() {
+        let home = std::env::temp_dir().join(format!(
+            "rub-orchestration-timeout-command-authority-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(home.join("workflows")).unwrap();
+
+        let action = TriggerActionSpec {
+            kind: TriggerActionKind::Workflow,
+            command: None,
+            payload: Some(serde_json::json!({
+                "steps": [
+                    {
+                        "command": "{{dynamic_command}}",
+                        "args": {
+                            "timeout_ms": 5_000
+                        }
+                    }
+                ],
+                "source_vars": {
+                    "dynamic_command": {
+                        "kind": "text",
+                        "selector": "#hero"
+                    }
+                }
+            })),
+        };
+
+        let error = orchestration_source_materialization_wait_budget_ms(&action, &home)
+            .expect_err("dynamic commands should fail closed");
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        let context = error.context.expect("timeout authority context");
+        assert_eq!(
+            context["reason"],
+            "orchestration_source_materialization_timeout_authority_ambiguous"
+        );
+        assert_eq!(context["path"], "$[0].command");
+
+        let _ = std::fs::remove_dir_all(home);
     }
 }

@@ -138,6 +138,119 @@ async fn session_starts_with_inactive_trigger_runtime() {
 }
 
 #[tokio::test]
+async fn automation_scheduler_metrics_track_queue_owned_worker_cycles() {
+    let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    state.record_trigger_worker_cycle_started();
+    state.record_orchestration_worker_cycle_started();
+
+    let metrics = state.automation_scheduler_metrics().await;
+
+    assert_eq!(metrics["slice"], "shared_fifo_scheduler_policy");
+    assert_eq!(
+        metrics["authority_inventory"]["trigger_worker_cycle_entry"],
+        "trigger_worker.run_trigger_cycle"
+    );
+    assert_eq!(
+        metrics["authority_inventory"]["accepted_connection_fence_authority"],
+        "session.connected_client_count"
+    );
+    assert_eq!(
+        metrics["authority_inventory"]["pre_request_response_fence_authority"],
+        "session.pre_request_response_fence_count"
+    );
+    assert_eq!(
+        metrics["authority_inventory"]["trigger_worker_pre_queue_gate"],
+        "none"
+    );
+    assert_eq!(
+        metrics["trigger_worker"]["rule_count"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        metrics["trigger_worker"]["cycle_count"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        metrics["reservation_wait_policy"]["worker_cycle"]["mode"],
+        serde_json::json!("persistent_queue_contender")
+    );
+    assert_eq!(
+        metrics["reservation_wait_policy"]["active_orchestration_step"]["mode"],
+        serde_json::json!("action_timeout_budget")
+    );
+    assert_eq!(
+        metrics["reservation_wait_policy"]["active_orchestration_step"]["timeout_authority"],
+        serde_json::json!("orchestration_action_request.timeout_ms")
+    );
+    assert!(
+        metrics["trigger_worker"]["last_cycle_uptime_ms"]
+            .as_u64()
+            .is_some()
+    );
+    assert_eq!(
+        metrics["orchestration_worker"]["metrics"]["rule_count"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        metrics["orchestration_worker"]["metrics"]["cycle_count"],
+        serde_json::json!(1)
+    );
+}
+
+#[tokio::test]
+async fn automation_scheduler_metrics_track_queue_pressure_and_shutdown_drain() {
+    let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    state.record_in_flight_count_observation(3);
+    state.record_queue_pressure_timeout();
+    state.record_shutdown_drain_wait(2, 1, 3);
+    state.record_shutdown_drain_soft_timeout(4, 2, 5);
+
+    let metrics = state.automation_scheduler_metrics().await;
+
+    assert_eq!(
+        metrics["queue_pressure"]["max_in_flight_count"],
+        serde_json::json!(3)
+    );
+    assert_eq!(
+        metrics["queue_pressure"]["queue_timeout_count"],
+        serde_json::json!(1)
+    );
+    assert!(
+        metrics["queue_pressure"]["last_queue_timeout_uptime_ms"]
+            .as_u64()
+            .is_some()
+    );
+    assert_eq!(
+        metrics["shutdown_drain"]["wait_loop_count"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        metrics["shutdown_drain"]["soft_timeout_count"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        metrics["shutdown_drain"]["connected_only_soft_release_count"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        metrics["shutdown_drain"]["max_observed_in_flight_count"],
+        serde_json::json!(4)
+    );
+    assert_eq!(
+        metrics["shutdown_drain"]["max_observed_connected_client_count"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        metrics["shutdown_drain"]["max_observed_pre_request_response_fence_count"],
+        serde_json::json!(5)
+    );
+}
+
+#[tokio::test]
 async fn session_records_storage_snapshot_and_mutation_history() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
     state
@@ -303,6 +416,26 @@ async fn session_records_redacted_post_commit_journal_entry() {
 
         assert_eq!(journal.len(), 1);
         assert_eq!(
+            journal[0]["journal_state"]["surface"],
+            serde_json::json!("post_commit_journal")
+        );
+        assert_eq!(
+            journal[0]["journal_state"]["visibility"],
+            serde_json::json!("internal_only")
+        );
+        assert_eq!(
+            journal[0]["journal_state"]["recovery_role"],
+            serde_json::json!("daemon_recovery_writer")
+        );
+        assert_eq!(
+            journal[0]["journal_state"]["upstream_commit_truth"],
+            serde_json::json!("daemon_response_committed")
+        );
+        assert_eq!(
+            journal[0]["journal_state"]["retention_scope"],
+            serde_json::json!("session_runtime_cleanup")
+        );
+        assert_eq!(
             journal[0]["request"]["args"]["text"],
             serde_json::json!("$RUB_TOKEN")
         );
@@ -363,6 +496,10 @@ async fn session_redacts_post_commit_journal_error_response_context() {
             .expect("read journal");
 
         assert_eq!(journal.len(), 1);
+        assert_eq!(
+            journal[0]["journal_state"]["reader_contract"],
+            serde_json::json!("no_public_api")
+        );
         assert_eq!(
             journal[0]["response"]["error"]["message"],
             serde_json::json!("$RUB_TOKEN is not allowed")
@@ -759,6 +896,175 @@ async fn browser_event_enqueue_failure_commits_dropped_sequence() {
 
     assert_eq!(state.browser_event_cursor(), sequence);
     assert_eq!(state.committed_browser_event_cursor(), sequence);
+}
+
+#[test]
+fn browser_event_bounded_progress_ingress_only_applies_to_in_progress_updates() {
+    assert!(
+        BrowserSessionEvent::DownloadProgress {
+            browser_sequence: 1,
+            generation: 0,
+            guid: "guid-1".to_string(),
+            state: DownloadState::InProgress,
+            received_bytes: 64,
+            total_bytes: Some(128),
+            final_path: None,
+        }
+        .uses_bounded_progress_ingress()
+    );
+    assert!(
+        !BrowserSessionEvent::DownloadProgress {
+            browser_sequence: 2,
+            generation: 0,
+            guid: "guid-1".to_string(),
+            state: DownloadState::Completed,
+            received_bytes: 128,
+            total_bytes: Some(128),
+            final_path: Some("/tmp/file.txt".to_string()),
+        }
+        .uses_bounded_progress_ingress()
+    );
+}
+
+#[tokio::test]
+async fn browser_event_worker_preserves_download_started_before_progress_across_split_ingress() {
+    let state = Arc::new(SessionState::new(
+        "default",
+        PathBuf::from("/tmp/rub-test"),
+        None,
+    ));
+    let sink = BrowserSessionEventSink::with_progress_capacity_for_test(&state, 1);
+    let baseline = state.browser_event_cursor();
+    let started_sequence = state.allocate_browser_event_sequence();
+    sink.enqueue(BrowserSessionEvent::DownloadStarted {
+        browser_sequence: started_sequence,
+        generation: 1,
+        guid: "guid-ordered".to_string(),
+        url: "https://example.test/file.txt".to_string(),
+        suggested_filename: "file.txt".to_string(),
+        frame_id: Some("frame-main".to_string()),
+    });
+    let progress_sequence = state.allocate_browser_event_sequence();
+    sink.enqueue(BrowserSessionEvent::DownloadProgress {
+        browser_sequence: progress_sequence,
+        generation: 1,
+        guid: "guid-ordered".to_string(),
+        state: DownloadState::InProgress,
+        received_bytes: 128,
+        total_bytes: Some(256),
+        final_path: None,
+    });
+
+    state
+        .wait_for_browser_event_quiescence_since(
+            baseline,
+            Duration::from_millis(100),
+            Duration::from_millis(5),
+        )
+        .await;
+
+    let downloads = state.download_runtime().await;
+    let entry = downloads
+        .active_downloads
+        .iter()
+        .find(|entry| entry.guid == "guid-ordered")
+        .expect("download should be present");
+    assert_eq!(entry.url.as_deref(), Some("https://example.test/file.txt"));
+    assert_eq!(entry.suggested_filename.as_deref(), Some("file.txt"));
+    assert_eq!(entry.frame_id.as_deref(), Some("frame-main"));
+    assert_eq!(entry.received_bytes, 128);
+    assert_eq!(entry.total_bytes, Some(256));
+    assert_eq!(state.committed_browser_event_cursor(), progress_sequence);
+}
+
+#[tokio::test]
+async fn browser_event_worker_backfills_late_download_started_without_regressing_state() {
+    let state = Arc::new(SessionState::new(
+        "default",
+        PathBuf::from("/tmp/rub-test"),
+        None,
+    ));
+    let sink = BrowserSessionEventSink::with_progress_capacity_for_test(&state, 1);
+    let baseline = state.browser_event_cursor();
+    let progress_sequence = state.allocate_browser_event_sequence();
+    sink.enqueue(BrowserSessionEvent::DownloadProgress {
+        browser_sequence: progress_sequence,
+        generation: 1,
+        guid: "guid-late-start".to_string(),
+        state: DownloadState::InProgress,
+        received_bytes: 128,
+        total_bytes: Some(256),
+        final_path: None,
+    });
+    let started_sequence = state.allocate_browser_event_sequence();
+    sink.enqueue(BrowserSessionEvent::DownloadStarted {
+        browser_sequence: started_sequence,
+        generation: 1,
+        guid: "guid-late-start".to_string(),
+        url: "https://example.test/file.txt".to_string(),
+        suggested_filename: "file.txt".to_string(),
+        frame_id: Some("frame-main".to_string()),
+    });
+
+    state
+        .wait_for_browser_event_quiescence_since(
+            baseline,
+            Duration::from_millis(100),
+            Duration::from_millis(5),
+        )
+        .await;
+
+    let downloads = state.download_runtime().await;
+    let entry = downloads
+        .active_downloads
+        .iter()
+        .find(|entry| entry.guid == "guid-late-start")
+        .expect("download should be present");
+    assert_eq!(entry.state, DownloadState::InProgress);
+    assert_eq!(entry.received_bytes, 128);
+    assert_eq!(entry.total_bytes, Some(256));
+    assert_eq!(entry.url.as_deref(), Some("https://example.test/file.txt"));
+    assert_eq!(entry.suggested_filename.as_deref(), Some("file.txt"));
+    assert_eq!(entry.frame_id.as_deref(), Some("frame-main"));
+    assert_eq!(state.committed_browser_event_cursor(), started_sequence);
+}
+
+#[tokio::test]
+async fn browser_event_progress_overflow_commits_sequence_and_marks_download_runtime_degraded() {
+    let state = Arc::new(SessionState::new(
+        "default",
+        PathBuf::from("/tmp/rub-test"),
+        None,
+    ));
+    let sink = BrowserSessionEventSink::saturated_progress_for_test(&state);
+    let baseline = state.browser_event_cursor();
+    let sequence = state.allocate_browser_event_sequence();
+
+    sink.enqueue(BrowserSessionEvent::DownloadProgress {
+        browser_sequence: sequence,
+        generation: 7,
+        guid: "guid-overflow".to_string(),
+        state: DownloadState::InProgress,
+        received_bytes: 64,
+        total_bytes: Some(128),
+        final_path: None,
+    });
+
+    state
+        .wait_for_browser_event_quiescence_since(
+            baseline,
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+        )
+        .await;
+
+    assert_eq!(state.browser_event_cursor(), sequence);
+    assert_eq!(state.committed_browser_event_cursor(), sequence);
+    assert_eq!(state.browser_event_ingress_drop_count(), 1);
+    assert_eq!(
+        state.download_runtime().await.degraded_reason.as_deref(),
+        Some("browser_event_ingress_overflow:download_progress")
+    );
 }
 
 #[test]

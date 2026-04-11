@@ -82,6 +82,10 @@ pub(super) struct FillArgs {
     pub(super) spec: String,
     #[serde(default, rename = "spec_source")]
     pub(super) _spec_source: Option<serde_json::Value>,
+    #[serde(default, rename = "_trigger")]
+    pub(super) _trigger: Option<serde_json::Value>,
+    #[serde(default, rename = "_orchestration")]
+    pub(super) _orchestration: Option<serde_json::Value>,
     #[serde(flatten)]
     pub(super) submit: SubmitLocatorArgs,
     #[serde(default, rename = "wait_after")]

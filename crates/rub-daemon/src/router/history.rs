@@ -97,8 +97,16 @@ mod tests {
             .expect("history command succeeds");
 
         assert_eq!(
+            exported["result"]["projection_state"]["surface"],
+            serde_json::json!("command_history")
+        );
+        assert_eq!(
             exported["result"]["projection_state"]["projection_kind"],
             serde_json::json!("bounded_post_commit_projection")
+        );
+        assert_eq!(
+            exported["result"]["projection_state"]["truth_level"],
+            serde_json::json!("operator_projection")
         );
         assert_eq!(
             exported["result"]["projection_state"]["projection_authority"],
@@ -107,6 +115,14 @@ mod tests {
         assert_eq!(
             exported["result"]["projection_state"]["upstream_commit_truth"],
             serde_json::json!("daemon_response_committed")
+        );
+        assert_eq!(
+            exported["result"]["projection_state"]["control_role"],
+            serde_json::json!("display_only")
+        );
+        assert_eq!(
+            exported["result"]["projection_state"]["durability"],
+            serde_json::json!("best_effort")
         );
         assert_eq!(
             exported["result"]["projection_state"]["lossy"],
@@ -150,12 +166,28 @@ mod tests {
             .await
             .expect("export succeeds");
         assert_eq!(
+            exported["result"]["projection_state"]["surface"],
+            serde_json::json!("workflow_capture_export")
+        );
+        assert_eq!(
             exported["result"]["projection_state"]["projection_authority"],
             serde_json::json!("session.workflow_capture")
         );
         assert_eq!(
+            exported["result"]["projection_state"]["truth_level"],
+            serde_json::json!("operator_projection")
+        );
+        assert_eq!(
             exported["result"]["projection_state"]["upstream_commit_truth"],
             serde_json::json!("daemon_response_committed")
+        );
+        assert_eq!(
+            exported["result"]["projection_state"]["control_role"],
+            serde_json::json!("display_only")
+        );
+        assert_eq!(
+            exported["result"]["projection_state"]["durability"],
+            serde_json::json!("best_effort")
         );
         assert_eq!(
             exported["result"]["entries"]

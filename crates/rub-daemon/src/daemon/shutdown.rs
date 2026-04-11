@@ -24,22 +24,33 @@ pub(super) async fn wait_for_transaction_drain_with_timeout(
     let deadline = tokio::time::Instant::now() + timeout;
     let mut timeout_logged = false;
     loop {
+        let now = tokio::time::Instant::now();
         let in_flight = state
             .in_flight_count
             .load(std::sync::atomic::Ordering::SeqCst);
         let connected = state
             .connected_client_count
             .load(std::sync::atomic::Ordering::SeqCst);
-        if in_flight == 0 && connected == 0 {
+        let pre_request_response_fences = state
+            .pre_request_response_fence_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if in_flight == 0 && connected == 0 && pre_request_response_fences == 0 {
             break;
         }
-        if !timeout_logged && tokio::time::Instant::now() >= deadline {
-            error!(
-                in_flight_count = in_flight,
-                connected_client_count = connected,
-                "Shutdown drain exceeded the soft budget; continuing to wait because teardown must not cut an in-flight transaction"
+        state.record_shutdown_drain_wait(in_flight, connected, pre_request_response_fences);
+        if now >= deadline && !timeout_logged {
+            state.record_shutdown_drain_soft_timeout(
+                in_flight,
+                connected,
+                pre_request_response_fences,
             );
             timeout_logged = true;
+            info!(
+                in_flight_count = in_flight,
+                connected_client_count = connected,
+                pre_request_response_fence_count = pre_request_response_fences,
+                "Shutdown drain exceeded the soft budget; continuing to wait because active request or response fences are still authoritative"
+            );
         }
         tokio::time::sleep(poll_interval).await;
     }

@@ -12,14 +12,16 @@ use crate::session::{
     rfc3339_now,
 };
 use rub_core::error::{ErrorCode, ErrorEnvelope};
-use rub_ipc::codec::NdJsonCodec;
 use rub_ipc::protocol::IPC_PROTOCOL_VERSION;
 
 mod io;
 mod projection;
 mod shutdown;
 
-use io::{handle_connection, protocol_read_failure_response};
+use io::{
+    ConnectedClientGuard, PreRequestResponseFenceGuard, handle_connection,
+    protocol_read_failure_response, write_response_with_timeout,
+};
 use projection::{
     publish_pid_projection, publish_socket_projection, publish_startup_commit_marker,
     restore_previous_authority, signal_ready, startup_ready_marker_path,
@@ -27,6 +29,7 @@ use projection::{
 use shutdown::{wait_for_shutdown_signal, wait_for_transaction_drain, wait_for_worker_shutdown};
 
 const IPC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const IPC_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SHUTDOWN_DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 const MAX_PRE_FRAMING_CONNECTIONS: usize = 128;
@@ -177,7 +180,11 @@ pub async fn run_daemon(
                 let router = router.clone();
                 let state = state.clone();
                 let Ok(permit) = connection_slots.clone().try_acquire_owned() else {
+                    let reject_state = state.clone();
+                    let reject_response_fence =
+                        PreRequestResponseFenceGuard::new(reject_state.clone());
                     tokio::spawn(async move {
+                        let _reject_response_fence = reject_response_fence;
                         let (_reader, mut writer) = stream.into_split();
                         let response = protocol_read_failure_response(
                             ErrorEnvelope::new(
@@ -190,12 +197,14 @@ pub async fn run_daemon(
                                 "limit": MAX_PRE_FRAMING_CONNECTIONS,
                             })),
                         );
-                        let _ = NdJsonCodec::write(&mut writer, &response).await;
+                        let _ = write_response_with_timeout(&mut writer, &response).await;
                     });
                     continue;
                 };
+                let connected_client_fence = ConnectedClientGuard::new(state.clone());
                 tokio::spawn(async move {
                     let _permit = permit;
+                    let _connected_client_fence = connected_client_fence;
                     if let Err(e) = handle_connection(stream, router, state).await {
                         error!(error = %e, "Connection handler error");
                     }
@@ -512,6 +521,116 @@ mod tests {
         assert!(
             elapsed >= std::time::Duration::from_millis(20),
             "drain returned before in-flight transaction quiesced"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_waits_past_soft_timeout_until_connected_request_fence_clears() {
+        let state = Arc::new(SessionState::new_with_id(
+            "default",
+            "sess-default",
+            temp_home(),
+            None,
+        ));
+        state
+            .connected_client_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+
+        let drain_state = state.clone();
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            drain_state
+                .connected_client_count
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let start = tokio::time::Instant::now();
+        wait_for_transaction_drain_with_timeout(
+            &state,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        let metrics = state.automation_scheduler_metrics().await;
+        releaser.await.unwrap();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(20),
+            "drain returned before the connected request fence quiesced"
+        );
+        assert_eq!(
+            metrics["shutdown_drain"]["soft_timeout_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            metrics["shutdown_drain"]["connected_only_soft_release_count"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            metrics["shutdown_drain"]["max_observed_in_flight_count"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            metrics["shutdown_drain"]["max_observed_connected_client_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            metrics["shutdown_drain"]["max_observed_pre_request_response_fence_count"],
+            serde_json::json!(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_waits_past_soft_timeout_until_pre_request_response_fence_clears() {
+        let state = Arc::new(SessionState::new_with_id(
+            "default",
+            "sess-default",
+            temp_home(),
+            None,
+        ));
+        state
+            .pre_request_response_fence_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+
+        let drain_state = state.clone();
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            drain_state
+                .pre_request_response_fence_count
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let start = tokio::time::Instant::now();
+        wait_for_transaction_drain_with_timeout(
+            &state,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        let metrics = state.automation_scheduler_metrics().await;
+        releaser.await.unwrap();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(20),
+            "drain returned before the pre-request response fence quiesced"
+        );
+        assert_eq!(
+            metrics["shutdown_drain"]["soft_timeout_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            metrics["shutdown_drain"]["max_observed_in_flight_count"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            metrics["shutdown_drain"]["max_observed_connected_client_count"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            metrics["shutdown_drain"]["max_observed_pre_request_response_fence_count"],
+            serde_json::json!(1)
         );
     }
 

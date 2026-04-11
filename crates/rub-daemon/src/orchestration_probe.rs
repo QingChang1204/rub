@@ -12,7 +12,8 @@ use rub_ipc::protocol::IpcRequest;
 use serde::{Deserialize, Serialize};
 
 use crate::orchestration_executor::{
-    decode_orchestration_success_payload, dispatch_remote_orchestration_request,
+    RemoteDispatchContract, decode_orchestration_success_payload,
+    dispatch_remote_orchestration_request,
 };
 use crate::session::SessionState;
 
@@ -182,7 +183,7 @@ pub(crate) async fn evaluate_orchestration_probe_for_tab(
             let Some(record) = window
                 .records
                 .into_iter()
-                .find(|record| network_request_matches(record, tab_target_id, condition))
+                .find(|record| network_request_matches(record, tab_target_id, frame_id, condition))
             else {
                 return Ok(OrchestrationProbeResult {
                     matched: false,
@@ -253,10 +254,14 @@ pub(crate) async fn dispatch_remote_orchestration_probe(
             }),
             30_000,
         ),
-        "probe",
-        "orchestration_source_session_unreachable",
-        "orchestration_source_probe_dispatch_failed",
-        "remote orchestration probe returned an error without an envelope",
+        RemoteDispatchContract {
+            dispatch_subject: "probe",
+            unreachable_reason: "orchestration_source_session_unreachable",
+            transport_failure_reason: "orchestration_source_probe_dispatch_transport_failed",
+            protocol_failure_reason: "orchestration_source_probe_dispatch_protocol_failed",
+            missing_error_message:
+                "remote orchestration probe returned an error without an envelope",
+        },
     )
     .await?;
 
@@ -309,9 +314,16 @@ fn readiness_matches(readiness: &rub_core::model::ReadinessInfo, requested: &str
 fn network_request_matches(
     record: &rub_core::model::NetworkRequestRecord,
     tab_target_id: &str,
+    frame_id: Option<&str>,
     condition: &TriggerConditionSpec,
 ) -> bool {
     if record.tab_target_id.as_deref() != Some(tab_target_id) {
+        return false;
+    }
+
+    if let Some(frame_id) = frame_id
+        && record.frame_id.as_deref() != Some(frame_id)
+    {
         return false;
     }
 
@@ -377,5 +389,84 @@ fn parse_storage_area(area: Option<&str>) -> Result<Option<StorageArea>, RubErro
             ErrorCode::InvalidInput,
             format!("Unsupported orchestration storage area '{other}'; use 'local' or 'session'"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::network_request_matches;
+    use rub_core::model::{
+        NetworkRequestLifecycle, NetworkRequestRecord, TriggerConditionKind, TriggerConditionSpec,
+    };
+    use std::collections::BTreeMap;
+
+    fn network_record(frame_id: Option<&str>) -> NetworkRequestRecord {
+        NetworkRequestRecord {
+            request_id: "req-1".to_string(),
+            sequence: 1,
+            lifecycle: NetworkRequestLifecycle::Completed,
+            url: "https://example.test/api".to_string(),
+            method: "GET".to_string(),
+            tab_target_id: Some("tab-source".to_string()),
+            status: Some(200),
+            request_headers: BTreeMap::new(),
+            response_headers: BTreeMap::new(),
+            request_body: None,
+            response_body: None,
+            original_url: None,
+            rewritten_url: None,
+            applied_rule_effects: Vec::new(),
+            error_text: None,
+            frame_id: frame_id.map(str::to_string),
+            resource_type: None,
+            mime_type: None,
+        }
+    }
+
+    fn network_condition() -> TriggerConditionSpec {
+        TriggerConditionSpec {
+            kind: TriggerConditionKind::NetworkRequest,
+            locator: None,
+            text: None,
+            url_pattern: Some("/api".to_string()),
+            readiness_state: None,
+            method: Some("GET".to_string()),
+            status_code: Some(200),
+            storage_area: None,
+            key: None,
+            value: None,
+        }
+    }
+
+    #[test]
+    fn orchestration_network_request_matches_require_source_frame_when_present() {
+        let condition = network_condition();
+        let record = network_record(Some("frame-a"));
+
+        assert!(network_request_matches(
+            &record,
+            "tab-source",
+            Some("frame-a"),
+            &condition
+        ));
+        assert!(!network_request_matches(
+            &record,
+            "tab-source",
+            Some("frame-b"),
+            &condition
+        ));
+    }
+
+    #[test]
+    fn orchestration_network_request_matches_allow_tab_scoped_rules_without_frame() {
+        let condition = network_condition();
+        let record = network_record(Some("frame-a"));
+
+        assert!(network_request_matches(
+            &record,
+            "tab-source",
+            None,
+            &condition
+        ));
     }
 }

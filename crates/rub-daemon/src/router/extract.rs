@@ -10,6 +10,7 @@ use super::projection::snapshot_entity;
 use super::secret_resolution::redact_json_value;
 use super::snapshot::build_stable_snapshot;
 use super::*;
+use crate::router::addressing::load_snapshot;
 use crate::router::extract_postprocess::resolve_missing_field;
 use collection::{ExtractEntrySpec, extract_collection};
 use field::{
@@ -120,13 +121,8 @@ pub(super) async fn cmd_extract(
         return Ok(data);
     }
 
-    let snapshot = if let Some(snapshot_id) = parsed_args.snapshot_id() {
-        state.get_snapshot(snapshot_id).await.ok_or_else(|| {
-            RubError::domain(
-                ErrorCode::StaleSnapshot,
-                format!("Snapshot '{snapshot_id}' not found in cache"),
-            )
-        })?
+    let snapshot = if parsed_args.snapshot_id().is_some() {
+        load_snapshot(router, args, state, deadline, false).await?
     } else {
         let snapshot =
             build_stable_snapshot(router, args, state, deadline, Some(0), false, false).await?;

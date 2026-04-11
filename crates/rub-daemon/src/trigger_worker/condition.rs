@@ -32,6 +32,7 @@ pub(super) enum TriggerConditionState {
     Triggered(TriggeredTriggerCondition),
 }
 
+#[derive(Clone)]
 pub(super) struct TriggeredTriggerCondition {
     pub(super) evidence: TriggerEvidenceInfo,
     pub(super) evidence_fingerprint: String,
@@ -121,7 +122,11 @@ pub(super) async fn evaluate_trigger_condition(
         TriggerConditionKind::TextPresent => {
             let text = trigger.condition.text.as_deref().unwrap_or_default();
             if !browser
-                .tab_has_text(&trigger.source_tab.target_id, None, text)
+                .tab_has_text(
+                    &trigger.source_tab.target_id,
+                    trigger.source_tab.frame_id.as_deref(),
+                    text,
+                )
                 .await?
             {
                 return Ok(TriggerConditionEvaluation {
@@ -155,7 +160,11 @@ pub(super) async fn evaluate_trigger_condition(
                 )
             })?;
             let matches = browser
-                .find_content_matches_in_tab(&trigger.source_tab.target_id, None, &locator)
+                .find_content_matches_in_tab(
+                    &trigger.source_tab.target_id,
+                    trigger.source_tab.frame_id.as_deref(),
+                    &locator,
+                )
                 .await?;
             if matches.is_empty() {
                 return Ok(TriggerConditionEvaluation {
@@ -183,7 +192,10 @@ pub(super) async fn evaluate_trigger_condition(
         }
         TriggerConditionKind::Readiness => {
             let readiness = browser
-                .probe_runtime_state_for_tab(&trigger.source_tab.target_id, None)
+                .probe_runtime_state_for_tab(
+                    &trigger.source_tab.target_id,
+                    trigger.source_tab.frame_id.as_deref(),
+                )
                 .await?
                 .readiness_state;
             let requested = trigger
@@ -251,7 +263,10 @@ pub(super) async fn evaluate_trigger_condition(
         }
         TriggerConditionKind::StorageValue => {
             let snapshot = browser
-                .storage_snapshot_for_tab(&trigger.source_tab.target_id, None)
+                .storage_snapshot_for_tab(
+                    &trigger.source_tab.target_id,
+                    trigger.source_tab.frame_id.as_deref(),
+                )
                 .await?;
             if !storage_snapshot_matches(&snapshot, trigger)? {
                 return Ok(TriggerConditionEvaluation {
@@ -313,6 +328,11 @@ pub(super) fn network_request_matches(
     trigger: &TriggerInfo,
 ) -> bool {
     if record.tab_target_id.as_deref() != Some(trigger.source_tab.target_id.as_str()) {
+        return false;
+    }
+    if let Some(frame_id) = trigger.source_tab.frame_id.as_deref()
+        && record.frame_id.as_deref() != Some(frame_id)
+    {
         return false;
     }
 

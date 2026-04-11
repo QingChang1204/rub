@@ -23,6 +23,15 @@ pub(super) async fn cmd_fill(
     execution::cmd_fill(router, args, deadline, state).await
 }
 
+pub(super) async fn cmd_trigger_fill(
+    router: &DaemonRouter,
+    args: &serde_json::Value,
+    deadline: TransactionDeadline,
+    state: &Arc<SessionState>,
+) -> Result<serde_json::Value, RubError> {
+    execution::cmd_trigger_fill(router, args, deadline, state).await
+}
+
 pub(super) async fn cmd_pipe(
     router: &DaemonRouter,
     args: &serde_json::Value,
@@ -32,12 +41,25 @@ pub(super) async fn cmd_pipe(
     execution::cmd_pipe(router, args, deadline, state).await
 }
 
+pub(super) async fn cmd_trigger_pipe(
+    router: &DaemonRouter,
+    args: &serde_json::Value,
+    deadline: TransactionDeadline,
+    state: &Arc<SessionState>,
+) -> Result<serde_json::Value, RubError> {
+    execution::cmd_trigger_pipe(router, args, deadline, state).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::args::SubmitLocatorArgs;
     use super::{
-        FillArgs, PipeArgs, parse_pipe_spec, resolve_step_references,
-        spec::resolve_template_string, submit_args,
+        FillArgs, PipeArgs,
+        command_build::build_fill_step_locator_args,
+        execution::{OrchestrationMetadataInheritancePolicy, inherit_orchestration_metadata},
+        parse_pipe_spec, resolve_step_references,
+        spec::resolve_template_string,
+        submit_args,
     };
     use crate::router::automation_fence::ensure_committed_automation_result;
     use crate::router::request_args::parse_json_args;
@@ -129,6 +151,8 @@ mod tests {
                 "submit_label": "Send",
                 "submit_first": true,
                 "wait_after": {"selector":"#done"},
+                "_trigger": {"kind": "trigger_action"},
+                "_orchestration": {"frame_id": "frame-target"},
             }),
             "fill",
         )
@@ -137,6 +161,14 @@ mod tests {
         assert_eq!(parsed.submit.label.as_deref(), Some("Send"));
         assert!(parsed.submit.first);
         assert!(parsed._wait_after.is_some());
+        assert!(parsed._trigger.is_some());
+        assert_eq!(
+            parsed
+                ._orchestration
+                .as_ref()
+                .and_then(|value| value.get("frame_id")),
+            Some(&json!("frame-target"))
+        );
     }
 
     #[test]
@@ -168,6 +200,97 @@ mod tests {
         .expect_err("unknown pipe fields should still fail")
         .into_envelope();
         assert_eq!(error.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn inherit_orchestration_metadata_preserves_child_frame_by_default() {
+        let mut args = json!({
+            "selector": "#submit",
+            "_orchestration": {
+                "frame_id": "child-frame",
+                "command_id": "child-command",
+            }
+        });
+        let inherited = json!({
+            "frame_id": "target-frame",
+            "command_id": "parent-command",
+            "phase": "trigger_action"
+        });
+
+        inherit_orchestration_metadata(
+            &mut args,
+            Some(&inherited),
+            OrchestrationMetadataInheritancePolicy::PreserveChildOverrides,
+        );
+
+        assert_eq!(args["_orchestration"]["frame_id"], "child-frame");
+        assert_eq!(args["_orchestration"]["command_id"], "child-command");
+        assert_eq!(args["_orchestration"]["phase"], "trigger_action");
+    }
+
+    #[test]
+    fn inherit_orchestration_metadata_overwrites_frame_for_trigger_owned_workflow() {
+        let mut args = json!({
+            "selector": "#submit",
+            "_orchestration": {
+                "frame_id": "child-frame",
+                "command_id": "child-command",
+            }
+        });
+        let inherited = json!({
+            "frame_id": "target-frame",
+            "command_id": "parent-command",
+            "phase": "trigger_action"
+        });
+
+        inherit_orchestration_metadata(
+            &mut args,
+            Some(&inherited),
+            OrchestrationMetadataInheritancePolicy::TriggerAuthoritativeFrame,
+        );
+
+        assert_eq!(args["_orchestration"]["frame_id"], "target-frame");
+        assert_eq!(args["_orchestration"]["command_id"], "child-command");
+        assert_eq!(args["_orchestration"]["phase"], "trigger_action");
+    }
+
+    #[test]
+    fn inherit_orchestration_metadata_normalizes_non_object_child_metadata() {
+        let mut args = json!({
+            "selector": "#submit",
+            "_orchestration": "bad-shape"
+        });
+        let inherited = json!({
+            "frame_id": "target-frame",
+        });
+
+        inherit_orchestration_metadata(
+            &mut args,
+            Some(&inherited),
+            OrchestrationMetadataInheritancePolicy::PreserveChildOverrides,
+        );
+
+        assert_eq!(args["_orchestration"]["frame_id"], "target-frame");
+    }
+
+    #[test]
+    fn fill_step_locator_args_receive_inherited_frame_metadata_before_resolution() {
+        let step: super::args::FillStepSpec = serde_json::from_value(json!({
+            "selector": "#submit",
+            "value": "hello"
+        }))
+        .expect("fill step should deserialize");
+        let mut locator_args = build_fill_step_locator_args(&step);
+
+        inherit_orchestration_metadata(
+            &mut locator_args,
+            Some(&json!({
+                "frame_id": "target-frame",
+            })),
+            OrchestrationMetadataInheritancePolicy::TriggerAuthoritativeFrame,
+        );
+
+        assert_eq!(locator_args["_orchestration"]["frame_id"], "target-frame");
     }
 
     #[test]

@@ -8,8 +8,9 @@ use crate::session::SessionState;
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 use rub_ipc::codec::NdJsonCodec;
 use rub_ipc::protocol::IpcRequest;
+use rub_ipc::protocol::IpcResponse;
 
-use super::IPC_READ_TIMEOUT;
+use super::{IPC_READ_TIMEOUT, IPC_WRITE_TIMEOUT};
 
 /// Handle a single IPC connection from a CLI client.
 pub(super) async fn handle_connection(
@@ -44,13 +45,13 @@ async fn handle_connection_inner(
                         "reason": "ipc_read_timeout",
                     })),
                 );
-                let _ = NdJsonCodec::write(&mut writer, &response).await;
+                let _ = write_response_with_timeout(&mut writer, &response).await;
                 return Ok(());
             }
             Ok(Ok(request)) => request,
             Ok(Err(error)) => {
                 let response = protocol_read_failure_response(read_failure_envelope(error));
-                let _ = NdJsonCodec::write(&mut writer, &response).await;
+                let _ = write_response_with_timeout(&mut writer, &response).await;
                 return Ok(());
             }
         };
@@ -58,21 +59,45 @@ async fn handle_connection_inner(
         return Ok(());
     };
 
-    let _connected_client = ConnectedClientGuard::new(state);
     info!(command = %request.command, command_id = ?request.command_id, "Received request");
 
     let response = router.dispatch(request, state).await;
-    NdJsonCodec::write(&mut writer, &response).await?;
+    write_response_with_timeout(&mut writer, &response).await?;
 
     Ok(())
 }
 
-struct ConnectedClientGuard<'a> {
-    state: &'a Arc<SessionState>,
+pub(super) async fn write_response_with_timeout<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: &IpcResponse,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    write_response_with_timeout_duration(writer, response, IPC_WRITE_TIMEOUT).await
 }
 
-impl<'a> ConnectedClientGuard<'a> {
-    fn new(state: &'a Arc<SessionState>) -> Self {
+async fn write_response_with_timeout_duration<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: &IpcResponse,
+    timeout: std::time::Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match tokio::time::timeout(timeout, NdJsonCodec::write(writer, response)).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "Timed out waiting for an NDJSON response commit fence after {}s",
+                timeout.as_secs()
+            ),
+        )
+        .into()),
+    }
+}
+
+pub(super) struct ConnectedClientGuard {
+    state: Arc<SessionState>,
+}
+
+impl ConnectedClientGuard {
+    pub(super) fn new(state: Arc<SessionState>) -> Self {
         state
             .connected_client_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -80,10 +105,31 @@ impl<'a> ConnectedClientGuard<'a> {
     }
 }
 
-impl Drop for ConnectedClientGuard<'_> {
+impl Drop for ConnectedClientGuard {
     fn drop(&mut self) {
         self.state
             .connected_client_count
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub(super) struct PreRequestResponseFenceGuard {
+    state: Arc<SessionState>,
+}
+
+impl PreRequestResponseFenceGuard {
+    pub(super) fn new(state: Arc<SessionState>) -> Self {
+        state
+            .pre_request_response_fence_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self { state }
+    }
+}
+
+impl Drop for PreRequestResponseFenceGuard {
+    fn drop(&mut self) {
+        self.state
+            .pre_request_response_fence_count
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -141,5 +187,67 @@ pub(super) fn read_failure_envelope(
                 })),
             },
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PreRequestResponseFenceGuard, write_response_with_timeout_duration};
+    use crate::session::SessionState;
+    use rub_ipc::protocol::{IpcResponse, ResponseStatus};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn response_write_timeout_bounds_stalled_writer_fence() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let response = IpcResponse {
+            ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+            request_id: "req-timeout".to_string(),
+            command_id: None,
+            status: ResponseStatus::Success,
+            timing: rub_core::model::Timing::default(),
+            data: Some(serde_json::json!({
+                "result": "x".repeat(2048),
+            })),
+            error: None,
+        };
+
+        let error = write_response_with_timeout_duration(
+            &mut writer,
+            &response,
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .expect_err("stalled response writer should time out");
+
+        let io_error = error
+            .downcast::<std::io::Error>()
+            .expect("timeout helper should return an io::Error");
+        assert_eq!(io_error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn pre_request_response_guard_tracks_shutdown_fence_until_drop() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-test"),
+            None,
+        ));
+        let guard = PreRequestResponseFenceGuard::new(state.clone());
+        assert_eq!(
+            state
+                .pre_request_response_fence_count
+                .load(Ordering::SeqCst),
+            1
+        );
+        drop(guard);
+        assert_eq!(
+            state
+                .pre_request_response_fence_count
+                .load(Ordering::SeqCst),
+            0
+        );
     }
 }

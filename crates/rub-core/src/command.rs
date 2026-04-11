@@ -2,6 +2,7 @@
 pub struct CommandMetadata {
     pub internal: bool,
     pub supports_post_wait: bool,
+    pub in_process_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -9,8 +10,11 @@ pub enum CommandName {
     Handshake,
     UpgradeCheck,
     OrchestrationProbe,
+    OrchestrationTabFrames,
     OrchestrationTargetDispatch,
     OrchestrationWorkflowSourceVars,
+    TriggerFill,
+    TriggerPipe,
     Open,
     State,
     Observe,
@@ -61,8 +65,11 @@ impl CommandName {
             Self::Handshake => "_handshake",
             Self::UpgradeCheck => "_upgrade_check",
             Self::OrchestrationProbe => "_orchestration_probe",
+            Self::OrchestrationTabFrames => "_orchestration_tab_frames",
             Self::OrchestrationTargetDispatch => "_orchestration_target_dispatch",
             Self::OrchestrationWorkflowSourceVars => "_orchestration_workflow_source_vars",
+            Self::TriggerFill => "_trigger_fill",
+            Self::TriggerPipe => "_trigger_pipe",
             Self::Open => "open",
             Self::State => "state",
             Self::Observe => "observe",
@@ -113,10 +120,17 @@ impl CommandName {
             Self::Handshake
             | Self::UpgradeCheck
             | Self::OrchestrationProbe
+            | Self::OrchestrationTabFrames
             | Self::OrchestrationTargetDispatch
             | Self::OrchestrationWorkflowSourceVars => CommandMetadata {
                 internal: true,
                 supports_post_wait: false,
+                in_process_only: false,
+            },
+            Self::TriggerFill | Self::TriggerPipe => CommandMetadata {
+                internal: true,
+                supports_post_wait: true,
+                in_process_only: true,
             },
             Self::Open
             | Self::Back
@@ -133,10 +147,12 @@ impl CommandName {
             | Self::Pipe => CommandMetadata {
                 internal: false,
                 supports_post_wait: true,
+                in_process_only: false,
             },
             _ => CommandMetadata {
                 internal: false,
                 supports_post_wait: false,
+                in_process_only: false,
             },
         }
     }
@@ -146,8 +162,11 @@ impl CommandName {
             "_handshake" => Some(Self::Handshake),
             "_upgrade_check" => Some(Self::UpgradeCheck),
             "_orchestration_probe" => Some(Self::OrchestrationProbe),
+            "_orchestration_tab_frames" => Some(Self::OrchestrationTabFrames),
             "_orchestration_target_dispatch" => Some(Self::OrchestrationTargetDispatch),
             "_orchestration_workflow_source_vars" => Some(Self::OrchestrationWorkflowSourceVars),
+            "_trigger_fill" => Some(Self::TriggerFill),
+            "_trigger_pipe" => Some(Self::TriggerPipe),
             "open" => Some(Self::Open),
             "state" => Some(Self::State),
             "observe" => Some(Self::Observe),
@@ -214,8 +233,11 @@ mod tests {
             CommandName::Handshake,
             CommandName::UpgradeCheck,
             CommandName::OrchestrationProbe,
+            CommandName::OrchestrationTabFrames,
             CommandName::OrchestrationTargetDispatch,
             CommandName::OrchestrationWorkflowSourceVars,
+            CommandName::TriggerFill,
+            CommandName::TriggerPipe,
             CommandName::Open,
             CommandName::State,
             CommandName::Observe,
@@ -284,20 +306,24 @@ mod tests {
         let handshake = command_metadata(CommandName::Handshake.as_str());
         assert!(handshake.internal);
         assert!(!handshake.supports_post_wait);
+        assert!(!handshake.in_process_only);
 
         let open = command_metadata(CommandName::Open.as_str());
         assert!(!open.internal);
         assert!(open.supports_post_wait);
+        assert!(!open.in_process_only);
 
         let click = command_metadata(CommandName::Click.as_str());
         assert!(!click.internal);
         assert!(click.supports_post_wait);
+        assert!(!click.in_process_only);
 
         let history = command_metadata(CommandName::History.as_str());
         assert!(!history.internal);
         assert!(!history.supports_post_wait);
+        assert!(!history.in_process_only);
 
-        // Internal commands are never post-wait capable
+        // Management-plane internal commands are never post-wait capable.
         for cmd in [
             CommandName::Handshake,
             CommandName::UpgradeCheck,
@@ -311,6 +337,17 @@ mod tests {
                 !meta.supports_post_wait,
                 "{cmd:?} should not support post-wait"
             );
+            assert!(
+                !meta.in_process_only,
+                "{cmd:?} should remain transport-exposed internal"
+            );
+        }
+
+        for cmd in [CommandName::TriggerFill, CommandName::TriggerPipe] {
+            let meta = cmd.metadata();
+            assert!(meta.internal, "{cmd:?} should be internal");
+            assert!(meta.supports_post_wait, "{cmd:?} should support post-wait");
+            assert!(meta.in_process_only, "{cmd:?} should be in-process only");
         }
     }
 }

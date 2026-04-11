@@ -85,10 +85,11 @@ fn classify_retryable_orchestration_error(error: &ErrorEnvelope) -> Option<&'sta
         | (ErrorCode::DaemonNotRunning, Some("orchestration_source_session_unreachable")) => {
             Some("session_unreachable")
         }
-        (ErrorCode::IpcProtocolError, Some("orchestration_target_dispatch_failed"))
-        | (ErrorCode::IpcProtocolError, Some("orchestration_source_var_dispatch_failed")) => {
-            Some("dispatch_transport_transient")
-        }
+        (ErrorCode::IpcProtocolError, Some("orchestration_target_dispatch_transport_failed"))
+        | (
+            ErrorCode::IpcProtocolError,
+            Some("orchestration_source_var_dispatch_transport_failed"),
+        ) => Some("dispatch_transport_transient"),
         (ErrorCode::BrowserCrashed, Some("orchestration_target_not_active")) => {
             Some("target_activation_transient")
         }
@@ -194,7 +195,10 @@ mod tests {
 
     use rub_core::error::{ErrorCode, ErrorEnvelope};
 
-    use super::{OrchestrationRetryPolicy, run_with_orchestration_retry};
+    use super::{
+        OrchestrationRetryPolicy, classify_retryable_orchestration_error,
+        run_with_orchestration_retry,
+    };
 
     #[tokio::test]
     async fn orchestration_retry_retries_transient_dispatch_failures_then_succeeds() {
@@ -213,7 +217,7 @@ mod tests {
                         Err::<&'static str, ErrorEnvelope>(
                             ErrorEnvelope::new(ErrorCode::IpcProtocolError, "dispatch failed")
                                 .with_context(serde_json::json!({
-                                    "reason": "orchestration_target_dispatch_failed",
+                                    "reason": "orchestration_target_dispatch_transport_failed",
                                 })),
                         )
                     } else {
@@ -281,7 +285,7 @@ mod tests {
                     Err::<(), ErrorEnvelope>(
                         ErrorEnvelope::new(ErrorCode::IpcProtocolError, "dispatch failed")
                             .with_context(serde_json::json!({
-                                "reason": "orchestration_target_dispatch_failed",
+                                "reason": "orchestration_target_dispatch_transport_failed",
                             })),
                     )
                 }
@@ -302,6 +306,15 @@ mod tests {
             context.get("retry_reason"),
             Some(&serde_json::json!("dispatch_transport_transient")),
         );
+    }
+
+    #[test]
+    fn orchestration_retry_does_not_retry_protocol_dispatch_failures() {
+        let envelope = ErrorEnvelope::new(ErrorCode::IpcProtocolError, "dispatch failed")
+            .with_context(serde_json::json!({
+                "reason": "orchestration_target_dispatch_protocol_failed",
+            }));
+        assert_eq!(classify_retryable_orchestration_error(&envelope), None);
     }
 
     #[tokio::test]

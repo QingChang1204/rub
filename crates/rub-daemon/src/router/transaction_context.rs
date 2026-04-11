@@ -87,3 +87,16 @@ impl Drop for RouterTransactionGuard<'_> {
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
+
+pub(crate) struct OwnedRouterTransactionGuard {
+    pub(crate) _permit: tokio::sync::OwnedSemaphorePermit,
+    pub(crate) state: Arc<SessionState>,
+}
+
+impl Drop for OwnedRouterTransactionGuard {
+    fn drop(&mut self) {
+        self.state
+            .in_flight_count
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}

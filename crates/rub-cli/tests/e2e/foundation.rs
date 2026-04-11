@@ -2142,9 +2142,9 @@ fn t381_doctor_reports_l0_when_stealth_disabled() {
 #[serial]
 fn t382_humanize_click_reports_delay_in_timing() {
     let home_fast = unique_home();
-    cleanup(&home_fast);
+    prepare_home(&home_fast);
     let home_human = unique_home();
-    cleanup(&home_human);
+    prepare_home(&home_human);
 
     let (_rt, server) = start_test_server(vec![(
         "/humanize-click",

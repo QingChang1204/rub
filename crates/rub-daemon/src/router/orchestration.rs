@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use rub_core::command::command_metadata as shared_command_metadata;
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::OrchestrationAddressInfo;
 use rub_ipc::protocol::{IPC_PROTOCOL_VERSION, IpcRequest};
@@ -84,6 +85,35 @@ pub(super) async fn cmd_orchestration_probe(
     serde_json::to_value(result).map_err(RubError::from)
 }
 
+pub(super) async fn cmd_orchestration_tab_frames(
+    router: &DaemonRouter,
+    args: &serde_json::Value,
+    _state: &Arc<SessionState>,
+) -> Result<serde_json::Value, RubError> {
+    let tab_target_id = required_string_arg(args, "tab_target_id")?;
+    let frames = router
+        .browser
+        .list_frames_for_tab(&tab_target_id)
+        .await
+        .map_err(|error| {
+            RubError::domain_with_context(
+                ErrorCode::BrowserCrashed,
+                format!(
+                    "Unable to inspect orchestration tab frame inventory for '{tab_target_id}': {error}"
+                ),
+                serde_json::json!({
+                    "reason": "orchestration_tab_frames_query_failed",
+                    "tab_target_id": tab_target_id,
+                }),
+            )
+        })?;
+    Ok(serde_json::json!({
+        "result": {
+            "items": frames,
+        },
+    }))
+}
+
 pub(super) async fn cmd_orchestration_workflow_source_vars(
     router: &DaemonRouter,
     args: &serde_json::Value,
@@ -158,6 +188,7 @@ pub(super) async fn cmd_orchestration_target_dispatch(
             }),
         ));
     }
+    ensure_transport_safe_target_dispatch_request(&request)?;
 
     let current_session = projected_orchestration_session(
         state.session_id.clone(),
@@ -187,15 +218,42 @@ pub(super) async fn cmd_orchestration_target_dispatch(
     })
 }
 
+fn ensure_transport_safe_target_dispatch_request(request: &IpcRequest) -> Result<(), RubError> {
+    let metadata = shared_command_metadata(request.command.as_str());
+    if metadata.internal {
+        return Err(RubError::domain_with_context(
+            ErrorCode::IpcProtocolError,
+            format!(
+                "_orchestration_target_dispatch cannot execute internal command '{}'",
+                request.command
+            ),
+            serde_json::json!({
+                "reason": "orchestration_target_dispatch_inner_command_internal",
+                "inner_command": request.command,
+            }),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::execution::{
         ensure_orchestration_addressing_available, ensure_orchestration_execution_available,
     };
-    use super::{OrchestrationIdArgs, command::required_u32_arg};
+    use super::{
+        OrchestrationIdArgs, cmd_orchestration_target_dispatch, command::required_u32_arg,
+        ensure_transport_safe_target_dispatch_request,
+    };
+    use crate::router::DaemonRouter;
     use crate::router::request_args::parse_json_args;
+    use crate::session::SessionState;
     use rub_core::error::ErrorCode;
     use rub_core::model::OrchestrationRuntimeInfo;
+    use rub_ipc::protocol::IpcRequest;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
 
     #[test]
     fn orchestration_rule_id_rejects_values_larger_than_u32() {
@@ -228,5 +286,88 @@ mod tests {
             .expect_err("degraded runtime must reject execution");
         assert_eq!(addressing.into_envelope().code, ErrorCode::SessionBusy);
         assert_eq!(execution.into_envelope().code, ErrorCode::SessionBusy);
+    }
+
+    #[test]
+    fn target_dispatch_rejects_internal_inner_command() {
+        let request = IpcRequest::new("_trigger_pipe", serde_json::json!({ "spec": "[]" }), 1_000);
+
+        let error = ensure_transport_safe_target_dispatch_request(&request)
+            .expect_err("target dispatch must reject internal inner commands");
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|context| context.get("reason")),
+            Some(&serde_json::json!(
+                "orchestration_target_dispatch_inner_command_internal"
+            ))
+        );
+    }
+
+    fn test_router() -> DaemonRouter {
+        let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
+            rub_cdp::browser::BrowserLaunchOptions {
+                headless: true,
+                ignore_cert_errors: false,
+                user_data_dir: None,
+                download_dir: None,
+                profile_directory: None,
+                hide_infobars: true,
+                stealth: true,
+            },
+        ));
+        let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
+            manager,
+            Arc::new(AtomicU64::new(0)),
+            rub_cdp::humanize::HumanizeConfig {
+                enabled: false,
+                speed: rub_cdp::humanize::HumanizeSpeed::Normal,
+            },
+        ));
+        DaemonRouter::new(adapter)
+    }
+
+    #[tokio::test]
+    async fn orchestration_target_dispatch_fails_closed_before_in_process_dispatch_for_internal_inner_command()
+     {
+        let router = test_router();
+        let state = Arc::new(SessionState::new_with_id(
+            "default",
+            "sess-local",
+            PathBuf::from("/tmp/rub-orchestration-target-dispatch"),
+            None,
+        ));
+        let error = cmd_orchestration_target_dispatch(
+            &router,
+            &serde_json::json!({
+                "target": {
+                    "session_id": "sess-local",
+                    "session_name": "default",
+                    "tab_target_id": "tab-target",
+                },
+                "request": {
+                    "ipc_protocol_version": rub_ipc::protocol::IPC_PROTOCOL_VERSION,
+                    "command": "_trigger_pipe",
+                    "args": { "spec": "[]" },
+                    "timeout_ms": 1_000,
+                }
+            }),
+            &state,
+        )
+        .await
+        .expect_err("wrapper must reject internal inner command before local dispatch");
+
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|context| context.get("inner_command")),
+            Some(&serde_json::json!("_trigger_pipe"))
+        );
     }
 }

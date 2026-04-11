@@ -36,9 +36,12 @@ pub(super) fn command_history_projection_state_json(
 
     serde_json::json!({
         "surface": "command_history",
+        "truth_level": "operator_projection",
         "projection_kind": "bounded_post_commit_projection",
         "projection_authority": "session.history",
         "upstream_commit_truth": "daemon_response_committed",
+        "control_role": "display_only",
+        "durability": "best_effort",
         "lossy": !lossy_reasons.is_empty(),
         "lossy_reasons": lossy_reasons,
     })
@@ -70,9 +73,12 @@ pub(super) fn workflow_export_projection_state_json(
 
     serde_json::json!({
         "surface": "workflow_capture_export",
+        "truth_level": "operator_projection",
         "projection_kind": "bounded_post_commit_projection",
         "projection_authority": "session.workflow_capture",
         "upstream_commit_truth": "daemon_response_committed",
+        "control_role": "display_only",
+        "durability": "best_effort",
         "lossy": !lossy_reasons.is_empty(),
         "lossy_reasons": lossy_reasons,
     })

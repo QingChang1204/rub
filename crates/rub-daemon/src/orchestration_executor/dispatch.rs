@@ -7,11 +7,14 @@ use rub_ipc::protocol::IpcRequest;
 
 use crate::router::RouterTransactionGuard;
 use crate::router::automation_fence::ensure_committed_automation_result;
+use crate::scheduler_policy::AUTOMATION_QUEUE_SHUTDOWN_POLL_INTERVAL;
 
 use super::action_request::{
     build_orchestration_action_request, orchestration_action_execution_info,
-    orchestration_action_label, orchestration_step_command_id,
+    orchestration_action_label, orchestration_source_materialization_wait_budget_ms,
+    orchestration_step_command_id,
 };
+use super::protocol::align_orchestration_timeout_authority;
 use super::retry::{orchestration_retry_policy, run_with_orchestration_retry};
 use super::target::dispatch_action_to_target_session;
 use super::*;
@@ -83,9 +86,13 @@ async fn build_dispatchable_orchestration_action_request(
     step_index: u32,
     command_id: &str,
 ) -> Result<IpcRequest, ErrorEnvelope> {
+    let step_started_at = tokio::time::Instant::now();
     let _source_transaction =
         reserve_source_materialization_authority(context, session, action, step_index).await?;
-    build_orchestration_action_request(context, action, step_index, command_id).await
+    let mut request =
+        build_orchestration_action_request(context, action, step_index, command_id).await?;
+    trim_action_request_timeout_after_pre_dispatch(&mut request, step_started_at, step_index)?;
+    Ok(request)
 }
 
 async fn reserve_source_materialization_authority<'a>(
@@ -98,12 +105,17 @@ async fn reserve_source_materialization_authority<'a>(
         return Ok(None);
     }
 
+    let queue_wait_budget = std::time::Duration::from_millis(
+        orchestration_source_materialization_wait_budget_ms(action, context.rub_home)?,
+    );
+
     context
         .router
-        .begin_automation_transaction(
+        .begin_automation_transaction_with_wait_budget(
             context.state,
-            ORCHESTRATION_SOURCE_MATERIALIZATION_TIMEOUT_MS,
             "orchestration_source_materialization",
+            queue_wait_budget,
+            AUTOMATION_QUEUE_SHUTDOWN_POLL_INTERVAL,
         )
         .await
         .map(Some)
@@ -122,8 +134,54 @@ async fn reserve_source_materialization_authority<'a>(
                 "target_session_id": session.session_id,
                 "target_session_name": session.session_name,
                 "step_index": step_index,
+                "wait_budget_ms": queue_wait_budget.as_millis(),
             }))
         })
+}
+
+fn trim_action_request_timeout_after_pre_dispatch(
+    request: &mut IpcRequest,
+    step_started_at: tokio::time::Instant,
+    step_index: u32,
+) -> Result<(), ErrorEnvelope> {
+    let original_timeout_ms = request.timeout_ms;
+    let elapsed_ms = step_started_at.elapsed().as_millis() as u64;
+    let remaining_timeout_ms = original_timeout_ms.saturating_sub(elapsed_ms);
+    if remaining_timeout_ms == 0 {
+        return Err(
+            ErrorEnvelope::new(
+                ErrorCode::IpcTimeout,
+                format!(
+                    "orchestration step {} exhausted its declared timeout budget of {}ms before target dispatch",
+                    step_index + 1,
+                    original_timeout_ms
+                ),
+            )
+            .with_context(serde_json::json!({
+                "reason": "orchestration_action_timeout_budget_exhausted_before_target_dispatch",
+                "step_index": step_index,
+                "original_timeout_ms": original_timeout_ms,
+                "elapsed_pre_dispatch_ms": elapsed_ms,
+            })),
+        );
+    }
+    request.timeout_ms = remaining_timeout_ms;
+    align_orchestration_timeout_authority(request).map_err(|reason| {
+        ErrorEnvelope::new(
+            ErrorCode::IpcProtocolError,
+            format!(
+                "Failed to align orchestration step {} timeout authority before target dispatch: {reason}",
+                step_index + 1
+            ),
+        )
+        .with_context(serde_json::json!({
+            "reason": "orchestration_action_timeout_authority_projection_failed",
+            "step_index": step_index,
+            "original_timeout_ms": original_timeout_ms,
+            "elapsed_pre_dispatch_ms": elapsed_ms,
+        }))
+    })?;
+    Ok(())
 }
 
 fn requires_remote_source_materialization(
@@ -143,4 +201,53 @@ pub(super) fn action_requires_source_materialization(action: &TriggerActionSpec)
             .as_ref()
             .and_then(|payload| payload.as_object())
             .is_some_and(|payload| payload.get("source_vars").is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trim_action_request_timeout_after_pre_dispatch;
+    use rub_core::error::ErrorCode;
+    use rub_ipc::protocol::IpcRequest;
+
+    #[test]
+    fn trim_action_request_timeout_after_pre_dispatch_projects_remaining_budget() {
+        let started_at = tokio::time::Instant::now() - std::time::Duration::from_millis(80);
+        let mut request = IpcRequest::new("wait", serde_json::json!({ "timeout_ms": 500 }), 500);
+
+        trim_action_request_timeout_after_pre_dispatch(&mut request, started_at, 0)
+            .expect("remaining budget should stay positive");
+
+        assert!(request.timeout_ms <= 420);
+        assert_eq!(
+            request
+                .args
+                .get("timeout_ms")
+                .and_then(serde_json::Value::as_u64),
+            Some(request.timeout_ms.saturating_sub(1_000))
+        );
+    }
+
+    #[test]
+    fn trim_action_request_timeout_after_pre_dispatch_fails_when_budget_is_exhausted() {
+        let started_at = tokio::time::Instant::now() - std::time::Duration::from_millis(50);
+        let mut request = IpcRequest::new("wait", serde_json::json!({ "timeout_ms": 10 }), 10);
+
+        let error = trim_action_request_timeout_after_pre_dispatch(&mut request, started_at, 1)
+            .expect_err("elapsed pre-dispatch budget should fail closed");
+
+        assert_eq!(error.code, ErrorCode::IpcTimeout);
+        let context = error.context.expect("timeout error should publish context");
+        assert_eq!(
+            context["reason"],
+            "orchestration_action_timeout_budget_exhausted_before_target_dispatch"
+        );
+        assert_eq!(context["step_index"], 1u32);
+        assert_eq!(context["original_timeout_ms"], 10u64);
+        assert!(
+            context["elapsed_pre_dispatch_ms"]
+                .as_u64()
+                .is_some_and(|elapsed| elapsed >= 50),
+            "elapsed pre-dispatch budget should record the consumed wait time"
+        );
+    }
 }

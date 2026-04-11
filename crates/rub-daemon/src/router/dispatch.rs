@@ -13,6 +13,10 @@ pub(super) fn is_internal_command(command: &str) -> bool {
     command_metadata(command).internal
 }
 
+pub(super) fn is_in_process_only_command(command: &str) -> bool {
+    command_metadata(command).in_process_only
+}
+
 pub(super) fn command_supports_post_wait(command: &str) -> bool {
     command_metadata(command).supports_post_wait
 }
@@ -36,6 +40,11 @@ pub(super) async fn dispatch_named_command(
                 .await
                 .map(CommandDispatchOutcome::new)
         }
+        Some(CommandName::OrchestrationTabFrames) => {
+            orchestration::cmd_orchestration_tab_frames(router, args, state)
+                .await
+                .map(CommandDispatchOutcome::new)
+        }
         Some(CommandName::OrchestrationTargetDispatch) => {
             orchestration::cmd_orchestration_target_dispatch(router, args, state)
                 .await
@@ -46,6 +55,12 @@ pub(super) async fn dispatch_named_command(
                 .await
                 .map(CommandDispatchOutcome::new)
         }
+        Some(CommandName::TriggerFill) => workflow::cmd_trigger_fill(router, args, deadline, state)
+            .await
+            .map(CommandDispatchOutcome::new),
+        Some(CommandName::TriggerPipe) => workflow::cmd_trigger_pipe(router, args, deadline, state)
+            .await
+            .map(CommandDispatchOutcome::new),
         Some(CommandName::Open) => navigation::cmd_open(router, args, deadline, state).await,
         Some(CommandName::State) => navigation::cmd_state(router, args, deadline, state)
             .await
@@ -203,22 +218,36 @@ pub(super) fn execute_named_command_with_fence<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{command_metadata, command_supports_post_wait, is_internal_command};
+    use super::{
+        command_metadata, command_supports_post_wait, is_in_process_only_command,
+        is_internal_command,
+    };
 
     #[test]
     fn command_metadata_single_sources_internal_and_post_wait_flags() {
         let handshake = command_metadata("_handshake");
         assert!(handshake.internal);
         assert!(!handshake.supports_post_wait);
+        assert!(!handshake.in_process_only);
         assert!(is_internal_command("_handshake"));
+        assert!(!is_in_process_only_command("_handshake"));
 
         let open = command_metadata("open");
         assert!(!open.internal);
         assert!(open.supports_post_wait);
+        assert!(!open.in_process_only);
         assert!(command_supports_post_wait("open"));
 
         let history = command_metadata("history");
         assert!(!history.internal);
         assert!(!history.supports_post_wait);
+        assert!(!history.in_process_only);
+
+        let trigger_fill = command_metadata("_trigger_fill");
+        assert!(trigger_fill.internal);
+        assert!(trigger_fill.supports_post_wait);
+        assert!(trigger_fill.in_process_only);
+        assert!(is_internal_command("_trigger_fill"));
+        assert!(is_in_process_only_command("_trigger_fill"));
     }
 }

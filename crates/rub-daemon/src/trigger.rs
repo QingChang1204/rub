@@ -54,6 +54,7 @@ mod tests {
         TriggerTabBindingInfo {
             index,
             target_id: target_id.to_string(),
+            frame_id: None,
             url: format!("https://example.com/{index}"),
             title: format!("Tab {index}"),
         }

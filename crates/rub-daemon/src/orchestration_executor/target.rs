@@ -13,6 +13,7 @@ use serde::Deserialize;
 use crate::router::DaemonRouter;
 use crate::session::SessionState;
 
+use super::protocol::RemoteDispatchContract;
 use super::{
     ORCHESTRATION_ACTION_BASE_TIMEOUT_MS, decode_orchestration_success_payload_field,
     decode_orchestration_success_result_items, dispatch_remote_orchestration_request,
@@ -442,10 +443,14 @@ async fn dispatch_target_request(
         session,
         "target",
         request,
-        "request",
-        "orchestration_target_session_unreachable",
-        "orchestration_target_dispatch_failed",
-        "remote orchestration dispatch returned an error without an envelope",
+        RemoteDispatchContract {
+            dispatch_subject: "request",
+            unreachable_reason: "orchestration_target_session_unreachable",
+            transport_failure_reason: "orchestration_target_dispatch_transport_failed",
+            protocol_failure_reason: "orchestration_target_dispatch_protocol_failed",
+            missing_error_message:
+                "remote orchestration dispatch returned an error without an envelope",
+        },
     )
     .await
 }
@@ -455,18 +460,44 @@ fn orchestration_target_dispatch_request(
     request: IpcRequest,
 ) -> IpcRequest {
     let timeout_ms = request.timeout_ms;
-    IpcRequest::new(
+    let command_id = orchestration_target_dispatch_command_id(address, &request);
+    let request = IpcRequest::new(
         "_orchestration_target_dispatch",
         serde_json::json!({
             "target": address,
             "request": request,
         }),
         timeout_ms,
-    )
+    );
+    if let Some(command_id) = command_id {
+        request
+            .with_command_id(command_id)
+            .expect("derived orchestration target dispatch command_id must remain protocol-valid")
+    } else {
+        request
+    }
+}
+
+fn orchestration_target_dispatch_command_id(
+    address: &OrchestrationAddressInfo,
+    request: &IpcRequest,
+) -> Option<String> {
+    request.command_id.as_ref().map(|command_id| {
+        format!(
+            "orchestration_target_dispatch:{}:{command_id}",
+            address.session_id
+        )
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    use crate::orchestration_runtime::projected_orchestration_session;
+    use crate::session::SessionState;
     use rub_core::error::ErrorCode;
     use rub_core::model::{
         FrameContextInfo, FrameContextStatus, FrameRuntimeInfo, HumanVerificationHandoffInfo,
@@ -475,12 +506,17 @@ mod tests {
         ReadinessInfo, ReadinessStatus, RouteStability, SessionAccessibility, TabInfo,
         TakeoverRuntimeInfo, TakeoverRuntimeStatus, TakeoverVisibilityMode,
     };
+    use rub_ipc::codec::NdJsonCodec;
 
     use super::{
-        OrchestrationTargetRuntimeSummary, orchestration_target_continuity_failure,
+        OrchestrationTargetRuntimeSummary, dispatch_action_to_target_session,
+        orchestration_target_continuity_failure, orchestration_target_dispatch_command_id,
         orchestration_target_dispatch_request,
     };
+    use crate::router::DaemonRouter;
     use rub_ipc::protocol::IpcRequest;
+    use tokio::io::{AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
 
     fn runtime_summary() -> OrchestrationTargetRuntimeSummary {
         OrchestrationTargetRuntimeSummary {
@@ -624,5 +660,164 @@ mod tests {
                 .and_then(|value| value.as_u64()),
             Some(42_000)
         );
+    }
+
+    #[test]
+    fn target_dispatch_wrapper_uses_dedicated_command_id_for_replay() {
+        let address = target_address();
+        let inner = IpcRequest::new("click", serde_json::json!({ "selector": "#go" }), 1_000)
+            .with_command_id("step-cmd")
+            .expect("static command_id must be valid");
+
+        let wrapped = orchestration_target_dispatch_request(&address, inner.clone());
+
+        assert_eq!(
+            wrapped.command_id.as_deref(),
+            orchestration_target_dispatch_command_id(&address, &inner).as_deref()
+        );
+        assert_eq!(
+            wrapped
+                .args
+                .get("request")
+                .and_then(|value| value.get("command_id"))
+                .and_then(|value| value.as_str()),
+            Some("step-cmd")
+        );
+    }
+
+    fn test_router() -> DaemonRouter {
+        let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
+            rub_cdp::browser::BrowserLaunchOptions {
+                headless: true,
+                ignore_cert_errors: false,
+                user_data_dir: None,
+                download_dir: None,
+                profile_directory: None,
+                hide_infobars: true,
+                stealth: true,
+            },
+        ));
+        let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
+            manager,
+            Arc::new(AtomicU64::new(0)),
+            rub_cdp::humanize::HumanizeConfig {
+                enabled: false,
+                speed: rub_cdp::humanize::HumanizeSpeed::Normal,
+            },
+        ));
+        DaemonRouter::new(adapter)
+    }
+
+    #[tokio::test]
+    async fn remote_target_dispatch_replays_partial_response_through_wrapper_command_id() {
+        let socket_path = PathBuf::from(format!(
+            "/tmp/rub-orch-target-{}.sock",
+            uuid::Uuid::now_v7()
+        ));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind listener");
+
+        let server = tokio::spawn(async move {
+            let expected_outer_command_id = "orchestration_target_dispatch:sess-target:step-cmd";
+
+            let (stream, _) = listener.accept().await.expect("accept first");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let request: IpcRequest = NdJsonCodec::read(&mut reader)
+                .await
+                .expect("read first request")
+                .expect("first request");
+            assert_eq!(request.command, "_orchestration_target_dispatch");
+            assert_eq!(request.daemon_session_id.as_deref(), Some("sess-target"));
+            assert_eq!(
+                request.command_id.as_deref(),
+                Some(expected_outer_command_id)
+            );
+            let inner_request: IpcRequest = serde_json::from_value(
+                request
+                    .args
+                    .get("request")
+                    .cloned()
+                    .expect("wrapper request payload"),
+            )
+            .expect("decode inner request");
+            assert_eq!(inner_request.command_id.as_deref(), Some("step-cmd"));
+            writer
+                .write_all(br#"{"ipc_protocol_version":"1.0","request_id":"req-1""#)
+                .await
+                .expect("write partial response");
+            writer.shutdown().await.expect("shutdown partial writer");
+
+            let (stream, _) = listener.accept().await.expect("accept replay");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let replay_request: IpcRequest = NdJsonCodec::read(&mut reader)
+                .await
+                .expect("read replay request")
+                .expect("replay request");
+            assert_eq!(replay_request.command, "_orchestration_target_dispatch");
+            assert_eq!(
+                replay_request.command_id.as_deref(),
+                Some(expected_outer_command_id)
+            );
+            let replay_inner: IpcRequest = serde_json::from_value(
+                replay_request
+                    .args
+                    .get("request")
+                    .cloned()
+                    .expect("replay wrapper request payload"),
+            )
+            .expect("decode replay inner request");
+            assert_eq!(replay_inner.command_id.as_deref(), Some("step-cmd"));
+            let response = rub_ipc::protocol::IpcResponse::success(
+                "req-2",
+                serde_json::json!({ "result": { "ok": true } }),
+            )
+            .with_command_id(expected_outer_command_id)
+            .expect("static wrapper command_id must be valid");
+            NdJsonCodec::write(&mut writer, &response)
+                .await
+                .expect("write replay response");
+        });
+
+        let state = Arc::new(SessionState::new_with_id(
+            "default",
+            "sess-local",
+            PathBuf::from("/tmp/rub-orch-target-state"),
+            None,
+        ));
+        let router = test_router();
+        let session = projected_orchestration_session(
+            "sess-target".to_string(),
+            "target".to_string(),
+            42,
+            socket_path.display().to_string(),
+            false,
+            rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+            None,
+        );
+        let address = OrchestrationAddressInfo {
+            session_id: "sess-target".to_string(),
+            session_name: "target".to_string(),
+            tab_index: Some(0),
+            tab_target_id: Some("tab-target".to_string()),
+            frame_id: Some("frame-target".to_string()),
+        };
+        let request = IpcRequest::new("click", serde_json::json!({ "selector": "#go" }), 1_000)
+            .with_command_id("step-cmd")
+            .expect("static step command_id must be valid");
+
+        let response =
+            dispatch_action_to_target_session(&router, &state, &session, &address, request)
+                .await
+                .expect("wrapper replay should recover committed response");
+
+        assert_eq!(
+            response.command_id.as_deref(),
+            Some("orchestration_target_dispatch:sess-target:step-cmd")
+        );
+
+        server.await.expect("server join");
+        let _ = std::fs::remove_file(&socket_path);
     }
 }

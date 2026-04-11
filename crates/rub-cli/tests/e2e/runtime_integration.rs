@@ -390,8 +390,7 @@ fn t388_389c_external_handoff_and_takeover_grouped_scenario() {
     assert_eq!(replay["data"]["result"], 4);
 
     let _ = session.cmd().arg("close").output();
-    terminate_external_chrome(&mut chrome);
-    let _ = std::fs::remove_dir_all(profile_dir);
+    terminate_external_chrome(&mut chrome, &profile_dir);
 }
 
 /// T389d: managed headed sessions should support takeover start/resume without external attach.

@@ -28,6 +28,7 @@ pub(crate) async fn cmd_doctor(
         true,
     );
     let detection_risks = detection_risks(&launch_policy);
+    let automation_scheduler = state.automation_scheduler_metrics().await;
     let mut result = serde_json::json!({
         "browser": {
             "found": report.browser_found,
@@ -59,6 +60,7 @@ pub(crate) async fn cmd_doctor(
         "capabilities": agent_capabilities(),
         "dom_epoch": state.current_epoch(),
         "detection_risks": detection_risks,
+        "automation_scheduler": automation_scheduler,
     });
     annotate_doctor_operator_path_states(&mut result);
 

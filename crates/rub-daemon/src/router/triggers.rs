@@ -64,12 +64,14 @@ mod tests {
                 active: true,
             }],
             4,
+            Some("frame-child"),
             "source",
         )
         .expect("binding should resolve");
 
         assert_eq!(binding.target_id, "page-target-4");
         assert_eq!(binding.index, 4);
+        assert_eq!(binding.frame_id.as_deref(), Some("frame-child"));
     }
 
     #[test]
@@ -115,6 +117,22 @@ mod tests {
         };
         validate_trigger_action(&mut action).expect("browser command should validate");
         assert_eq!(action.payload, Some(json!({})));
+    }
+
+    #[test]
+    fn validate_trigger_action_rejects_reserved_browser_command_metadata() {
+        let mut action = TriggerActionSpec {
+            kind: TriggerActionKind::BrowserCommand,
+            command: Some("click".to_string()),
+            payload: Some(json!({
+                "_orchestration": {
+                    "frame_id": "other-frame"
+                }
+            })),
+        };
+        let error = validate_trigger_action(&mut action)
+            .expect_err("reserved metadata should be rejected for browser commands");
+        assert!(error.to_string().contains("_orchestration"));
     }
 
     #[test]
@@ -182,6 +200,23 @@ mod tests {
     }
 
     #[test]
+    fn validate_trigger_action_rejects_reserved_workflow_metadata() {
+        let mut action = TriggerActionSpec {
+            kind: TriggerActionKind::Workflow,
+            command: None,
+            payload: Some(json!({
+                "workflow_name": "reply_flow",
+                "_trigger": {
+                    "kind": "forbidden"
+                }
+            })),
+        };
+        let error = validate_trigger_action(&mut action)
+            .expect_err("reserved metadata should be rejected for workflow actions");
+        assert!(error.to_string().contains("_trigger"));
+    }
+
+    #[test]
     fn validate_trigger_action_rejects_invalid_workflow_name() {
         let mut action = TriggerActionSpec {
             kind: TriggerActionKind::Workflow,
@@ -239,12 +274,14 @@ mod tests {
         let source_tab = TriggerTabBindingInfo {
             index: 1,
             target_id: "tab-source".to_string(),
+            frame_id: Some("source-frame".to_string()),
             url: "https://example.com/source".to_string(),
             title: "Source".to_string(),
         };
         let target_tab = TriggerTabBindingInfo {
             index: 2,
             target_id: "tab-target".to_string(),
+            frame_id: Some("target-frame".to_string()),
             url: "https://example.com/target".to_string(),
             title: "Target".to_string(),
         };
@@ -282,6 +319,8 @@ mod tests {
             mode: TriggerMode::Once,
             source_tab: source_tab.index,
             target_tab: target_tab.index,
+            source_frame_id: source_tab.frame_id.clone(),
+            target_frame_id: target_tab.frame_id.clone(),
             condition,
             action,
         };
@@ -299,12 +338,14 @@ mod tests {
         let source_tab = TriggerTabBindingInfo {
             index: 1,
             target_id: "tab-source".to_string(),
+            frame_id: None,
             url: "https://example.com/source".to_string(),
             title: "Source".to_string(),
         };
         let target_tab = TriggerTabBindingInfo {
             index: 2,
             target_id: "tab-target".to_string(),
+            frame_id: None,
             url: "https://example.com/target".to_string(),
             title: "Target".to_string(),
         };
@@ -312,6 +353,8 @@ mod tests {
             mode: TriggerMode::Once,
             source_tab: source_tab.index,
             target_tab: target_tab.index,
+            source_frame_id: None,
+            target_frame_id: None,
             condition: TriggerConditionSpec {
                 kind: TriggerConditionKind::TextPresent,
                 locator: None,
@@ -353,6 +396,72 @@ mod tests {
         assert!(!trigger_registration_reusable(
             &existing,
             &source_tab,
+            &target_tab,
+            &spec,
+        ));
+    }
+
+    #[test]
+    fn trigger_registration_equivalence_requires_matching_frame_bindings() {
+        let existing_source_tab = TriggerTabBindingInfo {
+            index: 1,
+            target_id: "tab-source".to_string(),
+            frame_id: Some("source-frame".to_string()),
+            url: "https://example.com/source".to_string(),
+            title: "Source".to_string(),
+        };
+        let resolved_source_tab = TriggerTabBindingInfo {
+            frame_id: Some("other-source-frame".to_string()),
+            ..existing_source_tab.clone()
+        };
+        let target_tab = TriggerTabBindingInfo {
+            index: 2,
+            target_id: "tab-target".to_string(),
+            frame_id: Some("target-frame".to_string()),
+            url: "https://example.com/target".to_string(),
+            title: "Target".to_string(),
+        };
+        let spec = TriggerRegistrationSpec {
+            mode: TriggerMode::Once,
+            source_tab: existing_source_tab.index,
+            target_tab: target_tab.index,
+            source_frame_id: resolved_source_tab.frame_id.clone(),
+            target_frame_id: target_tab.frame_id.clone(),
+            condition: TriggerConditionSpec {
+                kind: TriggerConditionKind::TextPresent,
+                locator: None,
+                text: Some("Ready".to_string()),
+                url_pattern: None,
+                readiness_state: None,
+                method: None,
+                status_code: None,
+                storage_area: None,
+                key: None,
+                value: None,
+            },
+            action: TriggerActionSpec {
+                kind: TriggerActionKind::BrowserCommand,
+                command: Some("click".to_string()),
+                payload: Some(json!({ "selector": "#continue" })),
+            },
+        };
+        let existing = TriggerInfo {
+            id: 18,
+            status: TriggerStatus::Armed,
+            mode: spec.mode,
+            source_tab: existing_source_tab,
+            target_tab: target_tab.clone(),
+            condition: spec.condition.clone(),
+            action: spec.action.clone(),
+            last_condition_evidence: None,
+            consumed_evidence_fingerprint: None,
+            last_action_result: None,
+            unavailable_reason: None,
+        };
+
+        assert!(!trigger_registration_equivalent(
+            &existing,
+            &resolved_source_tab,
             &target_tab,
             &spec,
         ));

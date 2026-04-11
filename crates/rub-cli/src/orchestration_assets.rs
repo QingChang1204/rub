@@ -568,9 +568,13 @@ mod tests {
             "result": {
                 "format": "orchestration",
                 "rule_identity_projection": {
+                    "surface": "orchestration_rule_identity",
+                    "truth_level": "operator_projection",
                     "projection_kind": "live_rule_identity",
                     "projection_authority": "session.orchestration_runtime.rules",
                     "upstream_truth": "session_orchestration_rule",
+                    "control_role": "display_only",
+                    "durability": "best_effort",
                     "canonical_spec_kind": "replayable_orchestration_registration_spec",
                     "stripped_from_spec": ["correlation_key", "idempotency_key"],
                     "correlation_key": "corr-7",
@@ -609,6 +613,26 @@ mod tests {
         assert_eq!(
             data["result"]["persisted_artifacts"][0]["projection_state"]["upstream_commit_truth"],
             "daemon_response_committed"
+        );
+        assert_eq!(
+            data["result"]["rule_identity_projection"]["surface"],
+            "orchestration_rule_identity"
+        );
+        assert_eq!(
+            data["result"]["rule_identity_projection"]["truth_level"],
+            "operator_projection"
+        );
+        assert_eq!(
+            data["result"]["rule_identity_projection"]["projection_authority"],
+            "session.orchestration_runtime.rules"
+        );
+        assert_eq!(
+            data["result"]["rule_identity_projection"]["control_role"],
+            "display_only"
+        );
+        assert_eq!(
+            data["result"]["rule_identity_projection"]["durability"],
+            "best_effort"
         );
         assert_eq!(
             data["result"]["persisted_artifacts"][0]["source_rule_identity"]["correlation_key"],

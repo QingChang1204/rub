@@ -19,11 +19,13 @@ pub(crate) async fn cmd_handshake(
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     let runtime_state = state.runtime_state_snapshot().await;
+    let automation_scheduler = state.automation_scheduler_metrics().await;
     Ok(serde_json::json!({
         "daemon_session_id": state.session_id,
         "ipc_protocol_version": IPC_PROTOCOL_VERSION,
         "in_flight_count": state.in_flight_count.load(std::sync::atomic::Ordering::SeqCst),
         "connected_client_count": state.connected_client_count.load(std::sync::atomic::Ordering::SeqCst),
+        "browser_event_ingress_drop_count": state.browser_event_ingress_drop_count(),
         "launch_policy": router.browser.launch_policy(),
         "integration_runtime": state.integration_runtime().await,
         "dialog_runtime": state.dialog_runtime().await,
@@ -38,6 +40,7 @@ pub(crate) async fn cmd_handshake(
         "state_inspector": runtime_state.state_inspector,
         "readiness_state": runtime_state.readiness_state,
         "human_verification_handoff": state.human_verification_handoff().await,
+        "automation_scheduler": automation_scheduler,
         "capabilities": agent_capabilities(),
     }))
 }
@@ -48,6 +51,7 @@ pub(crate) async fn cmd_upgrade_check(
     let active_trigger_count = state.active_trigger_count().await;
     let active_orchestration_count = state.active_orchestration_count().await;
     let human_control_active = state.has_active_human_control().await;
+    let automation_scheduler = state.automation_scheduler_metrics().await;
     Ok(serde_json::json!({
         "idle": state.is_idle_for_upgrade().await && active_trigger_count == 0 && active_orchestration_count == 0,
         "in_flight_count": state.in_flight_count.load(std::sync::atomic::Ordering::SeqCst),
@@ -55,5 +59,6 @@ pub(crate) async fn cmd_upgrade_check(
         "active_trigger_count": active_trigger_count,
         "active_orchestration_count": active_orchestration_count,
         "human_control_active": human_control_active,
+        "automation_scheduler": automation_scheduler,
     }))
 }

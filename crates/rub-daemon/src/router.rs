@@ -70,7 +70,8 @@ use transaction::{
     replay_request_fingerprint,
 };
 pub(crate) use transaction_context::{
-    CommandDispatchOutcome, PendingExternalDomCommit, RouterTransactionGuard, TransactionDeadline,
+    CommandDispatchOutcome, OwnedRouterTransactionGuard, PendingExternalDomCommit,
+    RouterTransactionGuard, TransactionDeadline,
 };
 use wait_after::apply_post_wait_if_requested;
 
@@ -78,14 +79,14 @@ use wait_after::apply_post_wait_if_requested;
 pub struct DaemonRouter {
     browser: Arc<dyn BrowserPort>,
     /// Serializes command execution (FIFO).
-    exec_semaphore: tokio::sync::Semaphore,
+    exec_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl DaemonRouter {
     pub fn new(browser: Arc<dyn BrowserPort>) -> Self {
         Self {
             browser,
-            exec_semaphore: tokio::sync::Semaphore::new(1), // FIFO: one at a time
+            exec_semaphore: Arc::new(tokio::sync::Semaphore::new(1)), // FIFO: one at a time
         }
     }
 

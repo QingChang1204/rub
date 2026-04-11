@@ -14,6 +14,7 @@ use super::SessionState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PostCommitJournalEntry {
+    journal_state: serde_json::Value,
     session_id: String,
     session_name: String,
     command: String,
@@ -47,6 +48,7 @@ impl PostCommitJournalEntry {
             .map_err(|error| io::Error::other(format!("serialize journal request: {error}")))?;
         let response_json = redacted_post_commit_response(response, &state.rub_home)?;
         Ok(Self {
+            journal_state: post_commit_journal_state_json(),
             session_id: state.session_id.clone(),
             session_name: state.session_name.clone(),
             command: redacted_request.request.command,
@@ -63,6 +65,19 @@ impl PostCommitJournalEntry {
             response_redaction_reason: response_json.reason,
         })
     }
+}
+
+fn post_commit_journal_state_json() -> Value {
+    json!({
+        "surface": "post_commit_journal",
+        "visibility": "internal_only",
+        "recovery_role": "daemon_recovery_writer",
+        "upstream_commit_truth": "daemon_response_committed",
+        "commit_relation": "downstream_of_daemon_commit_fence",
+        "durability": "durable",
+        "retention_scope": "session_runtime_cleanup",
+        "reader_contract": "no_public_api",
+    })
 }
 
 fn append_durable_journal_entry(path: &Path, entry: &PostCommitJournalEntry) -> io::Result<()> {
@@ -190,6 +205,8 @@ impl SessionState {
         request: &IpcRequest,
         response: &IpcResponse,
     ) -> io::Result<()> {
+        // This journal is an internal recovery writer downstream of the daemon
+        // response commit fence. It must never redefine public commit truth.
         let _append_guard = self.post_commit_journal_append.lock().await;
         #[cfg(test)]
         if self

@@ -7,6 +7,7 @@ use crate::runtime_refresh::refresh_live_trigger_runtime;
 use crate::session::SessionState;
 
 use super::super::DaemonRouter;
+use super::super::frame_scope::ensure_tab_frame_available;
 use super::super::request_args::parse_json_spec;
 use super::command::{TriggerAddArgs, TriggerTraceArgs};
 use super::projection::{
@@ -24,8 +25,25 @@ pub(super) async fn cmd_trigger_add(
     validate_trigger_registration_spec(&mut spec)?;
 
     let tabs = refresh_live_trigger_runtime(&router.browser, state).await?;
-    let source_tab = resolve_trigger_tab_binding(&tabs, spec.source_tab, "source")?;
-    let target_tab = resolve_trigger_tab_binding(&tabs, spec.target_tab, "target")?;
+    let browser = router.browser_port();
+    let source_tab = resolve_trigger_tab_binding(
+        &tabs,
+        spec.source_tab,
+        spec.source_frame_id.as_deref(),
+        "source",
+    )?;
+    if let Some(frame_id) = source_tab.frame_id.as_deref() {
+        ensure_tab_frame_available(&browser, &source_tab.target_id, frame_id, "source").await?;
+    }
+    let target_tab = resolve_trigger_tab_binding(
+        &tabs,
+        spec.target_tab,
+        spec.target_frame_id.as_deref(),
+        "target",
+    )?;
+    if let Some(frame_id) = target_tab.frame_id.as_deref() {
+        ensure_tab_frame_available(&browser, &target_tab.target_id, frame_id, "target").await?;
+    }
 
     let existing_trigger =
         state.triggers().await.into_iter().find(|trigger| {

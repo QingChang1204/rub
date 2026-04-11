@@ -237,6 +237,54 @@ macro_rules! assert_post_commit_local_failure {
             "Expected explicit post-commit local failure state, got: {}",
             serde_json::to_string_pretty(json).unwrap_or_default()
         );
+        assert_eq!(
+            json["data"]["post_commit_followup_state"]["surface"],
+            "cli_post_commit_followup_failure",
+            "Expected explicit post-commit follow-up surface, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert_eq!(
+            json["data"]["post_commit_followup_state"]["truth_level"],
+            "operator_projection",
+            "Expected operator projection truth label for post-commit follow-up, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert_eq!(
+            json["data"]["post_commit_followup_state"]["projection_kind"],
+            "cli_post_commit_followup_failure",
+            "Expected explicit post-commit follow-up projection kind, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert_eq!(
+            json["data"]["post_commit_followup_state"]["projection_authority"],
+            "cli.post_commit_followup",
+            "Expected cli.post_commit_followup authority, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert_eq!(
+            json["data"]["post_commit_followup_state"]["upstream_commit_truth"],
+            "daemon_response_committed",
+            "Expected committed daemon truth ancestry, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert_eq!(
+            json["data"]["post_commit_followup_state"]["control_role"],
+            "display_only",
+            "Expected display_only control role for post-commit follow-up, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert_eq!(
+            json["data"]["post_commit_followup_state"]["durability"],
+            "best_effort",
+            "Expected best_effort durability for post-commit follow-up, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert_eq!(
+            json["data"]["post_commit_followup_state"]["recovery_contract"],
+            "no_public_recovery_contract",
+            "Expected no public durable recovery contract, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
     }};
 }
 
@@ -244,12 +292,25 @@ macro_rules! assert_post_commit_local_failure {
 /// as a bounded post-commit projection derived from committed daemon truth.
 #[macro_export]
 macro_rules! assert_bounded_projection_surface {
-    ($json:expr, $projection_authority:expr) => {{
+    ($json:expr, $projection_authority:expr, $surface:expr) => {{
         let json = &$json;
+        assert_eq!(
+            json["projection_state"]["surface"],
+            $surface,
+            "Expected surface={}, got: {}",
+            $surface,
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
         assert_eq!(
             json["projection_state"]["projection_kind"],
             "bounded_post_commit_projection",
             "Expected bounded post-commit projection surface, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert_eq!(
+            json["projection_state"]["truth_level"],
+            "operator_projection",
+            "Expected operator projection truth label, got: {}",
             serde_json::to_string_pretty(json).unwrap_or_default()
         );
         assert_eq!(
@@ -263,6 +324,18 @@ macro_rules! assert_bounded_projection_surface {
             json["projection_state"]["upstream_commit_truth"],
             "daemon_response_committed",
             "Expected committed daemon truth label, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert_eq!(
+            json["projection_state"]["control_role"],
+            "display_only",
+            "Expected display_only control role, got: {}",
+            serde_json::to_string_pretty(json).unwrap_or_default()
+        );
+        assert_eq!(
+            json["projection_state"]["durability"],
+            "best_effort",
+            "Expected best_effort durability label, got: {}",
             serde_json::to_string_pretty(json).unwrap_or_default()
         );
         assert!(
@@ -486,6 +559,16 @@ mod tests {
             "timing": {},
             "data": {
                 "commit_state": "daemon_committed_local_followup_failed",
+                "post_commit_followup_state": {
+                    "surface": "cli_post_commit_followup_failure",
+                    "truth_level": "operator_projection",
+                    "projection_kind": "cli_post_commit_followup_failure",
+                    "projection_authority": "cli.post_commit_followup",
+                    "upstream_commit_truth": "daemon_response_committed",
+                    "control_role": "display_only",
+                    "durability": "best_effort",
+                    "recovery_contract": "no_public_recovery_contract"
+                },
                 "result": { "format": "pipe" }
             },
             "error": {
@@ -501,14 +584,22 @@ mod tests {
     fn bounded_projection_surface_macro_accepts_projection_labels() {
         let json = serde_json::json!({
             "projection_state": {
+                "surface": "workflow_capture_export",
+                "truth_level": "operator_projection",
                 "projection_kind": "bounded_post_commit_projection",
                 "projection_authority": "session.workflow_capture",
                 "upstream_commit_truth": "daemon_response_committed",
+                "control_role": "display_only",
+                "durability": "best_effort",
                 "lossy": false,
                 "lossy_reasons": []
             }
         });
-        crate::assert_bounded_projection_surface!(json, "session.workflow_capture");
+        crate::assert_bounded_projection_surface!(
+            json,
+            "session.workflow_capture",
+            "workflow_capture_export"
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::connection_hardening::{
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::process::is_process_alive;
 use rub_daemon::rub_paths::RubPaths;
-use rub_ipc::client::IpcClient;
+use rub_ipc::client::{IpcClient, IpcClientError};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -111,26 +111,49 @@ async fn probe_upgrade_check(client: &mut IpcClient, session_name: &str) -> Resu
         ))
         .await
         .map(|_| ())
-        .map_err(|error| {
-            if let Some(envelope) = error.protocol_envelope() {
-                RubError::domain_with_context(
-                    envelope.code,
-                    format!(
-                        "Failed to fetch upgrade status for session '{session_name}': {}",
-                        envelope.message
-                    ),
-                    envelope
-                        .context
-                        .clone()
-                        .unwrap_or_else(|| serde_json::json!({})),
-                )
-            } else {
-                RubError::domain(
-                    ErrorCode::IpcProtocolError,
-                    format!("Failed to fetch upgrade status for session '{session_name}': {error}"),
-                )
+        .map_err(|error| upgrade_probe_send_error(session_name, error))
+}
+
+fn upgrade_probe_send_error(session_name: &str, error: IpcClientError) -> RubError {
+    match error {
+        IpcClientError::Protocol(envelope) => RubError::domain_with_context(
+            envelope.code,
+            format!(
+                "Failed to fetch upgrade status for session '{session_name}': {}",
+                envelope.message
+            ),
+            envelope.context.unwrap_or_else(|| serde_json::json!({})),
+        ),
+        IpcClientError::Transport(io_error) => {
+            let mut context = serde_json::Map::from_iter([(
+                "reason".to_string(),
+                serde_json::json!("daemon_ctl_upgrade_check_transport_failed"),
+            )]);
+            if let Some(transport_reason) = classify_io_transient(&io_error) {
+                context.insert(
+                    "transport_reason".to_string(),
+                    serde_json::json!(transport_reason),
+                );
             }
-        })
+            RubError::domain_with_context(
+                ErrorCode::IpcProtocolError,
+                format!("Failed to fetch upgrade status for session '{session_name}': {io_error}"),
+                serde_json::Value::Object(context),
+            )
+        }
+    }
+}
+
+fn transport_reason_from_error(error: &RubError) -> Option<String> {
+    match error {
+        RubError::Domain(envelope) => envelope
+            .context
+            .as_ref()
+            .and_then(|context| context.get("transport_reason"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        _ => None,
+    }
 }
 
 pub(crate) async fn detect_or_connect_hardened(
@@ -166,7 +189,18 @@ pub(crate) async fn detect_or_connect_hardened(
                 {
                     match probe_upgrade_check(&mut handshake_client, session_name).await {
                         Ok(()) => requires_handshake_reconnect = true,
-                        Err(_) => {
+                        Err(error) => {
+                            if let Some(reason) = transport_reason_from_error(&error) {
+                                last_failure = Some(RetryFailure {
+                                    error,
+                                    attribution: RetryAttribution {
+                                        retry_count: 0,
+                                        retry_reason: Some(reason),
+                                    },
+                                    final_failure_class: ConnectionFailureClass::TransportTransient,
+                                });
+                                continue;
+                            }
                             hard_cut_outdated_daemon(rub_home, session_name, entry).await?;
                             return Ok(DaemonConnection::NeedStart);
                         }
@@ -184,7 +218,23 @@ pub(crate) async fn detect_or_connect_hardened(
                     .map_err(|failure| failure.into_error())?;
                     handshake_client = reconnected_client;
                 }
-                let handshake = fetch_handshake_info(&mut handshake_client).await?;
+                let handshake = match fetch_handshake_info(&mut handshake_client).await {
+                    Ok(handshake) => handshake,
+                    Err(error) => {
+                        if let Some(reason) = transport_reason_from_error(&error) {
+                            last_failure = Some(RetryFailure {
+                                error,
+                                attribution: RetryAttribution {
+                                    retry_count: 0,
+                                    retry_reason: Some(reason),
+                                },
+                                final_failure_class: ConnectionFailureClass::TransportTransient,
+                            });
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                };
                 return maybe_upgrade_if_needed(
                     rub_home,
                     session_name,

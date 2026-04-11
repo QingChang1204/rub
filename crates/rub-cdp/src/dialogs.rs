@@ -91,6 +91,46 @@ pub(crate) fn intercept_policy_matches(
         .is_none_or(|t| t == tab_target_id)
 }
 
+fn take_matching_intercept_policy(
+    intercept: &SharedDialogIntercept,
+    tab_target_id: &str,
+) -> Option<DialogInterceptPolicy> {
+    if let Ok(mut guard) = intercept.lock() {
+        let should_consume = guard
+            .as_ref()
+            .is_some_and(|p| intercept_policy_matches(p, tab_target_id));
+        if should_consume { guard.take() } else { None }
+    } else {
+        None
+    }
+}
+
+async fn publish_dialog_opening(
+    runtime_state: &SharedDialogRuntime,
+    opened_callback: Option<&OpeningCallback>,
+    opened: &BrowserDialogOpening,
+) {
+    {
+        let mut state = runtime_state.write().await;
+        apply_dialog_runtime_status(&mut state, DialogRuntimeStatus::Active);
+        state.pending_dialog = Some(PendingDialogInfo {
+            kind: opened.kind,
+            message: opened.message.clone(),
+            url: opened.url.clone(),
+            tab_target_id: opened.tab_target_id.clone(),
+            frame_id: opened.frame_id.clone(),
+            default_prompt: opened.default_prompt.clone(),
+            has_browser_handler: opened.has_browser_handler,
+            opened_at: rfc3339_now(),
+        });
+        state.last_dialog = state.pending_dialog.clone();
+    }
+
+    if let Some(callback) = opened_callback {
+        callback(opened.clone());
+    }
+}
+
 pub async fn ensure_page_dialog_runtime(
     page: Arc<Page>,
     callbacks: DialogCallbacks,
@@ -125,21 +165,6 @@ pub async fn ensure_page_dialog_runtime(
                         default_prompt: event.default_prompt.clone(),
                         has_browser_handler: event.has_browser_handler,
                     };
-                    {
-                        let mut state = runtime_state.write().await;
-                        apply_dialog_runtime_status(&mut state, DialogRuntimeStatus::Active);
-                        state.pending_dialog = Some(PendingDialogInfo {
-                            kind: opened.kind,
-                            message: opened.message.clone(),
-                            url: opened.url.clone(),
-                            tab_target_id: opened.tab_target_id.clone(),
-                            frame_id: opened.frame_id.clone(),
-                            default_prompt: opened.default_prompt.clone(),
-                            has_browser_handler: opened.has_browser_handler,
-                            opened_at: rfc3339_now(),
-                        });
-                        state.last_dialog = state.pending_dialog.clone();
-                    }
 
                     // ── Dialog Intercept (one-shot, page-scoped) ─────────────
                     // Consume the pre-registered intercept policy and call
@@ -154,27 +179,19 @@ pub async fn ensure_page_dialog_runtime(
                     // The MutexGuard is scoped to the inner block below so it is
                     // guaranteed dropped before the .await (std::sync::MutexGuard
                     // is !Send and must not be held across an await point).
-                    let intercept_policy = {
-                        if let Ok(mut guard) = intercept.lock() {
-                            let should_consume = guard
-                                .as_ref()
-                                .is_some_and(|p| intercept_policy_matches(p, &tab_target_id));
-                            if should_consume { guard.take() } else { None }
-                        } else {
-                            None
-                        }
-                    }; // guard dropped here — safe to await below
+                    let intercept_policy =
+                        take_matching_intercept_policy(&intercept, &tab_target_id);
+
+                    publish_dialog_opening(&runtime_state, opened_callback.as_ref(), &opened).await;
 
                     if let Some(policy) = intercept_policy {
-                        // Direct await — stays in the same listener task,
-                        // eliminating the second-spawn timing gap.
+                        // Opening has already committed to the shared runtime and
+                        // downstream callbacks before the browser handler runs, so
+                        // a fast intercepted close cannot overtake the opening
+                        // authority at the projection seam.
                         let _ =
                             handle_dialog(&page_for_intercept, policy.accept, policy.prompt_text)
                                 .await;
-                    }
-
-                    if let Some(callback) = &opened_callback {
-                        callback(opened);
                     }
                 }
             });
@@ -319,10 +336,12 @@ fn normalize_dialog_kind(event: &EventJavascriptDialogOpening) -> DialogKind {
 #[cfg(test)]
 mod tests {
     use super::{
-        DialogCallbacks, apply_dialog_runtime_status, commit_dialog_hook_install_projection,
-        new_shared_dialog_runtime,
+        BrowserDialogOpening, DialogCallbacks, DialogRuntimeInfo, DialogRuntimeStatus,
+        OpeningCallback, apply_dialog_runtime_status, commit_dialog_hook_install_projection,
+        new_shared_dialog_runtime, publish_dialog_opening,
     };
-    use rub_core::model::{DialogKind, DialogRuntimeInfo, DialogRuntimeStatus};
+    use rub_core::model::DialogKind;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn empty_callbacks_report_empty() {
@@ -389,6 +408,54 @@ mod tests {
                 .as_ref()
                 .and_then(|dialog| dialog.tab_target_id.as_deref()),
             Some("target-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_dialog_opening_commits_runtime_before_callback() {
+        let runtime = new_shared_dialog_runtime();
+        let observed_message = Arc::new(Mutex::new(None::<String>));
+        let runtime_for_callback = runtime.clone();
+        let observed_message_for_callback = observed_message.clone();
+        let callback: OpeningCallback = Arc::new(move |opened| {
+            let state = runtime_for_callback
+                .try_read()
+                .expect("opening callback should observe committed runtime state");
+            let pending = state
+                .pending_dialog
+                .as_ref()
+                .map(|dialog| dialog.message.clone());
+            drop(state);
+            assert_eq!(pending.as_deref(), Some(opened.message.as_str()));
+            *observed_message_for_callback
+                .lock()
+                .expect("callback mutex") = Some(opened.message.clone());
+        });
+        let opened = BrowserDialogOpening {
+            generation: 1,
+            kind: DialogKind::Alert,
+            message: "Hello from callback".to_string(),
+            url: "https://example.test/dialog".to_string(),
+            tab_target_id: Some("tab-1".to_string()),
+            frame_id: Some("frame-1".to_string()),
+            default_prompt: None,
+            has_browser_handler: true,
+        };
+
+        publish_dialog_opening(&runtime, Some(&callback), &opened).await;
+
+        assert_eq!(
+            observed_message.lock().expect("callback mutex").as_deref(),
+            Some("Hello from callback")
+        );
+        let state = runtime.read().await;
+        assert_eq!(state.status, DialogRuntimeStatus::Active);
+        assert_eq!(
+            state
+                .pending_dialog
+                .as_ref()
+                .map(|dialog| dialog.message.as_str()),
+            Some("Hello from callback")
         );
     }
 }

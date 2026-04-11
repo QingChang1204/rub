@@ -21,6 +21,8 @@ pub(super) struct ClickArgs {
     pub(super) _snapshot_id: Option<String>,
     #[serde(flatten)]
     pub(super) _locator: LocatorRequestArgs,
+    #[serde(default, rename = "_trigger")]
+    pub(super) _trigger: Option<serde_json::Value>,
     #[serde(default, rename = "_orchestration")]
     pub(super) _orchestration: Option<serde_json::Value>,
 }
@@ -47,6 +49,8 @@ pub(super) struct TextEntryArgs {
     pub(super) _snapshot_id: Option<String>,
     #[serde(flatten)]
     pub(super) locator: LocatorRequestArgs,
+    #[serde(default, rename = "_trigger")]
+    pub(super) _trigger: Option<serde_json::Value>,
     #[serde(default, rename = "_orchestration")]
     pub(super) _orchestration: Option<serde_json::Value>,
 }

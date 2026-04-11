@@ -48,49 +48,69 @@ impl IpcClientError {
         }
     }
 
-    fn response_read_envelope(error: Box<dyn Error + Send + Sync>) -> ErrorEnvelope {
+    fn response_read_error(error: Box<dyn Error + Send + Sync>) -> Self {
         match error.downcast::<IpcProtocolDecodeError>() {
-            Ok(protocol_error) => protocol_error.into_envelope(),
+            Ok(protocol_error) => Self::Protocol(protocol_error.into_envelope()),
             Err(error) => match error.downcast::<std::io::Error>() {
-                Ok(io_error) => {
-                    let reason = match io_error.kind() {
-                        std::io::ErrorKind::UnexpectedEof => "partial_ndjson_frame",
-                        std::io::ErrorKind::InvalidData
-                            if io_error
-                                .to_string()
-                                .contains("NDJSON frame exceeds maximum on-wire size") =>
-                        {
-                            "oversized_ndjson_frame"
-                        }
-                        std::io::ErrorKind::InvalidData => "invalid_ndjson_frame",
-                        _ => "ipc_response_read_failure",
-                    };
-                    ErrorEnvelope::new(
-                        ErrorCode::IpcProtocolError,
-                        format!("Invalid IPC response frame: {io_error}"),
-                    )
-                    .with_context(serde_json::json!({
-                        "phase": "ipc_response_read",
-                        "reason": reason,
-                    }))
-                }
+                Ok(io_error) => match io_error.kind() {
+                    // Response framing is not committed until a full NDJSON line arrives.
+                    // Transport interruptions before that fence must remain replay-recoverable.
+                    std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::BrokenPipe => Self::Transport(*io_error),
+                    std::io::ErrorKind::InvalidData
+                        if io_error
+                            .to_string()
+                            .contains("NDJSON frame exceeds maximum on-wire size") =>
+                    {
+                        Self::Protocol(
+                            ErrorEnvelope::new(
+                                ErrorCode::IpcProtocolError,
+                                format!("Invalid IPC response frame: {io_error}"),
+                            )
+                            .with_context(serde_json::json!({
+                                "phase": "ipc_response_read",
+                                "reason": "oversized_ndjson_frame",
+                            })),
+                        )
+                    }
+                    std::io::ErrorKind::InvalidData => Self::Protocol(
+                        ErrorEnvelope::new(
+                            ErrorCode::IpcProtocolError,
+                            format!("Invalid IPC response frame: {io_error}"),
+                        )
+                        .with_context(serde_json::json!({
+                            "phase": "ipc_response_read",
+                            "reason": "invalid_ndjson_frame",
+                        })),
+                    ),
+                    _ => Self::Transport(*io_error),
+                },
                 Err(error) => match error.downcast::<serde_json::Error>() {
-                    Ok(json_error) => ErrorEnvelope::new(
-                        ErrorCode::IpcProtocolError,
-                        format!("Invalid JSON response body: {json_error}"),
-                    )
-                    .with_context(serde_json::json!({
-                        "phase": "ipc_response_read",
-                        "reason": "invalid_json_response",
-                    })),
-                    Err(error) => ErrorEnvelope::new(
-                        ErrorCode::IpcProtocolError,
-                        format!("Failed to decode IPC response: {error}"),
-                    )
-                    .with_context(serde_json::json!({
-                        "phase": "ipc_response_read",
-                        "reason": "ipc_response_read_failure",
-                    })),
+                    Ok(json_error) => Self::Protocol(
+                        ErrorEnvelope::new(
+                            ErrorCode::IpcProtocolError,
+                            format!("Invalid JSON response body: {json_error}"),
+                        )
+                        .with_context(serde_json::json!({
+                            "phase": "ipc_response_read",
+                            "reason": "invalid_json_response",
+                        })),
+                    ),
+                    Err(error) => Self::Protocol(
+                        ErrorEnvelope::new(
+                            ErrorCode::IpcProtocolError,
+                            format!("Failed to decode IPC response: {error}"),
+                        )
+                        .with_context(serde_json::json!({
+                            "phase": "ipc_response_read",
+                            "reason": "ipc_response_read_failure",
+                        })),
+                    ),
                 },
             },
         }
@@ -215,8 +235,7 @@ impl IpcClient {
             let mut buf_reader = BufReader::new(reader);
             NdJsonCodec::read(&mut buf_reader)
                 .await
-                .map_err(IpcClientError::response_read_envelope)
-                .map_err(IpcClientError::protocol)?
+                .map_err(IpcClientError::response_read_error)?
                 .ok_or_else(|| {
                     IpcClientError::transport(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
@@ -282,6 +301,7 @@ mod tests {
     use crate::codec::NdJsonCodec;
     use crate::protocol::{IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse, ResponseStatus};
     use rub_core::error::{ErrorCode, ErrorEnvelope};
+    use tokio::io::AsyncWriteExt;
     use tokio::io::BufReader;
     use tokio::net::UnixListener;
 
@@ -602,6 +622,48 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("invalid_ipc_response_contract")
         );
+
+        server.await.expect("server join");
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&socket_dir);
+    }
+
+    #[tokio::test]
+    async fn client_treats_partial_response_frame_as_transport_error() {
+        let socket_dir = std::env::temp_dir().join(format!("rubipc-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&socket_dir).expect("create socket dir");
+        let socket_path = socket_dir.join("ipc.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind listener");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let _: IpcRequest = NdJsonCodec::read(&mut reader)
+                .await
+                .expect("read request")
+                .expect("request");
+            writer
+                .write_all(br#"{"ipc_protocol_version":"1.0","request_id":"req-1""#)
+                .await
+                .expect("write partial response");
+            writer.shutdown().await.expect("shutdown writer");
+        });
+
+        let mut client = IpcClient::connect(&socket_path).await.expect("connect");
+        let request = IpcRequest::new("doctor", serde_json::json!({}), 1_000);
+        let error = client
+            .send(&request)
+            .await
+            .expect_err("partial response frame should fail");
+        match error {
+            super::IpcClientError::Transport(io_error) => {
+                assert_eq!(io_error.kind(), std::io::ErrorKind::UnexpectedEof);
+            }
+            super::IpcClientError::Protocol(envelope) => {
+                panic!("partial response must remain transport-scoped, got {envelope:?}");
+            }
+        }
 
         server.await.expect("server join");
         let _ = std::fs::remove_file(&socket_path);

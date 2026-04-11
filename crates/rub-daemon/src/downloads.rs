@@ -16,6 +16,7 @@ const DOWNLOAD_EVENT_LIMIT: usize = 128;
 #[derive(Debug, Default)]
 pub struct DownloadRuntimeState {
     next_sequence: u64,
+    runtime_event_sequence: u64,
     projection: DownloadRuntimeInfo,
     entries: HashMap<String, DownloadEntry>,
     entry_event_sequence: HashMap<String, u64>,
@@ -23,6 +24,12 @@ pub struct DownloadRuntimeState {
     completed_order: VecDeque<String>,
     timeline: VecDeque<DownloadEvent>,
     current_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadRuntimeMutationOutcome {
+    pub projection: DownloadRuntimeInfo,
+    pub applied: bool,
 }
 
 #[derive(Debug)]
@@ -183,6 +190,137 @@ mod tests {
             state.get("guid-1").as_ref().map(|entry| entry.state),
             Some(DownloadState::Completed)
         );
+    }
+
+    #[test]
+    fn late_started_event_backfills_metadata_without_regressing_progress_state() {
+        let mut state = DownloadRuntimeState::default();
+        state.record_progress(DownloadProgressEvent {
+            generation: 0,
+            sequence: 10,
+            guid: "guid-1".to_string(),
+            state: DownloadState::InProgress,
+            received_bytes: 64,
+            total_bytes: Some(128),
+            final_path: None,
+        });
+
+        let projection = state.record_started(
+            0,
+            11,
+            "guid-1".to_string(),
+            "https://example.test/report.csv".to_string(),
+            "report.csv".to_string(),
+            Some("frame-main".to_string()),
+        );
+
+        assert_eq!(projection.state, DownloadState::InProgress);
+        assert_eq!(projection.received_bytes, 64);
+        assert_eq!(projection.total_bytes, Some(128));
+        assert_eq!(
+            projection.url.as_deref(),
+            Some("https://example.test/report.csv")
+        );
+        assert_eq!(projection.suggested_filename.as_deref(), Some("report.csv"));
+        assert_eq!(projection.frame_id.as_deref(), Some("frame-main"));
+        assert_eq!(
+            state
+                .projection()
+                .last_download
+                .as_ref()
+                .map(|entry| entry.state),
+            Some(DownloadState::InProgress)
+        );
+        let events = state.events_after(0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, rub_core::model::DownloadEventKind::Progress);
+        assert_eq!(
+            events[0].download.url.as_deref(),
+            Some("https://example.test/report.csv")
+        );
+        assert_eq!(
+            events[0].download.suggested_filename.as_deref(),
+            Some("report.csv")
+        );
+        assert_eq!(events[0].download.frame_id.as_deref(), Some("frame-main"));
+    }
+
+    #[test]
+    fn late_started_event_backfills_metadata_for_terminal_downloads() {
+        let mut state = DownloadRuntimeState::default();
+        state.record_progress(DownloadProgressEvent {
+            generation: 0,
+            sequence: 10,
+            guid: "guid-completed".to_string(),
+            state: DownloadState::Completed,
+            received_bytes: 128,
+            total_bytes: Some(128),
+            final_path: Some("/tmp/rub-downloads/guid-completed".to_string()),
+        });
+
+        let completed = state.record_started(
+            0,
+            11,
+            "guid-completed".to_string(),
+            "https://example.test/report.csv".to_string(),
+            "report.csv".to_string(),
+            Some("frame-main".to_string()),
+        );
+
+        assert_eq!(completed.state, DownloadState::Completed);
+        assert_eq!(
+            completed.url.as_deref(),
+            Some("https://example.test/report.csv")
+        );
+        assert_eq!(completed.suggested_filename.as_deref(), Some("report.csv"));
+        assert_eq!(completed.frame_id.as_deref(), Some("frame-main"));
+
+        state.record_progress(DownloadProgressEvent {
+            generation: 0,
+            sequence: 20,
+            guid: "guid-canceled".to_string(),
+            state: DownloadState::Canceled,
+            received_bytes: 64,
+            total_bytes: Some(128),
+            final_path: None,
+        });
+
+        let canceled = state.record_started(
+            0,
+            21,
+            "guid-canceled".to_string(),
+            "https://example.test/cancel.csv".to_string(),
+            "cancel.csv".to_string(),
+            Some("frame-cancel".to_string()),
+        );
+
+        assert_eq!(canceled.state, DownloadState::Canceled);
+        assert_eq!(
+            canceled.url.as_deref(),
+            Some("https://example.test/cancel.csv")
+        );
+        assert_eq!(canceled.suggested_filename.as_deref(), Some("cancel.csv"));
+        assert_eq!(canceled.frame_id.as_deref(), Some("frame-cancel"));
+        let events = state.events_after(0);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].download.url.as_deref(),
+            Some("https://example.test/report.csv")
+        );
+        assert_eq!(
+            events[0].download.suggested_filename.as_deref(),
+            Some("report.csv")
+        );
+        assert_eq!(events[0].download.frame_id.as_deref(), Some("frame-main"));
+        assert_eq!(
+            events[1].download.url.as_deref(),
+            Some("https://example.test/cancel.csv")
+        );
+        assert_eq!(
+            events[1].download.suggested_filename.as_deref(),
+            Some("cancel.csv")
+        );
+        assert_eq!(events[1].download.frame_id.as_deref(), Some("frame-cancel"));
     }
 
     #[test]

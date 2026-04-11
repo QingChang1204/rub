@@ -31,6 +31,7 @@ pub(super) fn trigger_subject(id: u32) -> serde_json::Value {
 pub(super) fn resolve_trigger_tab_binding(
     tabs: &[TabInfo],
     index: u32,
+    frame_id: Option<&str>,
     role: &str,
 ) -> Result<TriggerTabBindingInfo, RubError> {
     let tab = tabs.iter().find(|tab| tab.index == index).ok_or_else(|| {
@@ -42,6 +43,7 @@ pub(super) fn resolve_trigger_tab_binding(
     Ok(TriggerTabBindingInfo {
         index: tab.index,
         target_id: tab.target_id.clone(),
+        frame_id: frame_id.map(ToOwned::to_owned),
         url: tab.url.clone(),
         title: tab.title.clone(),
     })
@@ -55,7 +57,9 @@ pub(super) fn trigger_registration_equivalent(
 ) -> bool {
     existing.mode == spec.mode
         && existing.source_tab.target_id == source_tab.target_id
+        && existing.source_tab.frame_id == source_tab.frame_id
         && existing.target_tab.target_id == target_tab.target_id
+        && existing.target_tab.frame_id == target_tab.frame_id
         && existing.condition == spec.condition
         && existing.action == spec.action
 }

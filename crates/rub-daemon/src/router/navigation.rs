@@ -383,8 +383,8 @@ pub(super) async fn cmd_reload(
 #[cfg(test)]
 mod tests {
     use super::args::{
-        OpenArgs, ScreenshotArgs, ScrollArgs, StateArgs, SwitchArgs, parse_optional_load_strategy,
-        parse_optional_scroll_direction,
+        OpenArgs, ReloadArgs, ScreenshotArgs, ScrollArgs, StateArgs, SwitchArgs,
+        parse_optional_load_strategy, parse_optional_scroll_direction,
     };
     use super::{inline_screenshot_payload_exceeds_limit, write_screenshot_artifact};
     use crate::router::request_args::parse_json_args;
@@ -439,11 +439,27 @@ mod tests {
             &serde_json::json!({
                 "url": "https://example.com",
                 "wait_after": {"text":"Ready"},
+                "_trigger": {"kind": "trigger_action"},
             }),
             "open",
         )
         .expect("open payload should accept post-wait compatibility field");
         assert!(parsed._wait_after.is_some());
+        assert!(parsed._trigger.is_some());
+    }
+
+    #[test]
+    fn typed_reload_payload_accepts_trigger_metadata() {
+        let parsed: ReloadArgs = parse_json_args(
+            &serde_json::json!({
+                "load_strategy": "load",
+                "_trigger": {"kind": "trigger_action"},
+            }),
+            "reload",
+        )
+        .expect("reload payload should accept trigger metadata");
+        assert_eq!(parsed.load_strategy.as_deref(), Some("load"));
+        assert!(parsed._trigger.is_some());
     }
 
     #[test]

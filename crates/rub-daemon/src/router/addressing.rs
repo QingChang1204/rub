@@ -11,7 +11,7 @@ use self::semantic::{
     resolve_elements_by_label, resolve_elements_by_role, resolve_elements_by_testid,
     resolve_elements_by_text,
 };
-use self::snapshot::load_snapshot;
+use self::snapshot::load_snapshot as load_addressed_snapshot;
 use super::*;
 use crate::router::request_args::{LocatorParseOptions, parse_canonical_locator};
 use rub_core::locator::{CanonicalLocator, LocatorSelection};
@@ -49,6 +49,16 @@ pub(super) async fn resolve_element(
         )),
         elements => Err(ambiguous_locator_error(command_name, args, elements)),
     }
+}
+
+pub(super) async fn load_snapshot(
+    router: &DaemonRouter,
+    args: &serde_json::Value,
+    state: &Arc<SessionState>,
+    deadline: TransactionDeadline,
+    prefer_a11y: bool,
+) -> Result<Arc<Snapshot>, RubError> {
+    load_addressed_snapshot(router, args, state, deadline, prefer_a11y).await
 }
 
 pub(super) async fn resolve_elements(
@@ -146,6 +156,9 @@ async fn resolve_elements_against_locator(
             .cloned()
             .collect::<Vec<_>>()),
         CanonicalLocator::Selector { css: selector, .. } => {
+            // Selector matching is a live, frame-scoped probe against the snapshot's frame.
+            // We still project matches back onto snapshot element indices, so this is not a
+            // pure in-memory lookup and intentionally does not participate in locator memo.
             router
                 .browser
                 .find_snapshot_elements_by_selector(snapshot, selector)

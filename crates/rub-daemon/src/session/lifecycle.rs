@@ -64,6 +64,10 @@ impl SessionState {
         self.started_at.elapsed().as_secs()
     }
 
+    pub fn uptime_millis(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+
     /// External CDP events only advance the epoch when no command transaction owns the commit.
     pub fn observe_external_dom_change(&self) -> Option<u64> {
         if self.in_flight_count.load(Ordering::SeqCst) == 0 {

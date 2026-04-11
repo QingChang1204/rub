@@ -267,6 +267,16 @@ impl SessionState {
             .load(Ordering::SeqCst)
     }
 
+    pub fn record_browser_event_ingress_overflow(&self) -> u64 {
+        self.browser_event_ingress_drop_count
+            .fetch_add(1, Ordering::SeqCst)
+            + 1
+    }
+
+    pub fn browser_event_ingress_drop_count(&self) -> u64 {
+        self.browser_event_ingress_drop_count.load(Ordering::SeqCst)
+    }
+
     pub async fn record_workflow_capture(
         &self,
         request: &rub_ipc::protocol::IpcRequest,
