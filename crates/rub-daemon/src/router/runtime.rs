@@ -1,4 +1,5 @@
 mod admin;
+mod blockers;
 mod cookies;
 mod doctor;
 mod intercept;
@@ -24,6 +25,13 @@ pub(super) async fn cmd_runtime(
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, RubError> {
     surface::cmd_runtime(router, state, args).await
+}
+
+pub(super) async fn cmd_blocker_diagnose(
+    router: &DaemonRouter,
+    state: &Arc<SessionState>,
+) -> Result<serde_json::Value, RubError> {
+    blockers::cmd_blocker_diagnose(router, state).await
 }
 
 pub(super) async fn cmd_handoff(

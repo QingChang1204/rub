@@ -748,6 +748,184 @@ fn interaction_projection_attaches_network_request_grouping() {
 }
 
 #[test]
+fn interaction_projection_marks_confirmed_follow_up_activity_for_page_mutation_with_terminal_network()
+ {
+    use rub_core::model::{
+        InteractionActuation, InteractionConfirmation, InteractionConfirmationKind,
+        InteractionConfirmationStatus, InteractionOutcome, InteractionSemanticClass,
+        NetworkRequestLifecycle, NetworkRequestRecord,
+    };
+    use std::collections::BTreeMap;
+
+    let outcome = InteractionOutcome {
+        semantic_class: InteractionSemanticClass::Activate,
+        element_verified: true,
+        actuation: Some(InteractionActuation::Pointer),
+        confirmation: Some(InteractionConfirmation {
+            status: InteractionConfirmationStatus::Confirmed,
+            kind: Some(InteractionConfirmationKind::PageMutation),
+            details: Some(serde_json::json!({
+                "before": {
+                    "url": "https://example.test/signup",
+                    "title": "Signup",
+                },
+                "after": {
+                    "url": "https://example.test/signup",
+                    "title": "Signup",
+                }
+            })),
+        }),
+    };
+    let requests = vec![NetworkRequestRecord {
+        request_id: "req-1".to_string(),
+        sequence: 12,
+        lifecycle: NetworkRequestLifecycle::Completed,
+        url: "https://example.test/api/signup".to_string(),
+        method: "POST".to_string(),
+        tab_target_id: None,
+        status: Some(202),
+        request_headers: BTreeMap::new(),
+        response_headers: BTreeMap::new(),
+        request_body: None,
+        response_body: None,
+        original_url: None,
+        rewritten_url: None,
+        applied_rule_effects: Vec::new(),
+        error_text: None,
+        frame_id: None,
+        resource_type: Some("xhr".to_string()),
+        mime_type: Some("application/json".to_string()),
+    }];
+
+    let mut value = serde_json::json!({
+        "result": {
+            "gesture": "single"
+        }
+    });
+    let frame_runtime = rub_core::model::FrameRuntimeInfo::default();
+    attach_interaction_projection(
+        &mut value,
+        &outcome,
+        crate::router::projection::ProjectionSignals {
+            frame_runtime: &frame_runtime,
+            runtime_before: None,
+            runtime_after: None,
+            interference_before: None,
+            interference_after: None,
+            observatory_events: &[],
+            observatory_authoritative: true,
+            observatory_degraded_reason: None,
+            network_requests: &requests,
+            network_authoritative: true,
+            network_degraded_reason: None,
+            download_events: &[],
+            download_authoritative: true,
+            download_degraded_reason: None,
+        },
+    );
+
+    assert_eq!(
+        value["result"]["outcome_summary"]["class"],
+        "confirmed_follow_up_activity"
+    );
+    assert_eq!(value["result"]["outcome_summary"]["authoritative"], true);
+    assert_eq!(
+        value["result"]["outcome_summary"]["activity"]["surface"],
+        "network_requests"
+    );
+    assert_eq!(
+        value["result"]["outcome_summary"]["activity"]["terminal_request_count"],
+        1
+    );
+    assert_eq!(
+        value["result"]["outcome_summary"]["activity"]["last_request"]["request_id"],
+        "req-1"
+    );
+    assert_eq!(
+        value["result"]["outcome_summary"]["activity"]["last_request"]["method"],
+        "POST"
+    );
+    assert_eq!(
+        value["result"]["outcome_summary"]["activity"]["last_request"]["url"],
+        "https://example.test/api/signup"
+    );
+    assert_eq!(
+        value["result"]["outcome_summary"]["activity"]["last_request"]["status"],
+        202
+    );
+}
+
+#[test]
+fn interaction_projection_omits_follow_up_activity_when_network_surface_is_not_authoritative() {
+    use rub_core::model::{
+        InteractionActuation, InteractionConfirmation, InteractionConfirmationKind,
+        InteractionConfirmationStatus, InteractionOutcome, InteractionSemanticClass,
+        NetworkRequestLifecycle, NetworkRequestRecord,
+    };
+    use std::collections::BTreeMap;
+
+    let outcome = InteractionOutcome {
+        semantic_class: InteractionSemanticClass::Activate,
+        element_verified: true,
+        actuation: Some(InteractionActuation::Pointer),
+        confirmation: Some(InteractionConfirmation {
+            status: InteractionConfirmationStatus::Confirmed,
+            kind: Some(InteractionConfirmationKind::PageMutation),
+            details: Some(serde_json::json!({})),
+        }),
+    };
+    let requests = vec![NetworkRequestRecord {
+        request_id: "req-1".to_string(),
+        sequence: 12,
+        lifecycle: NetworkRequestLifecycle::Completed,
+        url: "https://example.test/api/signup".to_string(),
+        method: "POST".to_string(),
+        tab_target_id: None,
+        status: Some(202),
+        request_headers: BTreeMap::new(),
+        response_headers: BTreeMap::new(),
+        request_body: None,
+        response_body: None,
+        original_url: None,
+        rewritten_url: None,
+        applied_rule_effects: Vec::new(),
+        error_text: None,
+        frame_id: None,
+        resource_type: Some("xhr".to_string()),
+        mime_type: Some("application/json".to_string()),
+    }];
+
+    let mut value = serde_json::json!({
+        "result": {
+            "gesture": "single"
+        }
+    });
+    let frame_runtime = rub_core::model::FrameRuntimeInfo::default();
+    attach_interaction_projection(
+        &mut value,
+        &outcome,
+        crate::router::projection::ProjectionSignals {
+            frame_runtime: &frame_runtime,
+            runtime_before: None,
+            runtime_after: None,
+            interference_before: None,
+            interference_after: None,
+            observatory_events: &[],
+            observatory_authoritative: true,
+            observatory_degraded_reason: None,
+            network_requests: &requests,
+            network_authoritative: false,
+            network_degraded_reason: Some("overflow"),
+            download_events: &[],
+            download_authoritative: true,
+            download_degraded_reason: None,
+        },
+    );
+
+    assert!(value["result"].get("outcome_summary").is_none(), "{value}");
+}
+
+#[test]
 fn interaction_projection_attaches_observed_effects() {
     use rub_core::model::{
         ConsoleErrorEvent, InteractionActuation, InteractionConfirmation,

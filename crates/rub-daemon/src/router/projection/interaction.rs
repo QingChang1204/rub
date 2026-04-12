@@ -60,6 +60,13 @@ pub(crate) fn attach_interaction_projection(
         signals.download_authoritative,
         signals.download_degraded_reason,
     );
+    attach_interaction_outcome_summary(
+        data,
+        outcome.semantic_class,
+        outcome.confirmation.as_ref(),
+        signals.network_requests,
+        signals.network_authoritative,
+    );
     attach_observed_effects(data);
 }
 
@@ -100,6 +107,13 @@ pub(crate) fn attach_select_projection(
         signals.download_events,
         signals.download_authoritative,
         signals.download_degraded_reason,
+    );
+    attach_interaction_outcome_summary(
+        data,
+        outcome.semantic_class,
+        outcome.confirmation.as_ref(),
+        signals.network_requests,
+        signals.network_authoritative,
     );
     attach_observed_effects(data);
 }
@@ -496,6 +510,82 @@ fn attach_observed_effects(data: &mut serde_json::Value) {
             serde_json::Value::Object(observed),
         );
     }
+}
+
+fn attach_interaction_outcome_summary(
+    data: &mut serde_json::Value,
+    semantic_class: InteractionSemanticClass,
+    confirmation: Option<&InteractionConfirmation>,
+    network_requests: &[NetworkRequestRecord],
+    network_authoritative: bool,
+) {
+    let Some(confirmation) = confirmation else {
+        return;
+    };
+    if confirmation.status != InteractionConfirmationStatus::Confirmed {
+        return;
+    }
+    if confirmation.kind != Some(rub_core::model::InteractionConfirmationKind::PageMutation) {
+        return;
+    }
+    if !matches!(
+        semantic_class,
+        InteractionSemanticClass::Activate | InteractionSemanticClass::InvokeWorkflow
+    ) {
+        return;
+    }
+    if !network_authoritative {
+        return;
+    }
+    let terminal_count = network_requests
+        .iter()
+        .filter(|request| {
+            matches!(
+                request.lifecycle,
+                NetworkRequestLifecycle::Completed | NetworkRequestLifecycle::Failed
+            )
+        })
+        .count();
+    if terminal_count == 0 {
+        return;
+    }
+    let last_terminal_request = network_requests.iter().rev().find(|request| {
+        matches!(
+            request.lifecycle,
+            NetworkRequestLifecycle::Completed | NetworkRequestLifecycle::Failed
+        )
+    });
+
+    let Some(object) = data.as_object_mut() else {
+        return;
+    };
+    let Some(result) = object
+        .get_mut("result")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    result.insert(
+        "outcome_summary".to_string(),
+        serde_json::json!({
+            "class": "confirmed_follow_up_activity",
+            "authoritative": true,
+            "summary": "The action produced a confirmed in-page mutation and authoritative follow-up network activity in the current runtime.",
+            "activity": {
+                "surface": "network_requests",
+                "terminal_request_count": terminal_count,
+                "last_request": last_terminal_request.map(|request| serde_json::json!({
+                    "request_id": request.request_id,
+                    "method": request.method,
+                    "url": request.url,
+                    "status": request.status,
+                    "lifecycle": request.lifecycle,
+                    "resource_type": request.resource_type,
+                })),
+            },
+        }),
+    );
 }
 
 fn copy_json_field(

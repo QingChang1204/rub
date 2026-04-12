@@ -2,6 +2,7 @@ mod budget;
 pub(crate) mod helpers;
 mod subcommands;
 
+use crate::commands::ExplainSubcommand;
 use crate::commands::{Commands, EffectiveCli, ElementAddressArgs};
 use rub_core::error::{ErrorCode, RubError};
 use rub_ipc::protocol::IpcRequest;
@@ -23,6 +24,8 @@ use self::subcommands::{
     build_storage_request, build_takeover_request, build_trigger_request,
 };
 
+const ATOMIC_FILL_ROLLBACK_RESERVE_MS_PER_STEP: u64 = 1_000;
+
 fn local_only_command_projection_error(command: &Commands) -> RubError {
     let surface = command
         .local_projection_surface()
@@ -31,6 +34,23 @@ fn local_only_command_projection_error(command: &Commands) -> RubError {
         ErrorCode::InternalError,
         format!("{surface} must be handled locally before IPC request projection"),
     )
+}
+
+fn resolve_type_text<'a>(
+    text: Option<&'a str>,
+    text_flag: Option<&'a str>,
+) -> Result<&'a str, RubError> {
+    match (text, text_flag) {
+        (Some(_), Some(_)) => Err(RubError::domain(
+            ErrorCode::InvalidInput,
+            "type text is ambiguous; provide either positional TEXT or `--text`, not both",
+        )),
+        (Some(text), None) | (None, Some(text)) => Ok(text),
+        (None, None) => Err(RubError::domain(
+            ErrorCode::InvalidInput,
+            "type requires text; provide positional TEXT or `--text`",
+        )),
+    }
 }
 
 pub(crate) fn align_embedded_timeout_authority(request: &mut IpcRequest) {
@@ -92,6 +112,7 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
         Commands::State {
             limit,
             format,
+            format_alias,
             a11y,
             viewport,
             diff,
@@ -103,7 +124,7 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
             merge_json_objects(
                 serde_json::json!({
                     "limit": limit,
-                    "format": format.map(|value| value.as_str()),
+                    "format": format.or(*format_alias).map(|value| value.as_str()),
                     "a11y": a11y,
                     "viewport": viewport,
                     "diff": diff,
@@ -147,18 +168,45 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
         Commands::Find {
             target,
             content,
+            explain,
             limit,
-        } => Ok(IpcRequest::new(
-            "find",
-            merge_json_objects(
-                element_address_args(None, target)?,
-                serde_json::json!({
-                    "content": content,
-                    "limit": limit
-                }),
-            ),
-            timeout,
-        )),
+        } => {
+            if *explain && limit.is_some() {
+                return Err(RubError::domain(
+                    ErrorCode::InvalidInput,
+                    "`find --explain` cannot be combined with `--limit`; explain must inspect the full authoritative candidate set",
+                ));
+            }
+            Ok(IpcRequest::new(
+                "find",
+                merge_json_objects(
+                    element_address_args(
+                        None,
+                        &ElementAddressArgs {
+                            snapshot: target.snapshot.clone(),
+                            element_ref: target.element_ref.clone(),
+                            selector: target.selector.clone(),
+                            target_text: target.target_text.clone(),
+                            role: target.role.clone(),
+                            label: target.label.clone(),
+                            testid: target.testid.clone(),
+                            visible: target.visible,
+                            prefer_enabled: target.prefer_enabled,
+                            topmost: target.topmost,
+                            first: if *explain { false } else { target.first },
+                            last: if *explain { false } else { target.last },
+                            nth: if *explain { None } else { target.nth },
+                        },
+                    )?,
+                    serde_json::json!({
+                        "content": content,
+                        "explain": explain,
+                        "limit": if *explain { None } else { *limit }
+                    }),
+                ),
+                timeout,
+            ))
+        }
         Commands::Click {
             index,
             target,
@@ -207,6 +255,47 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
                 "code": code,
                 "raw": raw,
             }),
+            timeout,
+        )),
+        Commands::Explain {
+            subcommand: ExplainSubcommand::Extract { .. },
+        } => Err(local_only_command_projection_error(&cli.command)),
+        Commands::Explain {
+            subcommand: ExplainSubcommand::Blockers,
+        } => Ok(IpcRequest::new(
+            "_blocker_diagnose",
+            serde_json::json!({}),
+            timeout,
+        )),
+        Commands::Explain {
+            subcommand: ExplainSubcommand::Interactability { target },
+        } => Ok(IpcRequest::new(
+            "_interactability_probe",
+            element_address_args(None, target)?,
+            timeout,
+        )),
+        Commands::Explain {
+            subcommand: ExplainSubcommand::Locator { target },
+        } => Ok(IpcRequest::new(
+            "find",
+            element_address_args(
+                None,
+                &ElementAddressArgs {
+                    snapshot: target.snapshot.clone(),
+                    element_ref: target.element_ref.clone(),
+                    selector: target.selector.clone(),
+                    target_text: target.target_text.clone(),
+                    role: target.role.clone(),
+                    label: target.label.clone(),
+                    testid: target.testid.clone(),
+                    visible: target.visible,
+                    prefer_enabled: target.prefer_enabled,
+                    topmost: target.topmost,
+                    first: false,
+                    last: false,
+                    nth: None,
+                },
+            )?,
             timeout,
         )),
         Commands::Scroll {
@@ -290,6 +379,7 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
             }
         }
         Commands::Cleanup => Err(local_only_command_projection_error(&cli.command)),
+        Commands::Teardown => Err(local_only_command_projection_error(&cli.command)),
         Commands::Sessions => Err(local_only_command_projection_error(&cli.command)),
         Commands::History {
             last: _,
@@ -344,24 +434,31 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
             target,
             clear,
             text,
+            text_flag,
             wait_after,
-        } => Ok(mutating_request(
-            "type",
-            with_wait_after(
-                merge_json_objects(
-                    optional_element_address_args(*index, target)?,
-                    serde_json::json!({
-                        "text": text,
-                        "clear": clear,
-                    }),
-                ),
-                wait_after,
-            )?,
-            timeout,
-        )),
+        } => {
+            let text = resolve_type_text(text.as_deref(), text_flag.as_deref())?;
+            Ok(mutating_request(
+                "type",
+                with_wait_after(
+                    merge_json_objects(
+                        optional_element_address_args(*index, target)?,
+                        serde_json::json!({
+                            "text": text,
+                            "clear": clear,
+                        }),
+                    ),
+                    wait_after,
+                )?,
+                timeout,
+            ))
+        }
         Commands::Fill {
             spec,
             file,
+            validate,
+            atomic,
+            snapshot,
             submit_index,
             submit_selector,
             submit_target_text,
@@ -387,34 +484,43 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
                     || submit_role.is_some()
                     || submit_label.is_some()
                     || submit_testid.is_some(),
+                *atomic && !*validate,
             ));
-            Ok(mutating_request(
-                "fill",
-                with_wait_after(
-                    serde_json::json!({
-                        "spec": resolved_spec,
-                        "spec_source": spec_source,
-                        "submit_index": submit_index,
-                        "submit_selector": submit_selector,
-                        "submit_target_text": submit_target_text,
-                        "submit_ref": submit_ref,
-                        "submit_role": submit_role,
-                        "submit_label": submit_label,
-                        "submit_testid": submit_testid,
-                        "submit_first": submit_first,
-                        "submit_last": submit_last,
-                        "submit_nth": submit_nth,
-                    }),
-                    wait_after,
-                )?,
-                request_timeout,
-            ))
+            let args = with_wait_after(
+                serde_json::json!({
+                    "spec": resolved_spec,
+                    "spec_source": spec_source,
+                    "atomic": atomic,
+                    "snapshot_id": snapshot,
+                    "submit_index": submit_index,
+                    "submit_selector": submit_selector,
+                    "submit_target_text": submit_target_text,
+                    "submit_ref": submit_ref,
+                    "submit_role": submit_role,
+                    "submit_label": submit_label,
+                    "submit_testid": submit_testid,
+                    "submit_first": submit_first,
+                    "submit_last": submit_last,
+                    "submit_nth": submit_nth,
+                }),
+                wait_after,
+            )?;
+            Ok(if *validate {
+                IpcRequest::new("_fill_validate", args, request_timeout)
+            } else {
+                mutating_request("fill", args, request_timeout)
+            })
         }
         Commands::Extract {
             spec,
             file,
             snapshot,
+            examples,
+            schema,
         } => {
+            if *schema || examples.is_some() {
+                return Err(local_only_command_projection_error(&cli.command));
+            }
             let (resolved_spec, spec_source) =
                 resolve_json_spec_source("extract", spec.as_deref(), file.as_deref())?;
             Ok(IpcRequest::new(
@@ -472,6 +578,9 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
             label,
             testid,
             text,
+            description_contains,
+            url_contains,
+            title_contains,
             first,
             last,
             nth,
@@ -486,6 +595,9 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
                     label: label.as_deref(),
                     testid: testid.as_deref(),
                     text: text.as_deref(),
+                    description_contains: description_contains.as_deref(),
+                    url_contains: url_contains.as_deref(),
+                    title_contains: title_contains.as_deref(),
                     first: *first,
                     last: *last,
                     nth: *nth,
@@ -627,6 +739,7 @@ fn fill_workflow_budget_ms(
     humanize: bool,
     humanize_speed: &str,
     has_submit: bool,
+    atomic: bool,
 ) -> u64 {
     let mut extra = rub_core::automation_timeout::fill_workflow_additional_timeout_ms(
         resolved_spec,
@@ -675,7 +788,20 @@ fn fill_workflow_budget_ms(
         ));
     }
 
+    if atomic {
+        extra = extra.saturating_add(atomic_fill_rollback_budget_ms(resolved_spec));
+    }
+
     extra
+}
+
+fn atomic_fill_rollback_budget_ms(resolved_spec: &str) -> u64 {
+    let step_count = serde_json::from_str::<Value>(resolved_spec)
+        .ok()
+        .and_then(|value| value.as_array().map(|steps| steps.len() as u64))
+        .filter(|count| *count > 0)
+        .unwrap_or(1);
+    step_count.saturating_mul(ATOMIC_FILL_ROLLBACK_RESERVE_MS_PER_STEP)
 }
 
 fn pipe_workflow_budget_ms(resolved_spec: &str, humanize: bool, humanize_speed: &str) -> u64 {
@@ -720,6 +846,7 @@ fn pipe_workflow_budget_ms(resolved_spec: &str, humanize: bool, humanize_speed: 
                 humanize,
                 humanize_speed,
                 has_submit,
+                args.get("atomic").and_then(Value::as_bool).unwrap_or(false),
             ));
             extra = extra.saturating_sub(
                 rub_core::automation_timeout::fill_workflow_additional_timeout_ms(

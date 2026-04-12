@@ -82,6 +82,10 @@ pub(super) struct FillArgs {
     pub(super) spec: String,
     #[serde(default, rename = "spec_source")]
     pub(super) _spec_source: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(super) atomic: bool,
+    #[serde(default, rename = "snapshot_id")]
+    pub(super) _snapshot_id: Option<String>,
     #[serde(default, rename = "_trigger")]
     pub(super) _trigger: Option<serde_json::Value>,
     #[serde(default, rename = "_orchestration")]
@@ -141,6 +145,9 @@ impl SubmitLocatorArgs {
             role: self.role.clone(),
             label: self.label.clone(),
             testid: self.testid.clone(),
+            visible: false,
+            prefer_enabled: false,
+            topmost: false,
             first: self.first,
             last: self.last,
             nth: self.nth,

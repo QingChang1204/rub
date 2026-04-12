@@ -1,6 +1,10 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -13,6 +17,7 @@ const MAX_REQUEST_HEAD_BYTES: usize = 8192;
 pub struct DownloadFixtureServer {
     addr: SocketAddr,
     shutdown_tx: Option<mpsc::Sender<()>>,
+    shutdown_flag: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -26,6 +31,8 @@ impl DownloadFixtureServer {
             .expect("download fixture nonblocking");
         let addr = listener.local_addr().expect("download fixture local addr");
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_loop_flag = Arc::clone(&shutdown_flag);
 
         let handle = thread::spawn(move || {
             loop {
@@ -34,7 +41,7 @@ impl DownloadFixtureServer {
                 }
 
                 match listener.accept() {
-                    Ok((mut stream, _)) => handle_request(&mut stream),
+                    Ok((mut stream, _)) => handle_request(&mut stream, &shutdown_loop_flag),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
                     }
@@ -46,6 +53,7 @@ impl DownloadFixtureServer {
         Self {
             addr,
             shutdown_tx: Some(shutdown_tx),
+            shutdown_flag,
             handle: Some(handle),
         }
     }
@@ -58,6 +66,7 @@ impl DownloadFixtureServer {
 
 impl Drop for DownloadFixtureServer {
     fn drop(&mut self) {
+        self.shutdown_flag.store(true, Ordering::SeqCst);
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -67,7 +76,7 @@ impl Drop for DownloadFixtureServer {
     }
 }
 
-fn handle_request(stream: &mut TcpStream) {
+fn handle_request(stream: &mut TcpStream, shutdown_flag: &Arc<AtomicBool>) {
     // The accept loop stays nonblocking so the fixture can observe shutdown,
     // but individual request streams must block until the client sends a head.
     let _ = stream.set_nonblocking(false);
@@ -89,7 +98,7 @@ fn handle_request(stream: &mut TcpStream) {
             &[("Content-Disposition", "attachment; filename=\"report.csv\"")],
             b"id,name\n1,Ada Lovelace\n",
         ),
-        "/slow.csv" => write_streaming_attachment(stream, "slow-report.csv"),
+        "/slow.csv" => write_streaming_attachment(stream, "slow-report.csv", shutdown_flag),
         _ => write_response(
             stream,
             "404 Not Found",
@@ -187,7 +196,11 @@ fn write_response(
     let _ = stream.write_all(body);
 }
 
-fn write_streaming_attachment(stream: &mut TcpStream, filename: &str) {
+fn write_streaming_attachment(
+    stream: &mut TcpStream,
+    filename: &str,
+    shutdown_flag: &Arc<AtomicBool>,
+) {
     const CHUNK_SIZE: usize = 16 * 1024;
     const CHUNK_COUNT: usize = 32;
     const TOTAL_BYTES: usize = CHUNK_SIZE * CHUNK_COUNT;
@@ -202,6 +215,9 @@ fn write_streaming_attachment(stream: &mut TcpStream, filename: &str) {
 
     let chunk = vec![b'Z'; CHUNK_SIZE];
     for _ in 0..CHUNK_COUNT {
+        if shutdown_flag.load(Ordering::SeqCst) {
+            return;
+        }
         if stream.write_all(&chunk).is_err() {
             return;
         }
@@ -267,5 +283,30 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("fixture shutdown should not hang on half-open connections");
+    }
+
+    #[test]
+    fn drop_does_not_hang_on_slow_stream_connection() {
+        let server = DownloadFixtureServer::start();
+        let authority = server.url().trim_start_matches("http://").to_string();
+        let mut stream = TcpStream::connect(&authority).expect("connect fixture server");
+        write!(
+            stream,
+            "GET /slow.csv HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write request");
+
+        let mut header_buf = [0u8; 256];
+        let _ = stream.read(&mut header_buf).expect("read response header");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            drop(server);
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("fixture shutdown should not hang on active slow stream");
     }
 }

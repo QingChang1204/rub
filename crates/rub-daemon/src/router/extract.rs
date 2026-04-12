@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
 mod collection;
@@ -21,7 +22,7 @@ use field::{
 #[cfg(test)]
 use field::{builder_locator_expression, extract_builder_field_examples};
 use rub_core::error::{ErrorCode, RubError};
-use scan::scan_collection;
+use scan::{scan_collection, wait_for_collection_match};
 use spec::{ExtractCommand, ExtractFieldSpec, ExtractKind, parse_extract_fields};
 
 const DEFAULT_SCAN_MAX_SCROLLS: u32 = 100;
@@ -41,6 +42,7 @@ pub(super) async fn cmd_extract(
     let fields = parsed.value;
     let metadata = parsed.metadata;
     let scan = parsed_args.scan_config()?;
+    let wait = parsed_args.wait_config()?;
     let is_inspect_list = matches!(&parsed_args, ExtractCommand::List(_));
     let source_kind = parsed_args.source_kind();
 
@@ -48,6 +50,18 @@ pub(super) async fn cmd_extract(
         return Err(RubError::domain(
             ErrorCode::InvalidInput,
             "inspect list scan cannot reuse --snapshot; scanning requires live snapshots across scroll steps",
+        ));
+    }
+    if wait.is_some() && parsed_args.snapshot_id().is_some() {
+        return Err(RubError::domain(
+            ErrorCode::InvalidInput,
+            "inspect list wait cannot reuse --snapshot; waiting for new matches requires live snapshots across poll passes",
+        ));
+    }
+    if scan.is_some() && wait.is_some() {
+        return Err(RubError::domain(
+            ErrorCode::InvalidInput,
+            "inspect list wait cannot be combined with scan in the current product surface",
         ));
     }
 
@@ -121,6 +135,47 @@ pub(super) async fn cmd_extract(
         return Ok(data);
     }
 
+    if let Some(wait) = wait {
+        let (collection_name, collection) =
+            resolve_single_collection(&fields, "inspect list wait")?;
+        let outcome = wait_for_collection_match(
+            router,
+            args,
+            state,
+            deadline,
+            collection_name,
+            collection,
+            &wait,
+        )
+        .await?;
+        let mut data = extract_payload(
+            serde_json::json!({
+                "kind": "collection_extract",
+                "source": "live_page",
+                "collection": collection_name,
+                "wait_requested": true,
+            }),
+            serde_json::json!({
+                "items": outcome.rows,
+                "item_count": outcome.item_count,
+                "matched_item": outcome.matched_item,
+                "wait": {
+                    "matched": true,
+                    "field_path": wait.field_path,
+                    "contains": wait.contains,
+                    "elapsed_ms": outcome.elapsed_ms,
+                },
+                "outcome_summary": {
+                    "class": "confirmed_new_item_observed",
+                    "authoritative": true,
+                    "summary": "A new matching projected item was observed in the current list surface.",
+                },
+            }),
+        );
+        redact_json_value(&mut data, &metadata);
+        return Ok(data);
+    }
+
     let snapshot = if parsed_args.snapshot_id().is_some() {
         load_snapshot(router, args, state, deadline, false).await?
     } else {
@@ -189,6 +244,296 @@ fn extract_payload(subject: serde_json::Value, result: serde_json::Value) -> ser
     })
 }
 
+pub(crate) fn explain_extract_spec_contract(
+    raw: &str,
+    rub_home: &Path,
+) -> Result<serde_json::Value, RubError> {
+    let parsed = parse_extract_fields(raw, rub_home).map_err(enrich_extract_explain_error)?;
+    let mut normalized_spec = serde_json::Value::Object(
+        parsed
+            .value
+            .iter()
+            .map(|(name, entry)| (name.clone(), render_extract_entry_spec(entry)))
+            .collect(),
+    );
+    redact_json_value(&mut normalized_spec, &parsed.metadata);
+
+    let mut summaries = Vec::new();
+    for (name, entry) in &parsed.value {
+        collect_entry_summaries(name, entry, &mut summaries);
+    }
+    let mut summary_value = serde_json::Value::Array(summaries);
+    redact_json_value(&mut summary_value, &parsed.metadata);
+
+    Ok(serde_json::json!({
+        "subject": {
+            "kind": "extract_explain",
+            "surface": "local_contract",
+        },
+        "result": {
+            "normalized_spec": normalized_spec,
+            "entry_summaries": summary_value,
+            "guidance": {
+                "schema_command": "rub extract --schema",
+                "examples_command": "rub extract --examples",
+                "example_topics": ["all", "basic", "attribute", "collection", "validation"],
+            }
+        }
+    }))
+}
+
+fn enrich_extract_explain_error(error: RubError) -> RubError {
+    let mut envelope = error.into_envelope();
+    let mut context = envelope
+        .context
+        .take()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(object) = context.as_object_mut() {
+        object.insert(
+            "schema_command".to_string(),
+            serde_json::json!("rub extract --schema"),
+        );
+        object.insert(
+            "examples_command".to_string(),
+            serde_json::json!("rub extract --examples"),
+        );
+        object.insert(
+            "example_topics".to_string(),
+            serde_json::json!(["all", "basic", "attribute", "collection", "validation"]),
+        );
+    }
+    envelope.context = Some(context);
+    if envelope.suggestion.is_empty() {
+        envelope.suggestion =
+            "Try `rub extract --schema` for the canonical field contract or `rub extract --examples` for working shapes.".to_string();
+    }
+    RubError::Domain(envelope)
+}
+
+fn render_extract_entry_spec(entry: &ExtractEntrySpec) -> serde_json::Value {
+    match entry {
+        ExtractEntrySpec::Field(field) => render_extract_field_spec(field),
+        ExtractEntrySpec::Collection(collection) => render_extract_collection_spec(collection),
+    }
+}
+
+fn render_extract_field_spec(field: &ExtractFieldSpec) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    insert_locator_keys(&mut object, field);
+    object.insert("kind".to_string(), serde_json::json!(field.kind.as_str()));
+    if let Some(attribute) = &field.attribute {
+        object.insert("attribute".to_string(), serde_json::json!(attribute));
+    }
+    if field.many {
+        object.insert("many".to_string(), serde_json::json!(true));
+    }
+    if !field.required {
+        object.insert("required".to_string(), serde_json::json!(false));
+    }
+    if let Some(default) = &field.default {
+        object.insert("default".to_string(), default.clone());
+    }
+    if !field.map.is_empty() {
+        object.insert("map".to_string(), serde_json::json!(field.map));
+    }
+    if let Some(transform) = field.transform {
+        object.insert(
+            "transform".to_string(),
+            serde_json::json!(transform.as_str()),
+        );
+    }
+    if let Some(value_type) = field.value_type {
+        object.insert("type".to_string(), serde_json::json!(value_type.as_str()));
+    }
+    serde_json::Value::Object(object)
+}
+
+fn render_extract_collection_spec(
+    collection: &collection::ExtractCollectionSpec,
+) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    if let Some(selector) = &collection.collection {
+        object.insert("collection".to_string(), serde_json::json!(selector));
+    }
+    if let Some(selector) = &collection.selector {
+        object.insert("selector".to_string(), serde_json::json!(selector));
+    }
+    if let Some(target_text) = &collection.target_text {
+        object.insert("target_text".to_string(), serde_json::json!(target_text));
+    }
+    if let Some(role) = &collection.role {
+        object.insert("role".to_string(), serde_json::json!(role));
+    }
+    if let Some(label) = &collection.label {
+        object.insert("label".to_string(), serde_json::json!(label));
+    }
+    if let Some(testid) = &collection.testid {
+        object.insert("testid".to_string(), serde_json::json!(testid));
+    }
+    if let Some(row_scope_selector) = &collection.row_scope_selector {
+        object.insert(
+            "row_scope_selector".to_string(),
+            serde_json::json!(row_scope_selector),
+        );
+    }
+    if collection.first {
+        object.insert("first".to_string(), serde_json::json!(true));
+    }
+    if collection.last {
+        object.insert("last".to_string(), serde_json::json!(true));
+    }
+    if let Some(nth) = collection.nth {
+        object.insert("nth".to_string(), serde_json::json!(nth));
+    }
+    let fields = collection
+        .fields
+        .iter()
+        .map(|(name, entry)| (name.clone(), render_extract_entry_spec(entry)))
+        .collect();
+    object.insert("fields".to_string(), serde_json::Value::Object(fields));
+    serde_json::Value::Object(object)
+}
+
+fn insert_locator_keys(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    field: &ExtractFieldSpec,
+) {
+    if let Some(index) = field.index {
+        object.insert("index".to_string(), serde_json::json!(index));
+    }
+    if let Some(element_ref) = &field.element_ref {
+        object.insert("ref".to_string(), serde_json::json!(element_ref));
+    }
+    if let Some(selector) = &field.selector {
+        object.insert("selector".to_string(), serde_json::json!(selector));
+    }
+    if let Some(target_text) = &field.target_text {
+        object.insert("target_text".to_string(), serde_json::json!(target_text));
+    }
+    if let Some(role) = &field.role {
+        object.insert("role".to_string(), serde_json::json!(role));
+    }
+    if let Some(label) = &field.label {
+        object.insert("label".to_string(), serde_json::json!(label));
+    }
+    if let Some(testid) = &field.testid {
+        object.insert("testid".to_string(), serde_json::json!(testid));
+    }
+    if field.first {
+        object.insert("first".to_string(), serde_json::json!(true));
+    }
+    if field.last {
+        object.insert("last".to_string(), serde_json::json!(true));
+    }
+    if let Some(nth) = field.nth {
+        object.insert("nth".to_string(), serde_json::json!(nth));
+    }
+}
+
+fn collect_entry_summaries(
+    path: &str,
+    entry: &ExtractEntrySpec,
+    summaries: &mut Vec<serde_json::Value>,
+) {
+    match entry {
+        ExtractEntrySpec::Field(field) => summaries.push(serde_json::json!({
+            "path": path,
+            "entry_kind": "field",
+            "kind": field.kind.as_str(),
+            "locator_keys_present": extract_locator_keys_present(field),
+            "many": field.many,
+            "required": field.required,
+            "type": field.value_type.map(|value_type| value_type.as_str()),
+            "transform": field.transform.map(|transform| transform.as_str()),
+        })),
+        ExtractEntrySpec::Collection(collection) => {
+            summaries.push(serde_json::json!({
+                "path": path,
+                "entry_kind": "collection",
+                "locator_keys_present": extract_collection_locator_keys_present(collection),
+                "row_scope_selector": collection.row_scope_selector,
+                "field_count": collection.fields.len(),
+            }));
+            for (field_name, nested) in &collection.fields {
+                let nested_path = format!("{path}.{field_name}");
+                collect_entry_summaries(&nested_path, nested, summaries);
+            }
+        }
+    }
+}
+
+fn extract_locator_keys_present(field: &ExtractFieldSpec) -> Vec<&'static str> {
+    let mut keys = Vec::new();
+    if field.index.is_some() {
+        keys.push("index");
+    }
+    if field.element_ref.is_some() {
+        keys.push("ref");
+    }
+    if field.selector.is_some() {
+        keys.push("selector");
+    }
+    if field.target_text.is_some() {
+        keys.push("target_text");
+    }
+    if field.role.is_some() {
+        keys.push("role");
+    }
+    if field.label.is_some() {
+        keys.push("label");
+    }
+    if field.testid.is_some() {
+        keys.push("testid");
+    }
+    if field.first {
+        keys.push("first");
+    }
+    if field.last {
+        keys.push("last");
+    }
+    if field.nth.is_some() {
+        keys.push("nth");
+    }
+    keys
+}
+
+fn extract_collection_locator_keys_present(
+    collection: &collection::ExtractCollectionSpec,
+) -> Vec<&'static str> {
+    let mut keys = Vec::new();
+    if collection.collection.is_some() {
+        keys.push("collection");
+    }
+    if collection.selector.is_some() {
+        keys.push("selector");
+    }
+    if collection.target_text.is_some() {
+        keys.push("target_text");
+    }
+    if collection.role.is_some() {
+        keys.push("role");
+    }
+    if collection.label.is_some() {
+        keys.push("label");
+    }
+    if collection.testid.is_some() {
+        keys.push("testid");
+    }
+    if collection.row_scope_selector.is_some() {
+        keys.push("row_scope_selector");
+    }
+    if collection.first {
+        keys.push("first");
+    }
+    if collection.last {
+        keys.push("last");
+    }
+    if collection.nth.is_some() {
+        keys.push("nth");
+    }
+    keys
+}
+
 fn resolve_single_collection<'a>(
     fields: &'a BTreeMap<String, ExtractEntrySpec>,
     command_label: &str,
@@ -216,7 +561,7 @@ fn resolve_single_collection<'a>(
 mod tests {
     use super::{
         ExtractCommand, ExtractFieldSpec, ExtractKind, builder_locator_expression,
-        extract_builder_field_examples,
+        explain_extract_spec_contract, extract_builder_field_examples,
     };
     use crate::router::extract_postprocess::ExtractValueType;
     use serde_json::json;
@@ -384,5 +729,42 @@ mod tests {
 
         assert_eq!(field.attribute.as_deref(), Some("src"));
         assert!(matches!(field.kind, ExtractKind::Attribute));
+    }
+
+    #[test]
+    fn explain_extract_spec_contract_returns_normalized_spec_and_summaries() {
+        let result = explain_extract_spec_contract(
+            r#"{"title":"h1","items":{"collection":"li.item","fields":{"price":{"selector":".price","kind":"text","transform":"parse_float","type":"number"}}}}"#,
+            std::path::Path::new("/tmp/nonexistent-rub-home-for-extract-explain"),
+        )
+        .expect("explain contract should succeed");
+
+        assert_eq!(result["subject"]["kind"], "extract_explain");
+        assert_eq!(result["result"]["normalized_spec"]["title"]["kind"], "text");
+        assert_eq!(
+            result["result"]["normalized_spec"]["items"]["fields"]["price"]["transform"],
+            "parse_float"
+        );
+        assert_eq!(
+            result["result"]["entry_summaries"][1]["path"],
+            "items.price"
+        );
+        assert_eq!(
+            result["result"]["guidance"]["schema_command"],
+            "rub extract --schema"
+        );
+    }
+
+    #[test]
+    fn explain_extract_spec_contract_enriches_parse_errors_with_guidance() {
+        let error = explain_extract_spec_contract(
+            r#"{"title":{"unknown_key":true}}"#,
+            std::path::Path::new("/tmp/nonexistent-rub-home-for-extract-explain"),
+        )
+        .expect_err("invalid extract spec should fail");
+        let envelope = error.into_envelope();
+        let context = envelope.context.expect("context");
+        assert_eq!(context["schema_command"], "rub extract --schema");
+        assert_eq!(context["examples_command"], "rub extract --examples");
     }
 }

@@ -1,9 +1,13 @@
 //! JSON output formatter for CLI → stdout.
 
+mod continuity;
+
+use self::continuity::attach_workflow_continuity;
 use rub_core::error::ErrorEnvelope;
 use rub_core::model::CommandResult;
 use rub_ipc::protocol::IpcResponse;
 use serde_json::{Map, Value, json};
+use std::path::Path;
 
 const POST_COMMIT_LOCAL_FAILURE_STATE: &str = "daemon_committed_local_followup_failed";
 
@@ -19,6 +23,7 @@ pub fn format_response(
     response: &IpcResponse,
     command: &str,
     session: &str,
+    rub_home: &Path,
     pretty: bool,
     trace_mode: InteractionTraceMode,
 ) -> String {
@@ -54,6 +59,7 @@ pub fn format_response(
         error: response.error.clone(),
     };
     attach_interaction_trace(&mut result, trace_mode);
+    attach_workflow_continuity(&mut result, rub_home);
 
     if pretty {
         serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
@@ -171,6 +177,7 @@ fn post_commit_followup_state_json() -> Value {
 pub fn format_cli_success(
     command: &str,
     session: &str,
+    rub_home: &Path,
     data: serde_json::Value,
     pretty: bool,
     trace_mode: InteractionTraceMode,
@@ -178,6 +185,7 @@ pub fn format_cli_success(
     let mut result =
         CommandResult::success(command, session, uuid::Uuid::now_v7().to_string(), data);
     attach_interaction_trace(&mut result, trace_mode);
+    attach_workflow_continuity(&mut result, rub_home);
 
     if pretty {
         serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
@@ -249,6 +257,11 @@ mod tests {
     use rub_core::model::Timing;
     use rub_ipc::protocol::{IpcResponse, ResponseStatus};
     use serde_json::Value;
+    use std::path::Path;
+
+    fn rub_home() -> &'static Path {
+        Path::new("/tmp/rub-home")
+    }
 
     #[test]
     fn format_response_trace_mode_attaches_full_interaction_trace() {
@@ -495,6 +508,7 @@ mod tests {
             &response,
             "select",
             "default",
+            rub_home(),
             false,
             InteractionTraceMode::Trace,
         );
@@ -657,6 +671,7 @@ mod tests {
             &response,
             "exec",
             "default",
+            rub_home(),
             false,
             InteractionTraceMode::Compact,
         );
@@ -724,6 +739,7 @@ mod tests {
             &response,
             "exec",
             "default",
+            rub_home(),
             false,
             InteractionTraceMode::Compact,
         );
@@ -756,6 +772,7 @@ mod tests {
             &response,
             "hover",
             "default",
+            rub_home(),
             false,
             InteractionTraceMode::Compact,
         );
@@ -790,6 +807,7 @@ mod tests {
             &response,
             "hover",
             "default",
+            rub_home(),
             false,
             InteractionTraceMode::Verbose,
         );
@@ -825,6 +843,7 @@ mod tests {
             &response,
             "hover",
             "default",
+            rub_home(),
             false,
             InteractionTraceMode::Verbose,
         );
@@ -851,6 +870,7 @@ mod tests {
             &response,
             "doctor",
             "default",
+            rub_home(),
             false,
             InteractionTraceMode::Compact,
         );
@@ -876,6 +896,7 @@ mod tests {
             &response,
             "doctor",
             "default",
+            rub_home(),
             false,
             InteractionTraceMode::Compact,
         );
@@ -904,6 +925,7 @@ mod tests {
             &response,
             "doctor",
             "default",
+            rub_home(),
             false,
             InteractionTraceMode::Compact,
         );

@@ -123,17 +123,40 @@ pub enum InspectSubcommand {
     },
     /// Inspect a structured list through the extract runtime
     List {
+        /// Print built-in help for the `--collection` / `--field` builder surface
+        #[arg(
+            long,
+            help_heading = "Built-in help",
+            conflicts_with_all = [
+                "spec",
+                "file",
+                "collection",
+                "row_scope",
+                "field",
+                "snapshot",
+                "scan_until",
+                "scan_key",
+                "max_scrolls",
+                "scroll_amount",
+                "settle_ms",
+                "stall_limit",
+                "wait_field",
+                "wait_contains",
+                "wait_timeout"
+            ]
+        )]
+        builder_help: bool,
         /// Inline JSON inspection/extract specification
-        #[arg(conflicts_with_all = ["file", "collection"])]
+        #[arg(conflicts_with_all = ["file", "collection", "builder_help"])]
         spec: Option<String>,
         /// Load the inspection/extract specification from a JSON file
-        #[arg(long, value_name = "PATH", conflicts_with_all = ["spec", "collection", "field"])]
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["spec", "collection", "field", "builder_help"])]
         file: Option<String>,
         /// Simple list-builder collection selector for common cases
-        #[arg(long, value_name = "SELECTOR", conflicts_with_all = ["spec", "file"])]
+        #[arg(long, value_name = "SELECTOR", conflicts_with_all = ["spec", "file", "builder_help"])]
         collection: Option<String>,
         /// Optional nearest-ancestor scope selector used as the projection root for child fields
-        #[arg(long, value_name = "SELECTOR", conflicts_with_all = ["spec", "file"])]
+        #[arg(long, value_name = "SELECTOR", conflicts_with_all = ["spec", "file", "builder_help"])]
         row_scope: Option<String>,
         /// Builder field shorthand:
         /// `name` (root text), `name=.selector`, `name=role:heading`,
@@ -144,7 +167,7 @@ pub enum InspectSubcommand {
         /// `name=attribute:href:.selector`,
         /// `name=attribute:src:testid:hero-image`
         /// Append `@first`, `@last`, `@many`, or `@nth(0)` to disambiguate repeated matches
-        #[arg(long = "field", value_name = "FIELD", conflicts_with_all = ["spec", "file"])]
+        #[arg(long = "field", value_name = "FIELD", conflicts_with_all = ["spec", "file", "builder_help"])]
         field: Vec<String>,
         /// Optional snapshot to reuse as the authoritative inspection fence
         #[arg(long)]
@@ -167,6 +190,30 @@ pub enum InspectSubcommand {
         /// Stop after this many consecutive no-growth passes
         #[arg(long, value_name = "COUNT", requires = "scan_until")]
         stall_limit: Option<u32>,
+        /// Wait until a projected row field contains the given substring
+        #[arg(
+            long,
+            value_name = "FIELD",
+            requires = "wait_contains",
+            conflicts_with = "scan_until"
+        )]
+        wait_field: Option<String>,
+        /// Substring to match inside the projected wait field
+        #[arg(
+            long,
+            value_name = "TEXT",
+            requires = "wait_field",
+            conflicts_with = "scan_until"
+        )]
+        wait_contains: Option<String>,
+        /// Timeout in milliseconds for `inspect list` wait mode
+        #[arg(
+            long,
+            value_name = "MS",
+            requires = "wait_field",
+            conflicts_with = "scan_until"
+        )]
+        wait_timeout: Option<u64>,
     },
     /// Follow a bounded set of list/detail URLs and extract structured fields from each detail page
     Harvest {

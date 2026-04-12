@@ -9,6 +9,9 @@ pub struct CommandMetadata {
 pub enum CommandName {
     Handshake,
     UpgradeCheck,
+    BlockerDiagnose,
+    InteractabilityProbe,
+    FillValidate,
     OrchestrationProbe,
     OrchestrationTabFrames,
     OrchestrationTargetDispatch,
@@ -64,6 +67,9 @@ impl CommandName {
         match self {
             Self::Handshake => "_handshake",
             Self::UpgradeCheck => "_upgrade_check",
+            Self::BlockerDiagnose => "_blocker_diagnose",
+            Self::InteractabilityProbe => "_interactability_probe",
+            Self::FillValidate => "_fill_validate",
             Self::OrchestrationProbe => "_orchestration_probe",
             Self::OrchestrationTabFrames => "_orchestration_tab_frames",
             Self::OrchestrationTargetDispatch => "_orchestration_target_dispatch",
@@ -119,6 +125,9 @@ impl CommandName {
         match self {
             Self::Handshake
             | Self::UpgradeCheck
+            | Self::BlockerDiagnose
+            | Self::InteractabilityProbe
+            | Self::FillValidate
             | Self::OrchestrationProbe
             | Self::OrchestrationTabFrames
             | Self::OrchestrationTargetDispatch
@@ -161,6 +170,9 @@ impl CommandName {
         match command {
             "_handshake" => Some(Self::Handshake),
             "_upgrade_check" => Some(Self::UpgradeCheck),
+            "_blocker_diagnose" => Some(Self::BlockerDiagnose),
+            "_interactability_probe" => Some(Self::InteractabilityProbe),
+            "_fill_validate" => Some(Self::FillValidate),
             "_orchestration_probe" => Some(Self::OrchestrationProbe),
             "_orchestration_tab_frames" => Some(Self::OrchestrationTabFrames),
             "_orchestration_target_dispatch" => Some(Self::OrchestrationTargetDispatch),
@@ -232,6 +244,8 @@ mod tests {
         let all_commands = [
             CommandName::Handshake,
             CommandName::UpgradeCheck,
+            CommandName::BlockerDiagnose,
+            CommandName::InteractabilityProbe,
             CommandName::OrchestrationProbe,
             CommandName::OrchestrationTabFrames,
             CommandName::OrchestrationTargetDispatch,
@@ -327,6 +341,8 @@ mod tests {
         for cmd in [
             CommandName::Handshake,
             CommandName::UpgradeCheck,
+            CommandName::BlockerDiagnose,
+            CommandName::InteractabilityProbe,
             CommandName::OrchestrationProbe,
             CommandName::OrchestrationTargetDispatch,
             CommandName::OrchestrationWorkflowSourceVars,

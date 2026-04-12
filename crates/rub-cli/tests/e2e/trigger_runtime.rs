@@ -911,9 +911,9 @@ fn t437f_trigger_degrades_when_target_selected_frame_becomes_stale() {
     title="Child Frame"
   ></iframe>
   <script>
-    setTimeout(() => {
+    window.removeChildFrame = () => {
       document.getElementById('child-frame')?.remove();
-    }, 500);
+    };
   </script>
 </body>
 </html>"#,
@@ -988,6 +988,14 @@ fn t437f_trigger_degrades_when_target_selected_frame_becomes_stale() {
             .unwrap(),
     );
     assert_eq!(selected["success"], true, "{selected}");
+
+    let removed = parse_json(
+        &rub_cmd(&home)
+            .args(["exec", "window.removeChildFrame(); 'removed'"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(removed["success"], true, "{removed}");
 
     let waited = parse_json(
         &rub_cmd(&home)

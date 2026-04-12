@@ -19,6 +19,19 @@ pub(super) async fn dispatch_named_command(
         Some(CommandName::UpgradeCheck) => runtime::cmd_upgrade_check(state)
             .await
             .map(CommandDispatchOutcome::new),
+        Some(CommandName::BlockerDiagnose) => runtime::cmd_blocker_diagnose(router, state)
+            .await
+            .map(CommandDispatchOutcome::new),
+        Some(CommandName::InteractabilityProbe) => {
+            interaction::cmd_interactability_probe(router, args, deadline, state)
+                .await
+                .map(CommandDispatchOutcome::new)
+        }
+        Some(CommandName::FillValidate) => {
+            workflow::cmd_fill_validate(router, args, deadline, state)
+                .await
+                .map(CommandDispatchOutcome::new)
+        }
         Some(CommandName::OrchestrationProbe) => {
             orchestration::cmd_orchestration_probe(router, args, state)
                 .await

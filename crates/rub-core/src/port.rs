@@ -352,6 +352,14 @@ pub trait BrowserPort: Send + Sync {
         selector: &str,
     ) -> Result<Vec<Element>, RubError>;
 
+    /// Filter published snapshot candidates through the live hit-test authority,
+    /// keeping only elements that currently expose a hittable point.
+    async fn filter_snapshot_elements_by_hit_test(
+        &self,
+        snapshot: &Snapshot,
+        elements: &[Element],
+    ) -> Result<Vec<Element>, RubError>;
+
     /// Resolve interactive snapshot elements that are descendants of one or
     /// more content roots matched by an observation scope.
     async fn find_snapshot_elements_in_observation_scope(

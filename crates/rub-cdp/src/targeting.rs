@@ -89,6 +89,10 @@ async fn resolve_element_with_fallback_selector(
         return Ok(resolved);
     }
 
+    if !allow_global_read_fallback(frame_id) {
+        return Err(frame_scoped_read_target_error(element));
+    }
+
     let candidates = page
         .find_elements(fallback_selector)
         .await
@@ -135,6 +139,21 @@ fn unverified_write_target_error(element: &Element, reason: &str) -> RubError {
             "tag": element.tag,
         }),
     )
+}
+
+fn frame_scoped_read_target_error(element: &Element) -> RubError {
+    RubError::domain_with_context(
+        ErrorCode::StaleSnapshot,
+        "Frame-scoped reads require a target that can still be resolved inside the selected frame authority",
+        serde_json::json!({
+            "authority_state": "frame_scoped_read_target_stale",
+            "element_index": element.index,
+        }),
+    )
+}
+
+fn allow_global_read_fallback(frame_id: Option<&str>) -> bool {
+    frame_id.is_none()
 }
 
 async fn resolve_element_within_frame_snapshot(
@@ -239,6 +258,23 @@ pub(crate) async fn resolve_pointer_point(
         ErrorCode::ElementNotInteractable,
         "Element does not expose a hittable clickable point",
     ))
+}
+
+pub(crate) async fn filter_snapshot_elements_by_hit_test(
+    page: &Arc<Page>,
+    _snapshot: &rub_core::model::Snapshot,
+    elements: &[Element],
+) -> Result<Vec<Element>, RubError> {
+    let mut filtered = Vec::with_capacity(elements.len());
+    for element in elements {
+        let Ok(resolved) = resolve_element(page, element).await else {
+            continue;
+        };
+        if resolve_pointer_point(page, &resolved).await.is_ok() {
+            filtered.push(element.clone());
+        }
+    }
+    Ok(filtered)
 }
 
 pub(crate) fn parse_backend_node_id(element_ref: Option<&str>) -> Option<BackendNodeId> {
@@ -596,10 +632,11 @@ fn snapshot_tag_matches(expected: ElementTag, candidate: ElementTag) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CandidateMatchRank, bounding_box_center_distance, bounding_box_match_score,
-        bounding_box_shape_matches, candidate_points, candidate_rank_precedes,
-        parse_backend_node_id, parse_element_ref_frame_id, snapshot_candidate_match_rank,
-        tag_matches, unverified_write_target_error,
+        CandidateMatchRank, allow_global_read_fallback, bounding_box_center_distance,
+        bounding_box_match_score, bounding_box_shape_matches, candidate_points,
+        candidate_rank_precedes, frame_scoped_read_target_error, parse_backend_node_id,
+        parse_element_ref_frame_id, snapshot_candidate_match_rank, tag_matches,
+        unverified_write_target_error,
     };
     use rub_core::error::ErrorCode;
     use rub_core::model::{BoundingBox, Element, ElementTag};
@@ -628,6 +665,12 @@ mod tests {
             Some("frame-1")
         );
         assert_eq!(parse_element_ref_frame_id(Some(":42")), None);
+    }
+
+    #[test]
+    fn global_read_fallback_is_disabled_for_frame_scoped_reads() {
+        assert!(!allow_global_read_fallback(Some("frame-1")));
+        assert!(allow_global_read_fallback(None));
     }
 
     #[test]
@@ -791,6 +834,38 @@ mod tests {
                 .as_ref()
                 .and_then(|ctx| ctx["element_index"].as_u64()),
             Some(7)
+        );
+    }
+
+    #[test]
+    fn frame_scoped_read_target_error_is_reported_as_stale_snapshot() {
+        let error = frame_scoped_read_target_error(&Element {
+            index: 11,
+            tag: ElementTag::Input,
+            text: String::new(),
+            attributes: HashMap::new(),
+            element_ref: Some("frame-1:42".to_string()),
+            bounding_box: None,
+            ax_info: None,
+            listeners: None,
+            depth: None,
+        });
+
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::StaleSnapshot);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx["authority_state"].as_str()),
+            Some("frame_scoped_read_target_stale")
+        );
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx["element_index"].as_u64()),
+            Some(11)
         );
     }
 }

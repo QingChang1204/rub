@@ -21,10 +21,22 @@ pub(super) struct InteractionObservationBaseline {
     pub(super) request_cursor: u64,
     pub(super) network_request_drop_count: u64,
     pub(super) download_cursor: u64,
-    pub(super) download_drop_count: u64,
+    pub(super) download_ingress_drop_count: u64,
+    pub(super) download_degraded_reason_before: Option<String>,
     pub(super) browser_event_cursor: u64,
     pub(super) runtime_before: Option<RuntimeStateSnapshot>,
     pub(super) interference_before: InterferenceRuntimeInfo,
+}
+
+pub(super) struct InteractionObservationFence {
+    pub(super) observatory_cursor: u64,
+    pub(super) observatory_drop_count: u64,
+    pub(super) request_cursor: u64,
+    pub(super) network_request_drop_count: u64,
+    pub(super) download_cursor: u64,
+    pub(super) download_ingress_drop_count: u64,
+    pub(super) download_degraded_reason_after: Option<String>,
+    pub(super) browser_event_cursor: u64,
 }
 
 pub(super) struct InteractionTraceWindows {
@@ -57,34 +69,67 @@ pub(super) async fn capture_interaction_baseline(
     if let Ok(tabs) = router.browser.list_tabs().await {
         state.prime_interference_baseline(&tabs).await;
     }
+    let download_runtime = state.download_runtime().await;
     InteractionObservationBaseline {
         observatory_cursor: state.observatory_cursor().await,
         observatory_drop_count: state.observatory().await.dropped_event_count,
         request_cursor: state.network_request_cursor().await,
         network_request_drop_count: state.network_request_drop_count().await,
         download_cursor: state.download_cursor().await,
-        download_drop_count: state.download_event_drop_count(),
+        download_ingress_drop_count: state.download_event_ingress_drop_count(),
+        download_degraded_reason_before: download_runtime.degraded_reason,
         browser_event_cursor: state.browser_event_cursor(),
         runtime_before: crate::interaction_trace::probe_runtime_state(&router.browser).await,
         interference_before: state.interference_runtime().await,
     }
 }
 
-async fn capture_interaction_trace_windows(
+async fn capture_interaction_observation_fence(
+    state: &Arc<SessionState>,
+) -> InteractionObservationFence {
+    let download_runtime = state.download_runtime().await;
+    InteractionObservationFence {
+        observatory_cursor: state.observatory_cursor().await,
+        observatory_drop_count: state.observatory().await.dropped_event_count,
+        request_cursor: state.network_request_cursor().await,
+        network_request_drop_count: state.network_request_drop_count().await,
+        download_cursor: state.download_cursor().await,
+        download_ingress_drop_count: state.download_event_ingress_drop_count(),
+        download_degraded_reason_after: download_runtime.degraded_reason,
+        browser_event_cursor: state.browser_event_cursor(),
+    }
+}
+
+pub(super) async fn capture_interaction_trace_windows(
     state: &Arc<SessionState>,
     baseline: &InteractionObservationBaseline,
+    fence: &InteractionObservationFence,
 ) -> InteractionTraceWindows {
     let observatory_window = state
-        .observatory_event_window_after(
+        .observatory_event_window_between(
             baseline.observatory_cursor,
+            fence.observatory_cursor,
             baseline.observatory_drop_count,
+            fence.observatory_drop_count,
         )
         .await;
     let network_window = state
-        .network_request_window_after(baseline.request_cursor, baseline.network_request_drop_count)
+        .network_request_window_between(
+            baseline.request_cursor,
+            fence.request_cursor,
+            baseline.network_request_drop_count,
+            fence.network_request_drop_count,
+        )
         .await;
     let download_window = state
-        .download_event_window_after(baseline.download_cursor, baseline.download_drop_count)
+        .download_event_window_between(
+            baseline.download_cursor,
+            fence.download_cursor,
+            baseline.download_ingress_drop_count,
+            fence.download_ingress_drop_count,
+            baseline.download_degraded_reason_before.as_deref(),
+            fence.download_degraded_reason_after.as_deref(),
+        )
         .await;
     InteractionTraceWindows {
         observatory_events: observatory_window.events,
@@ -228,14 +273,38 @@ where
             INTERACTION_BROWSER_EVENT_QUIET_PERIOD,
         )
         .await;
-    let projection_state = collect_post_interaction_projection(state, refresh).await;
-    let trace_windows = capture_interaction_trace_windows(state, baseline).await;
-    StableInteractionProjection {
-        projection_state,
-        trace_windows,
+    refresh().await;
+    let mut fence_cursor = state.browser_event_cursor();
+    loop {
+        state
+            .wait_for_browser_event_quiescence_since(
+                fence_cursor,
+                INTERACTION_BROWSER_EVENT_FENCE_TIMEOUT,
+                INTERACTION_BROWSER_EVENT_QUIET_PERIOD,
+            )
+            .await;
+        let fence = capture_interaction_observation_fence(state).await;
+        let projection_state = read_post_interaction_projection(state).await;
+        if state.browser_event_cursor() <= fence.browser_event_cursor {
+            let trace_windows = capture_interaction_trace_windows(state, baseline, &fence).await;
+            return StableInteractionProjection {
+                projection_state,
+                trace_windows,
+            };
+        }
+        fence_cursor = fence.browser_event_cursor;
     }
 }
 
+async fn read_post_interaction_projection(state: &Arc<SessionState>) -> InteractionProjectionState {
+    InteractionProjectionState {
+        runtime_after: state.runtime_state_snapshot().await,
+        frame_runtime: state.frame_runtime().await,
+        interference_after: state.interference_runtime().await,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) async fn collect_post_interaction_projection<F, Fut>(
     state: &Arc<SessionState>,
     refresh: F,
@@ -245,9 +314,5 @@ where
     Fut: Future<Output = ()>,
 {
     refresh().await;
-    InteractionProjectionState {
-        runtime_after: state.runtime_state_snapshot().await,
-        frame_runtime: state.frame_runtime().await,
-        interference_after: state.interference_runtime().await,
-    }
+    read_post_interaction_projection(state).await
 }

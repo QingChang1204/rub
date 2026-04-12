@@ -250,7 +250,7 @@ impl ExtractValueType {
 }
 
 impl ExtractTransform {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Trim => "trim",
             Self::Lowercase => "lowercase",

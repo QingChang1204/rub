@@ -1163,6 +1163,85 @@ async fn browser_event_progress_overflow_commits_sequence_and_marks_download_run
     assert!(window.events.is_empty());
 }
 
+#[tokio::test]
+async fn bounded_download_window_respects_preexisting_runtime_degradation() {
+    let state = Arc::new(SessionState::new(
+        "default",
+        PathBuf::from("/tmp/rub-test"),
+        None,
+    ));
+    state
+        .mark_download_runtime_degraded(0, "download_behavior_failed")
+        .await;
+    state
+        .record_download_started_sequenced(
+            0,
+            1,
+            "guid-1".to_string(),
+            "https://example.test/report.csv".to_string(),
+            "report.csv".to_string(),
+            None,
+        )
+        .await;
+
+    let window = state
+        .download_event_window_between(
+            0,
+            state.download_cursor().await,
+            0,
+            state.download_event_ingress_drop_count(),
+            Some("download_behavior_failed"),
+            Some("download_behavior_failed"),
+        )
+        .await;
+
+    assert!(!window.authoritative);
+    assert_eq!(
+        window.degraded_reason.as_deref(),
+        Some("download_behavior_failed")
+    );
+    assert_eq!(window.events.len(), 1);
+}
+
+#[tokio::test]
+async fn bounded_download_window_reports_timeline_eviction_truthfully() {
+    let state = Arc::new(SessionState::new(
+        "default",
+        PathBuf::from("/tmp/rub-test"),
+        None,
+    ));
+    for index in 0..140 {
+        state
+            .record_download_started_sequenced(
+                0,
+                index + 1,
+                format!("guid-{index}"),
+                format!("https://example.test/{index}.csv"),
+                format!("{index}.csv"),
+                None,
+            )
+            .await;
+    }
+
+    let window = state
+        .download_event_window_between(
+            0,
+            state.download_cursor().await,
+            0,
+            state.download_event_ingress_drop_count(),
+            None,
+            None,
+        )
+        .await;
+
+    assert!(!window.authoritative);
+    assert_eq!(
+        window.degraded_reason.as_deref(),
+        Some("download_event_timeline_overflow")
+    );
+    assert!(!window.events.is_empty());
+}
+
 #[test]
 fn browser_event_commit_cursor_advances_only_after_contiguous_sequences_land() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);

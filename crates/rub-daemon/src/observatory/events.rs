@@ -40,6 +40,14 @@ impl RuntimeObservatoryState {
             .collect()
     }
 
+    pub fn events_between(&self, cursor: u64, end_cursor: u64) -> Vec<RuntimeObservatoryEvent> {
+        self.timeline
+            .iter()
+            .filter(|event| event.sequence > cursor && event.sequence <= end_cursor)
+            .cloned()
+            .collect()
+    }
+
     pub fn push_console_error(&mut self, event: ConsoleErrorEvent) {
         self.mark_active();
         push_ring(&mut self.console_errors, event.clone());

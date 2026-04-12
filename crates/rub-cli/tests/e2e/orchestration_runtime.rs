@@ -2198,7 +2198,7 @@ fn t437t_u_orchestration_target_availability_grouped_scenario() {
 <html>
 <head><title>Orchestration Source Takeover</title></head>
 <body>
-  <div id="status">Ready</div>
+  <div id="status">Waiting</div>
 </body>
 </html>"#,
         ),
@@ -2475,6 +2475,19 @@ fn t437t_u_orchestration_target_availability_grouped_scenario() {
         takeover["data"]["runtime"]["automation_paused"], true,
         "{takeover}"
     );
+
+    let source_ready = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "source",
+                "exec",
+                "document.getElementById('status').textContent = 'Ready'; 'ok';",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(source_ready["success"], true, "{source_ready}");
 
     let executed = parse_json(
         &rub_cmd(home)

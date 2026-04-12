@@ -84,6 +84,19 @@ impl RuntimeObservatoryState {
             .collect()
     }
 
+    pub fn request_records_between(
+        &self,
+        cursor: u64,
+        end_cursor: u64,
+    ) -> Vec<NetworkRequestRecord> {
+        self.request_order
+            .iter()
+            .filter_map(|request_id| self.request_records.get(request_id))
+            .filter(|record| record.sequence > cursor && record.sequence <= end_cursor)
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn request_window_after(
         &self,
         cursor: u64,
@@ -96,6 +109,41 @@ impl RuntimeObservatoryState {
             .map(|record| record.sequence)
             .max()
             .unwrap_or_else(|| self.request_cursor());
+        let dropped_since_last_poll = total_drop_count > last_observed_drop_count;
+        let cursor_lost_to_eviction =
+            dropped_since_last_poll && cursor < self.last_evicted_request_sequence;
+        let degraded_reason = if cursor_lost_to_eviction {
+            Some("network_request_ring_overflow".to_string())
+        } else if self
+            .degraded_reason
+            .as_deref()
+            .is_some_and(|reason| reason != "network_request_ring_overflow")
+        {
+            self.degraded_reason.clone()
+        } else {
+            None
+        };
+        NetworkRequestWindow {
+            records,
+            next_cursor,
+            authoritative: degraded_reason.is_none(),
+            degraded_reason,
+        }
+    }
+
+    pub(crate) fn request_window_between(
+        &self,
+        cursor: u64,
+        end_cursor: u64,
+        total_drop_count: u64,
+        last_observed_drop_count: u64,
+    ) -> NetworkRequestWindow {
+        let records = self.request_records_between(cursor, end_cursor);
+        let next_cursor = records
+            .iter()
+            .map(|record| record.sequence)
+            .max()
+            .unwrap_or(end_cursor);
         let dropped_since_last_poll = total_drop_count > last_observed_drop_count;
         let cursor_lost_to_eviction =
             dropped_since_last_poll && cursor < self.last_evicted_request_sequence;

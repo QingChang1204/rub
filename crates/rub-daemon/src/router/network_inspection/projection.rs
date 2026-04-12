@@ -98,6 +98,28 @@ pub(super) fn network_payload(
     })
 }
 
+pub(super) fn network_wait_outcome_summary(
+    lifecycle: NetworkRequestWaitState,
+) -> serde_json::Value {
+    let (class, summary) = match lifecycle {
+        NetworkRequestWaitState::Completed
+        | NetworkRequestWaitState::Failed
+        | NetworkRequestWaitState::Terminal => (
+            "confirmed_terminal_request",
+            "A matching network request reached the requested terminal lifecycle.",
+        ),
+        NetworkRequestWaitState::Pending | NetworkRequestWaitState::Responded => (
+            "confirmed_new_item_observed",
+            "A matching network request was observed in the requested lifecycle window.",
+        ),
+    };
+    serde_json::json!({
+        "class": class,
+        "authoritative": true,
+        "summary": summary,
+    })
+}
+
 pub(super) fn network_registry_subject(
     last: Option<usize>,
     url_match: Option<&str>,

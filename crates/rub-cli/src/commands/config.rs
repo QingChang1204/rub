@@ -9,12 +9,40 @@ use std::path::{Component, Path, PathBuf};
 
 use super::Commands;
 
+const CLI_LONG_ABOUT: &str = "\
+Browser automation for AI agents.
+
+rub keeps browser work on canonical, explainable command surfaces instead of
+requiring ad hoc JavaScript for common tasks.";
+
+const CLI_AFTER_HELP: &str = "\
+Quick start:
+  Inspect a page:
+    rub open https://example.com
+    rub observe --path /tmp/page.jpg
+    rub state --format compact
+
+  Interact with a page:
+    rub click --label \"Sign in\"
+    rub fill '[{\"label\":\"Email\",\"value\":\"user@example.com\"}]'
+    rub extract '{\"title\":\"h1\"}'
+
+  Finish a session cleanly:
+    rub teardown
+
+Task map:
+  Read-only inspection: state, observe, find, extract, inspect, get
+  Interaction and waits: click, type, fill, select, upload, wait, pipe
+  Runtime lifecycle: sessions, runtime, close, cleanup, teardown";
+
 /// rub — Rust Browser Automation CLI for AI agents
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "rub",
     version = env!("RUB_BUILD_VERSION"),
-    about = "Browser automation for AI agents"
+    about = "Browser automation for AI agents",
+    long_about = CLI_LONG_ABOUT,
+    after_help = CLI_AFTER_HELP
 )]
 pub struct Cli {
     /// Session name (default: "default")
@@ -23,7 +51,8 @@ pub struct Cli {
         default_value = "default",
         env = "RUB_SESSION",
         global = true,
-        value_parser = parse_session_name
+        value_parser = parse_session_name,
+        help_heading = "Session & output"
     )]
     pub session: String,
 
@@ -32,60 +61,100 @@ pub struct Cli {
     pub session_id: Option<String>,
 
     /// RUB_HOME directory override
-    #[arg(long, env = "RUB_HOME", global = true)]
+    #[arg(
+        long,
+        env = "RUB_HOME",
+        global = true,
+        help_heading = "Session & output"
+    )]
     pub rub_home: Option<String>,
 
     /// Command timeout in milliseconds
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Session & output")]
     pub timeout: Option<u64>,
 
     /// Launch Chrome with a visible window instead of headless mode
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Browser connection & launch")]
     pub headed: bool,
 
     /// Ignore certificate errors (self-signed, expired, etc.)
-    #[arg(long, env = "RUB_IGNORE_CERT_ERRORS", global = true)]
+    #[arg(
+        long,
+        env = "RUB_IGNORE_CERT_ERRORS",
+        global = true,
+        help_heading = "Browser connection & launch"
+    )]
     pub ignore_cert_errors: bool,
 
     /// Use a specific Chrome user-data-dir / profile
-    #[arg(long, env = "RUB_USER_DATA_DIR", global = true)]
+    #[arg(
+        long,
+        env = "RUB_USER_DATA_DIR",
+        global = true,
+        help_heading = "Browser connection & launch"
+    )]
     pub user_data_dir: Option<String>,
 
     /// Show the Chrome automation infobar instead of hiding it
-    #[arg(long, env = "RUB_SHOW_INFOBARS", global = true)]
+    #[arg(
+        long,
+        env = "RUB_SHOW_INFOBARS",
+        global = true,
+        help_heading = "Browser connection & launch"
+    )]
     pub show_infobars: bool,
 
     /// Pretty-print JSON output
-    #[arg(long = "json-pretty", alias = "json", global = true)]
+    #[arg(
+        long = "json-pretty",
+        alias = "json",
+        global = true,
+        help_heading = "Session & output"
+    )]
     pub json_pretty: bool,
 
     /// Include a lightweight interaction trace summary in CLI output
-    #[arg(long, global = true, conflicts_with = "trace")]
+    #[arg(
+        long,
+        global = true,
+        conflicts_with = "trace",
+        help_heading = "Session & output"
+    )]
     pub verbose: bool,
 
     /// Include the full interaction trace with observed effects in CLI output
-    #[arg(long, global = true, conflicts_with = "verbose")]
+    #[arg(
+        long,
+        global = true,
+        conflicts_with = "verbose",
+        help_heading = "Session & output"
+    )]
     pub trace: bool,
 
     /// Connect to an external Chrome via CDP URL (ws:// or http://)
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Browser connection & launch")]
     pub cdp_url: Option<String>,
 
     /// Auto-discover and connect to a locally-running Chrome (ports 9222-9229)
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Browser connection & launch")]
     pub connect: bool,
 
     /// Connect using a named Chrome profile (e.g., "Default", "Work")
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Browser connection & launch")]
     pub profile: Option<String>,
 
     /// Disable the L1 stealth baseline and launch-arg minimization while
     /// keeping DOM hygiene enabled for snapshot correctness
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Browser connection & launch")]
     pub no_stealth: bool,
 
     /// Enable L2 humanized interaction (mouse movement, typing delay)
-    #[arg(long, env = "RUB_HUMANIZE", global = true)]
+    #[arg(
+        long,
+        env = "RUB_HUMANIZE",
+        global = true,
+        help_heading = "Browser connection & launch"
+    )]
     pub humanize: bool,
 
     /// Humanize speed preset: fast, normal, slow
@@ -94,7 +163,8 @@ pub struct Cli {
         env = "RUB_HUMANIZE_SPEED",
         value_parser = ["fast", "normal", "slow"],
         default_value = "normal",
-        global = true
+        global = true,
+        help_heading = "Browser connection & launch"
     )]
     pub humanize_speed: String,
 
@@ -425,13 +495,43 @@ mod tests {
     }
 
     #[test]
+    fn state_positional_format_alias_parses_common_compact_input() {
+        let cli = Cli::try_parse_from(["rub", "state", "compact"]).expect("cli should parse alias");
+        match cli.command {
+            Commands::State {
+                format,
+                format_alias,
+                ..
+            } => {
+                assert!(format.is_none());
+                assert_eq!(format_alias.map(|value| value.as_str()), Some("compact"));
+            }
+            other => panic!("expected state command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn state_positional_format_alias_conflicts_with_explicit_format_flag() {
+        let error =
+            Cli::try_parse_from(["rub", "state", "compact", "--format", "a11y"]).unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("--format"), "{rendered}");
+    }
+
+    #[test]
     fn type_index_example_requires_explicit_index_flag() {
         let cli = Cli::try_parse_from(["rub", "type", "--index", "5", "hello"])
             .expect("cli should parse");
         match cli.command {
-            Commands::Type { index, text, .. } => {
+            Commands::Type {
+                index,
+                text,
+                text_flag,
+                ..
+            } => {
                 assert_eq!(index, Some(5));
-                assert_eq!(text, "hello");
+                assert_eq!(text.as_deref(), Some("hello"));
+                assert!(text_flag.is_none());
             }
             other => panic!("expected type command, got {other:?}"),
         }
@@ -439,6 +539,31 @@ mod tests {
         let error = Cli::try_parse_from(["rub", "type", "5", "hello"]).unwrap_err();
         let rendered = error.to_string();
         assert!(rendered.contains("unexpected argument"), "{rendered}");
+    }
+
+    #[test]
+    fn type_accepts_text_flag_alias() {
+        let cli = Cli::try_parse_from(["rub", "type", "--label", "Email", "--text", "hello"])
+            .expect("cli should parse");
+        match cli.command {
+            Commands::Type {
+                text, text_flag, ..
+            } => {
+                assert!(text.is_none());
+                assert_eq!(text_flag.as_deref(), Some("hello"));
+            }
+            other => panic!("expected type command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn type_rejects_positional_and_text_flag_together() {
+        let error = Cli::try_parse_from([
+            "rub", "type", "--label", "Email", "--text", "hello", "world",
+        ])
+        .unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("--text"), "{rendered}");
     }
 
     #[test]

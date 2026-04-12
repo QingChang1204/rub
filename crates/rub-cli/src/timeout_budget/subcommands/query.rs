@@ -122,6 +122,7 @@ pub(crate) fn build_inspect_request(
             ),
         ),
         InspectSubcommand::List {
+            builder_help,
             spec,
             file,
             collection,
@@ -134,7 +135,22 @@ pub(crate) fn build_inspect_request(
             scroll_amount,
             settle_ms,
             stall_limit,
+            wait_field,
+            wait_contains,
+            wait_timeout,
         } => {
+            if *builder_help {
+                return Err(RubError::domain(
+                    ErrorCode::InternalError,
+                    "inspect list built-in help must be handled locally before IPC request projection",
+                ));
+            }
+            validate_inspect_list_wait_args(
+                wait_field.as_deref(),
+                wait_contains.as_deref(),
+                *wait_timeout,
+                *scan_until,
+            )?;
             let (resolved_spec, spec_source) = resolve_inspect_list_spec_source(
                 spec.as_deref(),
                 file.as_deref(),
@@ -142,6 +158,8 @@ pub(crate) fn build_inspect_request(
                 row_scope.as_deref(),
                 field,
             )?;
+            let effective_wait_timeout =
+                wait_field.as_ref().map(|_| wait_timeout.unwrap_or(timeout));
             serde_json::json!({
                 "sub": "list",
                 "spec": resolved_spec,
@@ -153,6 +171,9 @@ pub(crate) fn build_inspect_request(
                 "scroll_amount": scroll_amount,
                 "settle_ms": settle_ms,
                 "stall_limit": stall_limit,
+                "wait_field": wait_field,
+                "wait_contains": wait_contains,
+                "wait_timeout_ms": effective_wait_timeout,
             })
         }
         InspectSubcommand::Harvest { .. } => {
@@ -212,6 +233,13 @@ fn inspect_request_timeout(timeout: u64, subcommand: &InspectSubcommand) -> u64 
                 .saturating_add(max_scrolls.saturating_mul(settle_ms))
                 .saturating_add(WAIT_IPC_BUFFER_MS)
         }
+        InspectSubcommand::List {
+            wait_field: Some(_),
+            wait_timeout,
+            ..
+        } => wait_timeout
+            .unwrap_or(timeout)
+            .saturating_add(WAIT_IPC_BUFFER_MS),
         InspectSubcommand::Network { wait: true, .. } => {
             effective_network_wait_timeout_ms(timeout, subcommand)
                 .unwrap_or(timeout)
@@ -219,6 +247,35 @@ fn inspect_request_timeout(timeout: u64, subcommand: &InspectSubcommand) -> u64 
         }
         _ => timeout,
     }
+}
+
+fn validate_inspect_list_wait_args(
+    wait_field: Option<&str>,
+    wait_contains: Option<&str>,
+    wait_timeout: Option<u64>,
+    scan_until: Option<u32>,
+) -> Result<(), RubError> {
+    let has_wait_field = wait_field.is_some_and(|value| !value.trim().is_empty());
+    let has_wait_contains = wait_contains.is_some_and(|value| !value.trim().is_empty());
+    if has_wait_field != has_wait_contains {
+        return Err(RubError::domain(
+            ErrorCode::InvalidInput,
+            "inspect list wait requires both --wait-field and --wait-contains",
+        ));
+    }
+    if !has_wait_field && wait_timeout.is_some() {
+        return Err(RubError::domain(
+            ErrorCode::InvalidInput,
+            "--wait-timeout requires --wait-field and --wait-contains",
+        ));
+    }
+    if has_wait_field && scan_until.is_some() {
+        return Err(RubError::domain(
+            ErrorCode::InvalidInput,
+            "inspect list wait cannot be combined with --scan-until in the current product surface",
+        ));
+    }
+    Ok(())
 }
 
 fn effective_network_wait_timeout_ms(timeout: u64, subcommand: &InspectSubcommand) -> Option<u64> {

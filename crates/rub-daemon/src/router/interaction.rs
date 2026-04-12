@@ -1,10 +1,12 @@
 mod args;
+mod explain;
 mod projection;
 
 use self::args::{
     ClickArgs, ClickGesture, HoverArgs, KeysArgs, SelectArgs, TextEntryArgs, UploadArgs,
     click_command_name, click_gesture_name, requested_click_gesture,
 };
+use self::explain::enrich_interactability_error_if_needed;
 use self::projection::{
     capture_interaction_baseline, finalize_interaction_projection, finalize_select_projection,
 };
@@ -64,10 +66,24 @@ async fn cmd_click_with_gesture(
     .await?;
     let element = resolved.element;
     let baseline = capture_interaction_baseline(router, state).await;
-    let outcome = match gesture {
-        ClickGesture::Single => router.browser.click(&element).await?,
-        ClickGesture::Double => router.browser.dblclick(&element).await?,
-        ClickGesture::Right => router.browser.rightclick(&element).await?,
+    let outcome = match match gesture {
+        ClickGesture::Single => router.browser.click(&element).await,
+        ClickGesture::Double => router.browser.dblclick(&element).await,
+        ClickGesture::Right => router.browser.rightclick(&element).await,
+    } {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return Err(enrich_interactability_error_if_needed(
+                router,
+                state,
+                "click",
+                &element,
+                &resolved.snapshot_id,
+                raw_args,
+                error,
+            )
+            .await);
+        }
     };
     let mut data = serde_json::json!({});
     attach_subject(&mut data, element_subject(&element, &resolved.snapshot_id));
@@ -141,10 +157,25 @@ async fn cmd_text_entry(
             &mut data,
             element_subject(&resolved.element, &resolved.snapshot_id),
         );
-        router
+        match router
             .browser
             .type_into(&resolved.element, &text, clear)
-            .await?
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Err(enrich_interactability_error_if_needed(
+                    router,
+                    state,
+                    "type",
+                    &resolved.element,
+                    &resolved.snapshot_id,
+                    raw_args,
+                    error,
+                )
+                .await);
+            }
+        }
     } else if clear {
         return Err(RubError::domain(
             rub_core::error::ErrorCode::InvalidInput,
@@ -176,7 +207,21 @@ pub(super) async fn cmd_hover(
     let resolved = resolve_element(router, args, state, deadline, "hover").await?;
     let element = resolved.element;
     let baseline = capture_interaction_baseline(router, state).await;
-    let outcome = router.browser.hover(&element).await?;
+    let outcome = match router.browser.hover(&element).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return Err(enrich_interactability_error_if_needed(
+                router,
+                state,
+                "hover",
+                &element,
+                &resolved.snapshot_id,
+                args,
+                error,
+            )
+            .await);
+        }
+    };
     let mut data = serde_json::json!({});
     attach_subject(&mut data, element_subject(&element, &resolved.snapshot_id));
     attach_result(&mut data, serde_json::json!({}));
@@ -195,7 +240,21 @@ pub(super) async fn cmd_upload(
     let element = resolved.element;
     let path = parsed.path;
     let baseline = capture_interaction_baseline(router, state).await;
-    let outcome = router.browser.upload_file(&element, &path).await?;
+    let outcome = match router.browser.upload_file(&element, &path).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return Err(enrich_interactability_error_if_needed(
+                router,
+                state,
+                "upload",
+                &element,
+                &resolved.snapshot_id,
+                args,
+                error,
+            )
+            .await);
+        }
+    };
     let mut data = serde_json::json!({});
     attach_subject(&mut data, element_subject(&element, &resolved.snapshot_id));
     attach_result(
@@ -227,7 +286,21 @@ pub(super) async fn cmd_select(
     let element = resolved.element;
     let value = parsed.value;
     let baseline = capture_interaction_baseline(router, state).await;
-    let outcome = router.browser.select_option(&element, &value).await?;
+    let outcome = match router.browser.select_option(&element, &value).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return Err(enrich_interactability_error_if_needed(
+                router,
+                state,
+                "select",
+                &element,
+                &resolved.snapshot_id,
+                args,
+                error,
+            )
+            .await);
+        }
+    };
     let mut data = serde_json::json!({});
     attach_subject(&mut data, element_subject(&element, &resolved.snapshot_id));
     attach_result(
@@ -241,20 +314,32 @@ pub(super) async fn cmd_select(
     Ok(data)
 }
 
+pub(super) async fn cmd_interactability_probe(
+    router: &DaemonRouter,
+    args: &serde_json::Value,
+    deadline: TransactionDeadline,
+    state: &Arc<SessionState>,
+) -> Result<serde_json::Value, RubError> {
+    explain::cmd_interactability_probe(router, args, deadline, state).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::args::{ClickArgs, TextEntryArgs, UploadArgs};
     use super::projection::{
-        InteractionObservationBaseline, collect_post_interaction_projection,
+        InteractionObservationBaseline, InteractionObservationFence,
+        capture_interaction_trace_windows, collect_post_interaction_projection,
         collect_stable_post_interaction_projection,
     };
     use crate::router::request_args::parse_json_args;
     use crate::session::SessionState;
     use rub_core::model::{
-        FrameContextInfo, FrameContextStatus, FrameRuntimeInfo, InterferenceRuntimeInfo,
-        InterferenceRuntimeStatus, ReadinessInfo, ReadinessStatus, RouteStability,
-        RuntimeStateSnapshot, StateInspectorInfo, StateInspectorStatus,
+        ConsoleErrorEvent, FrameContextInfo, FrameContextStatus, FrameRuntimeInfo,
+        InterferenceRuntimeInfo, InterferenceRuntimeStatus, NetworkRequestLifecycle,
+        NetworkRequestRecord, ReadinessInfo, ReadinessStatus, RouteStability, RuntimeStateSnapshot,
+        StateInspectorInfo, StateInspectorStatus,
     };
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
@@ -416,7 +501,8 @@ mod tests {
             request_cursor: state.network_request_cursor().await,
             network_request_drop_count: state.network_request_drop_count().await,
             download_cursor: state.download_cursor().await,
-            download_drop_count: state.download_event_drop_count(),
+            download_ingress_drop_count: state.download_event_ingress_drop_count(),
+            download_degraded_reason_before: None,
             browser_event_cursor: state.browser_event_cursor(),
             runtime_before: Some(runtime_before),
             interference_before,
@@ -507,6 +593,133 @@ mod tests {
                 .as_deref(),
             Some("file.txt")
         );
+    }
+
+    #[tokio::test]
+    async fn interaction_trace_windows_are_capped_to_observation_fence() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-interaction-window-fence-test"),
+            None,
+        ));
+        state
+            .record_console_error(ConsoleErrorEvent {
+                level: "error".to_string(),
+                message: "first".to_string(),
+                source: None,
+            })
+            .await;
+        let observatory_cursor = state.observatory_cursor().await;
+        state
+            .record_console_error(ConsoleErrorEvent {
+                level: "error".to_string(),
+                message: "second".to_string(),
+                source: None,
+            })
+            .await;
+
+        state
+            .upsert_network_request_record(NetworkRequestRecord {
+                request_id: "req-1".to_string(),
+                sequence: 0,
+                lifecycle: NetworkRequestLifecycle::Completed,
+                url: "https://example.test/first".to_string(),
+                method: "GET".to_string(),
+                tab_target_id: None,
+                status: Some(200),
+                request_headers: BTreeMap::new(),
+                response_headers: BTreeMap::new(),
+                request_body: None,
+                response_body: None,
+                original_url: None,
+                rewritten_url: None,
+                applied_rule_effects: Vec::new(),
+                error_text: None,
+                frame_id: None,
+                resource_type: None,
+                mime_type: None,
+            })
+            .await;
+        let request_cursor = state.network_request_cursor().await;
+        state
+            .upsert_network_request_record(NetworkRequestRecord {
+                request_id: "req-2".to_string(),
+                sequence: 0,
+                lifecycle: NetworkRequestLifecycle::Completed,
+                url: "https://example.test/second".to_string(),
+                method: "GET".to_string(),
+                tab_target_id: None,
+                status: Some(200),
+                request_headers: BTreeMap::new(),
+                response_headers: BTreeMap::new(),
+                request_body: None,
+                response_body: None,
+                original_url: None,
+                rewritten_url: None,
+                applied_rule_effects: Vec::new(),
+                error_text: None,
+                frame_id: None,
+                resource_type: None,
+                mime_type: None,
+            })
+            .await;
+
+        state
+            .record_download_started_sequenced(
+                0,
+                1,
+                "guid-1".to_string(),
+                "https://example.test/file-1.txt".to_string(),
+                "file-1.txt".to_string(),
+                None,
+            )
+            .await;
+        let download_cursor = state.download_cursor().await;
+        state
+            .record_download_started_sequenced(
+                0,
+                2,
+                "guid-2".to_string(),
+                "https://example.test/file-2.txt".to_string(),
+                "file-2.txt".to_string(),
+                None,
+            )
+            .await;
+
+        let baseline = InteractionObservationBaseline {
+            observatory_cursor: 0,
+            observatory_drop_count: 0,
+            request_cursor: 0,
+            network_request_drop_count: 0,
+            download_cursor: 0,
+            download_ingress_drop_count: 0,
+            download_degraded_reason_before: None,
+            browser_event_cursor: 0,
+            runtime_before: None,
+            interference_before: InterferenceRuntimeInfo::default(),
+        };
+        let fence = InteractionObservationFence {
+            observatory_cursor,
+            observatory_drop_count: state.observatory().await.dropped_event_count,
+            request_cursor,
+            network_request_drop_count: state.network_request_drop_count().await,
+            download_cursor,
+            download_ingress_drop_count: state.download_event_ingress_drop_count(),
+            download_degraded_reason_after: None,
+            browser_event_cursor: 0,
+        };
+
+        let windows = capture_interaction_trace_windows(&state, &baseline, &fence).await;
+
+        assert_eq!(windows.observatory_events.len(), 1);
+        assert!(matches!(
+            windows.observatory_events[0].payload,
+            rub_core::model::RuntimeObservatoryEventPayload::ConsoleError(_)
+        ));
+        assert_eq!(windows.network_requests.len(), 1);
+        assert_eq!(windows.network_requests[0].request_id, "req-1");
+        assert_eq!(windows.download_events.len(), 1);
+        assert_eq!(windows.download_events[0].download.guid, "guid-1");
     }
 
     #[test]

@@ -27,7 +27,10 @@ impl DownloadRuntimeState {
             download,
         });
         while self.timeline.len() > DOWNLOAD_EVENT_LIMIT {
-            self.timeline.pop_front();
+            if let Some(evicted) = self.timeline.pop_front() {
+                self.last_evicted_sequence = self.last_evicted_sequence.max(evicted.sequence);
+                self.dropped_event_count = self.dropped_event_count.saturating_add(1);
+            }
         }
     }
 }

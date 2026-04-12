@@ -10,7 +10,7 @@ use self::args::{
 };
 use self::projection::{
     build_curl_export, network_payload, network_registry_subject, network_request_subject,
-    network_wait_subject, summarize_request_record,
+    network_wait_outcome_summary, network_wait_subject, summarize_request_record,
 };
 use crate::session::SessionState;
 use rub_core::error::{ErrorCode, RubError};
@@ -121,6 +121,7 @@ async fn cmd_network_wait(
                 "matched": true,
                 "elapsed_ms": started.elapsed().as_millis() as u64,
                 "request": request,
+                "outcome_summary": network_wait_outcome_summary(desired_state),
             }),
         ));
     }
@@ -175,6 +176,7 @@ async fn cmd_network_wait(
                     "matched": true,
                     "elapsed_ms": started.elapsed().as_millis() as u64,
                     "request": request,
+                    "outcome_summary": network_wait_outcome_summary(desired_state),
                 }),
             ));
         }
@@ -293,7 +295,8 @@ mod tests {
     use super::{
         InspectNetworkCommand, NetworkRequestWaitState, NetworkTimelineArgs, build_curl_export,
         cmd_network_wait, filter_requests_by_wait_state, network_payload, network_registry_subject,
-        network_request_subject, network_wait_subject, parse_lifecycle_filter,
+        network_request_subject, network_wait_outcome_summary, network_wait_subject,
+        parse_lifecycle_filter,
     };
     use rub_core::error::ErrorCode;
     use rub_core::model::{NetworkBodyPreview, NetworkRequestLifecycle, NetworkRequestRecord};
@@ -391,6 +394,10 @@ mod tests {
         assert_eq!(result["result"]["matched"], true);
         assert_eq!(result["result"]["request"]["request_id"], "req-existing");
         assert_eq!(result["subject"]["lifecycle"], "terminal");
+        assert_eq!(
+            result["result"]["outcome_summary"]["class"],
+            "confirmed_terminal_request"
+        );
     }
 
     #[test]
@@ -623,5 +630,15 @@ mod tests {
         );
         assert_eq!(payload["subject"]["kind"], "network_request");
         assert_eq!(payload["result"]["request"]["request_id"], "req-1");
+    }
+
+    #[test]
+    fn network_wait_outcome_summary_distinguishes_terminal_and_observed_states() {
+        let terminal = network_wait_outcome_summary(NetworkRequestWaitState::Terminal);
+        assert_eq!(terminal["class"], "confirmed_terminal_request");
+        assert_eq!(terminal["authoritative"], true);
+
+        let pending = network_wait_outcome_summary(NetworkRequestWaitState::Pending);
+        assert_eq!(pending["class"], "confirmed_new_item_observed");
     }
 }

@@ -536,7 +536,8 @@ mod tests {
         }
 
         let total_drop_count = state.dropped_timeline_event_count();
-        let window: ObservatoryEventWindow = state.event_window_after(0, total_drop_count, 0);
+        let window: ObservatoryEventWindow =
+            state.event_window_between(0, state.cursor(), total_drop_count, 0);
         assert!(!window.authoritative);
         assert_eq!(
             window.degraded_reason.as_deref(),

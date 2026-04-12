@@ -4,6 +4,11 @@ pub(crate) fn ensure_committed_automation_result(
     command: &str,
     data: Option<&serde_json::Value>,
 ) -> Result<(), ErrorEnvelope> {
+    let wait_after_matched = data
+        .and_then(|value| value.get("wait_after"))
+        .and_then(|value| value.get("matched"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     let Some(interaction) = data
         .and_then(|value| value.get("interaction"))
         .and_then(|value| value.as_object())
@@ -19,6 +24,10 @@ pub(crate) fn ensure_committed_automation_result(
     };
 
     if status == "confirmed" {
+        return Ok(());
+    }
+
+    if wait_after_matched {
         return Ok(());
     }
 
@@ -71,5 +80,24 @@ mod tests {
         )
         .expect_err("degraded interaction should fail closed in automation");
         assert_eq!(error.code, ErrorCode::WaitTimeout);
+    }
+
+    #[test]
+    fn matched_wait_after_is_explicit_fallback_automation_authority() {
+        ensure_committed_automation_result(
+            "click",
+            Some(&serde_json::json!({
+                "interaction": {
+                    "confirmation_status": "degraded",
+                    "confirmation_kind": "page_mutation",
+                },
+                "wait_after": {
+                    "matched": true,
+                    "kind": "text",
+                    "value": "Saved",
+                }
+            })),
+        )
+        .expect("matched wait_after should satisfy automation commit fence");
     }
 }

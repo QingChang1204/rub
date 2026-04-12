@@ -92,14 +92,18 @@ When a language model drives a browser through Playwright or Puppeteer, it runs 
 
 **Element Interaction**
 - `click` with `--double` / `--right` / `--xy` (coordinate click)
-- `type` for text input with `--clear` to reset fields first
+- `type` for text input with `--clear` to reset fields first; accepts `--text` flag as alternative to positional arg
 - `keys` for keyboard shortcuts (`Enter`, `Control+a`, `Shift+Tab`)
 - `hover` for mouse-over effects
 - `select` for dropdown options
 - `upload` for file inputs
 - `fill` for batch form filling with JSON specs and optional submit targeting
+  - `fill --atomic` — per-step rollback on failure (input/textarea/select); reserves rollback budget per step
+  - `fill --validate` — dry-run preflight against an optional snapshot without any side effects; projects atomic/rollbackable/live-confirmation status per step
 - `scroll` with directional control and pixel amounts
-- `wait` for conditions: CSS selector, text, role, label, testid — with state control (`visible`, `hidden`, `attached`, `detached`)
+- `wait` for conditions: CSS selector, text, role, label, testid, page URL/title, and accessible description — with state control (`visible`, `hidden`, `attached`, `detached`, `interactable`)
+  - `--url-contains`, `--title-contains`, `--description-contains` cover page-context and target-description waits without dropping to shell loops
+  - `--wait --state interactable` confirms DOM-level visible/enabled/writable readiness; it does **not** claim live `--topmost` hit-test authority
 
 **Element Targeting** (works across `click`, `type`, `inspect`, etc.)
 - Snapshot index: `rub click 3 --snapshot <id>`
@@ -112,10 +116,16 @@ When a language model drives a browser through Playwright or Puppeteer, it runs 
 - Disambiguation: `--first`, `--last`, `--nth N`
 - Implicit snapshots: omit `--snapshot` for automatic live snapshot
 
+**Locator Ranking Filters** (narrows candidate set before disambiguation)
+- `--visible` — keep only elements with a non-zero bounding box
+- `--prefer-enabled` — deprioritise disabled or non-writable writable targets (`disabled`, `aria-disabled`, `readonly`, `aria-readonly`) without eliminating them
+- `--topmost` — keep only elements that pass a live CDP hit-test at the element's center point; confirms the element is not occluded or off-screen. Disables memo caching to guarantee live accuracy.
+
 **Post-Action Waits** (available on most interaction commands)
 - `--wait-after-selector`, `--wait-after-text`, `--wait-after-role`, `--wait-after-label`, `--wait-after-testid`
 - `--wait-after-state` (`visible`, `hidden`, `attached`, `detached`)
 - `--wait-after-timeout` for custom timeout
+- `--wait-after-description-contains <substring>` — polls the element's accessible description (`aria-description` / `aria-describedby`) after an action; surfaces `confirmed_target_description` and `confirmed_follow_up_activity` when page mutation + network activity are observed
 
 ### 🔍 Unified Inspection Surface
 
@@ -129,10 +139,55 @@ The `inspect` command family provides read-only queries:
 | `inspect value` | Input/textarea values |
 | `inspect attributes` | Element attributes |
 | `inspect bbox` | Element bounding box (x, y, width, height) |
-| `inspect list` | Structured list extraction with JSON spec |
+| `inspect list` | Structured list extraction with JSON spec; supports `--wait-field`/`--wait-contains`/`--wait-timeout` to poll until a row field contains a substring |
+| `inspect harvest` | Follow a bounded set of list/detail URLs and extract structured fields from each detail page |
 | `inspect storage` | Web storage snapshot (localStorage/sessionStorage) |
 | `inspect network` | Network request log with filtering (`--match`, `--method`, `--status`, `--lifecycle`) and `--wait` |
 | `inspect curl` | Export a recorded network request as a reproducible `curl` command |
+
+### 🔬 Explain Surfaces (pre-flight diagnostics)
+
+`explain` provides local or lightweight remote analysis **without side effects** — ideal for agent pre-flight checks before committing to an action.
+
+| Subcommand | What it does |
+|---|---|
+| `explain extract <spec>` | Validates and normalises an extract spec contract locally; bypasses IPC timeout entirely |
+| `explain locator` | Previews candidate ordering and selection rules for a given locator; shows `selection_outcome`, `disambiguation_hints`, and unique anchors (label/role/testid/text) |
+| `explain interactability` | Probes readiness and interference blockers for a target element; surfaces `blocker_details` with `main_reason` and `workflow_guidance` |
+| `explain blockers` | Explains the dominant page-level blocker/interference state and returns structured `workflow_guidance` for recovery |
+
+All `explain` responses include a `recommended_command` pointer for the logical next action.
+`find --explain` is the read-only wrapper over the same locator analysis when you want candidate diagnostics directly from the `find` surface.
+
+### 🧭 Built-In Help & Operator Surfaces
+
+rub now ships several local, no-side-effect help surfaces so agents can validate intent before opening a browser or mutating a page:
+
+- `rub --help` — task-oriented root help with `Quick start` and `Task map`
+- `rub extract --examples [topic]` — built-in extract recipes by topic
+- `rub extract --schema` — canonical extract field and collection contract
+- `rub inspect list --builder-help` — builder help for `--collection` / `--field`
+- `rub teardown` — canonical lifecycle exit (`close --all` + `cleanup`) for one `RUB_HOME`
+
+### 🗺️ Workflow Continuity (agent session guidance)
+
+Every CLI response now carries a `workflow_continuity` hint block:
+
+```json
+{
+  "workflow_continuity": {
+    "continuation_kind": "same_runtime",
+    "reasoning": "...",
+    "recommended_runtime_map": { ... },
+    "next_command_hints": ["rub click --selector ...", "..."]
+  }
+}
+```
+
+- `same_runtime` — reuse the current `RUB_HOME` and session
+- `fresh_rub_home` — start a new isolated workspace (e.g. provider gate, overlay blocker detected)
+
+This eliminates the need for agents to maintain external session-state logic.
 
 ### 📊 Structured Data Extraction
 
@@ -213,6 +268,7 @@ rub sessions            # List all active sessions (name, PID, socket, protocol 
 rub close               # Close current session's browser
 rub close --all         # Terminate every active session
 rub cleanup             # Remove stale sockets, orphaned daemon state, temp artifacts
+rub teardown            # Canonical lifecycle exit for one RUB_HOME (close + cleanup)
 ```
 
 ### 🛡️ Anti-Detection & Stealth
@@ -467,12 +523,15 @@ rub inspect network --match "api/" --method GET
 
 # Extract structured data
 rub extract '{"title": "text:h1", "links": "text:a"}'
+rub extract --examples
+rub inspect list --builder-help
 
 # Session management
 rub sessions            # list all active sessions
 rub close               # close current session browser
 rub close --all         # close every active session
 rub cleanup             # purge stale sockets and orphaned state
+rub teardown            # canonical lifecycle exit for this RUB_HOME
 
 # Pretty-print output (--json is an alias for --json-pretty)
 rub --json state

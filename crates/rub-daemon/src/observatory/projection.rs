@@ -30,13 +30,14 @@ impl RuntimeObservatoryState {
         }
     }
 
-    pub(crate) fn event_window_after(
+    pub(crate) fn event_window_between(
         &self,
         cursor: u64,
+        end_cursor: u64,
         total_drop_count: u64,
         last_observed_drop_count: u64,
     ) -> ObservatoryEventWindow {
-        let events = self.events_after(cursor);
+        let events = self.events_between(cursor, end_cursor);
         let dropped_since_last_poll = total_drop_count > last_observed_drop_count;
         let cursor_lost_to_eviction =
             dropped_since_last_poll && cursor < self.last_evicted_timeline_sequence;

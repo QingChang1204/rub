@@ -29,6 +29,7 @@ impl TimeoutPhase {
     }
 }
 
+#[derive(Debug)]
 pub(super) struct ParsedWaitCondition {
     pub condition: WaitCondition,
     pub kind_name: &'static str,
@@ -39,6 +40,9 @@ pub(super) struct ParsedWaitCondition {
 #[serde(default, deny_unknown_fields)]
 struct WaitProbeArgs {
     text: Option<String>,
+    description_contains: Option<String>,
+    url_contains: Option<String>,
+    title_contains: Option<String>,
     state: Option<String>,
     timeout_ms: Option<u64>,
     #[serde(flatten)]
@@ -100,16 +104,47 @@ fn wait_probe_context(args: &serde_json::Value) -> serde_json::Value {
         &locator_json(parsed.locator.clone()),
         LocatorParseOptions::OPTIONAL_WAIT,
     ) {
-        let mut context = serde_json::json!({
-            "kind": locator.kind_name(),
-            "value": locator.probe_value(),
-        });
+        let mut context = if let Some(description_contains) = parsed.description_contains.as_deref()
+        {
+            serde_json::json!({
+                "kind": "description_contains",
+                "value": description_contains,
+                "target_kind": locator.kind_name(),
+                "target_value": locator.probe_value(),
+            })
+        } else {
+            serde_json::json!({
+                "kind": locator.kind_name(),
+                "value": locator.probe_value(),
+            })
+        };
+        if parsed.description_contains.is_none()
+            && let Some(state) = parsed.state.as_deref()
+            && let Some(object) = context.as_object_mut()
+        {
+            object.insert("state".to_string(), serde_json::json!(state));
+        }
         attach_wait_selection_context(&mut context, locator.selection());
         context
     } else if let Some(text) = parsed.text.as_deref() {
         serde_json::json!({
             "kind": "text",
             "value": text,
+        })
+    } else if let Some(description_contains) = parsed.description_contains.as_deref() {
+        serde_json::json!({
+            "kind": "description_contains",
+            "value": description_contains,
+        })
+    } else if let Some(url_contains) = parsed.url_contains.as_deref() {
+        serde_json::json!({
+            "kind": "url_contains",
+            "value": url_contains,
+        })
+    } else if let Some(title_contains) = parsed.title_contains.as_deref() {
+        serde_json::json!({
+            "kind": "title_contains",
+            "value": title_contains,
         })
     } else {
         serde_json::json!({})
@@ -221,35 +256,62 @@ pub(super) fn parse_wait_condition(
         LocatorParseOptions::OPTIONAL_WAIT,
     )?;
     let has_text = parsed.text.as_deref().is_some();
+    let has_description_contains = parsed.description_contains.as_deref().is_some();
+    let has_url_contains = parsed.url_contains.as_deref().is_some();
+    let has_title_contains = parsed.title_contains.as_deref().is_some();
+    let page_probe_count = has_text as u8 + has_url_contains as u8 + has_title_contains as u8;
 
-    if locator.is_some() && has_text {
+    if page_probe_count > 1 {
         return Err(RubError::domain(
             ErrorCode::InvalidInput,
-            "Wait probe is ambiguous: provide either page text or a single locator, not both",
+            "Wait probe is ambiguous: provide only one of text, url_contains, or title_contains",
         ));
     }
-    if locator.is_none() && !has_text {
+    if locator.is_some() && page_probe_count > 0 {
         return Err(RubError::domain(
             ErrorCode::InvalidInput,
-            "Missing required wait probe: selector, target_text, role, label, testid, or text",
+            "Wait probe is ambiguous: provide either a page-level probe or a single locator, not both",
         ));
     }
-    if has_text && parsed.locator.has_selection() {
+    if has_description_contains && locator.is_none() {
         return Err(RubError::domain(
             ErrorCode::InvalidInput,
-            "Match selection is not supported for page text waits",
+            "Wait probe `description_contains` requires exactly one locator such as label or selector",
+        ));
+    }
+    if locator.is_none() && page_probe_count == 0 {
+        return Err(RubError::domain(
+            ErrorCode::InvalidInput,
+            "Missing required wait probe: selector, target_text, role, label, testid, text, description_contains, url_contains, or title_contains",
+        ));
+    }
+    if page_probe_count > 0 && parsed.locator.has_selection() {
+        return Err(RubError::domain(
+            ErrorCode::InvalidInput,
+            "Match selection is not supported for page-level waits",
         ));
     }
 
     let (kind, kind_name, probe_value) = if let Some(locator) = locator {
-        (
-            WaitKind::Locator {
-                locator: locator.clone(),
-                state,
-            },
-            locator.kind_name(),
-            locator.probe_value(),
-        )
+        if let Some(description_contains) = parsed.description_contains.as_deref() {
+            (
+                WaitKind::LocatorDescriptionContains {
+                    locator: locator.clone(),
+                    value: description_contains.to_string(),
+                },
+                "description_contains",
+                description_contains.to_string(),
+            )
+        } else {
+            (
+                WaitKind::Locator {
+                    locator: locator.clone(),
+                    state,
+                },
+                locator.kind_name(),
+                locator.probe_value(),
+            )
+        }
     } else if let Some(text) = parsed.text.as_deref() {
         (
             WaitKind::Text {
@@ -257,6 +319,22 @@ pub(super) fn parse_wait_condition(
             },
             "text",
             text.to_string(),
+        )
+    } else if let Some(url_contains) = parsed.url_contains.as_deref() {
+        (
+            WaitKind::UrlContains {
+                value: url_contains.to_string(),
+            },
+            "url_contains",
+            url_contains.to_string(),
+        )
+    } else if let Some(title_contains) = parsed.title_contains.as_deref() {
+        (
+            WaitKind::TitleContains {
+                value: title_contains.to_string(),
+            },
+            "title_contains",
+            title_contains.to_string(),
         )
     } else {
         return Err(RubError::domain(
@@ -283,9 +361,12 @@ fn parse_wait_state(state: Option<&str>) -> Result<WaitState, RubError> {
         "hidden" => Ok(WaitState::Hidden),
         "attached" => Ok(WaitState::Attached),
         "detached" => Ok(WaitState::Detached),
+        "interactable" => Ok(WaitState::Interactable),
         other => Err(RubError::domain(
             ErrorCode::InvalidInput,
-            format!("Invalid wait state: '{other}'. Valid: visible, hidden, attached, detached"),
+            format!(
+                "Invalid wait state: '{other}'. Valid: visible, hidden, attached, detached, interactable"
+            ),
         )),
     }
 }
@@ -309,7 +390,14 @@ fn attach_wait_selection_context(
 
 fn wait_probe_args(args: &serde_json::Value) -> Result<WaitProbeArgs, RubError> {
     let mut filtered = serde_json::Map::new();
-    for key in ["text", "state", "timeout_ms"] {
+    for key in [
+        "text",
+        "description_contains",
+        "url_contains",
+        "title_contains",
+        "state",
+        "timeout_ms",
+    ] {
         if let Some(value) = args.get(key) {
             filtered.insert(key.to_string(), value.clone());
         }
@@ -352,11 +440,13 @@ pub(super) async fn execute_wait_command(
                 "kind": "wait_condition",
                 "wait_kind": parsed.kind_name,
                 "probe_value": parsed.probe_value,
+                "wait_state": wait_subject_state(&parsed.condition),
                 "frame_id": parsed.condition.frame_id,
             },
             "result": {
                 "matched": true,
                 "elapsed_ms": start.elapsed().as_millis() as u64,
+                "outcome_summary": wait_outcome_summary(parsed.kind_name, &parsed.condition),
             }
         })),
         Err(RubError::Domain(envelope)) if envelope.code == ErrorCode::WaitTimeout => {
@@ -381,10 +471,58 @@ pub(super) async fn execute_wait_command(
     }
 }
 
+fn wait_subject_state(condition: &WaitCondition) -> Option<&'static str> {
+    match &condition.kind {
+        WaitKind::Locator { state, .. } => Some(match state {
+            WaitState::Visible => "visible",
+            WaitState::Hidden => "hidden",
+            WaitState::Attached => "attached",
+            WaitState::Detached => "detached",
+            WaitState::Interactable => "interactable",
+        }),
+        WaitKind::LocatorDescriptionContains { .. } => None,
+        _ => None,
+    }
+}
+
+fn wait_outcome_summary(kind_name: &str, condition: &WaitCondition) -> Option<serde_json::Value> {
+    let (class, summary) = match (&condition.kind, kind_name) {
+        (
+            WaitKind::Locator {
+                state: WaitState::Interactable,
+                ..
+            },
+            _,
+        ) => (
+            "confirmed_interactable_target",
+            "The requested target matched the DOM-level interactable wait condition in the current runtime.",
+        ),
+        (WaitKind::LocatorDescriptionContains { .. }, _) => (
+            "confirmed_target_description",
+            "The requested target's accessible description matched the expected text in the current runtime.",
+        ),
+        (_, "url_contains" | "title_contains") => (
+            "confirmed_context_transition",
+            "A page-level context transition matched the requested wait condition.",
+        ),
+        _ => return None,
+    };
+    Some(serde_json::json!({
+        "class": class,
+        "authoritative": true,
+        "summary": summary,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_wait_condition, post_wait_timeout_error};
+    use super::{
+        parse_wait_condition, post_wait_timeout_error, wait_outcome_summary, wait_probe_context,
+        wait_subject_state,
+    };
     use rub_core::error::ErrorCode;
+    use rub_core::locator::CanonicalLocator;
+    use rub_core::model::{WaitCondition, WaitKind, WaitState};
     use rub_core::{DEFAULT_WAIT_AFTER_TIMEOUT_MS, DEFAULT_WAIT_TIMEOUT_MS};
 
     #[test]
@@ -424,5 +562,197 @@ mod tests {
                 .and_then(|ctx| ctx["transaction_timeout_ms"].as_u64()),
             Some(DEFAULT_WAIT_AFTER_TIMEOUT_MS)
         );
+    }
+
+    #[test]
+    fn url_contains_wait_parses_as_page_level_probe() {
+        let parsed = parse_wait_condition(
+            &serde_json::json!({
+                "url_contains": "/activate",
+            }),
+            DEFAULT_WAIT_TIMEOUT_MS,
+        )
+        .expect("url wait should parse");
+
+        match parsed.condition.kind {
+            WaitKind::UrlContains { value } => assert_eq!(value, "/activate"),
+            other => panic!("expected UrlContains wait kind, got {other:?}"),
+        }
+        assert_eq!(parsed.kind_name, "url_contains");
+        assert_eq!(parsed.probe_value, "/activate");
+    }
+
+    #[test]
+    fn title_contains_wait_rejects_locator_selection_flags() {
+        let error = parse_wait_condition(
+            &serde_json::json!({
+                "title_contains": "Confirm your account",
+                "first": true,
+            }),
+            DEFAULT_WAIT_TIMEOUT_MS,
+        )
+        .expect_err("page-level wait should reject locator selection flags")
+        .into_envelope();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        assert!(error.message.contains("page-level waits"), "{error}");
+    }
+
+    #[test]
+    fn interactable_wait_state_parses_for_locator_waits() {
+        let parsed = parse_wait_condition(
+            &serde_json::json!({
+                "label": "Compose",
+                "state": "interactable",
+            }),
+            DEFAULT_WAIT_TIMEOUT_MS,
+        )
+        .expect("interactable wait should parse");
+
+        match parsed.condition.kind {
+            WaitKind::Locator { state, .. } => {
+                assert_eq!(state, rub_core::model::WaitState::Interactable)
+            }
+            other => panic!("expected locator wait kind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn description_contains_wait_parses_for_locator_probe() {
+        let parsed = parse_wait_condition(
+            &serde_json::json!({
+                "label": "Email",
+                "description_contains": "We will email you to confirm",
+            }),
+            DEFAULT_WAIT_TIMEOUT_MS,
+        )
+        .expect("description wait should parse");
+
+        match parsed.condition.kind {
+            WaitKind::LocatorDescriptionContains { locator, value } => {
+                assert_eq!(
+                    locator,
+                    CanonicalLocator::Label {
+                        label: "Email".to_string(),
+                        selection: None,
+                    }
+                );
+                assert_eq!(value, "We will email you to confirm");
+            }
+            other => panic!("expected description wait kind, got {other:?}"),
+        }
+        assert_eq!(parsed.kind_name, "description_contains");
+    }
+
+    #[test]
+    fn wait_outcome_summary_marks_page_context_waits_as_confirmed_transition() {
+        let summary = wait_outcome_summary(
+            "url_contains",
+            &WaitCondition {
+                kind: WaitKind::UrlContains {
+                    value: "/activate".to_string(),
+                },
+                timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+                frame_id: None,
+            },
+        )
+        .expect("page context waits should produce an outcome summary");
+        assert_eq!(summary["class"], "confirmed_context_transition");
+        assert_eq!(summary["authoritative"], true);
+
+        assert!(
+            wait_outcome_summary(
+                "selector",
+                &WaitCondition {
+                    kind: WaitKind::Locator {
+                        locator: CanonicalLocator::Selector {
+                            css: "#ready".to_string(),
+                            selection: None,
+                        },
+                        state: WaitState::Visible,
+                    },
+                    timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+                    frame_id: None,
+                },
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn wait_outcome_summary_marks_interactable_waits_as_current_runtime_ready() {
+        let summary = wait_outcome_summary(
+            "label",
+            &WaitCondition {
+                kind: WaitKind::Locator {
+                    locator: CanonicalLocator::Label {
+                        label: "Compose".to_string(),
+                        selection: None,
+                    },
+                    state: WaitState::Interactable,
+                },
+                timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+                frame_id: None,
+            },
+        )
+        .expect("interactable waits should produce an outcome summary");
+        assert_eq!(summary["class"], "confirmed_interactable_target");
+        assert_eq!(summary["authoritative"], true);
+    }
+
+    #[test]
+    fn wait_outcome_summary_marks_description_waits_as_confirmed_target_description() {
+        let summary = wait_outcome_summary(
+            "description_contains",
+            &WaitCondition {
+                kind: WaitKind::LocatorDescriptionContains {
+                    locator: CanonicalLocator::Label {
+                        label: "Email".to_string(),
+                        selection: None,
+                    },
+                    value: "We will email you to confirm".to_string(),
+                },
+                timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+                frame_id: None,
+            },
+        )
+        .expect("description waits should produce an outcome summary");
+        assert_eq!(summary["class"], "confirmed_target_description");
+        assert_eq!(summary["authoritative"], true);
+    }
+
+    #[test]
+    fn wait_probe_context_includes_locator_wait_state() {
+        let context = wait_probe_context(&serde_json::json!({
+            "selector": "#composer",
+            "state": "interactable",
+        }));
+        assert_eq!(context["state"], "interactable");
+    }
+
+    #[test]
+    fn wait_probe_context_projects_description_wait_probe() {
+        let context = wait_probe_context(&serde_json::json!({
+            "label": "Email",
+            "description_contains": "We will email you to confirm",
+        }));
+        assert_eq!(context["kind"], "description_contains");
+        assert_eq!(context["target_kind"], "label");
+        assert_eq!(context["target_value"], "Email");
+    }
+
+    #[test]
+    fn wait_subject_state_projects_locator_state() {
+        let subject_state = wait_subject_state(&WaitCondition {
+            kind: WaitKind::Locator {
+                locator: CanonicalLocator::Selector {
+                    css: "#composer".to_string(),
+                    selection: None,
+                },
+                state: WaitState::Interactable,
+            },
+            timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+            frame_id: None,
+        });
+        assert_eq!(subject_state, Some("interactable"));
     }
 }

@@ -35,6 +35,22 @@ impl DownloadRuntimeState {
             .collect()
     }
 
+    pub fn events_between(&self, cursor: u64, end_cursor: u64) -> Vec<DownloadEvent> {
+        self.timeline
+            .iter()
+            .filter(|event| event.sequence > cursor && event.sequence <= end_cursor)
+            .cloned()
+            .collect()
+    }
+
+    pub fn dropped_event_count(&self) -> u64 {
+        self.dropped_event_count
+    }
+
+    pub fn last_evicted_sequence(&self) -> u64 {
+        self.last_evicted_sequence
+    }
+
     pub fn get(&self, guid: &str) -> Option<DownloadEntry> {
         self.entries.get(guid).cloned()
     }

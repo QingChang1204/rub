@@ -42,6 +42,7 @@ mod url_normalization;
 mod wait_after;
 mod workflow;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use rub_core::error::{ErrorCode, RubError};
@@ -83,6 +84,13 @@ impl DaemonRouter {
     pub async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.browser.close().await.map_err(|e| Box::new(e) as _)
     }
+}
+
+pub(crate) fn explain_extract_spec_contract(
+    raw: &str,
+    rub_home: &Path,
+) -> Result<serde_json::Value, RubError> {
+    extract::explain_extract_spec_contract(raw, rub_home)
 }
 
 #[cfg(test)]

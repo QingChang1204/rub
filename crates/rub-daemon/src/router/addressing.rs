@@ -13,10 +13,20 @@ use self::semantic::{
 };
 use self::snapshot::load_snapshot as load_addressed_snapshot;
 use super::*;
+use crate::router::element_semantics::{
+    has_snapshot_visible_bbox, is_prefer_enabled_blocked_in_snapshot,
+};
 use crate::router::request_args::{LocatorParseOptions, parse_canonical_locator};
 use rub_core::locator::{CanonicalLocator, LocatorSelection};
 use rub_core::model::{Element, Snapshot};
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct LocatorRankingPolicy {
+    pub(super) visible: bool,
+    pub(super) prefer_enabled: bool,
+    pub(super) topmost: bool,
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct ResolvedElement {
@@ -85,6 +95,7 @@ pub(super) async fn resolve_elements(
     }
 
     let elements = resolve_elements_against_locator(router, &snapshot, &locator.locator).await?;
+    let elements = apply_live_ranking(router, &snapshot, &locator, elements).await?;
     let elements = apply_disambiguation(elements, &locator, args)?;
     record_memoized_elements(state, &snapshot, &locator, &elements).await;
 
@@ -109,6 +120,7 @@ pub(super) async fn resolve_elements_against_snapshot(
 ) -> Result<ResolvedElements, RubError> {
     let parsed = parse_locator(locator)?;
     let elements = resolve_elements_against_locator(router, snapshot, &parsed.locator).await?;
+    let elements = apply_live_ranking(router, snapshot, &parsed, elements).await?;
     let elements = apply_disambiguation(elements, &parsed, locator)?;
     if elements.is_empty() {
         return Err(RubError::domain(
@@ -127,7 +139,21 @@ fn parse_locator(args: &serde_json::Value) -> Result<ParsedLocator, RubError> {
         parse_canonical_locator(args, LocatorParseOptions::ELEMENT_ADDRESS)?.ok_or_else(|| {
             RubError::domain(ErrorCode::InvalidInput, "Failed to parse element locator")
         })?;
-    Ok(ParsedLocator { locator })
+    let ranking = LocatorRankingPolicy {
+        visible: args
+            .get("visible")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        prefer_enabled: args
+            .get("prefer_enabled")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        topmost: args
+            .get("topmost")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+    };
+    Ok(ParsedLocator { locator, ranking })
 }
 
 async fn resolve_elements_against_locator(
@@ -173,19 +199,51 @@ async fn resolve_elements_against_locator(
     }
 }
 
+async fn apply_live_ranking(
+    router: &DaemonRouter,
+    snapshot: &Snapshot,
+    locator: &ParsedLocator,
+    elements: Vec<Element>,
+) -> Result<Vec<Element>, RubError> {
+    if locator.ranking.topmost {
+        return router
+            .browser
+            .filter_snapshot_elements_by_hit_test(snapshot, &elements)
+            .await;
+    }
+    Ok(elements)
+}
+
 fn apply_disambiguation(
     mut elements: Vec<Element>,
     locator: &ParsedLocator,
     args: &serde_json::Value,
 ) -> Result<Vec<Element>, RubError> {
+    if locator.ranking.visible {
+        elements.retain(has_snapshot_visible_bbox);
+    }
+
     let Some(selection) = locator.locator.selection() else {
+        if locator.ranking.prefer_enabled {
+            elements.sort_by_key(|element| {
+                (
+                    is_prefer_enabled_blocked_in_snapshot(element),
+                    element.index,
+                )
+            });
+        }
         return Ok(elements);
     };
     if elements.is_empty() {
         return Ok(elements);
     }
 
-    elements.sort_by_key(|element| element.index);
+    elements.sort_by_key(|element| {
+        (
+            locator.ranking.prefer_enabled && is_prefer_enabled_blocked_in_snapshot(element),
+            element.index,
+        )
+    });
     let selected = match selection {
         LocatorSelection::First => elements.into_iter().next(),
         LocatorSelection::Last => elements.into_iter().next_back(),
@@ -198,6 +256,11 @@ fn apply_disambiguation(
             "Locator disambiguation selected an out-of-range match",
             serde_json::json!({
                 "locator": locator_context(args),
+                "ranking_policy": {
+                    "visible": locator.ranking.visible,
+                    "prefer_enabled": locator.ranking.prefer_enabled,
+                    "topmost": locator.ranking.topmost,
+                },
                 "selection": selection_context(selection),
             }),
         )
@@ -207,8 +270,8 @@ fn apply_disambiguation(
 #[cfg(test)]
 mod tests {
     use super::{
-        ambiguous_locator_error, element_matches_text, parse_locator, resolve_elements_by_role,
-        resolve_elements_by_testid,
+        ambiguous_locator_error, apply_disambiguation, element_matches_text, parse_locator,
+        resolve_elements_by_role, resolve_elements_by_testid,
     };
     use crate::locator_memo::LocatorMemoTarget;
     use crate::router::addressing::memo::{
@@ -239,6 +302,58 @@ mod tests {
         assert_eq!(envelope.code, ErrorCode::InvalidInput);
         assert!(envelope.suggestion.contains("--first"));
         assert!(envelope.suggestion.contains("--nth"));
+        let context = envelope.context.expect("ambiguous locator context");
+        assert_eq!(context["ordering_policy"], "snapshot_index");
+        assert_eq!(context["candidates"][0]["label"], "Primary");
+        assert_eq!(
+            context["candidates"][0]["ranking_hints"]["unique_anchors"]["label"],
+            "Primary"
+        );
+    }
+
+    #[test]
+    fn ambiguous_locator_error_reports_topmost_ordering_policy() {
+        let err = ambiguous_locator_error(
+            "click",
+            &serde_json::json!({
+                "label": "Consent",
+                "topmost": true,
+            }),
+            &[
+                element(1, "Consent", Some("Consent"), Some("main:1")),
+                element(2, "Consent", Some("Consent"), Some("main:2")),
+            ],
+        );
+        let envelope = err.into_envelope();
+        let context = envelope.context.expect("ambiguous locator context");
+        assert_eq!(
+            context["ordering_policy"],
+            "topmost_hit_test_then_snapshot_index"
+        );
+    }
+
+    #[test]
+    fn ambiguous_locator_error_suggests_visible_when_one_candidate_is_visible() {
+        let mut visible = element(1, "Username", Some("Username"), Some("main:1"));
+        visible.bounding_box = Some(rub_core::model::BoundingBox {
+            x: 10.0,
+            y: 10.0,
+            width: 80.0,
+            height: 24.0,
+        });
+        let hidden = element(2, "username", Some("username"), Some("main:2"));
+
+        let err = ambiguous_locator_error(
+            "type",
+            &serde_json::json!({ "label": "Username" }),
+            &[visible, hidden],
+        );
+        let envelope = err.into_envelope();
+        assert!(
+            envelope.suggestion.contains("--visible"),
+            "{}",
+            envelope.suggestion
+        );
     }
 
     #[test]
@@ -320,6 +435,25 @@ mod tests {
         assert!(
             locator
                 .memo_key(&snapshot(vec![element(0, "Save", None, Some("frame:10"))]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn topmost_target_text_locators_do_not_participate_in_locator_memo() {
+        let locator = parse_locator(&serde_json::json!({
+            "target_text": "save draft",
+            "topmost": true
+        }))
+        .expect("topmost target_text locator should parse");
+        assert!(
+            locator
+                .memo_key(&snapshot(vec![element(
+                    0,
+                    "Save draft",
+                    None,
+                    Some("frame:10")
+                )]))
                 .is_none()
         );
     }
@@ -421,6 +555,99 @@ mod tests {
             resolve_elements_by_testid(&snapshot, "save-primary").expect("testid should match");
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].index, 0);
+    }
+
+    #[test]
+    fn visible_ranking_filters_out_candidates_without_visible_bbox() {
+        let locator = parse_locator(&serde_json::json!({
+            "label": "Continue",
+            "visible": true,
+            "first": true
+        }))
+        .expect("visible locator should parse");
+        let mut hidden = element(0, "Continue", Some("Continue"), Some("main:10"));
+        hidden.bounding_box = None;
+        let mut visible = element(1, "Continue", Some("Continue"), Some("main:11"));
+        visible.bounding_box = Some(rub_core::model::BoundingBox {
+            x: 10.0,
+            y: 20.0,
+            width: 80.0,
+            height: 24.0,
+        });
+
+        let selected = apply_disambiguation(
+            vec![hidden, visible.clone()],
+            &locator,
+            &serde_json::json!({
+                "label": "Continue",
+                "visible": true,
+                "first": true
+            }),
+        )
+        .expect("visible disambiguation should succeed");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].index, visible.index);
+    }
+
+    #[test]
+    fn prefer_enabled_ranking_moves_disabled_candidates_after_enabled_ones() {
+        let locator = parse_locator(&serde_json::json!({
+            "label": "Consent",
+            "prefer_enabled": true,
+            "first": true
+        }))
+        .expect("prefer-enabled locator should parse");
+        let mut disabled = element(0, "Consent", Some("Consent"), Some("main:10"));
+        disabled
+            .attributes
+            .insert("disabled".to_string(), String::new());
+        let enabled = element(1, "Consent", Some("Consent"), Some("main:11"));
+
+        let selected = apply_disambiguation(
+            vec![disabled, enabled.clone()],
+            &locator,
+            &serde_json::json!({
+                "label": "Consent",
+                "prefer_enabled": true,
+                "first": true
+            }),
+        )
+        .expect("prefer-enabled disambiguation should succeed");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].index, enabled.index);
+    }
+
+    #[test]
+    fn prefer_enabled_ranking_moves_readonly_text_targets_after_writable_ones() {
+        let locator = parse_locator(&serde_json::json!({
+            "label": "Email",
+            "prefer_enabled": true,
+            "first": true
+        }))
+        .expect("prefer-enabled locator should parse");
+        let mut readonly = element(0, "", Some("Email"), Some("main:10"));
+        readonly.tag = ElementTag::Input;
+        readonly
+            .attributes
+            .insert("readonly".to_string(), String::new());
+        let mut writable = element(1, "", Some("Email"), Some("main:11"));
+        writable.tag = ElementTag::Input;
+
+        let selected = apply_disambiguation(
+            vec![readonly, writable.clone()],
+            &locator,
+            &serde_json::json!({
+                "label": "Email",
+                "prefer_enabled": true,
+                "first": true
+            }),
+        )
+        .expect("prefer-enabled disambiguation should succeed");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].index, writable.index);
     }
 
     fn snapshot(elements: Vec<Element>) -> rub_core::model::Snapshot {

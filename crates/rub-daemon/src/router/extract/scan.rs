@@ -30,6 +30,14 @@ pub(super) struct ExtractScanOutcome {
     pub(super) stop_reason: &'static str,
 }
 
+#[derive(Debug)]
+pub(super) struct ExtractListWaitOutcome {
+    pub(super) rows: Vec<serde_json::Value>,
+    pub(super) matched_item: serde_json::Value,
+    pub(super) item_count: usize,
+    pub(super) elapsed_ms: u64,
+}
+
 pub(super) async fn scan_collection(
     router: &DaemonRouter,
     args: &serde_json::Value,
@@ -110,6 +118,57 @@ pub(super) async fn scan_collection(
     })
 }
 
+pub(super) async fn wait_for_collection_match(
+    router: &DaemonRouter,
+    args: &serde_json::Value,
+    state: &Arc<SessionState>,
+    deadline: TransactionDeadline,
+    collection_name: &str,
+    collection: &ExtractCollectionSpec,
+    wait: &super::spec::ExtractListWaitConfig,
+) -> Result<ExtractListWaitOutcome, RubError> {
+    const POLL_INTERVAL_MS: u64 = 250;
+
+    let started = std::time::Instant::now();
+    let timeout = wait.timeout;
+
+    loop {
+        let snapshot =
+            build_stable_snapshot(router, args, state, deadline, Some(0), false, false).await?;
+        let snapshot = state.cache_snapshot(snapshot).await;
+        let batch_value =
+            extract_collection(router, &snapshot, collection_name, collection).await?;
+        let rows = batch_value.as_array().cloned().ok_or_else(|| {
+            RubError::Internal("collection wait expected array payload".to_string())
+        })?;
+
+        if let Some(matched_item) = rows
+            .iter()
+            .find(|row| collection_row_matches_wait_probe(row, &wait.field_path, &wait.contains))
+            .cloned()
+        {
+            return Ok(ExtractListWaitOutcome {
+                item_count: rows.len(),
+                rows,
+                matched_item,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            });
+        }
+
+        if started.elapsed() >= timeout {
+            return Err(collection_wait_timeout_error(
+                collection_name,
+                &wait.field_path,
+                &wait.contains,
+                started.elapsed(),
+                rows.len(),
+            ));
+        }
+
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+}
+
 fn row_fingerprint(
     row: &serde_json::Value,
     dedupe_key: Option<&str>,
@@ -148,7 +207,10 @@ fn row_fingerprint(
     serde_json::to_string(row).map_err(RubError::from)
 }
 
-fn lookup_json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+pub(super) fn lookup_json_path<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
     let mut current = value;
     for segment in path.split('.') {
         if segment.is_empty() {
@@ -157,4 +219,91 @@ fn lookup_json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a 
         current = current.get(segment)?;
     }
     Some(current)
+}
+
+fn collection_row_matches_wait_probe(
+    row: &serde_json::Value,
+    field_path: &str,
+    contains: &str,
+) -> bool {
+    let Some(value) = lookup_json_path(row, field_path) else {
+        return false;
+    };
+    let haystack = normalize_wait_text(match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    });
+    let needle = normalize_wait_text(contains.to_string());
+    !needle.is_empty() && haystack.contains(&needle)
+}
+
+fn normalize_wait_text(value: String) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn collection_wait_timeout_error(
+    collection_name: &str,
+    field_path: &str,
+    contains: &str,
+    elapsed: Duration,
+    item_count: usize,
+) -> RubError {
+    RubError::domain_with_context(
+        ErrorCode::WaitTimeout,
+        format!(
+            "List wait timed out before any '{collection_name}' row matched {field_path} contains '{contains}'"
+        ),
+        serde_json::json!({
+            "kind": "collection_extract",
+            "collection": collection_name,
+            "field_path": field_path,
+            "contains": contains,
+            "elapsed_ms": elapsed.as_millis() as u64,
+            "item_count": item_count,
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collection_row_matches_wait_probe, lookup_json_path};
+    use serde_json::json;
+
+    #[test]
+    fn lookup_json_path_supports_nested_row_fields() {
+        let row = json!({
+            "subject": {
+                "text": "Confirm your new account"
+            }
+        });
+
+        assert_eq!(
+            lookup_json_path(&row, "subject.text"),
+            Some(&json!("Confirm your new account"))
+        );
+        assert_eq!(lookup_json_path(&row, "subject.missing"), None);
+    }
+
+    #[test]
+    fn collection_wait_probe_matches_case_insensitive_normalized_contains() {
+        let row = json!({
+            "subject": "  Confirm   your NEW account  ",
+            "from": "Discourse Demo"
+        });
+
+        assert!(collection_row_matches_wait_probe(
+            &row,
+            "subject",
+            "confirm your new account"
+        ));
+        assert!(!collection_row_matches_wait_probe(
+            &row,
+            "from",
+            "activation"
+        ));
+    }
 }

@@ -1,6 +1,7 @@
 pub mod daemon;
 pub mod dialogs;
 pub mod downloads;
+pub mod extract_contract;
 pub mod frame_runtime;
 pub mod handoff;
 pub mod health;

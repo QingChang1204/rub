@@ -1,3 +1,4 @@
+use super::LocatorRankingPolicy;
 use super::projection::selection_context;
 use super::semantic::{normalize_locator_text, validate_memoized_elements};
 use crate::locator_memo::LocatorMemoTarget;
@@ -10,14 +11,23 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub(super) struct ParsedLocator {
     pub(super) locator: CanonicalLocator,
+    pub(super) ranking: LocatorRankingPolicy,
 }
 
 impl ParsedLocator {
     pub(super) fn memo_key(&self, snapshot: &Snapshot) -> Option<String> {
-        if !locator_supports_memo(&self.locator) || !snapshot_supports_locator_memo(snapshot) {
+        if self.ranking.topmost
+            || !locator_supports_memo(&self.locator)
+            || !snapshot_supports_locator_memo(snapshot)
+        {
             return None;
         }
         let selection = self.locator.selection().map(selection_context);
+        let ranking = serde_json::json!({
+            "visible": self.ranking.visible,
+            "prefer_enabled": self.ranking.prefer_enabled,
+            "topmost": self.ranking.topmost,
+        });
         match &self.locator {
             CanonicalLocator::Index { .. } => None,
             CanonicalLocator::Ref { .. } => None,
@@ -36,6 +46,7 @@ impl ParsedLocator {
                     "kind": "target_text",
                     "value": normalize_locator_text(text),
                     "selection": selection,
+                    "ranking": ranking,
                 })
                 .to_string(),
             ),

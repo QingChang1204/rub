@@ -12,8 +12,8 @@ pub use config::RequestedLaunchPolicy;
 pub use config::{Cli, EffectiveCli};
 pub use enums::{DownloadWaitStateArg, InterferenceModeArg, StateFormatArg, StorageAreaArg};
 pub use subcommands::{
-    Commands, CookiesSubcommand, DialogSubcommand, DownloadSubcommand, GetSubcommand,
-    HandoffSubcommand, InspectSubcommand, InterceptSubcommand, InterferenceSubcommand,
-    OrchestrationSubcommand, RuntimeSubcommand, StorageSubcommand, TakeoverSubcommand,
-    TriggerSubcommand,
+    Commands, CookiesSubcommand, DialogSubcommand, DownloadSubcommand, ExplainSubcommand,
+    GetSubcommand, HandoffSubcommand, InspectSubcommand, InterceptSubcommand,
+    InterferenceSubcommand, OrchestrationSubcommand, RuntimeSubcommand, StorageSubcommand,
+    TakeoverSubcommand, TriggerSubcommand,
 };

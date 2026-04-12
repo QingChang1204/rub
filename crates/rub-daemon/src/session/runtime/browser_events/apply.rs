@@ -412,35 +412,96 @@ impl SessionState {
         self.downloads.read().await.events_after(cursor)
     }
 
-    /// Current download-ingress drop count for interaction window authority checks.
-    pub fn download_event_drop_count(&self) -> u64 {
+    /// Current browser-ingress drop count for download interaction window authority checks.
+    pub fn download_event_ingress_drop_count(&self) -> u64 {
         self.browser_event_ingress_drop_count()
+    }
+
+    /// Current download-timeline eviction count for interaction window authority checks.
+    pub async fn download_event_timeline_drop_count(&self) -> u64 {
+        self.downloads.read().await.dropped_event_count()
+    }
+
+    pub async fn download_last_evicted_sequence(&self) -> u64 {
+        self.downloads.read().await.last_evicted_sequence()
+    }
+
+    /// Combined download-event drop count for callers that only need a coarse budget view.
+    pub async fn download_event_drop_count(&self) -> u64 {
+        self.download_event_ingress_drop_count()
+            .saturating_add(self.download_event_timeline_drop_count().await)
     }
 
     /// Windowed download evidence after one interaction baseline.
     ///
-    /// The current browser-event ingress only drops bounded in-progress download
-    /// progress events. That means a delta in `download_event_drop_count()`
-    /// invalidates the download window for this interaction even if some sequenced
-    /// events were still published successfully.
+    /// Download windows become non-authoritative if browser ingress dropped
+    /// in-progress download progress events, if the download event timeline
+    /// evicted events that were still inside the requested cursor range, or if
+    /// the download runtime was degraded before/after the observation fence.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn download_event_window_after(
         &self,
         cursor: u64,
-        last_observed_drop_count: u64,
+        last_observed_ingress_drop_count: u64,
     ) -> crate::session::protocol::DownloadEventWindow {
-        let events = self.download_events_after(cursor).await;
-        let current_drop_count = self.download_event_drop_count();
-        let authoritative = current_drop_count == last_observed_drop_count;
-        let degraded_reason = if authoritative {
-            None
-        } else {
-            self.download_runtime().await.degraded_reason.or_else(|| {
+        let runtime = self.download_runtime().await;
+        let downloads = self.downloads.read().await;
+        let events = downloads.events_after(cursor);
+        let current_ingress_drop_count = self.download_event_ingress_drop_count();
+        let current_timeline_drop_count = downloads.dropped_event_count();
+        let current_last_evicted_sequence = downloads.last_evicted_sequence();
+        let ingress_overflow = current_ingress_drop_count > last_observed_ingress_drop_count;
+        let cursor_lost_to_timeline_eviction =
+            current_timeline_drop_count > 0 && cursor < current_last_evicted_sequence;
+        let degraded_reason = if ingress_overflow {
+            runtime.degraded_reason.or_else(|| {
                 Some(crate::session::protocol::DOWNLOAD_PROGRESS_OVERFLOW_REASON.to_string())
             })
+        } else if cursor_lost_to_timeline_eviction {
+            runtime
+                .degraded_reason
+                .or_else(|| Some("download_event_timeline_overflow".to_string()))
+        } else {
+            runtime.degraded_reason
         };
         crate::session::protocol::DownloadEventWindow {
             events,
-            authoritative,
+            authoritative: degraded_reason.is_none(),
+            degraded_reason,
+        }
+    }
+
+    pub(crate) async fn download_event_window_between(
+        &self,
+        cursor: u64,
+        end_cursor: u64,
+        last_observed_ingress_drop_count: u64,
+        observed_ingress_drop_count: u64,
+        baseline_degraded_reason: Option<&str>,
+        observed_degraded_reason: Option<&str>,
+    ) -> crate::session::protocol::DownloadEventWindow {
+        let downloads = self.downloads.read().await;
+        let events = downloads.events_between(cursor, end_cursor);
+        let current_timeline_drop_count = downloads.dropped_event_count();
+        let current_last_evicted_sequence = downloads.last_evicted_sequence();
+        let ingress_overflow = observed_ingress_drop_count > last_observed_ingress_drop_count;
+        let cursor_lost_to_timeline_eviction =
+            current_timeline_drop_count > 0 && cursor < current_last_evicted_sequence;
+        let degraded_reason = if let Some(reason) = observed_degraded_reason
+            .or(baseline_degraded_reason)
+            .map(str::to_string)
+        {
+            Some(reason)
+        } else if ingress_overflow {
+            Some(crate::session::protocol::DOWNLOAD_PROGRESS_OVERFLOW_REASON.to_string())
+        } else if cursor_lost_to_timeline_eviction {
+            Some("download_event_timeline_overflow".to_string())
+        } else {
+            None
+        };
+        crate::session::protocol::DownloadEventWindow {
+            events,
+            authoritative: degraded_reason.is_none(),
             degraded_reason,
         }
     }

@@ -119,7 +119,12 @@ fn frame_context_error_is_deterministic(error: &RubError) -> bool {
 fn wait_check_script(condition: &WaitCondition) -> Result<String, RubError> {
     match &condition.kind {
         WaitKind::Locator { locator, state } => locator_wait_script(locator, *state),
+        WaitKind::LocatorDescriptionContains { locator, value } => {
+            locator_description_wait_script(locator, value)
+        }
         WaitKind::Text { text } => text_wait_script(text),
+        WaitKind::UrlContains { value } => url_wait_script(value),
+        WaitKind::TitleContains { value } => title_wait_script(value),
     }
 }
 
@@ -170,6 +175,21 @@ fn locator_wait_script(locator: &CanonicalLocator, state: WaitState) -> Result<S
                 const rect = el.getBoundingClientRect();
                 return rect.width > 0 && rect.height > 0;
             }};
+            const hasTruthyAriaFlag = (el, attr) => {{
+                const value = String(el?.getAttribute?.(attr) || '').trim().toLowerCase();
+                return value === 'true';
+            }};
+            const isInteractable = (el) => {{
+                if (!el || !isVisible(el)) return false;
+                if (el.disabled === true || el.hasAttribute?.('disabled')) return false;
+                if (hasTruthyAriaFlag(el, 'aria-disabled')) return false;
+                const tag = String(el.tagName || '').toLowerCase();
+                const editorLike = el.isContentEditable || tag === 'input' || tag === 'textarea';
+                if (!editorLike) return true;
+                if (el.readOnly === true || el.hasAttribute?.('readonly')) return false;
+                if (hasTruthyAriaFlag(el, 'aria-readonly')) return false;
+                return true;
+            }};
             const matches = (() =>{{
                 try {{
                     return resolveLocatorMatches(locator);
@@ -189,9 +209,71 @@ fn locator_wait_script(locator: &CanonicalLocator, state: WaitState) -> Result<S
                 case 'hidden':
                     return JSON.stringify(selected === null || !isVisible(selected));
                 case 'visible':
+                    return JSON.stringify(selected !== null && isVisible(selected));
+                case 'interactable':
+                    return JSON.stringify(selected !== null && isInteractable(selected));
                 default:
                     return JSON.stringify(selected !== null && isVisible(selected));
             }}
+        }})()"#,
+        invalid_selector = invalid_selector
+    ))
+}
+
+fn locator_description_wait_script(
+    locator: &CanonicalLocator,
+    value: &str,
+) -> Result<String, RubError> {
+    let locator = serde_json::to_string(locator).map_err(|error| {
+        RubError::domain(
+            ErrorCode::InvalidInput,
+            format!("Failed to serialize wait locator: {error}"),
+        )
+    })?;
+    let value = serde_json::to_string(value).map_err(|error| {
+        RubError::domain(
+            ErrorCode::InvalidInput,
+            format!("Failed to serialize wait description probe: {error}"),
+        )
+    })?;
+    let invalid_selector = serde_json::to_string(INVALID_SELECTOR_SENTINEL).map_err(|error| {
+        RubError::domain(
+            ErrorCode::InvalidInput,
+            format!("Failed to serialize wait selector sentinel: {error}"),
+        )
+    })?;
+    Ok(format!(
+        r#"(() => {{
+            const locator = {locator};
+            {LOCATOR_JS_HELPERS}
+            const needle = normalize({value});
+            const pickSelection = (elements, selection) => {{
+                if (!selection) return elements[0] || null;
+                switch (selection) {{
+                    case 'first':
+                        return elements[0] || null;
+                    case 'last':
+                        return elements.length ? elements[elements.length - 1] : null;
+                    default:
+                        if (typeof selection === 'object' && selection !== null && Number.isInteger(selection.nth)) {{
+                            return elements[selection.nth] || null;
+                        }}
+                        return elements[0] || null;
+                }}
+            }};
+            const matches = (() => {{
+                try {{
+                    return resolveLocatorMatches(locator);
+                }} catch (_error) {{
+                    return {invalid_selector};
+                }}
+            }})();
+            if (typeof matches === 'string' && matches === {invalid_selector}) {{
+                return JSON.stringify(matches);
+            }}
+            const selected = pickSelection(matches, locator.selection);
+            const haystack = normalize(accessibleDescription(selected));
+            return JSON.stringify(needle.length > 0 && haystack.includes(needle));
         }})()"#,
         invalid_selector = invalid_selector
     ))
@@ -225,11 +307,49 @@ fn text_wait_script(text: &str) -> Result<String, RubError> {
     ))
 }
 
+fn url_wait_script(value: &str) -> Result<String, RubError> {
+    let value_literal = serde_json::to_string(value).map_err(|error| {
+        RubError::domain(
+            ErrorCode::InvalidInput,
+            format!("Failed to serialize wait URL probe: {error}"),
+        )
+    })?;
+    Ok(format!(
+        r#"(() => {{
+            const normalize = (input) => String(input || '').trim().toLocaleLowerCase();
+            const haystack = normalize(window.location.href);
+            const needle = normalize({value_literal});
+            return JSON.stringify(needle.length > 0 && haystack.includes(needle));
+        }})()"#
+    ))
+}
+
+fn title_wait_script(value: &str) -> Result<String, RubError> {
+    let value_literal = serde_json::to_string(value).map_err(|error| {
+        RubError::domain(
+            ErrorCode::InvalidInput,
+            format!("Failed to serialize wait title probe: {error}"),
+        )
+    })?;
+    Ok(format!(
+        r#"(() => {{
+            const normalize = (input) => String(input || '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .toLocaleLowerCase();
+            const haystack = normalize(document.title);
+            const needle = normalize({value_literal});
+            return JSON.stringify(needle.length > 0 && haystack.includes(needle));
+        }})()"#
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         INVALID_SELECTOR_SENTINEL, classify_terminal_wait_error,
-        frame_context_error_is_deterministic, locator_wait_script, text_wait_script,
+        frame_context_error_is_deterministic, locator_description_wait_script, locator_wait_script,
+        text_wait_script, title_wait_script, url_wait_script,
     };
     use rub_core::error::{ErrorCode, RubError};
     use rub_core::locator::{CanonicalLocator, LocatorSelection};
@@ -249,6 +369,24 @@ mod tests {
         let script = text_wait_script("Line 1\nLine 2").expect("text serialization should succeed");
         assert!(script.contains("Line 1\\nLine 2"), "{script}");
         assert!(!script.contains("Line 1\nLine 2"), "{script}");
+    }
+
+    #[test]
+    fn url_wait_script_normalizes_case_and_uses_location_href() {
+        let script =
+            url_wait_script("/Activate?token=ABC").expect("url wait serialization should succeed");
+        assert!(script.contains("window.location.href"));
+        assert!(script.contains(".toLocaleLowerCase()"));
+        assert!(script.contains("/Activate?token=ABC"));
+    }
+
+    #[test]
+    fn title_wait_script_normalizes_whitespace_and_case() {
+        let script = title_wait_script("Confirm   your account")
+            .expect("title wait serialization should succeed");
+        assert!(script.contains("document.title"));
+        assert!(script.contains(".replace(/\\s+/g, ' ')"));
+        assert!(script.contains("Confirm   your account"));
     }
 
     #[test]
@@ -280,6 +418,37 @@ mod tests {
         .expect("selector locator should serialize");
         assert!(script.contains(INVALID_SELECTOR_SENTINEL));
         assert!(script.contains("return "));
+    }
+
+    #[test]
+    fn locator_interactable_wait_script_checks_disabled_and_readonly_controls() {
+        let script = locator_wait_script(
+            &CanonicalLocator::Selector {
+                css: ".composer".to_string(),
+                selection: Some(LocatorSelection::First),
+            },
+            WaitState::Interactable,
+        )
+        .expect("selector locator should serialize");
+        assert!(script.contains("aria-disabled"), "{script}");
+        assert!(script.contains("readonly"), "{script}");
+        assert!(script.contains("isContentEditable"), "{script}");
+        assert!(script.contains("case 'interactable'"), "{script}");
+    }
+
+    #[test]
+    fn locator_description_wait_script_uses_accessible_description_probe() {
+        let script = locator_description_wait_script(
+            &CanonicalLocator::Label {
+                label: "Email".to_string(),
+                selection: Some(LocatorSelection::First),
+            },
+            "We will email you to confirm",
+        )
+        .expect("label locator should serialize");
+        assert!(script.contains("accessibleDescription"), "{script}");
+        assert!(script.contains("aria-describedby"), "{script}");
+        assert!(script.contains("\"kind\":\"label\""), "{script}");
     }
 
     #[test]

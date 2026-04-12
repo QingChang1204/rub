@@ -60,6 +60,20 @@ const accessibleLabel = (el) => {
     labels.push(el.innerText || el.textContent);
     return textish(...labels);
 };
+const accessibleDescription = (el) => {
+    if (!el || !el.getAttribute) return '';
+    const descriptions = [];
+    descriptions.push(el.getAttribute('aria-description'));
+    const describedBy = String(el.getAttribute('aria-describedby') || '')
+        .split(/\s+/)
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0);
+    for (const id of describedBy) {
+        const node = document.getElementById(id);
+        if (node) descriptions.push(node.innerText || node.textContent);
+    }
+    return textish(...descriptions);
+};
 const testingId = (el) => {
     if (!el.getAttribute) return '';
     return textish(

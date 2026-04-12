@@ -383,6 +383,14 @@ impl BrowserPort for ReadinessProbeBrowser {
         unexpected_browser_call!("find_snapshot_elements_by_selector")
     }
 
+    async fn filter_snapshot_elements_by_hit_test(
+        &self,
+        _snapshot: &Snapshot,
+        _elements: &[Element],
+    ) -> Result<Vec<Element>, RubError> {
+        unexpected_browser_call!("filter_snapshot_elements_by_hit_test")
+    }
+
     async fn find_snapshot_elements_in_observation_scope(
         &self,
         _snapshot: &Snapshot,

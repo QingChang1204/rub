@@ -75,17 +75,74 @@ pub(super) fn wait_after_args(args: &serde_json::Value) -> Option<serde_json::Va
         || wait_after
             .get("text")
             .and_then(|value| value.as_str())
+            .is_some()
+        || wait_after
+            .get("description_contains")
+            .and_then(|value| value.as_str())
+            .is_some()
+        || wait_after
+            .get("url_contains")
+            .and_then(|value| value.as_str())
+            .is_some()
+        || wait_after
+            .get("title_contains")
+            .and_then(|value| value.as_str())
+            .is_some()
+        || wait_after
+            .get("state")
+            .and_then(|value| value.as_str())
             .is_some();
     has_probe.then_some(wait_after)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::command_supports_post_wait;
+    use super::{command_supports_post_wait, wait_after_args};
 
     #[test]
     fn wait_after_supports_forward_and_reload() {
         assert!(command_supports_post_wait("forward"));
         assert!(command_supports_post_wait("reload"));
+    }
+
+    #[test]
+    fn wait_after_args_recognizes_page_level_wait_probes() {
+        assert!(
+            wait_after_args(&serde_json::json!({
+                "wait_after": {
+                    "url_contains": "/activate"
+                }
+            }))
+            .is_some()
+        );
+        assert!(
+            wait_after_args(&serde_json::json!({
+                "wait_after": {
+                    "title_contains": "Confirm your account"
+                }
+            }))
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn wait_after_args_recognizes_state_and_description_probes() {
+        assert!(
+            wait_after_args(&serde_json::json!({
+                "wait_after": {
+                    "state": "interactable"
+                }
+            }))
+            .is_some()
+        );
+        assert!(
+            wait_after_args(&serde_json::json!({
+                "wait_after": {
+                    "label": "Email",
+                    "description_contains": "We will email you to confirm"
+                }
+            }))
+            .is_some()
+        );
     }
 }

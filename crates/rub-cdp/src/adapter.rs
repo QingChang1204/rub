@@ -491,6 +491,15 @@ impl BrowserPort for ChromiumAdapter {
         crate::inspect::find_snapshot_elements_by_selector(&page, snapshot, selector).await
     }
 
+    async fn filter_snapshot_elements_by_hit_test(
+        &self,
+        snapshot: &Snapshot,
+        elements: &[Element],
+    ) -> Result<Vec<Element>, RubError> {
+        let page = self.manager.page().await?;
+        crate::targeting::filter_snapshot_elements_by_hit_test(&page, snapshot, elements).await
+    }
+
     async fn find_snapshot_elements_in_observation_scope(
         &self,
         snapshot: &Snapshot,

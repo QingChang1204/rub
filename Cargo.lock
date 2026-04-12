@@ -1302,9 +1302,12 @@ dependencies = [
 name = "rub-test-harness"
 version = "0.1.4"
 dependencies = [
+ "libc",
  "rub-core",
+ "rub-daemon",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

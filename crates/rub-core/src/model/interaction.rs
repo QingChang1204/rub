@@ -145,7 +145,8 @@ pub struct Element {
     pub tag: ElementTag,
     /// Visible text content (truncated to 200 chars).
     pub text: String,
-    /// Relevant attributes: href, placeholder, aria-label, type, name, value, role.
+    /// Relevant attributes: href, placeholder, aria-label, type, name, value, role,
+    /// and boolean-presence attributes such as disabled when they affect safe interaction.
     pub attributes: HashMap<String, String>,
     /// Stable CDP-derived identifier: "frame_id:backend_node_id".
     /// Survives re-renders if the underlying DOM node persists.
@@ -294,8 +295,18 @@ pub enum WaitKind {
         locator: CanonicalLocator,
         state: WaitState,
     },
+    LocatorDescriptionContains {
+        locator: CanonicalLocator,
+        value: String,
+    },
     Text {
         text: String,
+    },
+    UrlContains {
+        value: String,
+    },
+    TitleContains {
+        value: String,
     },
 }
 
@@ -307,6 +318,11 @@ pub enum WaitState {
     Hidden,
     Attached,
     Detached,
+    /// DOM-level interactable: visible and not disabled/readonly on writable controls.
+    ///
+    /// This deliberately excludes live hit-test/overlay authority. Commands that need
+    /// topmost/hittable confirmation must use stronger runtime surfaces.
+    Interactable,
 }
 
 /// A condition to wait for.

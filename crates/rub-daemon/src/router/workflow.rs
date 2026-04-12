@@ -5,6 +5,7 @@ mod command_build;
 mod execution;
 mod projection;
 mod spec;
+mod validate;
 
 #[cfg(test)]
 use self::args::{FillArgs, PipeArgs, submit_args};
@@ -21,6 +22,15 @@ pub(super) async fn cmd_fill(
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     execution::cmd_fill(router, args, deadline, state).await
+}
+
+pub(super) async fn cmd_fill_validate(
+    router: &DaemonRouter,
+    args: &serde_json::Value,
+    deadline: TransactionDeadline,
+    state: &Arc<SessionState>,
+) -> Result<serde_json::Value, RubError> {
+    validate::cmd_fill_validate(router, args, deadline, state).await
 }
 
 pub(super) async fn cmd_trigger_fill(
@@ -55,7 +65,11 @@ mod tests {
     use super::args::SubmitLocatorArgs;
     use super::{
         FillArgs, PipeArgs,
-        command_build::build_fill_step_locator_args,
+        command_build::{
+            build_atomic_rollback_command_for_resolved_target,
+            build_fill_step_command_for_resolved_target, build_fill_step_locator_args,
+            build_submit_command_for_resolved_target,
+        },
         execution::{OrchestrationMetadataInheritancePolicy, inherit_orchestration_metadata},
         parse_pipe_spec, resolve_step_references,
         spec::resolve_template_string,
@@ -64,6 +78,7 @@ mod tests {
     use crate::router::automation_fence::ensure_committed_automation_result;
     use crate::router::request_args::parse_json_args;
     use rub_core::error::ErrorCode;
+    use rub_core::model::{Element, ElementTag};
     use serde_json::json;
     use std::path::Path;
 
@@ -148,6 +163,8 @@ mod tests {
         let parsed: FillArgs = parse_json_args(
             &json!({
                 "spec": "[]",
+                "snapshot_id": "snap-123",
+                "atomic": true,
                 "submit_label": "Send",
                 "submit_first": true,
                 "wait_after": {"selector":"#done"},
@@ -160,6 +177,8 @@ mod tests {
 
         assert_eq!(parsed.submit.label.as_deref(), Some("Send"));
         assert!(parsed.submit.first);
+        assert!(parsed.atomic);
+        assert_eq!(parsed._snapshot_id.as_deref(), Some("snap-123"));
         assert!(parsed._wait_after.is_some());
         assert!(parsed._trigger.is_some());
         assert_eq!(
@@ -291,6 +310,196 @@ mod tests {
         );
 
         assert_eq!(locator_args["_orchestration"]["frame_id"], "target-frame");
+    }
+
+    #[test]
+    fn snapshot_fill_preflight_uses_element_ref_for_live_step_execution() {
+        let step: super::args::FillStepSpec = serde_json::from_value(json!({
+            "label": "Email",
+            "value": "user@example.com"
+        }))
+        .expect("fill step should deserialize");
+        let element = Element {
+            index: 3,
+            tag: ElementTag::Input,
+            text: String::new(),
+            attributes: std::collections::HashMap::new(),
+            element_ref: Some("frame-main:42".to_string()),
+            bounding_box: None,
+            ax_info: None,
+            listeners: None,
+            depth: None,
+        };
+
+        let (command, args) = build_fill_step_command_for_resolved_target(&step, &element)
+            .expect("snapshot preflight should build a live command");
+        assert_eq!(command, "type");
+        assert_eq!(args["element_ref"], "frame-main:42");
+        assert!(args.get("snapshot_id").is_none());
+    }
+
+    #[test]
+    fn snapshot_fill_preflight_accepts_contenteditable_editor_target() {
+        let step: super::args::FillStepSpec = serde_json::from_value(json!({
+            "label": "Body",
+            "value": "Hello editor"
+        }))
+        .expect("fill step should deserialize");
+        let mut element = Element {
+            index: 9,
+            tag: ElementTag::Other,
+            text: String::new(),
+            attributes: std::collections::HashMap::new(),
+            element_ref: Some("frame-main:99".to_string()),
+            bounding_box: None,
+            ax_info: None,
+            listeners: None,
+            depth: None,
+        };
+        element
+            .attributes
+            .insert("contenteditable".to_string(), "true".to_string());
+        element
+            .attributes
+            .insert("role".to_string(), "textbox".to_string());
+
+        let (command, args) = build_fill_step_command_for_resolved_target(&step, &element)
+            .expect("contenteditable targets should use the safe text path");
+        assert_eq!(command, "type");
+        assert_eq!(args["element_ref"], "frame-main:99");
+        assert_eq!(args["text"], "Hello editor");
+    }
+
+    #[test]
+    fn snapshot_fill_preflight_rejection_includes_safe_path_diagnostics() {
+        let step: super::args::FillStepSpec = serde_json::from_value(json!({
+            "label": "Submit",
+            "value": "wrong"
+        }))
+        .expect("fill step should deserialize");
+        let element = Element {
+            index: 5,
+            tag: ElementTag::Button,
+            text: "Submit".to_string(),
+            attributes: std::collections::HashMap::new(),
+            element_ref: Some("frame-main:55".to_string()),
+            bounding_box: None,
+            ax_info: None,
+            listeners: None,
+            depth: None,
+        };
+
+        let envelope = build_fill_step_command_for_resolved_target(&step, &element)
+            .expect_err("button value writes should fail closed")
+            .into_envelope();
+        let context = envelope.context.expect("safe-path rejection context");
+        assert_eq!(envelope.code, ErrorCode::InvalidInput);
+        assert_eq!(context["target"]["tag"], "button");
+        assert_eq!(context["rejection_reason"], "activation_only_control");
+        assert_eq!(
+            context["recommended_safe_fallback"],
+            "Use `activate: true` or a click step instead of a value write for activation-only targets."
+        );
+    }
+
+    #[test]
+    fn snapshot_fill_preflight_rejects_targets_without_stable_identity() {
+        let step: super::args::FillStepSpec = serde_json::from_value(json!({
+            "label": "Email",
+            "value": "user@example.com"
+        }))
+        .expect("fill step should deserialize");
+        let element = Element {
+            index: 3,
+            tag: ElementTag::Input,
+            text: String::new(),
+            attributes: std::collections::HashMap::new(),
+            element_ref: None,
+            bounding_box: None,
+            ax_info: None,
+            listeners: None,
+            depth: None,
+        };
+
+        let error = build_fill_step_command_for_resolved_target(&step, &element)
+            .expect_err("snapshot continuity should fail closed without element_ref")
+            .into_envelope();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn atomic_fill_rollback_uses_prior_text_value() {
+        let element = Element {
+            index: 3,
+            tag: ElementTag::Input,
+            text: String::new(),
+            attributes: std::collections::HashMap::new(),
+            element_ref: Some("frame-main:42".to_string()),
+            bounding_box: None,
+            ax_info: None,
+            listeners: None,
+            depth: None,
+        };
+
+        let (command, args) = build_atomic_rollback_command_for_resolved_target(
+            &element,
+            "type_text",
+            "previous@example.com",
+        )
+        .expect("text rollback should build");
+        assert_eq!(command, "type");
+        assert_eq!(args["element_ref"], "frame-main:42");
+        assert_eq!(args["text"], "previous@example.com");
+        assert_eq!(args["clear"], true);
+    }
+
+    #[test]
+    fn atomic_fill_rollback_rejects_editor_safe_surface_in_v1() {
+        let mut element = Element {
+            index: 9,
+            tag: ElementTag::Other,
+            text: String::new(),
+            attributes: std::collections::HashMap::new(),
+            element_ref: Some("frame-main:99".to_string()),
+            bounding_box: None,
+            ax_info: None,
+            listeners: None,
+            depth: None,
+        };
+        element
+            .attributes
+            .insert("contenteditable".to_string(), "true".to_string());
+
+        let envelope = build_atomic_rollback_command_for_resolved_target(
+            &element,
+            "type_editor_text",
+            "hello",
+        )
+        .expect_err("atomic v1 should fail closed on editor-safe rollback")
+        .into_envelope();
+        assert_eq!(envelope.code, ErrorCode::InvalidInput);
+        let context = envelope.context.expect("atomic rollback rejection context");
+        assert_eq!(context["write_mode"], "type_editor_text");
+    }
+
+    #[test]
+    fn snapshot_submit_preflight_uses_element_ref_for_live_submit_click() {
+        let element = Element {
+            index: 7,
+            tag: ElementTag::Button,
+            text: "Submit".to_string(),
+            attributes: std::collections::HashMap::new(),
+            element_ref: Some("frame-main:77".to_string()),
+            bounding_box: None,
+            ax_info: None,
+            listeners: None,
+            depth: None,
+        };
+
+        let args = build_submit_command_for_resolved_target(&element)
+            .expect("submit preflight should build a live click target");
+        assert_eq!(args["element_ref"], "frame-main:77");
+        assert!(args.get("snapshot_id").is_none());
     }
 
     #[test]

@@ -4,18 +4,22 @@ mod cleanup_ctl;
 mod commands;
 mod connection_hardening;
 mod daemon_ctl;
+mod explain_ctl;
+mod extract_help_ctl;
 mod harvest_ctl;
+mod inspect_list_help_ctl;
 mod internal_daemon;
 mod orchestration_assets;
 mod output;
 mod persisted_artifacts;
 mod session_policy;
+mod teardown_ctl;
 mod timeout_budget;
 mod workflow_assets;
 mod workflow_params;
 
 use clap::Parser;
-use commands::{Cli, Commands, EffectiveCli};
+use commands::{Cli, Commands, EffectiveCli, ExplainSubcommand, InspectSubcommand};
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 use session_policy::{
     ConnectionRequest, materialize_connection_request, parse_connection_request,
@@ -69,6 +73,7 @@ async fn main() {
                     output::format_cli_success(
                         "cleanup",
                         session,
+                        &rub_home,
                         cleanup_ctl::project_cleanup_result(&rub_home, &result),
                         pretty,
                         output_trace_mode(&cli),
@@ -80,6 +85,123 @@ async fn main() {
                 println!(
                     "{}",
                     output::format_cli_error("cleanup", session, error.into_envelope(), pretty)
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if matches!(&cli.command, Commands::Teardown) {
+        match teardown_ctl::teardown_runtime(&rub_home, timeout).await {
+            Ok(result) => {
+                println!(
+                    "{}",
+                    output::format_cli_success(
+                        "teardown",
+                        session,
+                        &rub_home,
+                        teardown_ctl::project_teardown_result(&rub_home, &result),
+                        pretty,
+                        output_trace_mode(&cli),
+                    )
+                );
+                return;
+            }
+            Err(error) => {
+                println!(
+                    "{}",
+                    output::format_cli_error("teardown", session, error.into_envelope(), pretty)
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Commands::Explain {
+        subcommand: ExplainSubcommand::Extract { .. },
+    } = &cli.command
+    {
+        let Commands::Explain { subcommand } = &cli.command else {
+            unreachable!("guarded by explain extract match");
+        };
+        match explain_ctl::project_explain(subcommand, &rub_home) {
+            Ok(result) => {
+                println!(
+                    "{}",
+                    output::format_cli_success(
+                        "explain",
+                        session,
+                        &rub_home,
+                        result,
+                        pretty,
+                        output_trace_mode(&cli),
+                    )
+                );
+                return;
+            }
+            Err(error) => {
+                println!(
+                    "{}",
+                    output::format_cli_error("explain", session, error.into_envelope(), pretty)
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Commands::Extract {
+        examples, schema, ..
+    } = &cli.command
+        && (*schema || examples.is_some())
+    {
+        match extract_help_ctl::project_extract_help(examples.as_deref(), *schema) {
+            Ok(result) => {
+                println!(
+                    "{}",
+                    output::format_cli_success(
+                        "extract",
+                        session,
+                        &rub_home,
+                        result,
+                        pretty,
+                        output_trace_mode(&cli),
+                    )
+                );
+                return;
+            }
+            Err(error) => {
+                println!(
+                    "{}",
+                    output::format_cli_error("extract", session, error.into_envelope(), pretty)
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Commands::Inspect(InspectSubcommand::List {
+        builder_help: true, ..
+    }) = &cli.command
+    {
+        match inspect_list_help_ctl::project_inspect_list_builder_help() {
+            Ok(result) => {
+                println!(
+                    "{}",
+                    output::format_cli_success(
+                        "inspect",
+                        session,
+                        &rub_home,
+                        result,
+                        pretty,
+                        output_trace_mode(&cli),
+                    )
+                );
+                return;
+            }
+            Err(error) => {
+                println!(
+                    "{}",
+                    output::format_cli_error("inspect", session, error.into_envelope(), pretty)
                 );
                 std::process::exit(1);
             }
@@ -107,6 +229,7 @@ async fn main() {
                     output::format_cli_success(
                         "close",
                         session,
+                        &rub_home,
                         daemon_ctl::project_batch_close_result(&rub_home, &result),
                         pretty,
                         output_trace_mode(&cli),
@@ -138,6 +261,7 @@ async fn main() {
                     &response,
                     "close",
                     session,
+                    &rub_home,
                     pretty,
                     output_trace_mode(&cli),
                 );
@@ -153,6 +277,7 @@ async fn main() {
                     output::format_cli_success(
                         "close",
                         session,
+                        &rub_home,
                         serde_json::json!({
                             "subject": {
                                 "kind": "session_browser",
@@ -204,6 +329,7 @@ async fn main() {
                     output::format_cli_success(
                         "pipe",
                         session,
+                        &rub_home,
                         result,
                         pretty,
                         output_trace_mode(&cli),
@@ -234,6 +360,7 @@ async fn main() {
                     output::format_cli_success(
                         "orchestration",
                         session,
+                        &rub_home,
                         result,
                         pretty,
                         output_trace_mode(&cli),
@@ -267,6 +394,7 @@ async fn main() {
                     output::format_cli_success(
                         "inspect",
                         session,
+                        &rub_home,
                         result,
                         pretty,
                         output_trace_mode(&cli),
@@ -415,6 +543,51 @@ async fn main() {
     {
         Ok(mut response) => {
             if response.status == rub_ipc::protocol::ResponseStatus::Success
+                && let Commands::Explain {
+                    subcommand: ExplainSubcommand::Locator { target },
+                } = &cli.command
+            {
+                match explain_ctl::project_locator_explain_response(target, response.data.take()) {
+                    Ok(data) => response.data = Some(data),
+                    Err(error) => {
+                        println!(
+                            "{}",
+                            output::format_cli_error(
+                                command_name.as_str(),
+                                session,
+                                error.into_envelope(),
+                                pretty,
+                            )
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+            if response.status == rub_ipc::protocol::ResponseStatus::Success
+                && let Commands::Find {
+                    target,
+                    content: false,
+                    explain: true,
+                    ..
+                } = &cli.command
+            {
+                match explain_ctl::project_locator_explain_response(target, response.data.take()) {
+                    Ok(data) => response.data = Some(data),
+                    Err(error) => {
+                        println!(
+                            "{}",
+                            output::format_cli_error(
+                                command_name.as_str(),
+                                session,
+                                error.into_envelope(),
+                                pretty,
+                            )
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+            if response.status == rub_ipc::protocol::ResponseStatus::Success
                 && let Some(data) = response.data.as_mut()
                 && let Err(error) = workflow_assets::persist_history_export_asset(&cli, data)
             {
@@ -483,6 +656,7 @@ async fn main() {
                         &response,
                         command_name.as_str(),
                         session,
+                        &rub_home,
                         pretty,
                         output_trace_mode(&cli),
                     )
@@ -492,6 +666,7 @@ async fn main() {
                     &response,
                     command_name.as_str(),
                     session,
+                    &rub_home,
                     pretty,
                     output_trace_mode(&cli),
                 )
@@ -715,195 +890,5 @@ pub(crate) fn daemon_args(cli: &EffectiveCli, request: &ConnectionRequest) -> Ve
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rub_core::error::ErrorCode;
-    use rub_daemon::session::RegistryEntry;
-
-    #[test]
-    fn daemon_args_forward_v14_policy_flags() {
-        let mut cli = EffectiveCli {
-            session: "default".to_string(),
-            session_id: None,
-            rub_home: std::path::PathBuf::from("/tmp/rub-test"),
-            timeout: 30_000,
-            headed: false,
-            ignore_cert_errors: false,
-            user_data_dir: None,
-            hide_infobars: true,
-            json_pretty: false,
-            verbose: false,
-            trace: false,
-            command: Commands::Doctor,
-            cdp_url: None,
-            connect: false,
-            profile: None,
-            no_stealth: false,
-            humanize: false,
-            humanize_speed: "normal".to_string(),
-            requested_launch_policy: commands::RequestedLaunchPolicy::default(),
-            effective_launch_policy: commands::RequestedLaunchPolicy::default(),
-        };
-        cli.no_stealth = true;
-        cli.humanize = true;
-        cli.humanize_speed = "slow".to_string();
-
-        let args = daemon_args(&cli, &ConnectionRequest::None);
-        assert!(args.contains(&"--no-stealth".to_string()));
-        assert!(args.contains(&"--humanize".to_string()));
-        assert!(args.contains(&"--humanize-speed".to_string()));
-        assert!(args.contains(&"slow".to_string()));
-    }
-
-    #[test]
-    fn daemon_args_skip_config_default_user_data_dir_for_profile_request() {
-        let cli = EffectiveCli {
-            session: "default".to_string(),
-            session_id: None,
-            rub_home: std::path::PathBuf::from("/tmp/rub-test"),
-            timeout: 30_000,
-            headed: false,
-            ignore_cert_errors: false,
-            user_data_dir: Some("/tmp/config-default-profile-root".to_string()),
-            hide_infobars: true,
-            json_pretty: false,
-            verbose: false,
-            trace: false,
-            command: Commands::Doctor,
-            cdp_url: None,
-            connect: false,
-            profile: Some("Default".to_string()),
-            no_stealth: false,
-            humanize: false,
-            humanize_speed: "normal".to_string(),
-            requested_launch_policy: commands::RequestedLaunchPolicy::default(),
-            effective_launch_policy: commands::RequestedLaunchPolicy {
-                user_data_dir: Some("/tmp/config-default-profile-root".to_string()),
-                ..commands::RequestedLaunchPolicy::default()
-            },
-        };
-
-        let args = daemon_args(
-            &cli,
-            &ConnectionRequest::Profile {
-                name: "Default".to_string(),
-                dir_name: "Default".to_string(),
-                resolved_path: "/tmp/config-default-profile-root/Default".to_string(),
-                user_data_root: "/tmp/config-default-profile-root".to_string(),
-            },
-        );
-        assert!(args.contains(&"--profile".to_string()));
-        assert!(!args.contains(&"--user-data-dir".to_string()));
-    }
-
-    #[test]
-    fn daemon_args_forward_materialized_auto_discover_as_explicit_cdp_url() {
-        let cli = EffectiveCli {
-            session: "default".to_string(),
-            session_id: None,
-            rub_home: std::path::PathBuf::from("/tmp/rub-test"),
-            timeout: 30_000,
-            headed: false,
-            ignore_cert_errors: false,
-            user_data_dir: None,
-            hide_infobars: true,
-            json_pretty: false,
-            verbose: false,
-            trace: false,
-            command: Commands::Doctor,
-            cdp_url: None,
-            connect: true,
-            profile: None,
-            no_stealth: false,
-            humanize: false,
-            humanize_speed: "normal".to_string(),
-            requested_launch_policy: commands::RequestedLaunchPolicy::default(),
-            effective_launch_policy: commands::RequestedLaunchPolicy::default(),
-        };
-
-        let args = daemon_args(
-            &cli,
-            &ConnectionRequest::CdpUrl {
-                url: "ws://127.0.0.1:9222/devtools/browser/browser-a".to_string(),
-            },
-        );
-        assert!(args.contains(&"--cdp-url".to_string()));
-        assert!(args.contains(&"ws://127.0.0.1:9222/devtools/browser/browser-a".to_string()));
-        assert!(!args.contains(&"--connect".to_string()));
-    }
-
-    #[test]
-    fn handle_sessions_reports_registry_read_failure_instead_of_empty_success() {
-        let temp = std::env::temp_dir().join(format!("rub-sessions-test-{}", std::process::id()));
-        let _ = std::fs::remove_file(&temp);
-        std::fs::write(&temp, b"not-a-directory").expect("temp file should be writable");
-
-        let error = handle_sessions(&temp, "default", false)
-            .expect_err("registry read failure should propagate")
-            .into_envelope();
-        assert_eq!(error.code, ErrorCode::DaemonNotRunning);
-        let context = error
-            .context
-            .expect("sessions failure should publish context");
-        assert_eq!(
-            context["reason"],
-            serde_json::json!("session_registry_read_failed")
-        );
-        assert_eq!(
-            context["rub_home_state"]["path_authority"],
-            "cli.sessions.subject.rub_home"
-        );
-
-        let _ = std::fs::remove_file(temp);
-    }
-
-    #[test]
-    fn rub_home_create_error_marks_rub_home_state() {
-        let envelope = rub_home_create_error(
-            std::path::Path::new("/tmp/rub-home"),
-            &std::io::Error::other("boom"),
-        );
-        let context = envelope.context.expect("rub_home startup context");
-        assert_eq!(context["reason"], "rub_home_create_failed");
-        assert_eq!(
-            context["rub_home_state"]["path_authority"],
-            "cli.main.subject.rub_home"
-        );
-        assert_eq!(context["rub_home_state"]["upstream_truth"], "cli_rub_home");
-    }
-
-    #[test]
-    fn project_sessions_result_marks_local_runtime_paths() {
-        let projected = project_sessions_result(
-            std::path::Path::new("/tmp/rub-home"),
-            vec![RegistryEntry {
-                session_id: "sess-default".to_string(),
-                session_name: "default".to_string(),
-                pid: 4242,
-                socket_path: "/tmp/rub-home/default.sock".to_string(),
-                created_at: "2026-04-08T00:00:00Z".to_string(),
-                ipc_protocol_version: "1.0".to_string(),
-                user_data_dir: Some("/tmp/rub-home/browser/default".to_string()),
-                attachment_identity: None,
-                connection_target: None,
-            }],
-        );
-
-        assert_eq!(
-            projected["subject"]["rub_home_state"]["path_authority"],
-            "cli.sessions.subject.rub_home"
-        );
-        assert_eq!(
-            projected["result"]["items"][0]["socket_state"]["path_authority"],
-            "cli.sessions.result.items.socket"
-        );
-        assert_eq!(
-            projected["result"]["items"][0]["socket_state"]["truth_level"],
-            "local_runtime_reference"
-        );
-        assert_eq!(
-            projected["result"]["items"][0]["user_data_dir_state"]["path_authority"],
-            "cli.sessions.result.items.user_data_dir"
-        );
-    }
-}
+#[path = "main/tests.rs"]
+mod tests;

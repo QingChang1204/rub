@@ -2092,7 +2092,7 @@ fn t310a_external_attach_rejects_ambiguous_page_authority() {
     let profile_dir = std::env::temp_dir().join(format!(
         "rub-external-chrome-{}-{}",
         std::process::id(),
-        HOME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        uuid::Uuid::now_v7()
     ));
     let mut chrome = std::process::Command::new(browser_path)
         .args([

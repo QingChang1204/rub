@@ -23,6 +23,8 @@ pub struct DownloadRuntimeState {
     active_order: VecDeque<String>,
     completed_order: VecDeque<String>,
     timeline: VecDeque<DownloadEvent>,
+    dropped_event_count: u64,
+    last_evicted_sequence: u64,
     current_generation: u64,
 }
 

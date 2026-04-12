@@ -20,6 +20,18 @@ pub struct WaitAfterArgs {
     /// Wait for this text after the action completes
     #[arg(long = "wait-after-text", id = "wait_after_text")]
     pub text: Option<String>,
+    /// Wait for the target's accessible description to contain this substring after the action completes
+    #[arg(
+        long = "wait-after-description-contains",
+        id = "wait_after_description_contains"
+    )]
+    pub description_contains: Option<String>,
+    /// Wait for the current frame/page URL to contain this substring after the action completes
+    #[arg(long = "wait-after-url-contains", id = "wait_after_url_contains")]
+    pub url_contains: Option<String>,
+    /// Wait for the current frame/page title to contain this substring after the action completes
+    #[arg(long = "wait-after-title-contains", id = "wait_after_title_contains")]
+    pub title_contains: Option<String>,
     /// Select the first match from a semantic wait locator
     #[arg(long = "wait-after-first", id = "wait_after_first")]
     pub first: bool,
@@ -32,7 +44,7 @@ pub struct WaitAfterArgs {
     /// Timeout in milliseconds for the post-action wait
     #[arg(long = "wait-after-timeout", id = "wait_after_timeout_ms")]
     pub timeout_ms: Option<u64>,
-    /// Selector wait state: visible, hidden, attached, detached
+    /// Selector wait state: visible, hidden, attached, detached, interactable
     #[arg(long = "wait-after-state", id = "wait_after_state")]
     pub state: Option<String>,
 }
@@ -60,6 +72,15 @@ pub struct ElementAddressArgs {
     /// Resolve the target through a testing id instead of an index
     #[arg(long)]
     pub testid: Option<String>,
+    /// Keep only candidates with a non-zero authoritative snapshot bounding box
+    #[arg(long)]
+    pub visible: bool,
+    /// Prefer candidates that are not disabled or aria-disabled in the authoritative snapshot
+    #[arg(long = "prefer-enabled")]
+    pub prefer_enabled: bool,
+    /// Keep only candidates that still expose a live hittable point
+    #[arg(long)]
+    pub topmost: bool,
     /// Select the first result from a multi-match locator
     #[arg(long)]
     pub first: bool,

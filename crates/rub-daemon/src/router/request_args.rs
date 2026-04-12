@@ -33,6 +33,9 @@ mod tests {
             role: Some("button".to_string()),
             label: Some("Continue".to_string()),
             testid: Some("primary-cta".to_string()),
+            visible: true,
+            prefer_enabled: true,
+            topmost: true,
             first: true,
             last: false,
             nth: Some(2),
@@ -44,6 +47,9 @@ mod tests {
         assert_eq!(locator["role"], "button");
         assert_eq!(locator["label"], "Continue");
         assert_eq!(locator["testid"], "primary-cta");
+        assert_eq!(locator["visible"], true);
+        assert_eq!(locator["prefer_enabled"], true);
+        assert_eq!(locator["topmost"], true);
         assert_eq!(locator["first"], true);
         assert_eq!(locator["last"], false);
         assert_eq!(locator["nth"], 2);

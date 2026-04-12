@@ -45,10 +45,12 @@ fn humanize_budget_ms(cli: &EffectiveCli) -> u64 {
             cli.humanize,
             &cli.humanize_speed,
         ),
-        Commands::Type { text, .. } => humanize_budget_ms_for_command_args(
+        Commands::Type {
+            text, text_flag, ..
+        } => humanize_budget_ms_for_command_args(
             "type",
             &serde_json::json!({
-                "text": text,
+                "text": text.as_deref().or(text_flag.as_deref()),
             }),
             cli.humanize,
             &cli.humanize_speed,

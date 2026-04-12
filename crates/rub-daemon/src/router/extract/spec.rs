@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -186,6 +187,8 @@ pub(super) struct ExtractListArgs {
     pub(super) snapshot_id: Option<String>,
     #[serde(flatten)]
     scan: ExtractScanArgs,
+    #[serde(flatten)]
+    wait: ExtractWaitArgs,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -197,6 +200,21 @@ struct ExtractScanArgs {
     scroll_amount: Option<u64>,
     settle_ms: Option<u64>,
     stall_limit: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ExtractListWaitConfig {
+    pub(super) field_path: String,
+    pub(super) contains: String,
+    pub(super) timeout: Duration,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ExtractWaitArgs {
+    wait_field: Option<String>,
+    wait_contains: Option<String>,
+    wait_timeout_ms: Option<u64>,
 }
 
 impl ExtractScanArgs {
@@ -260,6 +278,39 @@ impl ExtractScanArgs {
     }
 }
 
+impl ExtractWaitArgs {
+    fn parse_config(&self) -> Result<Option<ExtractListWaitConfig>, RubError> {
+        let field_path = self
+            .wait_field
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let contains = self
+            .wait_contains
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        match (field_path, contains) {
+            (None, None) => Ok(None),
+            (Some(_), None) | (None, Some(_)) => Err(RubError::domain(
+                ErrorCode::InvalidInput,
+                "inspect list wait requires both wait_field and wait_contains",
+            )),
+            (Some(field_path), Some(contains)) => Ok(Some(ExtractListWaitConfig {
+                field_path,
+                contains,
+                timeout: Duration::from_millis(
+                    self.wait_timeout_ms
+                        .unwrap_or(rub_core::DEFAULT_WAIT_TIMEOUT_MS),
+                ),
+            })),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum ExtractCommand {
     Query(ExtractQueryArgs),
@@ -316,6 +367,13 @@ impl ExtractCommand {
         }
     }
 
+    pub(super) fn wait_config(&self) -> Result<Option<ExtractListWaitConfig>, RubError> {
+        match self {
+            Self::Query(_) => Ok(None),
+            Self::List(args) => args.wait.parse_config(),
+        }
+    }
+
     pub(super) fn source_kind(&self) -> &'static str {
         if self.snapshot_id().is_some() {
             "snapshot"
@@ -369,5 +427,48 @@ impl ExtractKind {
             Self::Attributes => "attributes",
             Self::Attribute => "attribute",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExtractCommand, ExtractWaitArgs};
+    use rub_core::error::ErrorCode;
+
+    #[test]
+    fn extract_wait_args_require_both_field_and_contains() {
+        let error = ExtractWaitArgs {
+            wait_field: Some("subject".to_string()),
+            wait_contains: None,
+            wait_timeout_ms: None,
+        }
+        .parse_config()
+        .expect_err("partial wait config should fail")
+        .into_envelope();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        assert!(error.message.contains("requires both"), "{error}");
+    }
+
+    #[test]
+    fn extract_list_command_parses_wait_config() {
+        let command = ExtractCommand::parse(
+            &serde_json::json!({
+                "sub": "list",
+                "spec": "{\"items\":{\"collection\":\".mail-row\",\"fields\":{\"subject\":{\"kind\":\"text\",\"selector\":\".subject\"}}}}",
+                "wait_field": "subject",
+                "wait_contains": "Confirm your account",
+                "wait_timeout_ms": 5000,
+            }),
+            None,
+        )
+        .expect("list command should parse");
+
+        let wait = command
+            .wait_config()
+            .expect("wait config should parse")
+            .expect("wait config should be present");
+        assert_eq!(wait.field_path, "subject");
+        assert_eq!(wait.contains, "Confirm your account");
+        assert_eq!(wait.timeout.as_millis(), 5000);
     }
 }

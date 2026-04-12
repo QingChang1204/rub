@@ -7,15 +7,78 @@ use super::{
     WaitAfterArgs,
 };
 
+mod explain;
 mod query;
 mod runtime;
 
+pub use explain::ExplainSubcommand;
 pub use query::{GetSubcommand, InspectSubcommand};
 pub use runtime::{
     CookiesSubcommand, DialogSubcommand, DownloadSubcommand, HandoffSubcommand,
     InterceptSubcommand, InterferenceSubcommand, OrchestrationSubcommand, RuntimeSubcommand,
     StorageSubcommand, TakeoverSubcommand, TriggerSubcommand,
 };
+
+const FILL_LONG_ABOUT: &str = "\
+Fill multiple form fields through the canonical interaction runtime.
+
+Use `fill` when you already know the fields you want to set and want one
+command to apply them, optionally followed by a canonical submit click.
+
+The spec is a JSON array. Each entry targets one field and sets its value.
+You can mix locator styles in the same array.";
+
+const FILL_AFTER_LONG_HELP: &str = "\
+Spec formats:
+  By index:
+    rub fill '[{\"index\":3,\"value\":\"alice@example.com\"},{\"index\":5,\"value\":\"secret\"}]'
+
+  By label:
+    rub fill '[{\"label\":\"Email\",\"value\":\"alice@example.com\"},{\"label\":\"Password\",\"value\":\"secret\"}]'
+
+  By selector:
+    rub fill '[{\"selector\":\"#email\",\"value\":\"alice@example.com\"}]'
+
+  By text:
+    rub fill '[{\"target_text\":\"Email address\",\"value\":\"alice@example.com\"}]'
+
+Examples:
+  Fill and submit:
+    rub fill '[{\"label\":\"Email\",\"value\":\"user@example.com\"},{\"label\":\"Password\",\"value\":\"pass\"}]' --submit-label \"Log in\"
+
+  Load spec from a file:
+    rub fill --file form.json --submit-label \"Submit\"
+
+Notes:
+  Mixed locators are allowed in the same spec array.
+  Use `--snapshot` when you want strict preflight continuity against one captured snapshot.
+  Use the \"Submit action\" options to click a follow-up button after filling.
+  Use the \"Post-action wait\" options when you need an explicit confirmation fence.";
+
+const EXTRACT_LONG_ABOUT: &str = "\
+Extract structured data through the canonical query surface.
+
+Use `extract` to turn page content into stable JSON fields without dropping
+down to ad hoc JavaScript for common scraping/query tasks.";
+
+const EXTRACT_AFTER_LONG_HELP: &str = "\
+Examples:
+  Shorthand field-to-selector mapping:
+    rub extract '{\"title\":\"h1\",\"price\":\".price\",\"desc\":\".desc\"}'
+
+  Explicit extraction kind:
+    rub extract '{\"title\":{\"selector\":\"h1\",\"kind\":\"text\"}}'
+
+  Attribute extraction:
+    rub extract '{\"link\":{\"selector\":\"a.main\",\"kind\":\"attribute\",\"attr\":\"href\"}}'
+
+  Collection extraction:
+    rub extract '{\"items\":{\"collection\":\"li.item\",\"fields\":{\"name\":{\"kind\":\"text\"},\"price\":{\"selector\":\".price\"}}}}'
+
+Output shape:
+  {\"result\":{\"fields\":{\"title\":\"...\"},\"field_count\":N}}
+
+Use --snapshot when you want strict continuity against a previously captured snapshot.";
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
@@ -38,6 +101,9 @@ pub enum Commands {
         /// Output projection format (default: snapshot)
         #[arg(long, value_enum)]
         format: Option<StateFormatArg>,
+        /// Hidden positional alias for common `rub state compact`-style input.
+        #[arg(value_enum, hide = true, conflicts_with = "format")]
+        format_alias: Option<StateFormatArg>,
         /// Include accessibility information (ARIA roles, names)
         #[arg(long)]
         a11y: bool,
@@ -94,6 +160,9 @@ pub enum Commands {
         /// Search live DOM content anchors instead of only interactive snapshot elements
         #[arg(long)]
         content: bool,
+        /// Project the candidate set through the read-only locator explain surface
+        #[arg(long, conflicts_with_all = ["content", "limit"])]
+        explain: bool,
         /// Max number of matches to return
         #[arg(long)]
         limit: Option<u32>,
@@ -125,6 +194,12 @@ pub enum Commands {
         /// Print the result directly instead of the standard JSON envelope
         #[arg(long)]
         raw: bool,
+    },
+
+    /// Explain how canonical CLI surfaces will interpret a command shape
+    Explain {
+        #[command(subcommand)]
+        subcommand: ExplainSubcommand,
     },
 
     /// Scroll the viewport.
@@ -233,6 +308,21 @@ pub enum Commands {
     /// Clean stale session state and orphaned temporary rub/browser artifacts
     Cleanup,
 
+    /// Canonical lifecycle exit for one RUB_HOME.
+    ///
+    /// `teardown` is the operator-facing wrapper over:
+    ///   1. `close --all`
+    ///   2. `cleanup`
+    ///
+    /// It closes active sessions for the target RUB_HOME, waits for daemon
+    /// shutdown fences, then sweeps orphaned temporary browser profiles and
+    /// stale temp-owned homes for that same authority.
+    ///
+    /// Examples:
+    ///   rub teardown
+    ///   rub --rub-home /tmp/rub-bench teardown
+    Teardown,
+
     /// Show recent session-scoped command history
     History {
         /// Number of recent entries to return
@@ -322,13 +412,17 @@ pub enum Commands {
         /// Clear existing content before typing when targeting a specific element
         #[arg(long)]
         clear: bool,
+        /// Text to type (flag form)
+        #[arg(long = "text", value_name = "TEXT", conflicts_with = "text")]
+        text_flag: Option<String>,
         /// Text to type
-        text: String,
+        #[arg(value_name = "TEXT", required_unless_present = "text_flag")]
+        text: Option<String>,
         #[command(flatten)]
         wait_after: WaitAfterArgs,
     },
 
-    /// Wait for a condition (CSS selector or text) to be met
+    /// Wait for an element, page text, or page context condition to be met
     Wait {
         /// Wait for a CSS selector to match
         #[arg(long)]
@@ -348,6 +442,15 @@ pub enum Commands {
         /// Wait for text to appear on page
         #[arg(long)]
         text: Option<String>,
+        /// Wait for the target's accessible description to contain this substring
+        #[arg(long = "description-contains")]
+        description_contains: Option<String>,
+        /// Wait for the current frame/page URL to contain this substring
+        #[arg(long = "url-contains")]
+        url_contains: Option<String>,
+        /// Wait for the current frame/page title to contain this substring
+        #[arg(long = "title-contains")]
+        title_contains: Option<String>,
         /// Select the first match from a semantic wait locator
         #[arg(long)]
         first: bool,
@@ -360,7 +463,7 @@ pub enum Commands {
         /// Timeout in milliseconds (default: 30000)
         #[arg(long, default_value_t = DEFAULT_WAIT_TIMEOUT_MS)]
         timeout: u64,
-        /// Element state to wait for: visible, hidden, attached, detached (default: visible)
+        /// Element state to wait for: visible, hidden, attached, detached, interactable (default: visible)
         #[arg(long, default_value = "visible")]
         state: String,
     },
@@ -430,94 +533,104 @@ pub enum Commands {
         wait_after: WaitAfterArgs,
     },
 
-    /// Fill multiple form fields through the canonical interaction runtime.
-    ///
-    /// SPEC is a JSON array where each entry targets a field and sets its value.
-    /// Fields can be targeted by snapshot index (from `observe`/`state`), by
-    /// label, by CSS selector, or by semantic locator.
-    ///
-    /// Spec formats:
-    ///
-    ///   By index:    '[{"index":3,"value":"alice@example.com"},{"index":5,"value":"secret"}]'
-    ///   By label:    '[{"label":"Email","value":"alice@example.com"},{"label":"Password","value":"secret"}]'
-    ///   By selector: '[{"selector":"#email","value":"alice@example.com"}]'
-    ///   By text:     '[{"target_text":"Email address","value":"alice@example.com"}]'
-    ///
-    /// Mixed locators are allowed in the same spec array.
-    /// Add --submit-label "Sign in" (or --submit-index N) to click submit after filling.
-    ///
-    /// Examples:
-    ///   rub fill '[{"label":"Email","value":"user@example.com"},{"label":"Password","value":"pass"}]' --submit-label "Log in"
-    ///   rub fill --file form.json --submit-label "Submit"
+    /// Fill multiple form fields through the canonical interaction runtime
+    #[command(long_about = FILL_LONG_ABOUT, after_long_help = FILL_AFTER_LONG_HELP)]
     Fill {
         /// Inline JSON fill specification (array of field descriptors)
-        #[arg(conflicts_with = "file")]
+        #[arg(conflicts_with = "file", help_heading = "Fill spec input")]
         spec: Option<String>,
         /// Load the fill specification from a JSON file
-        #[arg(long, value_name = "PATH", conflicts_with = "spec")]
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with = "spec",
+            help_heading = "Fill spec input"
+        )]
         file: Option<String>,
+        /// Validate and explain the fill plan without mutating the page
+        #[arg(long, help_heading = "Planning")]
+        validate: bool,
+        /// Execute a strict opt-in atomic subset with explicit rollback on failure
+        #[arg(long, help_heading = "Planning")]
+        atomic: bool,
+        /// Snapshot ID for strict preflight continuity (target resolution only)
+        #[arg(long, value_name = "SNAPSHOT_ID", help_heading = "Planning")]
+        snapshot: Option<String>,
         /// Optional submit button index
-        #[arg(long = "submit-index")]
+        #[arg(long = "submit-index", help_heading = "Submit action")]
         submit_index: Option<u32>,
         /// Optional submit selector
-        #[arg(long = "submit-selector")]
+        #[arg(long = "submit-selector", help_heading = "Submit action")]
         submit_selector: Option<String>,
         /// Optional submit target text
-        #[arg(long = "submit-target-text")]
+        #[arg(long = "submit-target-text", help_heading = "Submit action")]
         submit_target_text: Option<String>,
         /// Optional submit ref
-        #[arg(long = "submit-ref")]
+        #[arg(long = "submit-ref", help_heading = "Submit action")]
         submit_ref: Option<String>,
         /// Optional submit semantic role
-        #[arg(long = "submit-role")]
+        #[arg(long = "submit-role", help_heading = "Submit action")]
         submit_role: Option<String>,
         /// Optional submit accessible/visible label
-        #[arg(long = "submit-label")]
+        #[arg(long = "submit-label", help_heading = "Submit action")]
         submit_label: Option<String>,
         /// Optional submit testing id
-        #[arg(long = "submit-testid")]
+        #[arg(long = "submit-testid", help_heading = "Submit action")]
         submit_testid: Option<String>,
         /// Select the first submit match
-        #[arg(long = "submit-first")]
+        #[arg(long = "submit-first", help_heading = "Submit action")]
         submit_first: bool,
         /// Select the last submit match
-        #[arg(long = "submit-last")]
+        #[arg(long = "submit-last", help_heading = "Submit action")]
         submit_last: bool,
         /// Select the nth submit match (0-based)
-        #[arg(long = "submit-nth")]
+        #[arg(long = "submit-nth", help_heading = "Submit action")]
         submit_nth: Option<u32>,
-        #[command(flatten)]
+        #[command(flatten, next_help_heading = "Post-action wait")]
         wait_after: WaitAfterArgs,
     },
 
-    /// Extract structured data through the canonical query surface.
-    ///
-    /// SPEC is a JSON object mapping output field names to extraction descriptors.
-    /// Each key becomes a field in the returned JSON.
-    ///
-    /// Shorthand — field name to CSS selector (defaults to text content):
-    ///   rub extract '{"title":"h1","price":".price","desc":".desc"}'
-    ///
-    /// Explicit kind (text, value, html, bbox, attributes, attribute):
-    ///   rub extract '{"title":{"selector":"h1","kind":"text"}}'
-    ///
-    /// Attribute extraction (use "attr" or "attribute" + "kind":"attribute"):
-    ///   rub extract '{"link":{"selector":"a.main","attr":"href"}}'
-    ///
-    /// Collection extraction (returns an array of row objects):
-    ///   rub extract '{"items":{"collection":"li.item","fields":{"name":{"kind":"text"},"price":{"selector":".price"}}}}'
-    ///
-    /// Output shape: {"result": {"fields": {"title": "...", ...}, "field_count": N}}
+    /// Extract structured data through the canonical query surface
+    #[command(long_about = EXTRACT_LONG_ABOUT, after_long_help = EXTRACT_AFTER_LONG_HELP)]
     Extract {
         /// Inline JSON extract specification
-        #[arg(conflicts_with = "file")]
+        #[arg(
+            conflicts_with_all = ["file", "examples", "schema"],
+            help_heading = "Extract spec input"
+        )]
         spec: Option<String>,
         /// Load the extract specification from a JSON file
-        #[arg(long, value_name = "PATH", conflicts_with = "spec")]
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with_all = ["spec", "examples", "schema"],
+            help_heading = "Extract spec input"
+        )]
         file: Option<String>,
         /// Snapshot ID (strict mode; omitted = use an implicit live snapshot)
-        #[arg(long)]
+        #[arg(
+            long,
+            conflicts_with_all = ["examples", "schema"],
+            help_heading = "Snapshot continuity"
+        )]
         snapshot: Option<String>,
+        /// Print built-in extract examples (optionally scoped to a topic)
+        #[arg(
+            long,
+            value_name = "TOPIC",
+            num_args = 0..=1,
+            default_missing_value = "all",
+            help_heading = "Built-in help",
+            conflicts_with_all = ["spec", "file", "snapshot", "schema"]
+        )]
+        examples: Option<String>,
+        /// Print the canonical extract field and collection schema
+        #[arg(
+            long,
+            help_heading = "Built-in help",
+            conflicts_with_all = ["spec", "file", "snapshot", "examples"]
+        )]
+        schema: bool,
     },
 
     /// Execute a workflow pipeline over existing canonical commands.
@@ -577,6 +690,7 @@ impl Commands {
             Self::Find { .. } => CommandName::Find.as_str(),
             Self::Click { .. } => CommandName::Click.as_str(),
             Self::Exec { .. } => CommandName::Exec.as_str(),
+            Self::Explain { .. } => "explain",
             Self::Scroll { .. } => CommandName::Scroll.as_str(),
             Self::Back { .. } => CommandName::Back.as_str(),
             Self::Forward { .. } => CommandName::Forward.as_str(),
@@ -591,6 +705,7 @@ impl Commands {
             Self::Frames => CommandName::Frames.as_str(),
             Self::Frame { .. } => CommandName::Frame.as_str(),
             Self::Cleanup => "cleanup",
+            Self::Teardown => "teardown",
             Self::History { .. } => CommandName::History.as_str(),
             Self::Downloads => CommandName::Downloads.as_str(),
             Self::Download { .. } => CommandName::Download.as_str(),
@@ -642,6 +757,17 @@ impl Commands {
         match self {
             Self::Close { all: true } => Some("close --all"),
             Self::Cleanup => Some("cleanup"),
+            Self::Teardown => Some("teardown"),
+            Self::Inspect(InspectSubcommand::List {
+                builder_help: true, ..
+            }) => Some("inspect list built-in help"),
+            Self::Explain {
+                subcommand: ExplainSubcommand::Extract { .. },
+            } => Some("explain extract"),
+            Self::Extract { schema: true, .. } => Some("extract built-in help"),
+            Self::Extract {
+                examples: Some(_), ..
+            } => Some("extract built-in help"),
             Self::Sessions => Some("sessions"),
             Self::InternalDaemon => Some("internal daemon"),
             _ => None,
@@ -650,77 +776,24 @@ impl Commands {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::Commands;
-    use crate::commands::Cli;
+pub(crate) fn render_nested_subcommand_long_help(parent: &str, child: &str) -> String {
     use clap::CommandFactory;
 
-    fn render_subcommand_long_help(name: &str) -> String {
-        let mut root = Cli::command();
-        let mut subcommand = root
-            .find_subcommand_mut(name)
-            .unwrap_or_else(|| panic!("missing subcommand {name}"))
-            .clone();
-        let mut buffer = Vec::new();
-        subcommand
-            .write_long_help(&mut buffer)
-            .expect("help should render");
-        String::from_utf8(buffer).expect("help should be valid utf-8")
-    }
-
-    #[test]
-    fn canonical_name_single_sources_public_command_strings() {
-        assert_eq!(
-            Commands::Downloads.canonical_name(),
-            rub_core::command::CommandName::Downloads.as_str()
-        );
-        assert_eq!(
-            Commands::Doctor.canonical_name(),
-            rub_core::command::CommandName::Doctor.as_str()
-        );
-        assert_eq!(Commands::Sessions.canonical_name(), "sessions");
-        assert_eq!(Commands::InternalDaemon.canonical_name(), "__daemon");
-    }
-
-    #[test]
-    fn local_projection_surface_marks_local_only_variants() {
-        assert_eq!(
-            Commands::Close { all: true }.local_projection_surface(),
-            Some("close --all")
-        );
-        assert_eq!(
-            Commands::Cleanup.local_projection_surface(),
-            Some("cleanup")
-        );
-        assert_eq!(
-            Commands::InternalDaemon.local_projection_surface(),
-            Some("internal daemon")
-        );
-        assert_eq!(Commands::Downloads.local_projection_surface(), None);
-    }
-
-    #[test]
-    fn observe_help_uses_index_flag_in_type_example() {
-        let help = render_subcommand_long_help("observe");
-        assert!(help.contains("rub type --index 5 \"hello\""), "{help}");
-        assert!(!help.contains("rub type 5 \"hello\""), "{help}");
-    }
-
-    #[test]
-    fn pipe_help_examples_use_command_step_key() {
-        let help = render_subcommand_long_help("pipe");
-        assert!(help.contains("\"command\":\"open\""), "{help}");
-        assert!(help.contains("{command, args} step objects"), "{help}");
-        assert!(!help.contains("\"cmd\":\"open\""), "{help}");
-        assert!(!help.contains("`cmd` key"), "{help}");
-    }
-
-    #[test]
-    fn exec_help_marks_raw_as_explicit_non_json_surface() {
-        let help = render_subcommand_long_help("exec");
-        assert!(
-            help.contains("Print the result directly instead of the standard JSON envelope"),
-            "{help}"
-        );
-    }
+    let mut root = super::Cli::command();
+    let mut parent_command = root
+        .find_subcommand_mut(parent)
+        .unwrap_or_else(|| panic!("missing subcommand {parent}"))
+        .clone();
+    let mut child_command = parent_command
+        .find_subcommand_mut(child)
+        .unwrap_or_else(|| panic!("missing subcommand {parent} {child}"))
+        .clone();
+    let mut buffer = Vec::new();
+    child_command
+        .write_long_help(&mut buffer)
+        .expect("help should render");
+    String::from_utf8(buffer).expect("help should be valid utf-8")
 }
+
+#[cfg(test)]
+mod tests;

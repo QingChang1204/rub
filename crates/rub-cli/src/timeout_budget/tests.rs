@@ -4,10 +4,10 @@ use super::{
     humanize_budget_ms_for_command_args,
 };
 use crate::commands::{
-    Commands, CookiesSubcommand, EffectiveCli, ElementAddressArgs, InspectSubcommand,
-    InterceptSubcommand, ObservationProjectionArgs, ObservationScopeArgs, OrchestrationSubcommand,
-    RequestedLaunchPolicy, RuntimeSubcommand, StateFormatArg, StorageSubcommand,
-    TakeoverSubcommand, TriggerSubcommand, WaitAfterArgs,
+    Commands, CookiesSubcommand, EffectiveCli, ElementAddressArgs, ExplainSubcommand,
+    InspectSubcommand, InterceptSubcommand, ObservationProjectionArgs, ObservationScopeArgs,
+    OrchestrationSubcommand, RequestedLaunchPolicy, RuntimeSubcommand, StateFormatArg,
+    StorageSubcommand, TakeoverSubcommand, TriggerSubcommand, WaitAfterArgs,
 };
 use rub_core::DEFAULT_WAIT_AFTER_TIMEOUT_MS;
 use rub_core::error::ErrorCode;
@@ -66,6 +66,9 @@ fn wait_request_uses_wait_timeout_plus_ipc_buffer() {
         label: None,
         testid: None,
         text: None,
+        description_contains: None,
+        url_contains: None,
+        title_contains: None,
         first: false,
         last: false,
         nth: None,
@@ -87,6 +90,9 @@ fn shrinking_wait_request_timeout_updates_embedded_wait_budget() {
         label: None,
         testid: None,
         text: None,
+        description_contains: None,
+        url_contains: None,
+        title_contains: None,
         first: false,
         last: false,
         nth: None,
@@ -155,6 +161,7 @@ fn inspect_network_wait_request_uses_global_timeout_when_subcommand_timeout_omit
 fn local_only_commands_fail_fast_in_request_builder() {
     for (command, expected_fragment) in [
         (Commands::Cleanup, "cleanup"),
+        (Commands::Teardown, "teardown"),
         (Commands::Sessions, "sessions"),
         (Commands::Close { all: true }, "close --all"),
         (Commands::InternalDaemon, "internal daemon"),
@@ -381,7 +388,8 @@ fn humanized_typing_budget_scales_with_text_length() {
             ..ElementAddressArgs::default()
         },
         clear: false,
-        text: "hello world".to_string(),
+        text_flag: None,
+        text: Some("hello world".to_string()),
         wait_after: WaitAfterArgs::default(),
     });
     cli.humanize = true;
@@ -474,6 +482,9 @@ fn fill_file_request_loads_spec_and_records_file_source() {
     let cli = cli_with(Commands::Fill {
         spec: None,
         file: Some(path.display().to_string()),
+        validate: false,
+        atomic: false,
+        snapshot: None,
         submit_index: None,
         submit_selector: None,
         submit_target_text: None,
@@ -518,6 +529,9 @@ fn fill_file_request_missing_file_reports_path_context() {
     let cli = cli_with(Commands::Fill {
         spec: None,
         file: Some(path.display().to_string()),
+        validate: false,
+        atomic: false,
+        snapshot: None,
         submit_index: None,
         submit_selector: None,
         submit_target_text: None,
@@ -553,6 +567,9 @@ fn fill_request_extends_timeout_for_step_wait_after_budget() {
             .to_string(),
         ),
         file: None,
+        validate: false,
+        atomic: false,
+        snapshot: None,
         submit_index: None,
         submit_selector: None,
         submit_target_text: None,
@@ -571,6 +588,91 @@ fn fill_request_extends_timeout_for_step_wait_after_budget() {
 }
 
 #[test]
+fn fill_validate_request_uses_internal_read_only_projection() {
+    let cli = cli_with(Commands::Fill {
+        spec: Some(r##"[{"selector":"#name","value":"Ada"}]"##.to_string()),
+        file: None,
+        validate: true,
+        atomic: false,
+        snapshot: None,
+        submit_index: None,
+        submit_selector: None,
+        submit_target_text: None,
+        submit_ref: None,
+        submit_role: None,
+        submit_label: None,
+        submit_testid: None,
+        submit_first: false,
+        submit_last: false,
+        submit_nth: None,
+        wait_after: WaitAfterArgs::default(),
+    });
+
+    let request = build_request(&cli).expect("fill validate request should build");
+    assert_eq!(request.command, "_fill_validate");
+    assert!(
+        request.command_id.is_none(),
+        "validate surface should not look mutating at the protocol layer"
+    );
+}
+
+#[test]
+fn fill_snapshot_request_projects_snapshot_id_into_fill_args() {
+    let cli = cli_with(Commands::Fill {
+        spec: Some(r##"[{"selector":"#name","value":"Ada"}]"##.to_string()),
+        file: None,
+        validate: false,
+        atomic: false,
+        snapshot: Some("snap-123".to_string()),
+        submit_index: None,
+        submit_selector: None,
+        submit_target_text: None,
+        submit_ref: None,
+        submit_role: None,
+        submit_label: None,
+        submit_testid: None,
+        submit_first: false,
+        submit_last: false,
+        submit_nth: None,
+        wait_after: WaitAfterArgs::default(),
+    });
+
+    let request = build_request(&cli).expect("fill snapshot request should build");
+    assert_eq!(request.command, "fill");
+    assert_eq!(request.args["snapshot_id"], "snap-123");
+}
+
+#[test]
+fn fill_atomic_request_projects_flag_and_reserves_rollback_budget() {
+    let cli = cli_with(Commands::Fill {
+        spec: Some(r##"[{"selector":"#name","value":"Ada"}]"##.to_string()),
+        file: None,
+        validate: false,
+        atomic: true,
+        snapshot: None,
+        submit_index: None,
+        submit_selector: None,
+        submit_target_text: None,
+        submit_ref: None,
+        submit_role: None,
+        submit_label: None,
+        submit_testid: None,
+        submit_first: false,
+        submit_last: false,
+        submit_nth: None,
+        wait_after: WaitAfterArgs::default(),
+    });
+
+    let request = build_request(&cli).expect("atomic fill request should build");
+    assert_eq!(request.command, "fill");
+    assert_eq!(request.args["atomic"], true);
+    assert!(
+        request.timeout_ms > command_timeout_ms(&cli),
+        "atomic fill should reserve additional rollback budget"
+    );
+}
+
+#[test]
 fn extract_file_request_loads_spec_and_records_file_source() {
     let path = std::env::temp_dir().join(format!("rub-extract-spec-{}.json", uuid::Uuid::now_v7()));
     fs::write(&path, r#"{"headline":{"selector":"h1","kind":"text"}}"#).expect("extract spec file");
@@ -579,6 +681,8 @@ fn extract_file_request_loads_spec_and_records_file_source() {
         spec: None,
         file: Some(path.display().to_string()),
         snapshot: None,
+        examples: None,
+        schema: false,
     });
 
     let request = build_request(&cli).expect("extract request should build");
@@ -602,6 +706,220 @@ fn extract_file_request_loads_spec_and_records_file_source() {
     );
 
     let _ = fs::remove_file(path);
+}
+
+#[test]
+fn extract_builtin_help_is_local_only_projection() {
+    let cli = cli_with(Commands::Extract {
+        spec: None,
+        file: None,
+        snapshot: None,
+        examples: Some("all".to_string()),
+        schema: false,
+    });
+
+    let error = build_request(&cli).expect_err("extract built-in help should stay local");
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::InternalError);
+    assert_eq!(
+        envelope.message,
+        "extract built-in help must be handled locally before IPC request projection"
+    );
+}
+
+#[test]
+fn explain_extract_is_local_only_projection() {
+    let cli = cli_with(Commands::Explain {
+        subcommand: ExplainSubcommand::Extract {
+            spec: Some("{\"title\":\"h1\"}".to_string()),
+            file: None,
+        },
+    });
+
+    let error = build_request(&cli).expect_err("explain extract should stay local");
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::InternalError);
+    assert_eq!(
+        envelope.message,
+        "explain extract must be handled locally before IPC request projection"
+    );
+}
+
+#[test]
+fn explain_locator_projects_to_find_without_selection() {
+    let cli = cli_with(Commands::Explain {
+        subcommand: ExplainSubcommand::Locator {
+            target: ElementAddressArgs {
+                snapshot: Some("snap-123".to_string()),
+                element_ref: None,
+                selector: None,
+                target_text: Some("New Topic".to_string()),
+                role: None,
+                label: None,
+                testid: None,
+                visible: false,
+                prefer_enabled: false,
+                topmost: false,
+                first: false,
+                last: false,
+                nth: Some(2),
+            },
+        },
+    });
+
+    let request = build_request(&cli).expect("explain locator should build");
+    assert_eq!(request.command, "find");
+    assert_eq!(request.args["snapshot_id"], "snap-123");
+    assert_eq!(request.args["target_text"], "New Topic");
+    assert_eq!(request.args["first"], false);
+    assert_eq!(request.args["last"], false);
+    assert_eq!(request.args["nth"], serde_json::Value::Null);
+}
+
+#[test]
+fn find_explain_projects_to_find_without_selection() {
+    let cli = cli_with(Commands::Find {
+        target: ElementAddressArgs {
+            snapshot: Some("snap-123".to_string()),
+            element_ref: None,
+            selector: None,
+            target_text: Some("New Topic".to_string()),
+            role: None,
+            label: None,
+            testid: None,
+            visible: false,
+            prefer_enabled: false,
+            topmost: false,
+            first: false,
+            last: false,
+            nth: Some(2),
+        },
+        content: false,
+        explain: true,
+        limit: None,
+    });
+
+    let request = build_request(&cli).expect("find --explain should build");
+    assert_eq!(request.command, "find");
+    assert_eq!(request.args["snapshot_id"], "snap-123");
+    assert_eq!(request.args["target_text"], "New Topic");
+    assert_eq!(request.args["content"], false);
+    assert_eq!(request.args["explain"], true);
+    assert_eq!(request.args["limit"], serde_json::Value::Null);
+    assert_eq!(request.args["first"], false);
+    assert_eq!(request.args["last"], false);
+    assert_eq!(request.args["nth"], serde_json::Value::Null);
+}
+
+#[test]
+fn find_explain_rejects_limit_because_explain_needs_full_candidate_set() {
+    let cli = cli_with(Commands::Find {
+        target: ElementAddressArgs {
+            snapshot: Some("snap-123".to_string()),
+            element_ref: None,
+            selector: None,
+            target_text: Some("New Topic".to_string()),
+            role: None,
+            label: None,
+            testid: None,
+            visible: false,
+            prefer_enabled: false,
+            topmost: false,
+            first: false,
+            last: false,
+            nth: Some(2),
+        },
+        content: false,
+        explain: true,
+        limit: Some(5),
+    });
+
+    let envelope = build_request(&cli)
+        .expect_err("find --explain --limit must fail closed")
+        .into_envelope();
+    assert_eq!(envelope.code, ErrorCode::InvalidInput);
+    assert!(
+        envelope
+            .message
+            .contains("full authoritative candidate set"),
+        "{}",
+        envelope.message
+    );
+}
+
+#[test]
+fn find_explain_projects_topmost_ranking_flag() {
+    let cli = cli_with(Commands::Find {
+        target: ElementAddressArgs {
+            snapshot: Some("snap-789".to_string()),
+            element_ref: None,
+            selector: Some(".cta".to_string()),
+            target_text: None,
+            role: None,
+            label: None,
+            testid: None,
+            visible: true,
+            prefer_enabled: true,
+            topmost: true,
+            first: false,
+            last: false,
+            nth: None,
+        },
+        content: false,
+        explain: true,
+        limit: None,
+    });
+
+    let request = build_request(&cli).expect("find --explain should build with topmost");
+    assert_eq!(request.command, "find");
+    assert_eq!(request.args["snapshot_id"], "snap-789");
+    assert_eq!(request.args["selector"], ".cta");
+    assert_eq!(request.args["visible"], true);
+    assert_eq!(request.args["prefer_enabled"], true);
+    assert_eq!(request.args["topmost"], true);
+    assert_eq!(request.args["first"], false);
+    assert_eq!(request.args["last"], false);
+    assert_eq!(request.args["nth"], serde_json::Value::Null);
+}
+
+#[test]
+fn explain_interactability_projects_to_internal_probe() {
+    let cli = cli_with(Commands::Explain {
+        subcommand: ExplainSubcommand::Interactability {
+            target: ElementAddressArgs {
+                snapshot: Some("snap-321".to_string()),
+                element_ref: None,
+                selector: None,
+                target_text: None,
+                role: None,
+                label: Some("Consent".to_string()),
+                testid: None,
+                visible: false,
+                prefer_enabled: false,
+                topmost: false,
+                first: true,
+                last: false,
+                nth: None,
+            },
+        },
+    });
+
+    let request = build_request(&cli).expect("explain interactability should build");
+    assert_eq!(request.command, "_interactability_probe");
+    assert_eq!(request.args["snapshot_id"], "snap-321");
+    assert_eq!(request.args["label"], "Consent");
+    assert_eq!(request.args["first"], true);
+}
+
+#[test]
+fn explain_blockers_projects_to_internal_probe() {
+    let cli = cli_with(Commands::Explain {
+        subcommand: ExplainSubcommand::Blockers,
+    });
+
+    let request = build_request(&cli).expect("explain blockers should build");
+    assert_eq!(request.command, "_blocker_diagnose");
+    assert_eq!(request.args, serde_json::json!({}));
 }
 
 #[test]
@@ -861,6 +1179,7 @@ fn storage_set_defaults_to_local_area() {
 #[test]
 fn inspect_list_builder_request_compiles_collection_and_fields() {
     let cli = cli_with(Commands::Inspect(InspectSubcommand::List {
+        builder_help: false,
         spec: None,
         file: None,
         collection: Some("option".to_string()),
@@ -877,6 +1196,9 @@ fn inspect_list_builder_request_compiles_collection_and_fields() {
         scroll_amount: None,
         settle_ms: None,
         stall_limit: None,
+        wait_field: None,
+        wait_contains: None,
+        wait_timeout: None,
     }));
 
     let request = build_request(&cli).expect("inspect list request should build");
@@ -908,6 +1230,7 @@ fn inspect_list_file_request_loads_spec_and_records_file_source() {
     .expect("inspect list spec file");
 
     let cli = cli_with(Commands::Inspect(InspectSubcommand::List {
+        builder_help: false,
         spec: None,
         file: Some(path.display().to_string()),
         collection: None,
@@ -920,6 +1243,9 @@ fn inspect_list_file_request_loads_spec_and_records_file_source() {
         scroll_amount: None,
         settle_ms: None,
         stall_limit: None,
+        wait_field: None,
+        wait_contains: None,
+        wait_timeout: None,
     }));
 
     let request = build_request(&cli).expect("inspect list request should build");
@@ -945,6 +1271,7 @@ fn inspect_list_file_request_loads_spec_and_records_file_source() {
 #[test]
 fn inspect_list_scan_request_projects_bounded_scan_surface() {
     let cli = cli_with(Commands::Inspect(InspectSubcommand::List {
+        builder_help: false,
         spec: None,
         file: None,
         collection: Some(".feed-item".to_string()),
@@ -960,6 +1287,9 @@ fn inspect_list_scan_request_projects_bounded_scan_surface() {
         scroll_amount: Some(1800),
         settle_ms: Some(900),
         stall_limit: Some(3),
+        wait_field: None,
+        wait_contains: None,
+        wait_timeout: None,
     }));
 
     let request = build_request(&cli).expect("inspect list scan request should build");
@@ -979,6 +1309,67 @@ fn inspect_list_scan_request_projects_bounded_scan_surface() {
 }
 
 #[test]
+fn inspect_list_wait_request_projects_match_probe_and_timeout() {
+    let cli = cli_with(Commands::Inspect(InspectSubcommand::List {
+        builder_help: false,
+        spec: None,
+        file: None,
+        collection: Some(".mail-row".to_string()),
+        row_scope: None,
+        field: vec![
+            "subject=text:.subject".to_string(),
+            "from=text:.from".to_string(),
+        ],
+        snapshot: None,
+        scan_until: None,
+        scan_key: None,
+        max_scrolls: None,
+        scroll_amount: None,
+        settle_ms: None,
+        stall_limit: None,
+        wait_field: Some("subject".to_string()),
+        wait_contains: Some("Confirm your new account".to_string()),
+        wait_timeout: Some(12_500),
+    }));
+
+    let request = build_request(&cli).expect("inspect list wait request should build");
+    assert_eq!(request.command, "inspect");
+    assert_eq!(request.args["sub"], "list");
+    assert_eq!(request.args["wait_field"], "subject");
+    assert_eq!(request.args["wait_contains"], "Confirm your new account");
+    assert_eq!(request.args["wait_timeout_ms"], 12_500);
+    assert_eq!(request.timeout_ms, 12_500 + WAIT_IPC_BUFFER_MS);
+}
+
+#[test]
+fn inspect_list_wait_rejects_scan_and_wait_combination_before_bootstrap() {
+    let cli = cli_with(Commands::Inspect(InspectSubcommand::List {
+        builder_help: false,
+        spec: None,
+        file: None,
+        collection: Some(".mail-row".to_string()),
+        row_scope: None,
+        field: vec!["subject=text:.subject".to_string()],
+        snapshot: None,
+        scan_until: Some(25),
+        scan_key: None,
+        max_scrolls: None,
+        scroll_amount: None,
+        settle_ms: None,
+        stall_limit: None,
+        wait_field: Some("subject".to_string()),
+        wait_contains: Some("Confirm".to_string()),
+        wait_timeout: None,
+    }));
+
+    let error = build_request(&cli)
+        .expect_err("inspect list wait must not mix with scan yet")
+        .into_envelope();
+    assert_eq!(error.code, ErrorCode::InvalidInput);
+    assert!(error.message.contains("cannot be combined"), "{error}");
+}
+
+#[test]
 fn inspect_harvest_is_handled_locally() {
     let cli = cli_with(Commands::Inspect(InspectSubcommand::Harvest {
         file: "feed.json".to_string(),
@@ -994,6 +1385,36 @@ fn inspect_harvest_is_handled_locally() {
 
     let error = build_request(&cli).expect_err("inspect harvest should stay local");
     assert!(error.to_string().contains("handled locally"));
+}
+
+#[test]
+fn inspect_list_builder_help_is_local_only_projection() {
+    let cli = cli_with(Commands::Inspect(InspectSubcommand::List {
+        builder_help: true,
+        spec: None,
+        file: None,
+        collection: None,
+        row_scope: None,
+        field: Vec::new(),
+        snapshot: None,
+        scan_until: None,
+        scan_key: None,
+        max_scrolls: None,
+        scroll_amount: None,
+        settle_ms: None,
+        stall_limit: None,
+        wait_field: None,
+        wait_contains: None,
+        wait_timeout: None,
+    }));
+
+    let error = build_request(&cli).expect_err("inspect list built-in help should stay local");
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::InternalError);
+    assert_eq!(
+        envelope.message,
+        "inspect list built-in help must be handled locally before IPC request projection"
+    );
 }
 
 #[test]
@@ -1585,6 +2006,9 @@ fn wait_after_budget_extends_command_timeout() {
             label: None,
             testid: None,
             text: None,
+            description_contains: None,
+            url_contains: None,
+            title_contains: None,
             first: false,
             last: false,
             nth: None,
@@ -1639,6 +2063,7 @@ fn state_request_serializes_semantic_observation_scope() {
     let cli = cli_with(Commands::State {
         limit: Some(25),
         format: Some(StateFormatArg::A11y),
+        format_alias: None,
         a11y: false,
         viewport: false,
         diff: None,
@@ -1656,6 +2081,24 @@ fn state_request_serializes_semantic_observation_scope() {
     assert_eq!(request.args["scope"]["role"], "main");
     assert_eq!(request.args["scope"]["selection"]["nth"], 1);
     assert!(request.args.get("selector").is_none());
+}
+
+#[test]
+fn state_request_uses_positional_format_alias_when_explicit_flag_is_absent() {
+    let cli = cli_with(Commands::State {
+        limit: None,
+        format: None,
+        format_alias: Some(StateFormatArg::Compact),
+        a11y: false,
+        viewport: false,
+        diff: None,
+        listeners: false,
+        scope: ObservationScopeArgs::default(),
+        projection: ObservationProjectionArgs::default(),
+    });
+
+    let request = build_request(&cli).expect("state request should build with positional alias");
+    assert_eq!(request.args["format"], "compact");
 }
 
 #[test]
@@ -1717,6 +2160,7 @@ fn state_request_rejects_multiple_observation_scope_kinds() {
     let cli = cli_with(Commands::State {
         limit: None,
         format: None,
+        format_alias: None,
         a11y: false,
         viewport: false,
         diff: None,
@@ -1741,6 +2185,7 @@ fn state_request_rejects_multiple_observation_scope_selections() {
     let cli = cli_with(Commands::State {
         limit: None,
         format: None,
+        format_alias: None,
         a11y: false,
         viewport: false,
         diff: None,
@@ -1771,7 +2216,8 @@ fn type_request_rejects_ambiguous_locator_before_bootstrap() {
             ..ElementAddressArgs::default()
         },
         clear: false,
-        text: "hello".to_string(),
+        text_flag: None,
+        text: Some("hello".to_string()),
         wait_after: WaitAfterArgs::default(),
     });
 
@@ -1788,7 +2234,8 @@ fn type_request_allows_focused_text_target_without_locator_before_bootstrap() {
         index: None,
         target: ElementAddressArgs::default(),
         clear: false,
-        text: "hello".to_string(),
+        text_flag: None,
+        text: Some("hello".to_string()),
         wait_after: WaitAfterArgs::default(),
     });
 
@@ -1799,6 +2246,50 @@ fn type_request_allows_focused_text_target_without_locator_before_bootstrap() {
     assert!(request.args["index"].is_null());
     assert!(request.args["selector"].is_null());
     assert!(request.args["target_text"].is_null());
+}
+
+#[test]
+fn type_request_accepts_text_flag_alias_before_bootstrap() {
+    let cli = cli_with(Commands::Type {
+        index: None,
+        target: ElementAddressArgs {
+            label: Some("Email".to_string()),
+            ..ElementAddressArgs::default()
+        },
+        clear: false,
+        text_flag: Some("hello@example.com".to_string()),
+        text: None,
+        wait_after: WaitAfterArgs::default(),
+    });
+
+    let request = build_request(&cli).expect("type request should build from --text alias");
+    assert_eq!(request.command, "type");
+    assert_eq!(request.args["label"], "Email");
+    assert_eq!(request.args["text"], "hello@example.com");
+}
+
+#[test]
+fn type_request_rejects_ambiguous_text_sources_before_bootstrap() {
+    let cli = cli_with(Commands::Type {
+        index: None,
+        target: ElementAddressArgs {
+            label: Some("Email".to_string()),
+            ..ElementAddressArgs::default()
+        },
+        clear: false,
+        text_flag: Some("hello@example.com".to_string()),
+        text: Some("duplicate".to_string()),
+        wait_after: WaitAfterArgs::default(),
+    });
+
+    let error = build_request(&cli)
+        .expect_err("type request should reject both positional text and --text")
+        .into_envelope();
+    assert_eq!(error.code, ErrorCode::InvalidInput);
+    assert!(
+        error.message.contains("either positional TEXT or `--text`"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1828,6 +2319,9 @@ fn wait_request_rejects_text_and_locator_before_bootstrap() {
         label: None,
         testid: None,
         text: Some("Loaded".to_string()),
+        description_contains: None,
+        url_contains: None,
+        title_contains: None,
         first: false,
         last: false,
         nth: None,
@@ -1840,6 +2334,84 @@ fn wait_request_rejects_text_and_locator_before_bootstrap() {
         .into_envelope();
     assert_eq!(error.code, ErrorCode::InvalidInput);
     assert!(error.message.contains("Wait probe is ambiguous"), "{error}");
+}
+
+#[test]
+fn wait_request_projects_url_contains_probe() {
+    let cli = cli_with(Commands::Wait {
+        selector: None,
+        target_text: None,
+        role: None,
+        label: None,
+        testid: None,
+        text: None,
+        description_contains: None,
+        url_contains: Some("/activate".to_string()),
+        title_contains: None,
+        first: false,
+        last: false,
+        nth: None,
+        timeout: 7_500,
+        state: "visible".to_string(),
+    });
+
+    let request = build_request(&cli).expect("url wait should build");
+    assert_eq!(request.command, "wait");
+    assert_eq!(request.args["url_contains"], "/activate");
+    assert_eq!(request.args["timeout_ms"], 7_500);
+}
+
+#[test]
+fn wait_request_projects_interactable_state() {
+    let cli = cli_with(Commands::Wait {
+        selector: Some("#composer".to_string()),
+        target_text: None,
+        role: None,
+        label: None,
+        testid: None,
+        text: None,
+        description_contains: None,
+        url_contains: None,
+        title_contains: None,
+        first: false,
+        last: false,
+        nth: None,
+        timeout: 4_000,
+        state: "interactable".to_string(),
+    });
+
+    let request = build_request(&cli).expect("interactable wait should build");
+    assert_eq!(request.command, "wait");
+    assert_eq!(request.args["selector"], "#composer");
+    assert_eq!(request.args["state"], "interactable");
+}
+
+#[test]
+fn wait_request_projects_description_contains_probe() {
+    let cli = cli_with(Commands::Wait {
+        selector: None,
+        target_text: None,
+        role: None,
+        label: Some("Email".to_string()),
+        testid: None,
+        text: None,
+        description_contains: Some("We will email you to confirm".to_string()),
+        url_contains: None,
+        title_contains: None,
+        first: false,
+        last: false,
+        nth: None,
+        timeout: 4_000,
+        state: "visible".to_string(),
+    });
+
+    let request = build_request(&cli).expect("description wait should build");
+    assert_eq!(request.command, "wait");
+    assert_eq!(request.args["label"], "Email");
+    assert_eq!(
+        request.args["description_contains"],
+        "We will email you to confirm"
+    );
 }
 
 #[test]
@@ -1862,4 +2434,49 @@ fn click_request_rejects_ambiguous_wait_after_before_bootstrap() {
         .into_envelope();
     assert_eq!(error.code, ErrorCode::InvalidInput);
     assert!(error.message.contains("Wait probe is ambiguous"), "{error}");
+}
+
+#[test]
+fn wait_after_rejects_selection_for_page_level_wait_probe() {
+    let cli = cli_with(Commands::Click {
+        index: Some(0),
+        target: ElementAddressArgs::default(),
+        xy: None,
+        double: false,
+        right: false,
+        wait_after: WaitAfterArgs {
+            title_contains: Some("Confirm".to_string()),
+            first: true,
+            ..WaitAfterArgs::default()
+        },
+    });
+
+    let error = build_request(&cli)
+        .expect_err("page-level wait-after plus selection should be rejected")
+        .into_envelope();
+    assert_eq!(error.code, ErrorCode::InvalidInput);
+    assert!(error.message.contains("page-level waits"), "{error}");
+}
+
+#[test]
+fn click_request_projects_description_wait_after_probe() {
+    let cli = cli_with(Commands::Click {
+        index: Some(0),
+        target: ElementAddressArgs::default(),
+        xy: None,
+        double: false,
+        right: false,
+        wait_after: WaitAfterArgs {
+            label: Some("Email".to_string()),
+            description_contains: Some("We will email you to confirm".to_string()),
+            ..WaitAfterArgs::default()
+        },
+    });
+
+    let request = build_request(&cli).expect("description wait-after should build");
+    assert_eq!(request.args["wait_after"]["label"], "Email");
+    assert_eq!(
+        request.args["wait_after"]["description_contains"],
+        "We will email you to confirm"
+    );
 }
