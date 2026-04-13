@@ -248,7 +248,9 @@ pub(crate) fn explain_extract_spec_contract(
     raw: &str,
     rub_home: &Path,
 ) -> Result<serde_json::Value, RubError> {
-    let parsed = parse_extract_fields(raw, rub_home).map_err(enrich_extract_explain_error)?;
+    let spec = rub_core::json_spec::NormalizedJsonSpec::from_raw_str(raw, "extract")
+        .map_err(enrich_extract_explain_error)?;
+    let parsed = parse_extract_fields(&spec, rub_home).map_err(enrich_extract_explain_error)?;
     let mut normalized_spec = serde_json::Value::Object(
         parsed
             .value
@@ -682,7 +684,8 @@ mod tests {
             r#"{"title":"h1","price":".price","link":{"selector":"a","attr":"href"}}"#,
         )
         .expect("test JSON should parse");
-        super::spec::normalize_extract_spec_shorthands_in_place(&mut value);
+        super::spec::normalize_extract_spec_shorthands_in_place(&mut value)
+            .expect("top-level shorthand normalization should succeed");
 
         // String values should be expanded to full objects
         assert_eq!(value["title"]["selector"], "h1");

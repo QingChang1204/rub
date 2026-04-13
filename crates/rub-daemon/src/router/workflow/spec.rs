@@ -3,22 +3,26 @@ use super::args::{
     PipeWorkflowAssetSpec,
 };
 use super::*;
+use crate::router::secret_resolution::resolve_json_value_with_secret_resolution;
+use rub_core::json_spec::NormalizedJsonSpec;
 
 pub(super) fn parse_fill_steps(
-    raw: &str,
+    raw: &NormalizedJsonSpec,
     rub_home: &std::path::Path,
 ) -> Result<super::super::secret_resolution::ResolvedJsonSpec<Vec<FillStepSpec>>, RubError> {
-    parse_json_spec_with_secret_resolution(raw, "fill", rub_home)
+    resolve_json_value_with_secret_resolution(raw.as_value().clone(), "fill", rub_home)
 }
 
 pub(super) fn parse_pipe_spec(
-    raw: &str,
+    raw: &NormalizedJsonSpec,
     rub_home: &std::path::Path,
 ) -> Result<super::super::secret_resolution::ResolvedJsonSpec<ParsedPipeWorkflowSpec>, RubError> {
-    let trimmed = raw.trim_start();
-    let parsed = if trimmed.starts_with('[') {
-        let parsed =
-            parse_json_spec_with_secret_resolution::<Vec<PipeStepSpec>>(raw, "pipe", rub_home)?;
+    let parsed = if raw.as_value().is_array() {
+        let parsed = resolve_json_value_with_secret_resolution::<Vec<PipeStepSpec>>(
+            raw.as_value().clone(),
+            "pipe",
+            rub_home,
+        )?;
         super::super::secret_resolution::ResolvedJsonSpec {
             value: ParsedPipeWorkflowSpec {
                 steps: parsed.value,
@@ -27,8 +31,11 @@ pub(super) fn parse_pipe_spec(
             metadata: parsed.metadata,
         }
     } else {
-        let parsed =
-            parse_json_spec_with_secret_resolution::<PipeWorkflowAssetSpec>(raw, "pipe", rub_home)?;
+        let parsed = resolve_json_value_with_secret_resolution::<PipeWorkflowAssetSpec>(
+            raw.as_value().clone(),
+            "pipe",
+            rub_home,
+        )?;
         super::super::secret_resolution::ResolvedJsonSpec {
             value: ParsedPipeWorkflowSpec {
                 steps: parsed.value.steps,
@@ -69,13 +76,12 @@ pub(super) fn build_embedded_orchestration_args(
     orchestration: &PipeEmbeddedOrchestrationSpec,
     block_index: usize,
 ) -> Result<serde_json::Value, RubError> {
-    let spec = serde_json::to_string(&orchestration.spec).map_err(RubError::from)?;
     let workflow_source = workflow_source
         .cloned()
         .unwrap_or_else(|| serde_json::json!({ "kind": "inline" }));
     Ok(serde_json::json!({
         "sub": "add",
-        "spec": spec,
+        "spec": orchestration.spec.clone(),
         "spec_source": {
             "kind": "workflow_embedded",
             "workflow_source": workflow_source,

@@ -115,7 +115,7 @@ pub(crate) async fn inspect_harvest(cli: &EffectiveCli) -> Result<serde_json::Va
     };
     let deadline = Instant::now() + Duration::from_millis(cli.timeout.max(1));
 
-    let extract_spec =
+    let (extract_spec, extract_spec_source) =
         load_extract_spec(extract.as_deref(), extract_file.as_deref(), field).await?;
     let sources = load_harvest_sources(
         Path::new(file),
@@ -188,6 +188,7 @@ pub(crate) async fn inspect_harvest(cli: &EffectiveCli) -> Result<serde_json::Va
             "extract",
             serde_json::json!({
                 "spec": extract_spec,
+                "spec_source": extract_spec_source,
             }),
             cli.timeout,
         )
@@ -508,6 +509,29 @@ mod tests {
         assert_eq!(
             context["reason"],
             "inspect_harvest_extract_spec_file_not_found"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_extract_spec_builder_preserves_structured_spec() {
+        let (spec, spec_source) = load_extract_spec(None, None, &["title=h1".to_string()])
+            .await
+            .expect("builder extract spec should load");
+        assert_eq!(
+            spec.as_value(),
+            &json!({
+                "title": {
+                    "selector": "h1",
+                    "kind": "text"
+                }
+            })
+        );
+        assert_eq!(
+            spec_source,
+            json!({
+                "kind": "builder",
+                "fields": ["title"],
+            })
         );
     }
 }

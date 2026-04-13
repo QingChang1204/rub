@@ -3,6 +3,7 @@ use crate::commands::{
     TriggerSubcommand,
 };
 use rub_core::error::{ErrorCode, RubError};
+use rub_core::json_spec::NormalizedJsonSpec;
 use rub_daemon::orchestration_assets::load_named_orchestration_spec_with_authority;
 use rub_ipc::protocol::IpcRequest;
 use std::path::Path;
@@ -43,6 +44,7 @@ pub(crate) fn build_trigger_request(
                     }),
                 ),
             })?;
+            let spec = NormalizedJsonSpec::from_raw_str(&spec, "trigger add")?;
             Ok(mutating_request(
                 "trigger",
                 serde_json::json!({
@@ -145,6 +147,7 @@ pub(crate) fn build_orchestration_request(
                                 }),
                             ),
                         })?;
+                    let spec = NormalizedJsonSpec::from_raw_str(&spec, "orchestration add")?;
                     (
                         spec,
                         serde_json::json!({
@@ -165,6 +168,7 @@ pub(crate) fn build_orchestration_request(
                         "cli.orchestration.spec_source.path",
                         "cli_orchestration_asset_option",
                     )?;
+                    let spec = NormalizedJsonSpec::from_raw_str(&spec, "orchestration add")?;
                     (
                         spec,
                         serde_json::json!({

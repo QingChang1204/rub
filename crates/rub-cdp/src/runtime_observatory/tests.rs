@@ -164,6 +164,7 @@ fn late_request_merge_does_not_downgrade_responded_pending() {
 #[test]
 fn terminal_fallback_uses_correlation_when_pending_request_is_missing() {
     let correlation = RequestCorrelation {
+        tab_target_id: Some("tab-9".to_string()),
         original_url: "https://example.com/image".to_string(),
         rewritten_url: Some("https://cdn.example.com/image.webp".to_string()),
         effective_request_headers: None,
@@ -212,6 +213,7 @@ fn terminal_correlation_merges_into_existing_pending_request() {
         mime_type: Some("image/webp".to_string()),
     };
     let correlation = RequestCorrelation {
+        tab_target_id: Some("tab-10".to_string()),
         original_url: "https://example.com/image".to_string(),
         rewritten_url: Some("https://cdn.example.com/image.webp".to_string()),
         effective_request_headers: None,

@@ -1,5 +1,36 @@
 use super::*;
 
+fn wait_for_distinct_tab_pair_by_title(
+    home: &str,
+    target_title: &str,
+    source_title: &str,
+) -> (String, String) {
+    for _ in 0..60 {
+        let tabs = parse_json(&rub_cmd(home).arg("tabs").output().unwrap());
+        if tabs["success"] != true {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        if let Some(items) = tabs["data"]["result"]["items"].as_array() {
+            let target_index = items
+                .iter()
+                .find(|tab| tab["title"].as_str() == Some(target_title))
+                .and_then(|tab| tab["index"].as_u64());
+            let source_index = items
+                .iter()
+                .find(|tab| tab["title"].as_str() == Some(source_title))
+                .and_then(|tab| tab["index"].as_u64());
+            if let (Some(target_index), Some(source_index)) = (target_index, source_index)
+                && target_index != source_index
+            {
+                return (target_index.to_string(), source_index.to_string());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("distinct tabs titled {target_title} and {source_title} should exist");
+}
+
 /// T437: same-session cross-tab triggers should fire a canonical action on the bound target tab.
 #[test]
 #[ignore]
@@ -1297,21 +1328,8 @@ fn t437g_h_trigger_workflow_grouped_scenario() {
             assert_eq!(opened["success"], true, "{opened}");
         }
         *expected_tabs_ref += 2;
-        let tabs = wait_for_tabs_count(&home, *expected_tabs_ref);
-        let tabs = tabs["data"]["result"]["items"].as_array().unwrap();
-        let target_index = tabs
-            .iter()
-            .find(|tab| tab["title"].as_str() == Some(target_title))
-            .and_then(|tab| tab["index"].as_u64())
-            .expect("target tab should exist")
-            .to_string();
-        let source_index = tabs
-            .iter()
-            .find(|tab| tab["title"].as_str() == Some(source_title))
-            .and_then(|tab| tab["index"].as_u64())
-            .expect("source tab should exist")
-            .to_string();
-        (target_index, source_index)
+        let _tabs = wait_for_tabs_count(&home, *expected_tabs_ref);
+        wait_for_distinct_tab_pair_by_title(&home, target_title, source_title)
     };
     let _reset_tabs = |expected_tabs_ref: &mut u64, bootstrap_ref: &mut bool| {
         let closed = parse_json(&session.cmd().args(["close", "--all"]).output().unwrap());
@@ -1663,21 +1681,8 @@ fn t437i_l_trigger_source_vars_storage_blocked_and_removed_grouped_scenario() {
             assert_eq!(opened["success"], true, "{opened}");
         }
         *expected_tabs_ref += 2;
-        let tabs = wait_for_tabs_count(&home, *expected_tabs_ref);
-        let tabs = tabs["data"]["result"]["items"].as_array().unwrap();
-        let target_index = tabs
-            .iter()
-            .find(|tab| tab["title"].as_str() == Some(target_title))
-            .and_then(|tab| tab["index"].as_u64())
-            .expect("target tab should exist")
-            .to_string();
-        let source_index = tabs
-            .iter()
-            .find(|tab| tab["title"].as_str() == Some(source_title))
-            .and_then(|tab| tab["index"].as_u64())
-            .expect("source tab should exist")
-            .to_string();
-        (target_index, source_index)
+        let _tabs = wait_for_tabs_count(&home, *expected_tabs_ref);
+        wait_for_distinct_tab_pair_by_title(&home, target_title, source_title)
     };
     let reset_tabs = |expected_tabs_ref: &mut u64, bootstrap_ref: &mut bool| {
         let closed = parse_json(&session.cmd().args(["close", "--all"]).output().unwrap());

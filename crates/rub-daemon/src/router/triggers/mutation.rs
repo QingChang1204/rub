@@ -8,7 +8,7 @@ use crate::session::SessionState;
 
 use super::super::DaemonRouter;
 use super::super::frame_scope::ensure_tab_frame_available;
-use super::super::request_args::parse_json_spec;
+use super::super::request_args::parse_json_spec_value;
 use super::command::{TriggerAddArgs, TriggerTraceArgs};
 use super::projection::{
     resolve_trigger_tab_binding, trigger_payload, trigger_registration_reusable,
@@ -21,7 +21,8 @@ pub(super) async fn cmd_trigger_add(
     args: TriggerAddArgs,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
-    let mut spec = parse_json_spec::<TriggerRegistrationSpec>(&args.spec, "trigger add")?;
+    let mut spec =
+        parse_json_spec_value::<TriggerRegistrationSpec>(args.spec.into_value(), "trigger add")?;
     validate_trigger_registration_spec(&mut spec)?;
 
     let tabs = refresh_live_trigger_runtime(&router.browser, state).await?;

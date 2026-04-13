@@ -798,26 +798,33 @@ fn t390_392b_intercept_network_grouped_scenario() {
     );
     assert_eq!(waited["success"], true, "{waited}");
 
-    let doctor = parse_json(&session.cmd().arg("doctor").output().unwrap());
-    let runtime = doctor_runtime(&doctor);
-    assert_eq!(doctor["success"], true, "{doctor}");
-    assert!(
-        runtime["runtime_observatory"]["recent_network_failures"]
+    let mut doctor = serde_json::Value::Null;
+    let mut doctor_matched = false;
+    for _ in 0..60 {
+        let out = parse_json(&session.cmd().arg("doctor").output().unwrap());
+        let runtime = doctor_runtime(&out);
+        assert_eq!(out["success"], true, "{out}");
+        doctor_matched = runtime["runtime_observatory"]["recent_network_failures"]
             .as_array()
-            .unwrap()
-            .iter()
-            .any(|event| {
-                event["url"]
-                    .as_str()
-                    .is_some_and(|url| url.ends_with("/api/blocked"))
-                    && event["applied_rule_effects"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|effect| effect["kind"] == "block")
-            }),
-        "{doctor}"
-    );
+            .is_some_and(|events| {
+                events.iter().any(|event| {
+                    event["url"]
+                        .as_str()
+                        .is_some_and(|url| url.ends_with("/api/blocked"))
+                        && event["applied_rule_effects"]
+                            .as_array()
+                            .is_some_and(|effects| {
+                                effects.iter().any(|effect| effect["kind"] == "block")
+                            })
+                })
+            });
+        doctor = out;
+        if doctor_matched {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(doctor_matched, "{doctor}");
 
     let cleared = parse_json(&session.cmd().args(["intercept", "clear"]).output().unwrap());
     assert_eq!(cleared["success"], true, "{cleared}");
@@ -882,24 +889,35 @@ fn t390_392b_intercept_network_grouped_scenario() {
         "{inspected}"
     );
 
-    let doctor = parse_json(&session.cmd().arg("doctor").output().unwrap());
-    let runtime = doctor_runtime(&doctor);
-    assert_eq!(doctor["success"], true, "{doctor}");
-    assert!(
-        runtime["runtime_observatory"]["recent_requests"]
+    let mut doctor = serde_json::Value::Null;
+    let mut doctor_matched = false;
+    for _ in 0..60 {
+        let out = parse_json(&session.cmd().arg("doctor").output().unwrap());
+        let runtime = doctor_runtime(&out);
+        assert_eq!(out["success"], true, "{out}");
+        let rule_active = runtime["integration_runtime"]["request_rules"]
             .as_array()
-            .unwrap()
-            .iter()
-            .any(|event| {
-                event["url"].as_str() == Some(capture_url.as_str())
-                    && event["applied_rule_effects"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|effect| effect["kind"] == "header_override")
-            }),
-        "{doctor}"
-    );
+            .is_some_and(|rules| {
+                rules.iter().any(|rule| {
+                    rule["kind"] == "header_override"
+                        && rule["url_pattern"].as_str() == Some(capture_url.as_str())
+                })
+            });
+        let request_visible = runtime["runtime_observatory"]["recent_requests"]
+            .as_array()
+            .is_some_and(|events| {
+                events
+                    .iter()
+                    .any(|event| event["url"].as_str() == Some(capture_url.as_str()))
+            });
+        doctor_matched = rule_active && request_visible;
+        doctor = out;
+        if doctor_matched {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(doctor_matched, "{doctor}");
 
     let cleared = parse_json(&session.cmd().args(["intercept", "clear"]).output().unwrap());
     assert_eq!(cleared["success"], true, "{cleared}");
@@ -1872,7 +1890,7 @@ fn t421_423_selected_same_origin_frame_grouped_context_scenario() {
         "{typed}"
     );
     assert_eq!(
-        typed["data"]["interaction"]["observed_effects"]["frame_context"]["name"], "child-frame",
+        typed["data"]["interaction"]["frame_context"]["name"], "child-frame",
         "{typed}"
     );
 

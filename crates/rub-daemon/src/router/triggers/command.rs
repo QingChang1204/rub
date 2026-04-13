@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use rub_core::error::{ErrorCode, RubError};
+use rub_core::json_spec::NormalizedJsonSpec;
 
 use crate::session::SessionState;
 
@@ -66,7 +67,7 @@ impl TriggerCommand {
 pub(super) struct TriggerAddArgs {
     #[serde(rename = "sub")]
     _sub: String,
-    pub(super) spec: String,
+    pub(super) spec: NormalizedJsonSpec,
     #[serde(default)]
     pub(super) paused: bool,
     #[serde(default)]

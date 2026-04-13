@@ -1,4 +1,5 @@
 use rub_core::error::{ErrorCode, RubError};
+use rub_core::json_spec::NormalizedJsonSpec;
 
 use super::super::request_args::parse_json_args;
 
@@ -78,7 +79,7 @@ impl OrchestrationCommand {
 pub(super) struct OrchestrationAddArgs {
     #[serde(rename = "sub")]
     pub(super) _sub: String,
-    pub(super) spec: String,
+    pub(super) spec: NormalizedJsonSpec,
     #[serde(default)]
     pub(super) paused: bool,
     #[serde(default)]

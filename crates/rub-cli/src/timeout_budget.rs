@@ -474,7 +474,7 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
             let (resolved_spec, spec_source) =
                 resolve_json_spec_source("fill", spec.as_deref(), file.as_deref())?;
             let request_timeout = timeout.saturating_add(fill_workflow_budget_ms(
-                &resolved_spec,
+                resolved_spec.as_value(),
                 cli.humanize,
                 &cli.humanize_speed,
                 submit_index.is_some()
@@ -555,7 +555,7 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
                 &cli.rub_home,
             )?;
             let request_timeout = timeout.saturating_add(pipe_workflow_budget_ms(
-                &resolved_spec,
+                resolved_spec.as_value(),
                 cli.humanize,
                 &cli.humanize_speed,
             ));
@@ -735,7 +735,7 @@ fn validate_scroll_projection_inputs(direction: &str, y: Option<i32>) -> Result<
 }
 
 fn fill_workflow_budget_ms(
-    resolved_spec: &str,
+    resolved_spec: &Value,
     humanize: bool,
     humanize_speed: &str,
     has_submit: bool,
@@ -745,10 +745,7 @@ fn fill_workflow_budget_ms(
         resolved_spec,
         has_submit,
     );
-    let Some(steps) = serde_json::from_str::<Value>(resolved_spec)
-        .ok()
-        .and_then(|value| value.as_array().cloned())
-    else {
+    let Some(steps) = resolved_spec.as_array() else {
         return humanize_budget_ms_for_command_args(
             "click",
             &serde_json::json!({}),
@@ -795,22 +792,22 @@ fn fill_workflow_budget_ms(
     extra
 }
 
-fn atomic_fill_rollback_budget_ms(resolved_spec: &str) -> u64 {
-    let step_count = serde_json::from_str::<Value>(resolved_spec)
-        .ok()
-        .and_then(|value| value.as_array().map(|steps| steps.len() as u64))
+fn atomic_fill_rollback_budget_ms(resolved_spec: &Value) -> u64 {
+    let step_count = resolved_spec
+        .as_array()
+        .map(|steps| steps.len() as u64)
         .filter(|count| *count > 0)
         .unwrap_or(1);
     step_count.saturating_mul(ATOMIC_FILL_ROLLBACK_RESERVE_MS_PER_STEP)
 }
 
-fn pipe_workflow_budget_ms(resolved_spec: &str, humanize: bool, humanize_speed: &str) -> u64 {
+fn pipe_workflow_budget_ms(resolved_spec: &Value, humanize: bool, humanize_speed: &str) -> u64 {
     let mut extra =
         rub_core::automation_timeout::pipe_workflow_additional_timeout_ms(resolved_spec);
-    let Some(workflow) = serde_json::from_str::<Value>(resolved_spec).ok() else {
-        return 0;
-    };
-    let Some(steps) = workflow.get("steps").and_then(Value::as_array) else {
+    let Some(steps) = resolved_spec
+        .as_array()
+        .or_else(|| resolved_spec.get("steps").and_then(Value::as_array))
+    else {
         return 0;
     };
 
@@ -828,7 +825,7 @@ fn pipe_workflow_budget_ms(resolved_spec: &str, humanize: bool, humanize_speed: 
             humanize_speed,
         ));
         if command == "fill"
-            && let Some(fill_spec) = args.get("spec").and_then(Value::as_str)
+            && let Some(fill_spec) = args.get("spec")
         {
             let has_submit = [
                 "submit_index",

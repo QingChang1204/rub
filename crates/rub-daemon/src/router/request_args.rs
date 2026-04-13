@@ -1,8 +1,10 @@
 mod json;
 mod locator;
 
+#[cfg(test)]
+pub(crate) use self::json::parse_json_spec;
 pub(crate) use self::json::{
-    parse_json_args, parse_json_spec, reject_unknown_fields, required_string_arg,
+    parse_json_args, parse_json_spec_value, reject_unknown_fields, required_string_arg,
 };
 pub(crate) use self::json::{parse_optional_u32_arg, subcommand_arg};
 pub(crate) use self::locator::parse_canonical_locator;
@@ -15,7 +17,7 @@ pub(crate) use self::locator::{
 mod tests {
     use super::{
         LocatorParseOptions, LocatorRequestArgs, canonical_locator_json, locator_json,
-        parse_canonical_locator, parse_json_spec, required_string_arg,
+        parse_canonical_locator, parse_json_spec, parse_json_spec_value, required_string_arg,
     };
     use rub_core::error::ErrorCode;
     use rub_core::error::RubError;
@@ -65,6 +67,27 @@ mod tests {
             }
             other => panic!("expected domain error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_json_spec_value_accepts_structured_json() {
+        let spec = parse_json_spec_value::<TriggerRegistrationSpec>(
+            serde_json::json!({
+                "source_tab": 0,
+                "target_tab": 1,
+                "condition": { "kind": "text_present", "text": "Ready" },
+                "action": {
+                    "kind": "browser_command",
+                    "command": "click",
+                    "payload": { "selector": "#go" }
+                }
+            }),
+            "trigger add",
+        )
+        .expect("structured trigger spec should parse");
+
+        assert_eq!(spec.source_tab, 0);
+        assert_eq!(spec.target_tab, 1);
     }
 
     #[test]

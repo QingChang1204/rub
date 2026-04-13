@@ -75,7 +75,7 @@ pub struct ElementAddressArgs {
     /// Keep only candidates with a non-zero authoritative snapshot bounding box
     #[arg(long)]
     pub visible: bool,
-    /// Prefer candidates that are not disabled or aria-disabled in the authoritative snapshot
+    /// Prefer candidates that are not disabled or non-writable (`readonly` / `aria-readonly`) in the authoritative snapshot
     #[arg(long = "prefer-enabled")]
     pub prefer_enabled: bool,
     /// Keep only candidates that still expose a live hittable point

@@ -4,6 +4,7 @@ use crate::commands::{
 use crate::workflow_assets::{resolve_named_workflow_path, workflow_asset_path_state};
 use crate::workflow_params::resolve_workflow_parameters;
 use rub_core::error::{ErrorCode, RubError};
+use rub_core::json_spec::NormalizedJsonSpec;
 use rub_core::model::PathReferenceState;
 use rub_ipc::protocol::IpcRequest;
 use std::path::{Path, PathBuf};
@@ -63,12 +64,12 @@ pub(crate) fn resolve_pipe_spec(
     workflow: Option<&str>,
     vars: &[String],
     rub_home: &Path,
-) -> Result<(String, serde_json::Value), RubError> {
+) -> Result<(NormalizedJsonSpec, serde_json::Value), RubError> {
     match (inline_spec, file, workflow) {
         (Some(spec), None, None) => {
             let parameterized = resolve_workflow_parameters(spec, vars)?;
             Ok((
-                parameterized.resolved_spec,
+                NormalizedJsonSpec::from_raw_str(&parameterized.resolved_spec, "pipe")?,
                 serde_json::json!({
                     "kind": "inline",
                     "vars": parameterized.parameter_keys,
@@ -102,7 +103,7 @@ pub(crate) fn resolve_pipe_spec(
             })?;
             let parameterized = resolve_workflow_parameters(&contents, vars)?;
             Ok((
-                parameterized.resolved_spec,
+                NormalizedJsonSpec::from_raw_str(&parameterized.resolved_spec, "pipe")?,
                 serde_json::json!({
                     "kind": "file",
                     "path": path,
@@ -138,7 +139,7 @@ pub(crate) fn resolve_pipe_spec(
             })?;
             let parameterized = resolve_workflow_parameters(&contents, vars)?;
             Ok((
-                parameterized.resolved_spec,
+                NormalizedJsonSpec::from_raw_str(&parameterized.resolved_spec, "pipe")?,
                 serde_json::json!({
                     "kind": "workflow",
                     "name": name,
@@ -165,10 +166,10 @@ pub(crate) fn resolve_json_spec_source(
     command: &str,
     inline_spec: Option<&str>,
     file: Option<&str>,
-) -> Result<(String, serde_json::Value), RubError> {
+) -> Result<(NormalizedJsonSpec, serde_json::Value), RubError> {
     match (inline_spec, file) {
         (Some(spec), None) => Ok((
-            spec.to_string(),
+            NormalizedJsonSpec::from_raw_str(spec, command)?,
             serde_json::json!({
                 "kind": "inline",
             }),
@@ -194,7 +195,7 @@ pub(crate) fn resolve_json_spec_source(
                 ),
             })?;
             Ok((
-                contents,
+                NormalizedJsonSpec::from_raw_str(&contents, command)?,
                 serde_json::json!({
                     "kind": "file",
                     "path": path_string,
@@ -262,7 +263,7 @@ pub(crate) fn resolve_inspect_list_spec_source(
     collection: Option<&str>,
     row_scope: Option<&str>,
     fields: &[String],
-) -> Result<(String, serde_json::Value), RubError> {
+) -> Result<(NormalizedJsonSpec, serde_json::Value), RubError> {
     if inline_spec.is_some() || file.is_some() {
         return resolve_json_spec_source("inspect list", inline_spec, file);
     }
@@ -296,7 +297,7 @@ pub(crate) fn resolve_inspect_list_spec_source(
         }
     });
     Ok((
-        serde_json::to_string(&spec).map_err(RubError::from)?,
+        NormalizedJsonSpec::from_value(spec),
         serde_json::json!({
             "kind": "builder",
             "collection": collection,
@@ -309,7 +310,7 @@ pub(crate) fn resolve_inspect_list_spec_source(
 pub(crate) fn resolve_extract_builder_spec_source(
     command: &str,
     fields: &[String],
-) -> Result<(String, serde_json::Value), RubError> {
+) -> Result<(NormalizedJsonSpec, serde_json::Value), RubError> {
     if fields.is_empty() {
         return Err(RubError::domain(
             ErrorCode::InvalidInput,
@@ -327,7 +328,7 @@ pub(crate) fn resolve_extract_builder_spec_source(
 
     let spec = serde_json::Value::Object(extracted);
     Ok((
-        serde_json::to_string(&spec).map_err(RubError::from)?,
+        NormalizedJsonSpec::from_value(spec),
         serde_json::json!({
             "kind": "builder",
             "fields": field_names,

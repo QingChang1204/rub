@@ -2,6 +2,7 @@ pub mod automation_timeout;
 pub mod command;
 pub mod error;
 pub mod fs;
+pub mod json_spec;
 pub mod locator;
 pub mod model;
 pub mod observation;

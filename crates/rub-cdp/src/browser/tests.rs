@@ -112,6 +112,7 @@ async fn close_preserves_network_rule_ssot_without_browser_handle() {
         None,
         "GET",
         crate::request_correlation::RequestCorrelation {
+            tab_target_id: Some("tab-1".to_string()),
             original_url: "https://example.com/api".to_string(),
             rewritten_url: None,
             effective_request_headers: None,
@@ -137,7 +138,13 @@ async fn close_preserves_network_rule_ssot_without_browser_handle() {
             .request_correlation
             .lock()
             .await
-            .take_for_request("req-1", "https://example.com/api", "GET", None)
+            .take_for_request(
+                "req-1",
+                "https://example.com/api",
+                "GET",
+                None,
+                Some("tab-1")
+            )
             .is_none()
     );
 }

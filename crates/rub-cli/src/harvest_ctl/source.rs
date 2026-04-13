@@ -1,5 +1,6 @@
 use super::*;
 use crate::timeout_budget::helpers::resolve_extract_builder_spec_source;
+use rub_core::json_spec::NormalizedJsonSpec;
 use rub_core::model::PathReferenceState;
 use tokio::fs;
 
@@ -7,11 +8,16 @@ pub(super) async fn load_extract_spec(
     inline_spec: Option<&str>,
     file: Option<&str>,
     fields: &[String],
-) -> Result<String, RubError> {
+) -> Result<(NormalizedJsonSpec, serde_json::Value), RubError> {
     match (inline_spec, file, fields.is_empty()) {
-        (Some(spec), None, true) => Ok(spec.to_string()),
+        (Some(spec), None, true) => Ok((
+            NormalizedJsonSpec::from_raw_str(spec, "inspect harvest")?,
+            serde_json::json!({
+                "kind": "inline",
+            }),
+        )),
         (None, Some(path), true) => {
-            fs::read_to_string(path)
+            let contents = fs::read_to_string(path)
                 .await
                 .map_err(|error| match error.kind() {
                     std::io::ErrorKind::NotFound => RubError::domain_with_context(
@@ -32,11 +38,17 @@ pub(super) async fn load_extract_spec(
                             "reason": "inspect_harvest_extract_spec_file_read_failed",
                         }),
                     ),
-                })
+                })?;
+            Ok((
+                NormalizedJsonSpec::from_raw_str(&contents, "inspect harvest")?,
+                serde_json::json!({
+                    "kind": "file",
+                    "path": path,
+                    "path_state": harvest_extract_spec_file_state(),
+                }),
+            ))
         }
-        (None, None, false) => {
-            resolve_extract_builder_spec_source("inspect harvest", fields).map(|(spec, _)| spec)
-        }
+        (None, None, false) => resolve_extract_builder_spec_source("inspect harvest", fields),
         (Some(_), Some(_), _) | (Some(_), _, false) | (_, Some(_), false) => Err(RubError::domain(
             ErrorCode::InvalidInput,
             "Use exactly one follow-page extract source: --extract, --extract-file, or one or more --field entries",

@@ -3042,7 +3042,7 @@ fn t232k_l_network_grouped_scenario() {
         "{clicked}"
     );
 
-    let grouped = &clicked["data"]["interaction"]["observed_effects"]["network_requests"];
+    let grouped = &clicked["data"]["interaction"]["network_requests"];
     let requests = grouped["requests"]
         .as_array()
         .expect("grouped network requests");

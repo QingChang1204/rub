@@ -2,6 +2,7 @@ use crate::router::request_args::{
     LocatorParseOptions, LocatorRequestArgs, canonical_locator_json, locator_json,
     parse_canonical_locator,
 };
+use rub_core::json_spec::NormalizedJsonSpec;
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -79,7 +80,7 @@ pub(super) struct ParsedPipeWorkflowSpec {
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct FillArgs {
-    pub(super) spec: String,
+    pub(super) spec: NormalizedJsonSpec,
     #[serde(default, rename = "spec_source")]
     pub(super) _spec_source: Option<serde_json::Value>,
     #[serde(default)]
@@ -99,7 +100,7 @@ pub(super) struct FillArgs {
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct PipeArgs {
-    pub(super) spec: String,
+    pub(super) spec: NormalizedJsonSpec,
     #[serde(default)]
     pub(super) spec_source: Option<serde_json::Value>,
     #[serde(default, rename = "_trigger")]
@@ -168,4 +169,42 @@ pub(super) fn submit_args(args: &SubmitLocatorArgs) -> Option<serde_json::Value>
     .ok()
     .flatten()
     .map(|locator| canonical_locator_json(&locator))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FillArgs, PipeArgs};
+
+    #[test]
+    fn fill_args_accept_string_and_structured_spec() {
+        let parsed = serde_json::from_value::<FillArgs>(serde_json::json!({
+            "spec": "[]"
+        }))
+        .expect("stringified fill spec should parse");
+        assert_eq!(parsed.spec.as_value(), &serde_json::json!([]));
+
+        let structured = serde_json::from_value::<FillArgs>(serde_json::json!({
+            "spec": []
+        }))
+        .expect("structured fill spec should parse");
+        assert_eq!(structured.spec.as_value(), &serde_json::json!([]));
+    }
+
+    #[test]
+    fn pipe_args_accept_string_and_structured_spec() {
+        let parsed = serde_json::from_value::<PipeArgs>(serde_json::json!({
+            "spec": "{\"steps\":[]}"
+        }))
+        .expect("stringified pipe spec should parse");
+        assert_eq!(parsed.spec.as_value(), &serde_json::json!({ "steps": [] }));
+
+        let structured = serde_json::from_value::<PipeArgs>(serde_json::json!({
+            "spec": { "steps": [] }
+        }))
+        .expect("structured pipe spec should parse");
+        assert_eq!(
+            structured.spec.as_value(),
+            &serde_json::json!({ "steps": [] })
+        );
+    }
 }

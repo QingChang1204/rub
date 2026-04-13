@@ -9,6 +9,7 @@ const CORRELATION_TTL: Duration = Duration::from_secs(900);
 /// by the runtime observatory when the request later resolves or fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestCorrelation {
+    pub tab_target_id: Option<String>,
     pub original_url: String,
     pub rewritten_url: Option<String>,
     pub effective_request_headers: Option<BTreeMap<String, String>>,
@@ -52,8 +53,16 @@ impl RequestCorrelationRegistry {
         url: &str,
         method: &str,
         request_headers: Option<&BTreeMap<String, String>>,
+        tab_target_id: Option<&str>,
     ) -> Option<RequestCorrelation> {
-        self.peek_at(request_id, url, method, request_headers, Instant::now())
+        self.peek_at(
+            request_id,
+            url,
+            method,
+            request_headers,
+            tab_target_id,
+            Instant::now(),
+        )
     }
 
     pub fn take_for_request(
@@ -62,8 +71,16 @@ impl RequestCorrelationRegistry {
         url: &str,
         method: &str,
         request_headers: Option<&BTreeMap<String, String>>,
+        tab_target_id: Option<&str>,
     ) -> Option<RequestCorrelation> {
-        self.take_at(request_id, url, method, request_headers, Instant::now())
+        self.take_at(
+            request_id,
+            url,
+            method,
+            request_headers,
+            tab_target_id,
+            Instant::now(),
+        )
     }
 
     fn record_at(
@@ -89,13 +106,14 @@ impl RequestCorrelationRegistry {
         url: &str,
         method: &str,
         request_headers: Option<&BTreeMap<String, String>>,
+        tab_target_id: Option<&str>,
         now: Instant,
     ) -> Option<RequestCorrelation> {
         self.prune(now);
         let entry_id = if let Some(entry_id) = self.by_key.get(request_id).copied() {
             Some(entry_id)
         } else {
-            self.find_unique_unresolved(url, method, request_headers)
+            self.find_unique_unresolved(url, method, request_headers, tab_target_id)
         };
         entry_id.and_then(|entry_id| self.remove_entry(entry_id))
     }
@@ -106,6 +124,7 @@ impl RequestCorrelationRegistry {
         url: &str,
         method: &str,
         request_headers: Option<&BTreeMap<String, String>>,
+        tab_target_id: Option<&str>,
         now: Instant,
     ) -> Option<RequestCorrelation> {
         self.prune(now);
@@ -117,7 +136,7 @@ impl RequestCorrelationRegistry {
                 .map(|entry| entry.correlation.clone());
         }
 
-        self.find_unique_unresolved(url, method, request_headers)
+        self.find_unique_unresolved(url, method, request_headers, tab_target_id)
             .and_then(|entry_id| self.by_id.get(&entry_id))
             .map(|entry| entry.correlation.clone())
     }
@@ -177,6 +196,7 @@ impl RequestCorrelationRegistry {
                 .unwrap_or_else(|| correlation.original_url.clone()),
             expected_method: method,
             effective_request_headers: correlation.effective_request_headers.clone(),
+            expected_tab_target_id: correlation.tab_target_id.clone(),
         });
         self.unresolved.push_back(entry_id);
 
@@ -197,8 +217,12 @@ impl RequestCorrelationRegistry {
         url: &str,
         method: &str,
         request_headers: Option<&BTreeMap<String, String>>,
+        tab_target_id: Option<&str>,
     ) -> Option<u64> {
-        let mut matched = None;
+        let mut strict_match = None;
+        let mut strict_ambiguous = false;
+        let mut relaxed_match = None;
+        let mut relaxed_ambiguous = false;
         for entry_id in &self.unresolved {
             let Some(entry) = self.by_id.get(entry_id) else {
                 continue;
@@ -212,20 +236,41 @@ impl RequestCorrelationRegistry {
             if unresolved_match.expected_method != method {
                 continue;
             }
-            if let Some(expected_headers) = unresolved_match.effective_request_headers.as_ref() {
-                let Some(actual_headers) = request_headers else {
-                    continue;
-                };
-                if !headers_include(actual_headers, expected_headers) {
-                    continue;
+            if unresolved_match.expected_tab_target_id.as_deref() != tab_target_id {
+                continue;
+            }
+
+            if relaxed_match.is_some() {
+                relaxed_ambiguous = true;
+            } else {
+                relaxed_match = Some(*entry_id);
+            }
+
+            let strict_headers_match = match unresolved_match.effective_request_headers.as_ref() {
+                Some(expected_headers) => request_headers.is_some_and(|actual_headers| {
+                    headers_include(actual_headers, expected_headers)
+                }),
+                None => true,
+            };
+            if strict_headers_match {
+                if strict_match.is_some() {
+                    strict_ambiguous = true;
+                } else {
+                    strict_match = Some(*entry_id);
                 }
             }
-            if matched.is_some() {
-                return None;
-            }
-            matched = Some(*entry_id);
         }
-        matched
+
+        if strict_ambiguous {
+            return None;
+        }
+        if let Some(entry_id) = strict_match {
+            return Some(entry_id);
+        }
+        if relaxed_ambiguous {
+            return None;
+        }
+        relaxed_match
     }
 
     fn remove_entry(&mut self, entry_id: u64) -> Option<RequestCorrelation> {
@@ -253,6 +298,7 @@ struct UnresolvedCorrelationMatch {
     expected_url: String,
     expected_method: String,
     effective_request_headers: Option<BTreeMap<String, String>>,
+    expected_tab_target_id: Option<String>,
 }
 
 fn headers_include(actual: &BTreeMap<String, String>, expected: &BTreeMap<String, String>) -> bool {
@@ -283,6 +329,7 @@ mod tests {
                 None,
                 "GET",
                 RequestCorrelation {
+                    tab_target_id: Some("tab-1".to_string()),
                     original_url: format!("https://example.com/{index}"),
                     rewritten_url: None,
                     effective_request_headers: None,
@@ -296,7 +343,7 @@ mod tests {
 
         assert!(
             registry
-                .take_for_request("req-0", "https://example.com/0", "GET", None)
+                .take_for_request("req-0", "https://example.com/0", "GET", None, Some("tab-1"))
                 .is_none()
         );
         let last = registry.take_for_request(
@@ -304,6 +351,7 @@ mod tests {
             &format!("https://example.com/{}", CORRELATION_LIMIT + 3),
             "GET",
             None,
+            Some("tab-1"),
         );
         assert!(last.is_some());
         assert!(
@@ -312,7 +360,8 @@ mod tests {
                     &format!("req-{}", CORRELATION_LIMIT + 3),
                     &format!("https://example.com/{}", CORRELATION_LIMIT + 3),
                     "GET",
-                    None
+                    None,
+                    Some("tab-1")
                 )
                 .is_none()
         );
@@ -326,6 +375,7 @@ mod tests {
             Some("net-1".to_string()),
             "GET",
             RequestCorrelation {
+                tab_target_id: Some("tab-1".to_string()),
                 original_url: "https://example.com/1".to_string(),
                 rewritten_url: Some("https://cdn.example.com/1".to_string()),
                 effective_request_headers: None,
@@ -337,12 +387,24 @@ mod tests {
         );
 
         let peeked = registry
-            .peek_for_request("net-1", "https://cdn.example.com/1", "GET", None)
+            .peek_for_request(
+                "net-1",
+                "https://cdn.example.com/1",
+                "GET",
+                None,
+                Some("tab-1"),
+            )
             .expect("peek should clone entry");
         assert_eq!(peeked.original_url, "https://example.com/1");
         assert!(
             registry
-                .take_for_request("req-1", "https://cdn.example.com/1", "GET", None)
+                .take_for_request(
+                    "req-1",
+                    "https://cdn.example.com/1",
+                    "GET",
+                    None,
+                    Some("tab-1")
+                )
                 .is_some()
         );
     }
@@ -356,6 +418,7 @@ mod tests {
             None,
             "GET".to_string(),
             RequestCorrelation {
+                tab_target_id: Some("tab-1".to_string()),
                 original_url: "https://example.com/1".to_string(),
                 rewritten_url: None,
                 effective_request_headers: None,
@@ -374,6 +437,7 @@ mod tests {
                     "https://example.com/1",
                     "GET",
                     None,
+                    Some("tab-1"),
                     now + CORRELATION_TTL + Duration::from_secs(1)
                 )
                 .is_none()
@@ -390,6 +454,7 @@ mod tests {
             None,
             "GET",
             RequestCorrelation {
+                tab_target_id: Some("tab-1".to_string()),
                 original_url: "https://example.com/api".to_string(),
                 rewritten_url: Some("https://cdn.example.com/api".to_string()),
                 effective_request_headers: Some(expected_headers.clone()),
@@ -406,6 +471,7 @@ mod tests {
                 "https://cdn.example.com/api",
                 "GET",
                 Some(&expected_headers),
+                Some("tab-1"),
             )
             .expect("fallback should bridge correlation");
         assert_eq!(peeked.original_url, "https://example.com/api");
@@ -415,7 +481,8 @@ mod tests {
                     "network-1",
                     "https://cdn.example.com/api",
                     "GET",
-                    Some(&expected_headers)
+                    Some(&expected_headers),
+                    Some("tab-1"),
                 )
                 .is_some()
         );
@@ -431,6 +498,7 @@ mod tests {
             Some("network-side-key".to_string()),
             "GET",
             RequestCorrelation {
+                tab_target_id: Some("tab-1".to_string()),
                 original_url: "https://example.com/api".to_string(),
                 rewritten_url: Some("https://cdn.example.com/api".to_string()),
                 effective_request_headers: Some(expected_headers.clone()),
@@ -447,6 +515,7 @@ mod tests {
                 "https://cdn.example.com/api",
                 "GET",
                 Some(&expected_headers),
+                Some("tab-1"),
             )
             .expect("fallback should bridge mismatched key spaces");
         assert_eq!(peeked.original_url, "https://example.com/api");
@@ -457,6 +526,7 @@ mod tests {
                     "https://cdn.example.com/api",
                     "GET",
                     Some(&expected_headers),
+                    Some("tab-1"),
                 )
                 .is_some()
         );
@@ -484,6 +554,7 @@ mod tests {
             Some("net-1".to_string()),
             "GET",
             RequestCorrelation {
+                tab_target_id: Some("tab-1".to_string()),
                 original_url: "https://example.com/api".to_string(),
                 rewritten_url: Some("https://cdn.example.com/api".to_string()),
                 effective_request_headers: Some(headers.clone()),
@@ -500,6 +571,7 @@ mod tests {
                 "https://cdn.example.com/api",
                 "GET",
                 Some(&headers),
+                Some("tab-1"),
             )
             .expect("exact binding should still succeed");
         assert_eq!(exact.original_url, "https://example.com/api");
@@ -510,6 +582,7 @@ mod tests {
                     "https://cdn.example.com/api",
                     "GET",
                     Some(&headers),
+                    Some("tab-1"),
                 )
                 .is_none(),
             "exactly bound correlations must leave the unresolved fallback pool"
@@ -524,6 +597,7 @@ mod tests {
             None,
             "POST",
             RequestCorrelation {
+                tab_target_id: Some("tab-1".to_string()),
                 original_url: "https://example.com/api".to_string(),
                 rewritten_url: Some("https://cdn.example.com/api".to_string()),
                 effective_request_headers: None,
@@ -536,13 +610,149 @@ mod tests {
 
         assert!(
             registry
-                .peek_for_request("req-1", "https://cdn.example.com/api", "GET", None)
+                .peek_for_request(
+                    "req-1",
+                    "https://cdn.example.com/api",
+                    "GET",
+                    None,
+                    Some("tab-1")
+                )
                 .is_none()
         );
         assert!(
             registry
-                .take_for_request("req-1", "https://cdn.example.com/api", "POST", None)
+                .take_for_request(
+                    "req-1",
+                    "https://cdn.example.com/api",
+                    "POST",
+                    None,
+                    Some("tab-1")
+                )
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn correlation_registry_falls_back_to_unique_url_method_when_effective_headers_are_not_visible()
+    {
+        let mut registry = RequestCorrelationRegistry::default();
+        let mut expected_headers = BTreeMap::new();
+        expected_headers.insert("x-rub-test".to_string(), "1".to_string());
+        registry.record(
+            "fetch-1".to_string(),
+            None,
+            "GET",
+            RequestCorrelation {
+                tab_target_id: Some("tab-1".to_string()),
+                original_url: "https://example.com/api".to_string(),
+                rewritten_url: Some("https://example.com/api".to_string()),
+                effective_request_headers: Some(expected_headers),
+                applied_rule_effects: vec![NetworkRuleEffect {
+                    rule_id: 11,
+                    kind: NetworkRuleEffectKind::HeaderOverride,
+                }],
+            },
+        );
+
+        let peeked = registry
+            .peek_for_request(
+                "network-1",
+                "https://example.com/api",
+                "GET",
+                Some(&BTreeMap::new()),
+                Some("tab-1"),
+            )
+            .expect("unique URL+method fallback should bridge correlation");
+        assert_eq!(peeked.applied_rule_effects.len(), 1);
+        assert_eq!(
+            peeked.applied_rule_effects[0].kind,
+            NetworkRuleEffectKind::HeaderOverride
+        );
+    }
+
+    #[test]
+    fn correlation_registry_relaxed_fallback_requires_same_tab_target() {
+        let mut registry = RequestCorrelationRegistry::default();
+        registry.record(
+            "fetch-1".to_string(),
+            None,
+            "GET",
+            RequestCorrelation {
+                tab_target_id: Some("tab-1".to_string()),
+                original_url: "https://example.com/api".to_string(),
+                rewritten_url: Some("https://example.com/api".to_string()),
+                effective_request_headers: Some(BTreeMap::from([(
+                    "x-rub-test".to_string(),
+                    "1".to_string(),
+                )])),
+                applied_rule_effects: vec![NetworkRuleEffect {
+                    rule_id: 12,
+                    kind: NetworkRuleEffectKind::HeaderOverride,
+                }],
+            },
+        );
+
+        assert!(
+            registry
+                .peek_for_request(
+                    "network-1",
+                    "https://example.com/api",
+                    "GET",
+                    Some(&BTreeMap::new()),
+                    Some("tab-2"),
+                )
+                .is_none(),
+            "relaxed fallback must stay within the same tab target"
+        );
+        assert!(
+            registry
+                .peek_for_request(
+                    "network-1",
+                    "https://example.com/api",
+                    "GET",
+                    Some(&BTreeMap::new()),
+                    Some("tab-1"),
+                )
+                .is_some(),
+            "same-tab relaxed fallback should still bridge when the match is unique"
+        );
+    }
+
+    #[test]
+    fn correlation_registry_fails_closed_when_relaxed_url_method_match_is_ambiguous() {
+        let mut registry = RequestCorrelationRegistry::default();
+
+        for (index, header_value) in ["1", "2"].into_iter().enumerate() {
+            let mut expected_headers = BTreeMap::new();
+            expected_headers.insert("x-rub-test".to_string(), header_value.to_string());
+            registry.record(
+                format!("fetch-{index}"),
+                None,
+                "GET",
+                RequestCorrelation {
+                    tab_target_id: Some("tab-1".to_string()),
+                    original_url: "https://example.com/api".to_string(),
+                    rewritten_url: Some("https://example.com/api".to_string()),
+                    effective_request_headers: Some(expected_headers),
+                    applied_rule_effects: vec![NetworkRuleEffect {
+                        rule_id: index as u32,
+                        kind: NetworkRuleEffectKind::HeaderOverride,
+                    }],
+                },
+            );
+        }
+
+        assert!(
+            registry
+                .peek_for_request(
+                    "network-1",
+                    "https://example.com/api",
+                    "GET",
+                    Some(&BTreeMap::new()),
+                    Some("tab-1"),
+                )
+                .is_none(),
+            "relaxed fallback must fail closed when multiple unresolved correlations share URL+method",
         );
     }
 }

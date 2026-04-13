@@ -1537,8 +1537,7 @@ fn t260_261_select_and_upload_grouped_scenario() {
         "{json}"
     );
     assert_eq!(
-        json["data"]["interaction"]["observed_effects"]["context_turnover"]["context_replaced"],
-        true,
+        json["data"]["interaction"]["context_turnover"]["context_replaced"], true,
         "{json}"
     );
     let title_json = parse_json(&session.cmd().args(["get", "title"]).output().unwrap());

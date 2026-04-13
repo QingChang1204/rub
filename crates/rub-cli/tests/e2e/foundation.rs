@@ -43,6 +43,28 @@ fn t039_daemon_auto_start_lifecycle() {
     // daemon PID file should exist
     assert!(default_session_pid_path(home).exists());
 
+    let mut closeable = false;
+    for _ in 0..60 {
+        let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
+        if sessions["success"] == true
+            && sessions["data"]["result"]["items"]
+                .as_array()
+                .is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| item["name"].as_str() == Some("default"))
+                })
+        {
+            closeable = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        closeable,
+        "session registry must commit before close is asserted"
+    );
+
     // close should work
     let output = rub_cmd(home).arg("close").output().unwrap();
     let json = parse_json(&output);

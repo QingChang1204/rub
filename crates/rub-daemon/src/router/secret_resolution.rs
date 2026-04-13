@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use super::request_args::parse_json_spec;
 use crate::rub_paths::RubPaths;
 use rub_core::error::{ErrorCode, RubError};
 use serde::de::DeserializeOwned;
@@ -98,18 +97,6 @@ impl SecretSources {
     }
 }
 
-pub(crate) fn parse_json_spec_with_secret_resolution<T>(
-    raw: &str,
-    command: &str,
-    rub_home: &Path,
-) -> Result<ResolvedJsonSpec<T>, RubError>
-where
-    T: DeserializeOwned,
-{
-    let spec = parse_json_value(raw, command)?;
-    resolve_json_value_with_secret_resolution(spec, command, rub_home)
-}
-
 /// Resolve secret placeholders in an already-parsed JSON `Value` and
 /// deserialize into the target type.  Use this when the caller needs to
 /// pre-process the parsed JSON (e.g. shorthand normalization) before
@@ -184,10 +171,6 @@ pub(crate) fn redact_rub_error(error: RubError, metadata: &SecretResolutionMetad
         }
         other => other,
     }
-}
-
-fn parse_json_value(raw: &str, command: &str) -> Result<Value, RubError> {
-    parse_json_spec(raw, command)
 }
 
 fn resolve_placeholders(
@@ -397,10 +380,11 @@ fn collect_secret_matches_and_redact_exact_leaves(
 #[cfg(test)]
 mod tests {
     use super::{
-        SecretResolutionMetadata, SecretSource, SecretSources,
-        parse_json_spec_with_secret_resolution, redact_json_value,
+        SecretResolutionMetadata, SecretSource, SecretSources, redact_json_value,
         redact_json_value_from_secret_sources, redact_rub_error,
+        resolve_json_value_with_secret_resolution,
     };
+    use crate::router::request_args::parse_json_spec;
     use rub_core::error::{ErrorCode, RubError};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -429,12 +413,13 @@ mod tests {
         .expect("write secrets.env");
         set_secure_permissions(&home.join("secrets.env"));
 
-        let resolved = parse_json_spec_with_secret_resolution::<DemoSpec>(
+        let spec = parse_json_spec(
             r#"{"username":"$RUB_USER","nested":{"password":"$RUB_PASSWORD"}}"#,
             "pipe",
-            &home,
         )
-        .expect("secret resolution should succeed");
+        .expect("raw json spec should parse");
+        let resolved = resolve_json_value_with_secret_resolution::<DemoSpec>(spec, "pipe", &home)
+            .expect("secret resolution should succeed");
 
         assert_eq!(
             resolved.value,
@@ -534,12 +519,11 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .expect("set permissions");
 
-        let error = parse_json_spec_with_secret_resolution::<serde_json::Value>(
-            r#"{"secret":"$RUB_SECRET"}"#,
-            "pipe",
-            &home,
-        )
-        .expect_err("insecure permissions should fail");
+        let spec =
+            parse_json_spec(r#"{"secret":"$RUB_SECRET"}"#, "pipe").expect("raw json spec parses");
+        let error =
+            resolve_json_value_with_secret_resolution::<serde_json::Value>(spec, "pipe", &home)
+                .expect_err("insecure permissions should fail");
 
         let envelope = error.into_envelope();
         assert_eq!(envelope.code, ErrorCode::InvalidInput);
@@ -549,12 +533,11 @@ mod tests {
     #[test]
     fn parse_json_spec_with_secret_resolution_reports_missing_reference() {
         let home = unique_temp_home();
-        let error = parse_json_spec_with_secret_resolution::<serde_json::Value>(
-            r#"{"secret":"$RUB_MISSING"}"#,
-            "fill",
-            &home,
-        )
-        .expect_err("missing secret should fail");
+        let spec =
+            parse_json_spec(r#"{"secret":"$RUB_MISSING"}"#, "fill").expect("raw json spec parses");
+        let error =
+            resolve_json_value_with_secret_resolution::<serde_json::Value>(spec, "fill", &home)
+                .expect_err("missing secret should fail");
         let envelope = error.into_envelope();
         assert_eq!(envelope.code, ErrorCode::InvalidInput);
         assert!(envelope.message.contains("$RUB_MISSING"));

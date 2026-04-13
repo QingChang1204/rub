@@ -162,6 +162,7 @@ pub(crate) async fn ensure_page_observatory(
                     &event.request.url,
                     event.request.method.as_str(),
                     Some(&request_headers),
+                    Some(&tab_target_id),
                 );
                 let pending = PendingRequest {
                     request_id: request_id.clone(),
@@ -233,6 +234,7 @@ pub(crate) async fn ensure_page_observatory(
                         &event.response.url,
                         &unknown_request_method(),
                         None,
+                        Some(&tab_target_id),
                     )
                 } else {
                     request_correlation.lock().await.take_for_request(
@@ -240,6 +242,7 @@ pub(crate) async fn ensure_page_observatory(
                         &event.response.url,
                         &unknown_request_method(),
                         None,
+                        Some(&tab_target_id),
                     )
                 };
                 let current = {
@@ -316,6 +319,7 @@ pub(crate) async fn ensure_page_observatory(
                     terminal_correlation_lookup_url(Some(&pending), terminal_identity.as_ref()),
                     terminal_correlation_lookup_method(Some(&pending), terminal_identity.as_ref()),
                     terminal_correlation_lookup_headers(Some(&pending), terminal_identity.as_ref()),
+                    Some(&tab_target_id),
                 );
                 apply_terminal_correlation(
                     &mut pending,
@@ -378,6 +382,7 @@ pub(crate) async fn ensure_page_observatory(
                         pending.as_ref(),
                         terminal_identity.as_ref(),
                     ),
+                    Some(&tab_target_id),
                 );
                 let fallback = pending_request_from_terminal(
                     &request_id,

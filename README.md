@@ -100,6 +100,7 @@ When a language model drives a browser through Playwright or Puppeteer, it runs 
 - `fill` for batch form filling with JSON specs and optional submit targeting
   - `fill --atomic` — per-step rollback on failure (input/textarea/select); reserves rollback budget per step
   - `fill --validate` — dry-run preflight against an optional snapshot without any side effects; projects atomic/rollbackable/live-confirmation status per step
+  - `fill --snapshot` — strict preflight continuity against one captured snapshot; the snapshot only fences target resolution, while writes still execute live against the resolved element refs
 - `scroll` with directional control and pixel amounts
 - `wait` for conditions: CSS selector, text, role, label, testid, page URL/title, and accessible description — with state control (`visible`, `hidden`, `attached`, `detached`, `interactable`)
   - `--url-contains`, `--title-contains`, `--description-contains` cover page-context and target-description waits without dropping to shell loops
@@ -171,15 +172,25 @@ rub now ships several local, no-side-effect help surfaces so agents can validate
 
 ### 🗺️ Workflow Continuity (agent session guidance)
 
-Every CLI response now carries a `workflow_continuity` hint block:
+Command results can carry a `workflow_continuity` hint block:
 
 ```json
 {
   "workflow_continuity": {
+    "surface": "cli_workflow_continuity",
     "continuation_kind": "same_runtime",
-    "reasoning": "...",
-    "recommended_runtime_map": { ... },
-    "next_command_hints": ["rub click --selector ...", "..."]
+    "source_signal": "confirmed_context_transition",
+    "summary": "Continue on the current runtime and verify the new page state.",
+    "recommended_runtime": {
+      "rub_home": "/tmp/rub-XXXX",
+      "session": "default"
+    },
+    "next_command_hints": [
+      {
+        "command": "rub state --format compact",
+        "reason": "Quickly confirm the current page state."
+      }
+    ]
   }
 }
 ```
@@ -189,15 +200,34 @@ Every CLI response now carries a `workflow_continuity` hint block:
 
 This eliminates the need for agents to maintain external session-state logic.
 
+Default success payloads are intentionally slimmer now: the authoritative
+`interaction` surface carries the core evidence, while `--verbose` and
+`--trace` still expose richer interaction diagnostics when needed.
+
 ### 📊 Structured Data Extraction
 
 ```bash
 # Extract a typed data structure from the page
-rub extract '{"title": "text:.product-name", "price": "text:.price", "in_stock": "exists:.in-stock"}'
+rub extract '{"title":".product-name","price":".price"}'
 
-# Extract collections with nested fields
-rub inspect list '{"container": ".product-list", "item": ".product-card", "fields": {"name": "text:h3", "price": "text:.price"}}'
+# Extract collections with builder-style fields
+rub inspect list --collection ".product-card" \
+  --field "name=text:h3" \
+  --field "price=text:.price"
+
+# Follow harvested list rows into detail pages and extract fields from each page
+rub inspect harvest --file rows.json \
+  --url-field url \
+  --name-field title \
+  --field "headline=h1" \
+  --field "author=text:.byline"
 ```
+
+Structured `spec` JSON is now the canonical shape across `fill`, `extract`,
+`inspect list`, `inspect harvest`, and nested workflow/orchestration surfaces.
+Legacy stringified JSON is still accepted for compatibility, but inline objects
+and arrays no longer need JSON-in-JSON escaping when they are nested inside
+`pipe`, trigger, or orchestration payloads.
 
 ### 🍪 State Management
 
@@ -298,6 +328,9 @@ rub pipe --file workflow.json
 
 # Parameterized workflows with secret resolution
 rub pipe --workflow login --var "username=admin" --var "password=secret"
+
+# Nested command args now accept structured spec JSON directly
+rub pipe '[{"command":"open","args":{"url":"https://example.com"}},{"command":"extract","args":{"spec":{"title":"h1","price":{"selector":".price","kind":"text"}}}}]'
 
 # Save/load named workflows
 rub history --export-pipe --save-as "my-flow"

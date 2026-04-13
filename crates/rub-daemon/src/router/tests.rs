@@ -742,7 +742,7 @@ fn interaction_projection_attaches_network_request_grouping() {
         "req-2"
     );
     assert_eq!(
-        value["interaction"]["observed_effects"]["network_requests"]["requests"][0]["request_id"],
+        value["interaction"]["network_requests"]["requests"][0]["request_id"],
         "req-1"
     );
 }
@@ -987,7 +987,7 @@ fn interaction_projection_attaches_observed_effects() {
         true
     );
     assert_eq!(
-        value["interaction"]["observed_effects"]["runtime_observatory_events"][0]["sequence"],
+        value["interaction"]["runtime_observatory_events"][0]["sequence"],
         9
     );
 }

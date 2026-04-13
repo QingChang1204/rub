@@ -198,6 +198,7 @@ async fn handle_request_paused(
                 .as_ref()
                 .map(|network_id| network_id.as_ref().to_string()),
             RequestCorrelation {
+                tab_target_id: Some(page.target_id().as_ref().to_string()),
                 original_url: event.request.url.clone(),
                 rewritten_url,
                 effective_request_headers,

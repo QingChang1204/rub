@@ -13,6 +13,7 @@ use crate::workflow_assets::{
 use crate::workflow_params::{
     parse_workflow_json_parameter_bindings, resolve_workflow_binding_map,
 };
+use rub_core::json_spec::NormalizedJsonSpec;
 use serde_json::Value;
 use std::path::Path;
 
@@ -102,8 +103,10 @@ pub(super) async fn build_orchestration_action_request(
                     );
                 }
             }
+            let resolved_spec =
+                normalized_resolved_workflow_spec_value(&parameterized.resolved_spec)?;
             let args = serde_json::json!({
-                "spec": parameterized.resolved_spec,
+                "spec": resolved_spec,
                 "spec_source": spec_source,
                 "_orchestration": orchestration_request_meta(
                     context.rule,
@@ -164,13 +167,29 @@ fn inspect_timeout_sensitive_value(value: Option<&Value>, path: &str) -> Result<
     Ok(())
 }
 
-fn inspect_fill_workflow_timeout_authority(spec: &str, scope: &str) -> Result<(), ErrorEnvelope> {
-    if !spec.contains(SOURCE_MATERIALIZATION_TIMEOUT_SENTINEL) {
+fn normalized_timeout_spec_value(spec: &Value, scope: &str) -> Result<Value, ErrorEnvelope> {
+    if let Some(raw) = spec.as_str() {
+        return serde_json::from_str(raw)
+            .map_err(|_| source_materialization_timeout_authority_error(scope));
+    }
+    Ok(spec.clone())
+}
+
+fn value_contains_timeout_sentinel(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains(SOURCE_MATERIALIZATION_TIMEOUT_SENTINEL),
+        Value::Array(values) => values.iter().any(value_contains_timeout_sentinel),
+        Value::Object(map) => map.values().any(value_contains_timeout_sentinel),
+        _ => false,
+    }
+}
+
+fn inspect_fill_workflow_timeout_authority(spec: &Value, scope: &str) -> Result<(), ErrorEnvelope> {
+    if !value_contains_timeout_sentinel(spec) {
         return Ok(());
     }
 
-    let steps = serde_json::from_str::<Value>(spec)
-        .map_err(|_| source_materialization_timeout_authority_error(scope))?;
+    let steps = normalized_timeout_spec_value(spec, scope)?;
     let Some(steps) = steps.as_array() else {
         return Err(source_materialization_timeout_authority_error(scope));
     };
@@ -186,13 +205,18 @@ fn inspect_fill_workflow_timeout_authority(spec: &str, scope: &str) -> Result<()
     Ok(())
 }
 
-fn inspect_pipe_workflow_timeout_authority(spec: &str, scope: &str) -> Result<(), ErrorEnvelope> {
-    if !spec.contains(SOURCE_MATERIALIZATION_TIMEOUT_SENTINEL) {
+fn normalized_resolved_workflow_spec_value(resolved_spec: &str) -> Result<Value, ErrorEnvelope> {
+    NormalizedJsonSpec::from_raw_str(resolved_spec, "pipe")
+        .map(NormalizedJsonSpec::into_value)
+        .map_err(|error| ErrorEnvelope::new(ErrorCode::InvalidInput, error.to_string()))
+}
+
+fn inspect_pipe_workflow_timeout_authority(spec: &Value, scope: &str) -> Result<(), ErrorEnvelope> {
+    if !value_contains_timeout_sentinel(spec) {
         return Ok(());
     }
 
-    let workflow = serde_json::from_str::<Value>(spec)
-        .map_err(|_| source_materialization_timeout_authority_error(scope))?;
+    let workflow = normalized_timeout_spec_value(spec, scope)?;
     let (steps, steps_scope) = if let Some(steps) = workflow.as_array() {
         (steps, scope.to_string())
     } else if let Some(steps) = workflow.get("steps").and_then(Value::as_array) {
@@ -220,7 +244,7 @@ fn inspect_pipe_workflow_timeout_authority(spec: &str, scope: &str) -> Result<()
                 &format!("{step_scope}.args.timeout_ms"),
             )?,
             "fill" => {
-                if let Some(spec) = args.get("spec").and_then(Value::as_str) {
+                if let Some(spec) = args.get("spec") {
                     inspect_fill_workflow_timeout_authority(
                         spec,
                         &format!("{step_scope}.args.spec"),
@@ -228,7 +252,7 @@ fn inspect_pipe_workflow_timeout_authority(spec: &str, scope: &str) -> Result<()
                 }
             }
             "pipe" => {
-                if let Some(spec) = args.get("spec").and_then(Value::as_str) {
+                if let Some(spec) = args.get("spec") {
                     inspect_pipe_workflow_timeout_authority(
                         spec,
                         &format!("{step_scope}.args.spec"),
@@ -243,7 +267,7 @@ fn inspect_pipe_workflow_timeout_authority(spec: &str, scope: &str) -> Result<()
 }
 
 fn ensure_static_source_materialization_timeout_authority(
-    resolved_spec: &str,
+    resolved_spec: &Value,
 ) -> Result<(), ErrorEnvelope> {
     inspect_pipe_workflow_timeout_authority(resolved_spec, "$")
 }
@@ -305,9 +329,11 @@ pub(super) fn orchestration_source_materialization_wait_budget_ms(
             }
             let parameterized = resolve_workflow_binding_map(&raw_spec, &bindings)
                 .map_err(|error| error.into_envelope())?;
-            ensure_static_source_materialization_timeout_authority(&parameterized.resolved_spec)?;
+            let resolved_spec =
+                normalized_resolved_workflow_spec_value(&parameterized.resolved_spec)?;
+            ensure_static_source_materialization_timeout_authority(&resolved_spec)?;
             let args = serde_json::json!({
-                "spec": parameterized.resolved_spec,
+                "spec": resolved_spec,
             });
             Ok(orchestration_action_timeout_ms("pipe", &args))
         }
@@ -808,6 +834,50 @@ mod tests {
             "orchestration_source_materialization_timeout_authority_ambiguous"
         );
         assert_eq!(context["path"], "$[0].command");
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn source_materialization_wait_budget_rejects_structured_nested_fill_spec_timeout_authority() {
+        let home = std::env::temp_dir().join(format!(
+            "rub-orchestration-timeout-structured-fill-spec-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(home.join("workflows")).unwrap();
+
+        let action = TriggerActionSpec {
+            kind: TriggerActionKind::Workflow,
+            command: None,
+            payload: Some(serde_json::json!({
+                "steps": [
+                    {
+                        "command": "fill",
+                        "args": {
+                            "spec": [
+                                {
+                                    "selector": "#email",
+                                    "value": "alice@example.com",
+                                    "wait_after": {
+                                        "timeout_ms": SOURCE_MATERIALIZATION_TIMEOUT_SENTINEL
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            })),
+        };
+
+        let error = orchestration_source_materialization_wait_budget_ms(&action, &home)
+            .expect_err("structured nested fill spec should fail closed");
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        let context = error.context.expect("timeout authority context");
+        assert_eq!(
+            context["reason"],
+            "orchestration_source_materialization_timeout_authority_ambiguous"
+        );
+        assert_eq!(context["path"], "$[0].args.spec[0].wait_after.timeout_ms");
 
         let _ = std::fs::remove_dir_all(home);
     }

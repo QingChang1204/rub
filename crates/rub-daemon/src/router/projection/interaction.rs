@@ -494,16 +494,6 @@ fn attach_observed_effects(data: &mut serde_json::Value) {
         }
     }
 
-    copy_interaction_field(interaction, &mut observed, "context_turnover");
-    copy_interaction_field(interaction, &mut observed, "frame_context_status");
-    copy_interaction_field(interaction, &mut observed, "frame_context");
-    copy_interaction_field(interaction, &mut observed, "frame_lineage");
-    copy_interaction_field(interaction, &mut observed, "runtime_state_delta");
-    copy_interaction_field(interaction, &mut observed, "interference");
-    copy_interaction_field(interaction, &mut observed, "runtime_observatory_events");
-    copy_interaction_field(interaction, &mut observed, "network_requests");
-    copy_interaction_field(interaction, &mut observed, "downloads");
-
     if !observed.is_empty() {
         interaction.insert(
             "observed_effects".to_string(),
@@ -598,16 +588,6 @@ fn copy_json_field(
     }
 }
 
-fn copy_interaction_field(
-    interaction: &serde_json::Map<String, serde_json::Value>,
-    observed: &mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) {
-    if let Some(value) = interaction.get(key) {
-        observed.insert(key.to_string(), value.clone());
-    }
-}
-
 fn summarize_page(page: Option<&serde_json::Value>) -> Option<serde_json::Value> {
     let page = page?.as_object()?;
     let mut summary = serde_json::Map::new();
@@ -672,6 +652,18 @@ mod tests {
     use super::{attach_download_events, attach_observed_effects};
     use rub_core::model::{DownloadEntry, DownloadEvent, DownloadEventKind, DownloadState};
 
+    const DUPLICATED_INTERACTION_FIELDS: &[&str] = &[
+        "context_turnover",
+        "frame_context_status",
+        "frame_context",
+        "frame_lineage",
+        "runtime_state_delta",
+        "interference",
+        "runtime_observatory_events",
+        "network_requests",
+        "downloads",
+    ];
+
     fn sample_download_event() -> DownloadEvent {
         DownloadEvent {
             sequence: 7,
@@ -694,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn download_surface_truth_labels_propagate_into_observed_effects() {
+    fn download_surface_truth_labels_remain_on_interaction_surface() {
         let mut data = serde_json::json!({
             "interaction": {}
         });
@@ -707,18 +699,14 @@ mod tests {
             data["interaction"]["downloads"]["degraded_reason"],
             serde_json::Value::Null
         );
-        assert_eq!(
-            data["interaction"]["observed_effects"]["downloads"]["authoritative"],
-            true
-        );
-        assert_eq!(
-            data["interaction"]["observed_effects"]["downloads"]["last_download"]["suggested_filename"],
-            "report.csv"
+        assert!(
+            data["interaction"]["observed_effects"]["downloads"].is_null(),
+            "{data}"
         );
     }
 
     #[test]
-    fn non_authoritative_empty_download_window_still_projects_degraded_surface() {
+    fn non_authoritative_empty_download_window_still_projects_degraded_interaction_surface() {
         let mut data = serde_json::json!({
             "interaction": {}
         });
@@ -736,14 +724,68 @@ mod tests {
             data["interaction"]["downloads"]["degraded_reason"],
             "browser_event_ingress_overflow:download_progress"
         );
-        assert_eq!(
-            data["interaction"]["observed_effects"]["downloads"]["authoritative"],
-            false
-        );
         assert!(
-            data["interaction"]["observed_effects"]["downloads"]["events"]
-                .as_array()
-                .is_some_and(|events| events.is_empty())
+            data["interaction"]["observed_effects"]["downloads"].is_null(),
+            "{data}"
         );
+    }
+
+    #[test]
+    fn observed_effects_do_not_recopy_interaction_projection_fields() {
+        let mut data = serde_json::json!({
+            "interaction": {
+                "context_turnover": {
+                    "context_changed": true,
+                    "context_replaced": false,
+                    "before_page": { "url": "https://before.test" },
+                    "after_page": { "url": "https://after.test" }
+                },
+                "frame_context_status": "current",
+                "frame_context": {
+                    "frame_id": "frame-main",
+                    "url": "https://after.test"
+                },
+                "frame_lineage": [
+                    { "frame_id": "frame-main" }
+                ],
+                "runtime_state_delta": {
+                    "title_changed": true
+                },
+                "interference": {
+                    "status_changed": true
+                },
+                "runtime_observatory_events": [
+                    { "sequence": 7, "payload": { "kind": "console_error" } }
+                ],
+                "network_requests": {
+                    "requests": [
+                        { "request_id": "req-1" }
+                    ],
+                    "terminal_count": 1,
+                    "last_request": { "request_id": "req-1" },
+                    "authoritative": true,
+                    "degraded_reason": null
+                },
+                "downloads": {
+                    "events": [
+                        { "sequence": 3 }
+                    ],
+                    "last_download": { "guid": "dl-1" },
+                    "authoritative": true,
+                    "degraded_reason": null
+                }
+            }
+        });
+
+        attach_observed_effects(&mut data);
+
+        let interaction = &data["interaction"];
+        let observed = &interaction["observed_effects"];
+        for key in DUPLICATED_INTERACTION_FIELDS {
+            assert!(
+                observed[*key].is_null(),
+                "expected observed_effects.{key} to be omitted: {data}"
+            );
+        }
     }
 }

@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use rub_core::json_spec::NormalizedJsonSpec;
 use serde::Deserialize;
 
 use super::scan::ExtractScanConfig;
 use crate::router::extract_postprocess::{ExtractTransform, ExtractValueType};
-use crate::router::request_args::{parse_json_args, parse_json_spec};
+use crate::router::request_args::parse_json_args;
 use crate::router::secret_resolution::{
     ResolvedJsonSpec, resolve_json_value_with_secret_resolution,
 };
@@ -170,7 +171,7 @@ pub(super) struct ContentExtractPayload {
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ExtractQueryArgs {
-    spec: String,
+    spec: NormalizedJsonSpec,
     #[serde(default, rename = "spec_source")]
     _spec_source: Option<serde_json::Value>,
     #[serde(default)]
@@ -180,7 +181,7 @@ pub(super) struct ExtractQueryArgs {
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ExtractListArgs {
-    spec: String,
+    spec: NormalizedJsonSpec,
     #[serde(default, rename = "spec_source")]
     _spec_source: Option<serde_json::Value>,
     #[serde(default)]
@@ -346,7 +347,7 @@ impl ExtractCommand {
         }
     }
 
-    pub(super) fn spec(&self) -> &str {
+    pub(super) fn spec(&self) -> &NormalizedJsonSpec {
         match self {
             Self::Query(args) => &args.spec,
             Self::List(args) => &args.spec,
@@ -388,11 +389,11 @@ fn default_extract_required() -> bool {
 }
 
 pub(super) fn parse_extract_fields(
-    raw: &str,
+    raw: &NormalizedJsonSpec,
     rub_home: &std::path::Path,
 ) -> Result<ResolvedJsonSpec<BTreeMap<String, super::collection::ExtractEntrySpec>>, RubError> {
-    let mut spec = parse_json_spec::<serde_json::Value>(raw, "extract")?;
-    normalize_extract_spec_shorthands_in_place(&mut spec);
+    let mut spec = raw.as_value().clone();
+    normalize_extract_spec_shorthands_in_place(&mut spec)?;
     resolve_json_value_with_secret_resolution(spec, "extract", rub_home)
 }
 
@@ -400,21 +401,67 @@ pub(super) fn parse_extract_fields(
 ///
 /// Converts `{"title": "h1"}` entries to `{"title": {"selector": "h1", "kind": "text"}}`.
 /// Object entries and non-object roots pass through unchanged.
-pub(super) fn normalize_extract_spec_shorthands_in_place(spec: &mut serde_json::Value) {
+pub(super) fn normalize_extract_spec_shorthands_in_place(
+    spec: &mut serde_json::Value,
+) -> Result<(), RubError> {
     let Some(object) = spec.as_object_mut() else {
-        return;
+        return Ok(());
     };
-    if !object.values().any(|v| v.is_string()) {
-        return;
-    }
-    for value in object.values_mut() {
-        if let serde_json::Value::String(selector) = value {
-            *value = serde_json::json!({
-                "selector": *selector,
-                "kind": "text"
-            });
+
+    normalize_extract_field_map_in_place(object, "$")
+}
+
+fn normalize_extract_field_map_in_place(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    path: &str,
+) -> Result<(), RubError> {
+    for (field_name, value) in fields.iter_mut() {
+        let field_path = format!("{path}.{field_name}");
+        match value {
+            serde_json::Value::String(selector) => {
+                *value = serde_json::json!({
+                    "selector": selector,
+                    "kind": "text"
+                });
+            }
+            serde_json::Value::Object(object) => {
+                if let Some(nested_fields) = object.get_mut("fields") {
+                    let Some(nested_map) = nested_fields.as_object_mut() else {
+                        return Err(RubError::domain_with_context(
+                            ErrorCode::InvalidInput,
+                            format!(
+                                "Invalid JSON spec for 'extract': collection fields at '{field_path}.fields' must be an object"
+                            ),
+                            serde_json::json!({
+                                "path": format!("{field_path}.fields"),
+                                "field": field_name,
+                                "surface": "extract_field_map",
+                            }),
+                        ));
+                    };
+                    normalize_extract_field_map_in_place(
+                        nested_map,
+                        &format!("{field_path}.fields"),
+                    )?;
+                }
+            }
+            _ => {
+                return Err(RubError::domain_with_context(
+                    ErrorCode::InvalidInput,
+                    format!(
+                        "Invalid JSON spec for 'extract': field entry at '{field_path}' must be an object or selector string shorthand"
+                    ),
+                    serde_json::json!({
+                        "path": field_path,
+                        "field": field_name,
+                        "surface": "extract_field_map",
+                    }),
+                ));
+            }
         }
     }
+
+    Ok(())
 }
 
 impl ExtractKind {
@@ -432,8 +479,11 @@ impl ExtractKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExtractCommand, ExtractWaitArgs};
+    use super::{
+        ExtractCommand, ExtractListArgs, ExtractQueryArgs, ExtractWaitArgs, parse_extract_fields,
+    };
     use rub_core::error::ErrorCode;
+    use rub_core::json_spec::NormalizedJsonSpec;
 
     #[test]
     fn extract_wait_args_require_both_field_and_contains() {
@@ -470,5 +520,141 @@ mod tests {
         assert_eq!(wait.field_path, "subject");
         assert_eq!(wait.contains, "Confirm your account");
         assert_eq!(wait.timeout.as_millis(), 5000);
+    }
+
+    #[test]
+    fn extract_args_accept_string_and_structured_spec() {
+        let query = serde_json::from_value::<ExtractQueryArgs>(serde_json::json!({
+            "spec": "{\"title\":{\"selector\":\"h1\",\"kind\":\"text\"}}"
+        }))
+        .expect("stringified extract query spec should parse");
+        assert_eq!(
+            query.spec.as_value(),
+            &serde_json::json!({"title":{"selector":"h1","kind":"text"}})
+        );
+
+        let structured_query = serde_json::from_value::<ExtractQueryArgs>(serde_json::json!({
+            "spec": { "title": { "selector": "h1", "kind": "text" } }
+        }))
+        .expect("structured extract query spec should parse");
+        assert_eq!(
+            structured_query.spec.as_value(),
+            &serde_json::json!({ "title": { "selector": "h1", "kind": "text" } })
+        );
+
+        let list = serde_json::from_value::<ExtractListArgs>(serde_json::json!({
+            "spec": "{\"items\":{\"collection\":\".mail-row\",\"fields\":{\"subject\":{\"selector\":\".subject\",\"kind\":\"text\"}}}}"
+        }))
+        .expect("stringified extract list spec should parse");
+        assert_eq!(
+            list.spec.as_value(),
+            &serde_json::json!({
+                "items":{"collection":".mail-row","fields":{"subject":{"selector":".subject","kind":"text"}}}
+            })
+        );
+
+        let structured_list = serde_json::from_value::<ExtractListArgs>(serde_json::json!({
+            "spec": {
+                "items": {
+                    "collection": ".mail-row",
+                    "fields": {
+                        "subject": { "selector": ".subject", "kind": "text" }
+                    }
+                }
+            }
+        }))
+        .expect("structured extract list spec should parse");
+        assert_eq!(
+            structured_list.spec.as_value(),
+            &serde_json::json!({
+                "items": {
+                    "collection": ".mail-row",
+                    "fields": {
+                        "subject": { "selector": ".subject", "kind": "text" }
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn parse_extract_fields_normalizes_nested_collection_string_shorthand() {
+        let home = std::env::temp_dir().join(format!(
+            "rub-extract-nested-shorthand-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let spec = NormalizedJsonSpec::from_raw_str(
+            r#"{
+                "items": {
+                    "collection": ".mail-row",
+                    "fields": {
+                        "subject": ".subject"
+                    }
+                }
+            }"#,
+            "extract",
+        )
+        .expect("nested collection shorthand fixture should parse as normalized spec");
+        let parsed = parse_extract_fields(&spec, &home)
+            .expect("nested collection shorthand should normalize recursively");
+
+        assert!(parsed.value.contains_key("items"));
+    }
+
+    #[test]
+    fn parse_extract_fields_accepts_nested_collection_object_entries() {
+        let home = std::env::temp_dir().join(format!(
+            "rub-extract-nested-object-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let spec = NormalizedJsonSpec::from_raw_str(
+            r#"{
+                "items": {
+                    "collection": ".mail-row",
+                    "fields": {
+                        "subject": {
+                            "selector": ".subject",
+                            "kind": "text"
+                        }
+                    }
+                }
+            }"#,
+            "extract",
+        )
+        .expect("nested collection object fixture should parse as normalized spec");
+        let parsed = parse_extract_fields(&spec, &home)
+            .expect("nested collection object entries should parse");
+
+        assert!(parsed.value.contains_key("items"));
+    }
+
+    #[test]
+    fn parse_extract_fields_reports_nested_field_path_for_invalid_collection_entry() {
+        let home = std::env::temp_dir().join(format!(
+            "rub-extract-nested-invalid-entry-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let spec = NormalizedJsonSpec::from_raw_str(
+            r#"{
+                "items": {
+                    "collection": ".mail-row",
+                    "fields": {
+                        "subject": 42
+                    }
+                }
+            }"#,
+            "extract",
+        )
+        .expect("invalid nested entry fixture should parse as normalized spec");
+        let error = parse_extract_fields(&spec, &home)
+            .expect_err("invalid nested collection entry should fail closed");
+
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::InvalidInput);
+        let context = envelope
+            .context
+            .expect("nested invalid entry should include path context");
+        assert_eq!(context["path"], "$.items.fields.subject");
+        assert_eq!(context["surface"], "extract_field_map");
     }
 }

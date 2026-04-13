@@ -636,7 +636,7 @@ fn verify_home_cleanup_ignores_unrelated_pid_artifacts_without_browser_authority
 
 #[test]
 fn verify_home_cleanup_complete_detects_managed_profile_residue_for_observed_daemon() {
-    let fake_pid = 424_242u32;
+    let fake_pid = 400_000u32 + (uuid::Uuid::now_v7().as_u128() % 100_000) as u32;
     let home = format!("/tmp/rub-e2e-cleanup-residue-{fake_pid}");
     let profile_dir = managed_browser_profile_dir_for_daemon(fake_pid);
     let _ = std::fs::remove_dir_all(&profile_dir);

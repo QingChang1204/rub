@@ -265,8 +265,7 @@ fn t403b_407c_interference_grouped_scenario() {
     );
     assert_eq!(clicked["success"], true, "{clicked}");
     assert_eq!(
-        clicked["data"]["interaction"]["observed_effects"]["interference"]["after"]["current_interference"]
-            ["kind"],
+        clicked["data"]["interaction"]["interference"]["after"]["current_interference"]["kind"],
         "interstitial_navigation",
         "{clicked}"
     );
@@ -275,7 +274,7 @@ fn t403b_407c_interference_grouped_scenario() {
         "{clicked}"
     );
     assert!(
-        clicked["data"]["interaction"]["observed_effects"]["interference"]["changed"]
+        clicked["data"]["interaction"]["interference"]["changed"]
             .as_array()
             .unwrap()
             .iter()
@@ -2326,6 +2325,76 @@ fn t414e_extract_supports_nested_collection_children() {
     );
 }
 
+/// T414e1: nested collection children also support string shorthand entries inside collection fields.
+#[test]
+#[ignore]
+#[serial]
+fn t414e1_extract_supports_nested_collection_string_shorthand_children() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
+
+    let (_rt, server) = start_test_server(vec![(
+        "/",
+        "text/html",
+        r#"<!DOCTYPE html>
+<html>
+<head><title>Nested Collection Shorthand Fixture</title></head>
+<body>
+  <section class="repo">
+    <h2 class="repo-name">rub</h2>
+    <ul class="labels">
+      <li class="label" data-tone="green"><span class="text">automation</span></li>
+      <li class="label" data-tone="blue"><span class="text">rust</span></li>
+    </ul>
+  </section>
+</body>
+</html>"#,
+    )]);
+
+    let opened = parse_json(
+        &rub_cmd(home)
+            .args(["open", &server.url()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+
+    let spec = json!({
+        "repos": {
+            "collection": ".repo",
+            "fields": {
+                "name": { "selector": ".repo-name", "kind": "text" },
+                "labels": {
+                    "collection": ".label",
+                    "fields": {
+                        "text": ".text",
+                        "tone": {
+                            "kind": "attribute",
+                            "attribute": "data-tone"
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .to_string();
+
+    let extracted = parse_json(&rub_cmd(home).args(["extract", &spec]).output().unwrap());
+    assert_eq!(extracted["success"], true, "{extracted}");
+    let repos = extracted["data"]["result"]["fields"]["repos"]
+        .as_array()
+        .unwrap();
+    assert_eq!(repos.len(), 1, "{extracted}");
+    assert_eq!(
+        repos[0]["labels"]["items"],
+        json!([
+            { "text": "automation", "tone": "green" },
+            { "text": "rust", "tone": "blue" }
+        ]),
+        "{extracted}"
+    );
+}
+
 /// T414f: nested collection children support row-scoped semantic locators beyond selector-only fields.
 #[test]
 #[ignore]
@@ -2501,7 +2570,7 @@ fn t430_433_download_runtime_grouped_scenario() {
         clicked["data"]["interaction"]["interaction_confirmed"], true,
         "{clicked}"
     );
-    let downloads = &clicked["data"]["interaction"]["observed_effects"]["downloads"];
+    let downloads = &clicked["data"]["interaction"]["downloads"];
     assert!(
         downloads["events"]
             .as_array()

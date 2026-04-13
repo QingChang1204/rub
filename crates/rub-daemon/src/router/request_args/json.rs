@@ -22,11 +22,24 @@ pub(crate) fn reject_unknown_fields(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn parse_json_spec<T>(raw: &str, command: &str) -> Result<T, RubError>
 where
     T: serde::de::DeserializeOwned,
 {
     serde_json::from_str(raw).map_err(|error| {
+        RubError::domain(
+            ErrorCode::InvalidInput,
+            format!("Invalid JSON spec for '{command}': {error}"),
+        )
+    })
+}
+
+pub(crate) fn parse_json_spec_value<T>(raw: serde_json::Value, command: &str) -> Result<T, RubError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_value(raw).map_err(|error| {
         RubError::domain(
             ErrorCode::InvalidInput,
             format!("Invalid JSON spec for '{command}': {error}"),

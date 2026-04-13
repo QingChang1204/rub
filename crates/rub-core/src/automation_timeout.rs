@@ -38,13 +38,13 @@ pub fn command_additional_timeout_ms(command: &str, args: &Value) -> u64 {
             ]
             .into_iter()
             .any(|key| args.get(key).is_some_and(|value| !value.is_null()));
-            if let Some(fill_spec) = args.get("spec").and_then(Value::as_str) {
+            if let Some(fill_spec) = args.get("spec") {
                 extra = extra
                     .saturating_add(fill_workflow_additional_timeout_ms(fill_spec, has_submit));
             }
         }
         "pipe" => {
-            if let Some(pipe_spec) = args.get("spec").and_then(Value::as_str) {
+            if let Some(pipe_spec) = args.get("spec") {
                 extra = extra.saturating_add(pipe_workflow_additional_timeout_ms(pipe_spec));
             }
         }
@@ -53,12 +53,9 @@ pub fn command_additional_timeout_ms(command: &str, args: &Value) -> u64 {
     extra
 }
 
-pub fn fill_workflow_additional_timeout_ms(resolved_spec: &str, _has_submit: bool) -> u64 {
+pub fn fill_workflow_additional_timeout_ms(resolved_spec: &Value, _has_submit: bool) -> u64 {
     let has_submit = _has_submit;
-    let Some(steps) = serde_json::from_str::<Value>(resolved_spec)
-        .ok()
-        .and_then(|value| value.as_array().cloned())
-    else {
+    let Some(steps) = resolved_spec.as_array() else {
         return if has_submit {
             DEFAULT_WAIT_AFTER_TIMEOUT_MS
         } else {
@@ -77,11 +74,11 @@ pub fn fill_workflow_additional_timeout_ms(resolved_spec: &str, _has_submit: boo
     }
 }
 
-pub fn pipe_workflow_additional_timeout_ms(resolved_spec: &str) -> u64 {
-    let Some(workflow) = serde_json::from_str::<Value>(resolved_spec).ok() else {
-        return 0;
-    };
-    let Some(steps) = workflow.get("steps").and_then(Value::as_array) else {
+pub fn pipe_workflow_additional_timeout_ms(resolved_spec: &Value) -> u64 {
+    let Some(steps) = resolved_spec
+        .as_array()
+        .or_else(|| resolved_spec.get("steps").and_then(Value::as_array))
+    else {
         return 0;
     };
 
@@ -109,16 +106,27 @@ mod tests {
                 {
                     "command": "pipe",
                     "args": {
-                        "spec": "{\"steps\":[{\"command\":\"wait\",\"args\":{\"timeout_ms\":1200}}]}"
+                        "spec": { "steps": [{ "command": "wait", "args": {"timeout_ms":1200} }] }
                     }
                 }
             ]
         });
 
-        let extra = pipe_workflow_additional_timeout_ms(
-            &serde_json::to_string(&spec).expect("serialize spec"),
-        );
+        let extra = pipe_workflow_additional_timeout_ms(&spec);
         assert_eq!(extra, 1_200);
+    }
+
+    #[test]
+    fn shared_timeout_helper_counts_legacy_array_form_pipe_specs() {
+        let spec = serde_json::json!([
+            {
+                "command": "wait",
+                "args": { "timeout_ms": 900 }
+            }
+        ]);
+
+        let extra = pipe_workflow_additional_timeout_ms(&spec);
+        assert_eq!(extra, 900);
     }
 
     #[test]
@@ -137,10 +145,7 @@ mod tests {
             { "field": "name", "value": "Alice", "wait_after": { "timeout_ms": 500 } },
             { "field": "email", "value": "a@example.com" }
         ]);
-        let extra = fill_workflow_additional_timeout_ms(
-            &serde_json::to_string(&spec).expect("serialize fill spec"),
-            false,
-        );
+        let extra = fill_workflow_additional_timeout_ms(&spec, false);
         assert_eq!(extra, 500);
     }
 
@@ -149,10 +154,52 @@ mod tests {
         let spec = serde_json::json!([
             { "field": "name", "value": "Alice" }
         ]);
-        let extra = fill_workflow_additional_timeout_ms(
-            &serde_json::to_string(&spec).expect("serialize fill spec"),
-            true,
-        );
+        let extra = fill_workflow_additional_timeout_ms(&spec, true);
         assert_eq!(extra, crate::DEFAULT_WAIT_AFTER_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn shared_timeout_helper_counts_structured_fill_spec_values() {
+        let args = serde_json::json!({
+            "spec": [
+                {
+                    "selector": "#email",
+                    "value": "alice@example.com",
+                    "wait_after": { "timeout_ms": 600 }
+                }
+            ]
+        });
+
+        assert_eq!(command_additional_timeout_ms("fill", &args), 600);
+    }
+
+    #[test]
+    fn shared_timeout_helper_counts_structured_pipe_spec_values() {
+        let args = serde_json::json!({
+            "spec": {
+                "steps": [
+                    {
+                        "command": "wait",
+                        "args": { "timeout_ms": 1_200 }
+                    }
+                ]
+            }
+        });
+
+        assert_eq!(command_additional_timeout_ms("pipe", &args), 1_200);
+    }
+
+    #[test]
+    fn shared_timeout_helper_counts_legacy_array_form_pipe_values() {
+        let args = serde_json::json!({
+            "spec": [
+                {
+                    "command": "wait",
+                    "args": { "timeout_ms": 1_050 }
+                }
+            ]
+        });
+
+        assert_eq!(command_additional_timeout_ms("pipe", &args), 1_050);
     }
 }

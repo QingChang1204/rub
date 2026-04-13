@@ -229,7 +229,7 @@ fn attach_interaction_trace(result: &mut CommandResult, trace_mode: InteractionT
     copy_field(&interaction, &mut trace, "confirmation_kind");
 
     if matches!(trace_mode, InteractionTraceMode::Trace)
-        && let Some(effects) = summarize_observed_effects(&interaction)
+        && let Some(effects) = summarize_observed_effects(&interaction, &trace)
     {
         trace.insert("observed_effects".to_string(), effects);
     }
@@ -243,8 +243,27 @@ fn copy_field(source: &Map<String, Value>, dest: &mut Map<String, Value>, key: &
     }
 }
 
-fn summarize_observed_effects(interaction: &Map<String, Value>) -> Option<Value> {
-    interaction.get("observed_effects").cloned()
+fn summarize_observed_effects(
+    interaction: &Map<String, Value>,
+    trace: &Map<String, Value>,
+) -> Option<Value> {
+    let mut observed = interaction
+        .get("observed_effects")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    for (key, value) in interaction {
+        if key != "observed_effects" && !trace.contains_key(key) {
+            observed.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+
+    if observed.is_empty() {
+        None
+    } else {
+        Some(Value::Object(observed))
+    }
 }
 
 #[cfg(test)]
@@ -395,107 +414,6 @@ mod tests {
                             "url": "https://example.com/after",
                             "title": "After",
                             "context_replaced": false
-                        },
-                        "context_turnover": {
-                            "context_changed": true,
-                            "context_replaced": false,
-                            "after_page": {
-                                "url": "https://example.com/after",
-                                "title": "After",
-                                "context_replaced": false
-                            }
-                        },
-                        "runtime_state_delta": {
-                            "before": {
-                                "state_inspector": {
-                                    "status": "active",
-                                    "auth_state": "anonymous",
-                                    "cookie_count": 0,
-                                    "local_storage_keys": [],
-                                    "session_storage_keys": [],
-                                    "auth_signals": []
-                                },
-                                "readiness_state": {
-                                    "status": "active",
-                                    "route_stability": "stable",
-                                    "loading_present": false,
-                                    "skeleton_present": false,
-                                    "overlay_state": "none",
-                                    "document_ready_state": "complete",
-                                    "blocking_signals": []
-                                }
-                            },
-                            "after": {
-                                "state_inspector": {
-                                    "status": "active",
-                                    "auth_state": "unknown",
-                                    "cookie_count": 0,
-                                    "local_storage_keys": ["authToken"],
-                                    "session_storage_keys": [],
-                                    "auth_signals": ["local_storage_present", "auth_like_storage_key_present"]
-                                },
-                                "readiness_state": {
-                                    "status": "active",
-                                    "route_stability": "transitioning",
-                                    "loading_present": true,
-                                    "skeleton_present": false,
-                                    "overlay_state": "none",
-                                    "document_ready_state": "complete",
-                                    "blocking_signals": ["loading_present", "route_transitioning"]
-                                }
-                            },
-                            "changed": [
-                                "state_inspector.auth_state",
-                                "state_inspector.local_storage_keys",
-                                "state_inspector.auth_signals",
-                                "readiness_state.route_stability",
-                                "readiness_state.loading_present",
-                                "readiness_state.blocking_signals"
-                            ]
-                        },
-                        "runtime_observatory_events": [
-                            {
-                                "kind": "console_error",
-                                "sequence": 7,
-                                "event": {
-                                    "level": "error",
-                                    "message": "boom",
-                                    "source": "main"
-                                }
-                            }
-                        ],
-                        "interference": {
-                            "before": {
-                                "mode": "public_web_stable",
-                                "status": "inactive",
-                                "active_policies": ["safe_recovery", "handoff_escalation"],
-                                "recovery_in_progress": false,
-                                "handoff_required": false
-                            },
-                            "after": {
-                                "mode": "public_web_stable",
-                                "status": "active",
-                                "current_interference": {
-                                    "kind": "interstitial_navigation",
-                                    "summary": "interstitial-like navigation drift detected",
-                                    "current_url": "https://example.com/after#vignette",
-                                    "primary_url": "https://example.com/before"
-                                },
-                                "last_interference": {
-                                    "kind": "interstitial_navigation",
-                                    "summary": "interstitial-like navigation drift detected",
-                                    "current_url": "https://example.com/after#vignette",
-                                    "primary_url": "https://example.com/before"
-                                },
-                                "active_policies": ["safe_recovery", "handoff_escalation"],
-                                "recovery_in_progress": false,
-                                "handoff_required": false
-                            },
-                            "changed": [
-                                "interference_runtime.status",
-                                "interference_runtime.current_interference",
-                                "interference_runtime.last_interference"
-                            ]
                         }
                     }
                 }
@@ -819,6 +737,52 @@ mod tests {
                 .get("observed_effects")
                 .is_none(),
             "{json}"
+        );
+    }
+
+    #[test]
+    fn format_response_trace_mode_picks_up_new_interaction_fields_without_hardcoded_list() {
+        let response = IpcResponse {
+            ipc_protocol_version: "1.0".to_string(),
+            command_id: Some("019-request".to_string()),
+            request_id: "019-request".to_string(),
+            status: ResponseStatus::Success,
+            data: Some(serde_json::json!({
+                "interaction": {
+                    "semantic_class": "click",
+                    "element_verified": true,
+                    "interaction_confirmed": true,
+                    "confirmation_status": "confirmed",
+                    "confirmation_kind": "dom_effect",
+                    "custom_projection": {
+                        "kind": "new_surface",
+                        "value": 7
+                    },
+                    "observed_effects": {
+                        "context_changed": true
+                    }
+                }
+            })),
+            error: None,
+            timing: rub_core::model::Timing::default(),
+        };
+
+        let output = format_response(
+            &response,
+            "click",
+            "default",
+            rub_home(),
+            false,
+            InteractionTraceMode::Trace,
+        );
+        let json: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            json["data"]["interaction_trace"]["observed_effects"]["custom_projection"]["kind"],
+            "new_surface"
+        );
+        assert_eq!(
+            json["data"]["interaction_trace"]["observed_effects"]["custom_projection"]["value"],
+            7
         );
     }
 

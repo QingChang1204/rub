@@ -405,7 +405,8 @@ mod tests {
 
     #[test]
     fn orphan_temp_browser_roots_include_residual_profile_dirs_without_live_daemon_owner() {
-        let root = std::env::temp_dir().join("rub-chrome-424242");
+        let pid = 400_000u32 + (uuid::Uuid::now_v7().as_u128() % 100_000) as u32;
+        let root = std::env::temp_dir().join(format!("rub-chrome-{pid}"));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 

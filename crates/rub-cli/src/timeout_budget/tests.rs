@@ -424,8 +424,7 @@ fn pipe_file_request_loads_spec_and_records_file_source() {
 
     let request = build_request(&cli).expect("pipe request should build");
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(request.args["spec"].as_str().unwrap())
-            .expect("workflow json"),
+        request.args["spec"],
         serde_json::json!([{ "command": "doctor", "args": {} }])
     );
     assert_eq!(request.args["spec_source"]["kind"], "file");
@@ -500,8 +499,7 @@ fn fill_file_request_loads_spec_and_records_file_source() {
 
     let request = build_request(&cli).expect("fill request should build");
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(request.args["spec"].as_str().unwrap())
-            .expect("fill json"),
+        request.args["spec"],
         serde_json::json!([{ "selector": "#name", "value": "Ada" }])
     );
     assert_eq!(request.args["spec_source"]["kind"], "file");
@@ -687,8 +685,7 @@ fn extract_file_request_loads_spec_and_records_file_source() {
 
     let request = build_request(&cli).expect("extract request should build");
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(request.args["spec"].as_str().unwrap())
-            .expect("extract json"),
+        request.args["spec"],
         serde_json::json!({ "headline": { "selector": "h1", "kind": "text" } })
     );
     assert_eq!(request.args["spec_source"]["kind"], "file");
@@ -964,8 +961,7 @@ fn pipe_request_parameterizes_workflow_file_before_dispatch() {
 
     let request = build_request(&cli).expect("pipe request should build");
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(request.args["spec"].as_str().unwrap())
-            .expect("resolved workflow json"),
+        request.args["spec"],
         serde_json::json!({ "steps": [{ "command": "open", "args": { "url": "https://example.com" } }] })
     );
     assert_eq!(
@@ -1012,6 +1008,27 @@ fn pipe_request_extends_timeout_for_step_waits_and_humanize() {
         request.timeout_ms,
         command_timeout_ms(&cli) + expected_extra
     );
+}
+
+#[test]
+fn pipe_request_extends_timeout_for_legacy_array_form_specs() {
+    let cli = cli_with(Commands::Pipe {
+        spec: Some(
+            r##"[
+                {"command":"click","args":{"selector":"#go","wait_after":{"selector":"#done","timeout_ms":800}}},
+                {"command":"wait","args":{"selector":"#done","timeout_ms":1200}}
+            ]"##
+            .to_string(),
+        ),
+        file: None,
+        workflow: None,
+        list_workflows: false,
+        vars: Vec::new(),
+        wait_after: WaitAfterArgs::default(),
+    });
+
+    let request = build_request(&cli).expect("legacy array-form pipe request should build");
+    assert_eq!(request.timeout_ms, command_timeout_ms(&cli) + 2_000);
 }
 
 #[test]
@@ -1210,8 +1227,7 @@ fn inspect_list_builder_request_compiles_collection_and_fields() {
         request.args["spec_source"]["row_scope_selector"],
         ".flavor-card"
     );
-    let spec =
-        serde_json::from_str::<serde_json::Value>(request.args["spec"].as_str().unwrap()).unwrap();
+    let spec = request.args["spec"].clone();
     assert_eq!(spec["items"]["collection"], "option");
     assert_eq!(spec["items"]["row_scope_selector"], ".flavor-card");
     assert_eq!(spec["items"]["fields"]["text"]["kind"], "text");
@@ -1428,8 +1444,7 @@ fn extract_builder_spec_source_supports_common_field_shorthand() {
     )
     .expect("builder field shorthand should compile");
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(&spec).expect("builder spec should be valid JSON");
+    let parsed = spec.as_value().clone();
     assert_eq!(source["kind"], "builder");
     assert_eq!(source["fields"], serde_json::json!(["title", "hero"]));
     assert_eq!(
@@ -1453,8 +1468,7 @@ fn extract_builder_spec_source_supports_match_selection_suffixes() {
     )
     .expect("builder field shorthand with selection should compile");
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(&spec).expect("builder spec should be valid JSON");
+    let parsed = spec.as_value().clone();
     assert_eq!(
         parsed,
         serde_json::json!({
@@ -1479,8 +1493,7 @@ fn extract_builder_spec_source_supports_semantic_locator_shorthand() {
     )
     .expect("semantic builder shorthand should compile");
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(&spec).expect("builder spec should be valid JSON");
+    let parsed = spec.as_value().clone();
     assert_eq!(
         parsed,
         serde_json::json!({
@@ -1662,6 +1675,15 @@ fn trigger_add_request_loads_spec_file_and_records_source() {
     assert!(request.command_id.is_some());
     assert_eq!(request.args["sub"], "add");
     assert_eq!(request.args["paused"], true);
+    assert_eq!(
+        request.args["spec"],
+        serde_json::json!({
+          "source_tab": 0,
+          "target_tab": 1,
+          "condition": { "kind": "text_present", "text": "Ready" },
+          "action": { "kind": "browser_command", "command": "click", "payload": { "selector": "#go" } }
+        })
+    );
     assert_eq!(request.args["spec_source"]["kind"], "file");
     assert_eq!(
         request.args["spec_source"]["path"],
@@ -1744,6 +1766,17 @@ fn orchestration_add_request_loads_spec_file_and_records_source() {
     assert_eq!(request.args["sub"], "add");
     assert_eq!(request.args["paused"], true);
     assert_eq!(
+        request.args["spec"],
+        serde_json::json!({
+          "source": { "session_id": "sess-a" },
+          "target": { "session_id": "sess-b" },
+          "condition": { "kind": "text_present", "text": "Ready" },
+          "actions": [
+            { "kind": "workflow", "payload": { "workflow_name": "reply_flow" } }
+          ]
+        })
+    );
+    assert_eq!(
         request.args["spec_source"]["path"],
         serde_json::json!(path.display().to_string())
     );
@@ -1796,6 +1829,17 @@ fn orchestration_add_request_loads_named_asset_and_records_source() {
     let request = build_request(&cli).expect("orchestration add asset request should build");
     assert_eq!(request.command, "orchestration");
     assert_eq!(request.args["sub"], "add");
+    assert_eq!(
+        request.args["spec"],
+        serde_json::json!({
+          "source": { "session_id": "sess-a" },
+          "target": { "session_id": "sess-b" },
+          "condition": { "kind": "text_present", "text": "Ready" },
+          "actions": [
+            { "kind": "browser_command", "command": "reload" }
+          ]
+        })
+    );
     assert_eq!(request.args["spec_source"]["kind"], "asset");
     assert_eq!(request.args["spec_source"]["name"], "reply_rule");
     assert_eq!(

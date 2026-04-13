@@ -21,15 +21,17 @@ use super::projection::{
 use super::rule::{
     orchestration_rule_to_registration_spec, validate_orchestration_registration_spec,
 };
-use crate::router::request_args::parse_json_spec;
+use crate::router::request_args::parse_json_spec_value;
 
 pub(super) async fn cmd_orchestration_add(
     router: &DaemonRouter,
     args: OrchestrationAddArgs,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
-    let mut spec =
-        parse_json_spec::<OrchestrationRegistrationSpec>(&args.spec, "orchestration add")?;
+    let mut spec = parse_json_spec_value::<OrchestrationRegistrationSpec>(
+        args.spec.into_value(),
+        "orchestration add",
+    )?;
     validate_orchestration_registration_spec(&mut spec)?;
 
     refresh_orchestration_runtime(state).await;

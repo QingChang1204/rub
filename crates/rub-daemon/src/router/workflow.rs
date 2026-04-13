@@ -11,7 +11,6 @@ mod validate;
 use self::args::{FillArgs, PipeArgs, submit_args};
 #[cfg(test)]
 use self::spec::{parse_pipe_spec, resolve_step_references};
-use super::secret_resolution::parse_json_spec_with_secret_resolution;
 use super::*;
 use rub_core::error::RubError;
 
@@ -72,12 +71,14 @@ mod tests {
         },
         execution::{OrchestrationMetadataInheritancePolicy, inherit_orchestration_metadata},
         parse_pipe_spec, resolve_step_references,
+        spec::build_embedded_orchestration_args,
         spec::resolve_template_string,
         submit_args,
     };
     use crate::router::automation_fence::ensure_committed_automation_result;
     use crate::router::request_args::parse_json_args;
     use rub_core::error::ErrorCode;
+    use rub_core::json_spec::NormalizedJsonSpec;
     use rub_core::model::{Element, ElementTag};
     use serde_json::json;
     use std::path::Path;
@@ -85,7 +86,11 @@ mod tests {
     #[test]
     fn parse_pipe_spec_accepts_legacy_steps_array_shorthand() {
         let parsed = parse_pipe_spec(
-            r#"[{"command":"open","args":{"url":"https://example.com"}}]"#,
+            &NormalizedJsonSpec::from_raw_str(
+                r#"[{"command":"open","args":{"url":"https://example.com"}}]"#,
+                "pipe",
+            )
+            .expect("legacy array shorthand should parse as normalized spec"),
             Path::new("/tmp/rub-workflow-parse-array"),
         )
         .expect("legacy pipe array shorthand should be normalized");
@@ -96,7 +101,8 @@ mod tests {
     #[test]
     fn parse_pipe_spec_rejects_watch_alias() {
         let error = parse_pipe_spec(
-            r##"{
+            &NormalizedJsonSpec::from_raw_str(
+                r##"{
               "steps": [{"command":"state","args":{"format":"compact"}}],
               "watch": [{
                 "label": "reply",
@@ -113,6 +119,9 @@ mod tests {
                 }
               }]
             }"##,
+                "pipe",
+            )
+            .expect("workflow object should parse as normalized spec"),
             Path::new("/tmp/rub-workflow-parse-object"),
         )
         .expect_err("watch alias should be rejected");
@@ -122,7 +131,8 @@ mod tests {
     #[test]
     fn parse_pipe_spec_rejects_empty_workflow_object() {
         let error = parse_pipe_spec(
-            r#"{"steps":[],"orchestrations":[]}"#,
+            &NormalizedJsonSpec::from_raw_str(r#"{"steps":[],"orchestrations":[]}"#, "pipe")
+                .expect("empty workflow object should parse as normalized spec"),
             Path::new("/tmp/rub-workflow-parse-empty"),
         )
         .expect_err("empty workflow object should fail");
@@ -132,15 +142,52 @@ mod tests {
     #[test]
     fn parse_pipe_spec_rejects_unknown_step_fields() {
         let error = parse_pipe_spec(
-            r##"{
+            &NormalizedJsonSpec::from_raw_str(
+                r##"{
               "steps": [
                 {"command":"click","args":{"selector":"#go"},"argz":{"selector":"#wrong"}}
               ]
             }"##,
+                "pipe",
+            )
+            .expect("workflow object should parse as normalized spec"),
             Path::new("/tmp/rub-workflow-parse-unknown"),
         )
         .expect_err("unknown step fields should fail closed");
         assert_eq!(error.into_envelope().code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn embedded_orchestration_args_preserve_structured_spec() {
+        let args = build_embedded_orchestration_args(
+            Some(&json!({
+                "kind": "file",
+                "path": "/tmp/workflow.json"
+            })),
+            &super::args::PipeEmbeddedOrchestrationSpec {
+                label: Some("watch rule".to_string()),
+                spec: json!({
+                    "source": { "session_id": "source" },
+                    "target": { "session_id": "target" },
+                    "condition": { "kind": "text_present", "text": "Ready" },
+                    "actions": [{ "kind": "browser_command", "command": "reload" }]
+                }),
+            },
+            2,
+        )
+        .expect("embedded orchestration args should build");
+
+        assert_eq!(
+            args["spec"],
+            json!({
+                "source": { "session_id": "source" },
+                "target": { "session_id": "target" },
+                "condition": { "kind": "text_present", "text": "Ready" },
+                "actions": [{ "kind": "browser_command", "command": "reload" }]
+            })
+        );
+        assert_eq!(args["spec_source"]["kind"], "workflow_embedded");
+        assert_eq!(args["spec_source"]["block_index"], 2);
     }
 
     #[test]
@@ -205,7 +252,7 @@ mod tests {
             "pipe",
         )
         .expect("pipe args should accept trigger and orchestration metadata");
-        assert_eq!(parsed.spec, "[]");
+        assert_eq!(parsed.spec.as_value(), &json!([]));
         assert!(parsed._trigger.is_some());
         assert!(parsed._orchestration.is_some());
 
@@ -680,7 +727,9 @@ mod tests {
             {"command": "observe", "label": "fetch"}
         ]"#;
         let rub_home = std::path::PathBuf::from("/tmp");
-        let err = parse_pipe_spec(spec, &rub_home).unwrap_err();
+        let spec =
+            NormalizedJsonSpec::from_raw_str(spec, "pipe").expect("duplicate label spec parses");
+        let err = parse_pipe_spec(&spec, &rub_home).unwrap_err();
         let envelope = err.into_envelope();
         assert_eq!(envelope.code, ErrorCode::InvalidInput);
         assert!(envelope.message.contains("Duplicate step label"));
