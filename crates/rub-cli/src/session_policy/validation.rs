@@ -84,7 +84,9 @@ pub(crate) fn attachment_identity_matches_request(
 ) -> bool {
     match request {
         ConnectionRequest::None => true,
-        ConnectionRequest::CdpUrl { .. } | ConnectionRequest::Profile { .. } => {
+        ConnectionRequest::CdpUrl { .. }
+        | ConnectionRequest::Profile { .. }
+        | ConnectionRequest::UserDataDir { .. } => {
             current_attachment_identity.as_deref() == requested_attachment_identity
         }
         ConnectionRequest::AutoDiscover => requested_attachment_identity
@@ -123,6 +125,7 @@ pub(crate) fn compatibility_launch_policy(
     let mut requested = cli.effective_launch_policy.clone();
     requested.user_data_dir = match request {
         ConnectionRequest::Profile { user_data_root, .. } => Some(user_data_root.clone()),
+        ConnectionRequest::UserDataDir { path } => Some(path.clone()),
         ConnectionRequest::None => requested.user_data_dir,
         ConnectionRequest::CdpUrl { .. } | ConnectionRequest::AutoDiscover => None,
     };

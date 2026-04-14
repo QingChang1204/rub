@@ -314,6 +314,50 @@ fn t388_389c_external_handoff_and_takeover_grouped_scenario() {
     assert_eq!(resumed_exec["success"], true, "{resumed_exec}");
     assert_eq!(resumed_exec["data"]["result"], 4);
 
+    let handoff_binding = parse_json(
+        &session
+            .cmd()
+            .args([
+                "--cdp-url",
+                &cdp_origin,
+                "binding",
+                "capture",
+                "external-handoff",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(handoff_binding["success"], true, "{handoff_binding}");
+    assert_eq!(handoff_binding["data"]["result"]["mode"], "capture");
+    assert_eq!(
+        handoff_binding["data"]["result"]["binding"]["alias"],
+        "external-handoff"
+    );
+    assert_eq!(
+        handoff_binding["data"]["result"]["binding"]["auth_provenance"]["created_via"],
+        "handoff_completed"
+    );
+    assert_eq!(
+        handoff_binding["data"]["result"]["binding"]["auth_provenance"]["auth_input_mode"],
+        "human"
+    );
+    assert_eq!(
+        handoff_binding["data"]["result"]["binding"]["auth_provenance"]["capture_fence"],
+        "handoff_complete"
+    );
+    assert_eq!(
+        handoff_binding["data"]["result"]["capture_candidate"]["capture_fence"]["status"],
+        "capture_ready"
+    );
+    assert_eq!(
+        handoff_binding["data"]["result"]["capture_candidate"]["durability"]["persistence_policy"],
+        "external_reattachment_required"
+    );
+    assert_eq!(
+        handoff_binding["data"]["result"]["capture_candidate"]["durability"]["reattachment_mode"],
+        "external_reattach_required"
+    );
+
     let runtime = parse_json(
         &session
             .cmd()
@@ -388,6 +432,46 @@ fn t388_389c_external_handoff_and_takeover_grouped_scenario() {
     );
     assert_eq!(replay["success"], true, "{replay}");
     assert_eq!(replay["data"]["result"], 4);
+
+    let takeover_binding = parse_json(
+        &session
+            .cmd()
+            .args([
+                "--cdp-url",
+                &cdp_origin,
+                "binding",
+                "capture",
+                "external-takeover",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(takeover_binding["success"], true, "{takeover_binding}");
+    assert_eq!(takeover_binding["data"]["result"]["mode"], "capture");
+    assert_eq!(
+        takeover_binding["data"]["result"]["binding"]["alias"],
+        "external-takeover"
+    );
+    assert_eq!(
+        takeover_binding["data"]["result"]["binding"]["auth_provenance"]["created_via"],
+        "takeover_resumed"
+    );
+    assert_eq!(
+        takeover_binding["data"]["result"]["binding"]["auth_provenance"]["auth_input_mode"],
+        "human"
+    );
+    assert_eq!(
+        takeover_binding["data"]["result"]["binding"]["auth_provenance"]["capture_fence"],
+        "takeover_resume"
+    );
+    assert_eq!(
+        takeover_binding["data"]["result"]["capture_candidate"]["capture_fence"]["status"],
+        "capture_ready"
+    );
+    assert_eq!(
+        takeover_binding["data"]["result"]["capture_candidate"]["capture_fence"]["capture_fence"],
+        "takeover_resume"
+    );
 
     let _ = session.cmd().arg("close").output();
     terminate_external_chrome(&mut chrome, &profile_dir);
@@ -604,6 +688,319 @@ fn t389e_takeover_elevate_promotes_managed_headless_session_to_visible_control()
     );
 
     let _ = session.cmd().arg("close").output();
+}
+
+/// T389f: bind-current should preserve temp-home ephemerality instead of claiming durable account memory.
+#[test]
+#[ignore]
+#[serial]
+fn t389f_bind_current_marks_temp_home_runtime_ephemeral() {
+    let (_rt, server) = start_standard_site_fixture();
+    let session = ManagedBrowserSession::new();
+    let _home = session.home();
+
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", server.url().as_str()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+
+    let bound = parse_json(
+        &session
+            .cmd()
+            .args(["binding", "bind-current", "temp-home"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(bound["success"], true, "{bound}");
+    assert_eq!(bound["data"]["result"]["mode"], "bind_current");
+    assert_eq!(bound["data"]["result"]["binding"]["alias"], "temp-home");
+    assert_eq!(
+        bound["data"]["result"]["binding"]["auth_provenance"]["created_via"],
+        "bound_existing_runtime"
+    );
+    assert!(
+        bound["data"]["result"]["binding"]["auth_provenance"]["capture_fence"].is_null(),
+        "{bound}"
+    );
+    assert_eq!(
+        bound["data"]["result"]["binding"]["persistence_policy"],
+        "rub_home_local_ephemeral"
+    );
+    assert_eq!(
+        bound["data"]["result"]["capture_candidate"]["capture_fence"]["status"],
+        "bind_current_only"
+    );
+    assert_eq!(
+        bound["data"]["result"]["capture_candidate"]["durability"]["persistence_policy"],
+        "rub_home_local_ephemeral"
+    );
+    assert_eq!(
+        bound["data"]["result"]["capture_candidate"]["durability"]["durability_scope"],
+        "rub_home_local_ephemeral"
+    );
+    assert_eq!(
+        bound["data"]["result"]["capture_candidate"]["durability"]["reattachment_mode"],
+        "temp_home_ephemeral"
+    );
+
+    let _ = session.cmd().arg("close").output();
+}
+
+/// T389g: explicit CLI-auth capture should stay operator-fenced instead of depending on heuristic capture-ready state.
+#[test]
+#[ignore]
+#[serial]
+fn t389g_capture_after_cli_auth_completion_uses_explicit_cli_fence() {
+    let (_rt, server) = start_standard_site_fixture();
+    let session = ManagedBrowserSession::new();
+    let _home = session.home();
+
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", server.url().as_str()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+
+    let scripted = parse_json(
+        &session
+            .cmd()
+            .args([
+                "exec",
+                "document.cookie = 'session=ok; path=/'; localStorage.setItem('authToken', 'ok'); 'done'",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(scripted["success"], true, "{scripted}");
+    assert_eq!(scripted["data"]["result"], "done");
+
+    let captured = parse_json(
+        &session
+            .cmd()
+            .args(["binding", "capture", "cli-auth", "--auth-input", "cli"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(captured["success"], true, "{captured}");
+    assert_eq!(captured["data"]["result"]["mode"], "capture");
+    assert_eq!(captured["data"]["result"]["binding"]["alias"], "cli-auth");
+    assert_eq!(
+        captured["data"]["result"]["binding"]["auth_provenance"]["created_via"],
+        "cli_auth_completed"
+    );
+    assert_eq!(
+        captured["data"]["result"]["binding"]["auth_provenance"]["auth_input_mode"],
+        "cli"
+    );
+    assert_eq!(
+        captured["data"]["result"]["binding"]["auth_provenance"]["capture_fence"],
+        "explicit_cli_auth_capture"
+    );
+    assert_eq!(
+        captured["data"]["result"]["capture_candidate"]["capture_fence"]["status"],
+        "bind_current_only"
+    );
+    assert!(
+        captured["data"]["result"]["capture_candidate"]["capture_fence"]["capture_fence"].is_null(),
+        "{captured}"
+    );
+
+    let _ = session.cmd().arg("close").output();
+}
+
+/// T389h: `--use` should reuse a remembered live binding through the top-level route.
+#[test]
+#[ignore]
+#[serial]
+fn t389h_use_alias_reuses_live_binding_through_top_level_route() {
+    let (_rt, server) = start_standard_site_fixture();
+    let session = ManagedBrowserSession::new();
+    let _home = session.home();
+
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", server.url().as_str()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+
+    let bound = parse_json(
+        &session
+            .cmd()
+            .args(["binding", "bind-current", "old-admin"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(bound["success"], true, "{bound}");
+
+    let remembered = parse_json(
+        &session
+            .cmd()
+            .args([
+                "binding",
+                "remember",
+                "finance",
+                "--binding",
+                "old-admin",
+                "--kind",
+                "workspace",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(remembered["success"], true, "{remembered}");
+
+    let doctor = parse_json(
+        &session
+            .cmd()
+            .args(["--use", "finance", "doctor"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(doctor["success"], true, "{doctor}");
+    assert_eq!(
+        doctor["data"]["binding_resolution"]["requested_alias"], "finance",
+        "{doctor}"
+    );
+    assert_eq!(
+        doctor["data"]["binding_resolution"]["binding_alias"], "old-admin",
+        "{doctor}"
+    );
+    assert_eq!(
+        doctor["data"]["binding_resolution"]["mode"], "reuse_live_session",
+        "{doctor}"
+    );
+    assert_eq!(
+        doctor_runtime(&doctor)["frame_runtime"]["current_frame"]["url"],
+        server.url_for("/"),
+        "{doctor}"
+    );
+
+    let _ = session.cmd().arg("close").output();
+}
+
+/// T389i: `--use` should launch a bound runtime through the top-level route when no live match exists.
+#[test]
+#[ignore]
+#[serial]
+fn t389i_use_alias_launches_bound_runtime_when_no_live_match() {
+    let (_rt, server) = start_standard_site_fixture();
+    let session = ManagedBrowserSession::new();
+    let home = session.home().to_string();
+    let profile_root = format!("{home}/remembered-runtime");
+
+    let opened = parse_json(
+        &rub_cmd(&home)
+            .args([
+                "--user-data-dir",
+                &profile_root,
+                "open",
+                server.url().as_str(),
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+
+    let bound = parse_json(
+        &rub_cmd(&home)
+            .args(["binding", "bind-current", "old-admin"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(bound["success"], true, "{bound}");
+    assert_eq!(
+        bound["data"]["result"]["binding"]["persistence_policy"], "rub_home_local_durable",
+        "{bound}"
+    );
+    assert_eq!(
+        bound["data"]["result"]["binding"]["user_data_dir_reference"], profile_root,
+        "{bound}"
+    );
+
+    let remembered = parse_json(
+        &rub_cmd(&home)
+            .args([
+                "binding",
+                "remember",
+                "finance",
+                "--binding",
+                "old-admin",
+                "--kind",
+                "workspace",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(remembered["success"], true, "{remembered}");
+
+    let closed = parse_json(&rub_cmd(&home).args(["close", "--all"]).output().unwrap());
+    assert_eq!(closed["success"], true, "{closed}");
+
+    let no_live_match = (0..50).find_map(|_| {
+        let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
+        if sessions["success"] == true
+            && sessions["data"]["result"]["items"]
+                .as_array()
+                .is_some_and(|items| items.is_empty())
+        {
+            Some(sessions)
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            None
+        }
+    });
+    assert!(
+        no_live_match.is_some(),
+        "expected close --all to leave no live sessions before --use fallback"
+    );
+
+    let doctor = parse_json(
+        &rub_cmd(&home)
+            .args(["--use", "finance", "doctor"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(doctor["success"], true, "{doctor}");
+    assert_eq!(
+        doctor["data"]["binding_resolution"]["requested_alias"], "finance",
+        "{doctor}"
+    );
+    assert_eq!(
+        doctor["data"]["binding_resolution"]["binding_alias"], "old-admin",
+        "{doctor}"
+    );
+    assert_eq!(
+        doctor["data"]["binding_resolution"]["mode"], "launch_bound_runtime",
+        "{doctor}"
+    );
+    assert_eq!(
+        doctor["data"]["binding_resolution"]["effective_user_data_dir"], profile_root,
+        "{doctor}"
+    );
+
+    let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
+    assert_eq!(sessions["success"], true, "{sessions}");
+    let session_items = sessions["data"]["result"]["items"]
+        .as_array()
+        .expect("sessions items must be an array");
+    assert!(
+        session_items
+            .iter()
+            .any(|entry| entry["user_data_dir"] == profile_root),
+        "expected relaunched session to use remembered user_data_dir: {sessions}"
+    );
+
+    let _ = rub_cmd(&home).arg("close").output();
 }
 
 /// T390/T391/T392/T392b: intercept rewrite/block/header-override network flows
@@ -1428,6 +1825,16 @@ fn t416_417_424_425_frame_runtime_inventory_and_stale_grouped_scenario() {
         get_text["error"]["context"]["authority_state"], "selected_frame_context_drifted",
         "{get_text}"
     );
+    assert_eq!(
+        get_text["error"]["context"]["authority_guidance"]["source_signal"],
+        "selected_frame_context_drifted",
+        "{get_text}"
+    );
+    assert_eq!(
+        get_text["error"]["context"]["authority_guidance"]["next_command_hints"][0]["command"],
+        "rub frames",
+        "{get_text}"
+    );
 
     let navigated = parse_json(
         &session
@@ -1551,6 +1958,20 @@ fn t416_417_424_425_frame_runtime_inventory_and_stale_grouped_scenario() {
     );
     assert_eq!(
         stale_runtime["data"]["runtime"]["degraded_reason"], "selected_frame_not_found",
+        "{stale_runtime}"
+    );
+    assert_eq!(
+        stale_runtime["data"]["workflow_continuity"]["source_signal"], "frame_runtime_stale",
+        "{stale_runtime}"
+    );
+    assert_eq!(
+        stale_runtime["data"]["workflow_continuity"]["next_command_hints"][0]["command"],
+        "rub frames",
+        "{stale_runtime}"
+    );
+    assert_eq!(
+        stale_runtime["data"]["workflow_continuity"]["authority_observation"]["frame_status"],
+        "stale",
         "{stale_runtime}"
     );
 
@@ -2430,6 +2851,21 @@ fn t400_402_interference_grouped_scenario() {
     assert_eq!(
         active_interference["data"]["runtime"]["current_interference"]["current_url"],
         interstitial_url,
+        "{active_interference}"
+    );
+    assert_eq!(
+        active_interference["data"]["workflow_continuity"]["source_signal"],
+        "interstitial_navigation",
+        "{active_interference}"
+    );
+    assert_eq!(
+        active_interference["data"]["workflow_continuity"]["next_command_hints"][0]["command"],
+        "rub interference recover",
+        "{active_interference}"
+    );
+    assert_eq!(
+        active_interference["data"]["workflow_continuity"]["authority_observation"]["interference_kind"],
+        "interstitial_navigation",
         "{active_interference}"
     );
 

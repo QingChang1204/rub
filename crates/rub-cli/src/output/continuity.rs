@@ -2,6 +2,10 @@ use rub_core::model::CommandResult;
 use serde_json::{Map, Value, json};
 use std::path::Path;
 
+mod authority;
+mod content;
+mod network;
+
 pub(super) fn attach_workflow_continuity(result: &mut CommandResult, rub_home: &Path) {
     let Some(data) = result.data.as_mut() else {
         return;
@@ -23,9 +27,8 @@ fn workflow_continuity_projection(
     rub_home: &Path,
     data: &Map<String, Value>,
 ) -> Option<Value> {
-    let subject_kind = data
-        .get("subject")
-        .and_then(Value::as_object)
+    let subject = data.get("subject").and_then(Value::as_object);
+    let subject_kind = subject
         .and_then(|subject| subject.get("kind"))
         .and_then(Value::as_str);
     let outcome_summary = data
@@ -33,6 +36,38 @@ fn workflow_continuity_projection(
         .and_then(Value::as_object)
         .and_then(|result| result.get("outcome_summary"))
         .and_then(Value::as_object);
+
+    if subject_kind == Some("tab_navigation")
+        && let Some(guidance) =
+            workflow_navigation_authority_projection(command, session, rub_home, data)
+    {
+        return Some(guidance);
+    }
+    if subject_kind == Some("runtime_surface")
+        && subject
+            .and_then(|subject| subject.get("surface"))
+            .and_then(Value::as_str)
+            == Some("frame")
+        && let Some(guidance) = workflow_runtime_frame_projection(command, session, rub_home, data)
+    {
+        return Some(guidance);
+    }
+    if subject_kind == Some("runtime_surface")
+        && subject
+            .and_then(|subject| subject.get("surface"))
+            .and_then(Value::as_str)
+            == Some("interference")
+        && let Some(guidance) =
+            workflow_runtime_interference_projection(command, session, rub_home, data)
+    {
+        return Some(guidance);
+    }
+    if subject_kind == Some("find_query")
+        && let Some(guidance) =
+            content::workflow_find_query_projection(command, session, rub_home, data)
+    {
+        return Some(guidance);
+    }
 
     if subject_kind == Some("blocker_explain") {
         let diagnosis = data
@@ -160,6 +195,12 @@ fn workflow_continuity_projection(
     if subject_kind == Some("network_request") {
         return workflow_network_request_projection(command, session, rub_home, data, false);
     }
+    if subject_kind == Some("network_request_registry")
+        && let Some(guidance) =
+            workflow_network_request_registry_projection(command, session, rub_home, data)
+    {
+        return Some(guidance);
+    }
 
     let class = outcome_summary
         .and_then(|summary| summary.get("class"))
@@ -187,7 +228,7 @@ fn workflow_continuity_projection(
             ),
         )),
         "confirmed_new_item_observed" => {
-            workflow_new_item_projection(command, session, rub_home, data)
+            content::workflow_new_item_projection(command, session, rub_home, data)
         }
         "confirmed_interactable_target" => Some(workflow_same_runtime_projection(
             command,
@@ -241,43 +282,31 @@ fn workflow_continuity_projection(
     }
 }
 
-fn workflow_new_item_projection(
+fn workflow_navigation_authority_projection(
     command: &str,
     session: &str,
     rub_home: &Path,
     data: &Map<String, Value>,
 ) -> Option<Value> {
-    let result = data.get("result")?.as_object()?;
-    let matched_item = result.get("matched_item").and_then(Value::as_object);
-    let open_hint = matched_item.and_then(matched_item_open_command_hint);
-    let text_hint = matched_item.and_then(matched_item_text_command_hint);
-    let mut hints = vec![command_hint(
-        "rub inspect list ...",
-        "re-read the current list surface in the same runtime",
-    )];
-    if let Some(open_hint) = open_hint {
-        hints.push(open_hint);
-    } else if let Some(text_hint) = text_hint {
-        hints.push(text_hint);
-    } else {
-        hints.push(command_hint(
-            "rub click ...",
-            "open or act on the newly observed item without switching runtimes",
-        ));
-    }
+    authority::workflow_navigation_authority_projection(command, session, rub_home, data)
+}
 
-    Some(workflow_same_runtime_projection(
-        command,
-        session,
-        rub_home,
-        "confirmed_new_item_observed",
-        "A new matching item was observed in this runtime. Keep follow-up inspection or actuation in the same RUB_HOME/session.",
-        hints,
-        same_runtime_roles(
-            "observation_runtime",
-            "Keep using the current runtime as the observation surface while you follow up on the newly observed item.",
-        ),
-    ))
+fn workflow_runtime_interference_projection(
+    command: &str,
+    session: &str,
+    rub_home: &Path,
+    data: &Map<String, Value>,
+) -> Option<Value> {
+    authority::workflow_runtime_interference_projection(command, session, rub_home, data)
+}
+
+fn workflow_runtime_frame_projection(
+    command: &str,
+    session: &str,
+    rub_home: &Path,
+    data: &Map<String, Value>,
+) -> Option<Value> {
+    authority::workflow_runtime_frame_projection(command, session, rub_home, data)
 }
 
 fn workflow_follow_up_activity_projection(
@@ -286,99 +315,7 @@ fn workflow_follow_up_activity_projection(
     rub_home: &Path,
     data: &Map<String, Value>,
 ) -> Option<Value> {
-    let result = data.get("result")?.as_object()?;
-    let activity = result
-        .get("outcome_summary")
-        .and_then(Value::as_object)
-        .and_then(|summary| summary.get("activity"))
-        .and_then(Value::as_object);
-    let last_request = activity
-        .and_then(|activity| activity.get("last_request"))
-        .and_then(Value::as_object);
-    let exact_request_hint = last_request.and_then(follow_up_network_request_command_hint);
-    let local_runtime_follow_up =
-        last_request.is_some_and(|request| is_same_runtime_follow_up_request(data, request));
-    let failed_request = last_request.is_some_and(is_failed_request);
-    let downstream_effect_like = last_request.is_some_and(is_downstream_effect_like_request);
-    let in_flight_write_like = last_request.is_some_and(is_in_flight_write_like_request);
-
-    let mut hints = vec![command_hint(
-        "rub state compact",
-        "inspect the local page after the confirmed follow-up activity in the current runtime",
-    )];
-    if let Some(exact_request_hint) = exact_request_hint {
-        hints.push(exact_request_hint);
-    } else {
-        hints.push(command_hint(
-            "rub inspect network --last 5",
-            "review the authoritative follow-up network activity that was observed after the action",
-        ));
-    }
-    if local_runtime_follow_up {
-        hints.push(command_hint(
-            "rub state a11y",
-            "re-check the current page's accessible text and field descriptions before branching to an external surface",
-        ));
-        hints.push(command_hint(
-            "rub explain blockers",
-            "confirm whether the current runtime still has a local blocker or validation message to resolve",
-        ));
-    } else if failed_request {
-        hints.push(command_hint(
-            "rub explain blockers",
-            "confirm whether the failed follow-up request corresponds to a local validation error, blocker, or route issue in the current runtime",
-        ));
-        hints.push(command_hint(
-            "rub state a11y",
-            "re-check the current page for local validation text, disabled controls, or route changes before assuming any downstream effect",
-        ));
-    } else if downstream_effect_like {
-        hints.push(command_hint(
-            "rub inspect list ... --wait-field ... --wait-contains ...",
-            "verify any downstream side effect in the runtime that owns the relevant inbox, list, or result surface",
-        ));
-        hints.push(command_hint(
-            "rub explain blockers",
-            "confirm whether the current runtime still needs local recovery while the downstream surface is being verified",
-        ));
-    } else if in_flight_write_like {
-        hints.push(command_hint(
-            "rub inspect network --id ...",
-            "re-check the same authoritative request after it reaches a terminal lifecycle before branching to downstream surfaces",
-        ));
-        hints.push(command_hint(
-            "rub explain blockers",
-            "confirm whether the current runtime still has a local blocker or validation state while the follow-up request is in flight",
-        ));
-    } else {
-        hints.push(command_hint(
-            "rub inspect list ... --wait-field ... --wait-contains ...",
-            "continue downstream observation in the runtime that owns the relevant list or inbox surface",
-        ));
-    }
-
-    Some(workflow_same_runtime_projection(
-        command,
-        session,
-        rub_home,
-        "confirmed_follow_up_activity",
-        if local_runtime_follow_up {
-            "The action produced authoritative same-runtime follow-up activity. Re-check the current page before branching to any external downstream surface."
-        } else if failed_request {
-            "The action produced authoritative failed follow-up activity in this runtime. Re-check the current page and the failed request before assuming any downstream effect."
-        } else if downstream_effect_like {
-            "The action produced authoritative write-like follow-up activity. Keep this runtime available while you verify any downstream effect in the owning runtime or inbox/list surface."
-        } else if in_flight_write_like {
-            "The action produced authoritative in-flight write-like follow-up activity. Keep this runtime available while the request reaches a terminal lifecycle and local state settles."
-        } else {
-            "The action produced authoritative local follow-up activity in this runtime. Keep this runtime available while you verify any downstream effects."
-        },
-        hints,
-        same_runtime_roles(
-            "observation_runtime",
-            "Keep using the current runtime as the local observation surface while you confirm any downstream effects.",
-        ),
-    ))
+    network::workflow_follow_up_activity_projection(command, session, rub_home, data)
 }
 
 fn workflow_network_request_projection(
@@ -388,116 +325,56 @@ fn workflow_network_request_projection(
     data: &Map<String, Value>,
     include_request_lookup_hint: bool,
 ) -> Option<Value> {
-    let result = data.get("result")?.as_object()?;
-    let request = result.get("request").and_then(Value::as_object)?;
-    let local_runtime_read_like = is_local_runtime_read_like_request(request);
-    let failed_request = is_failed_request(request);
-    let downstream_effect_like = is_downstream_effect_like_request(request);
-    let in_flight_write_like = is_in_flight_write_like_request(request);
-    let mut hints = Vec::new();
-    if include_request_lookup_hint
-        && let Some(request_hint) = follow_up_network_request_command_hint(request)
-    {
-        hints.push(request_hint);
-    }
-    hints.push(command_hint(
-        "rub state compact",
-        "inspect the current page alongside this authoritative network evidence in the same runtime",
-    ));
-    if local_runtime_read_like {
-        hints.push(command_hint(
-            "rub state a11y",
-            "re-check the current page's accessible text and control descriptions before branching to any external downstream surface",
-        ));
-        hints.push(command_hint(
-            "rub explain blockers",
-            "confirm whether the current runtime still has a local blocker, validation message, or route transition to resolve",
-        ));
-    } else if failed_request {
-        hints.push(command_hint(
-            "rub explain blockers",
-            "confirm whether the failed request corresponds to a local validation error, blocker, or route issue in the current runtime",
-        ));
-        hints.push(command_hint(
-            "rub state a11y",
-            "re-check the current page for local validation text, disabled controls, or route changes before assuming any downstream effect",
-        ));
-    } else if downstream_effect_like {
-        hints.push(command_hint(
-            "rub inspect list ... --wait-field ... --wait-contains ...",
-            "verify any downstream side effect in the runtime that owns the relevant inbox, list, or result surface",
-        ));
-        hints.push(command_hint(
-            "rub explain blockers",
-            "confirm whether the current runtime still needs local recovery while the downstream surface is being verified",
-        ));
-    } else if in_flight_write_like {
-        hints.push(command_hint(
-            "rub explain blockers",
-            "confirm whether the current runtime still has a local blocker or validation state while the follow-up request is in flight",
-        ));
-        hints.push(command_hint(
-            "rub inspect network --id ...",
-            "re-check the same authoritative request after it reaches a terminal lifecycle before branching to downstream surfaces",
-        ));
-    } else {
-        hints.push(command_hint(
-            "rub explain blockers",
-            "check whether the current runtime still has a local blocker or transition to resolve",
-        ));
-        hints.push(command_hint(
-            "rub inspect list ... --wait-field ... --wait-contains ...",
-            "continue downstream observation in the runtime that owns the relevant list or inbox surface",
-        ));
-    }
-
-    let request_method = request
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("request");
-    let request_url = request
-        .get("url")
-        .and_then(Value::as_str)
-        .unwrap_or("the observed URL");
-    let signal = if include_request_lookup_hint {
-        "confirmed_terminal_request"
-    } else {
-        "network_request_record"
-    };
-    let summary = if local_runtime_read_like {
-        format!(
-            "The current runtime now has authoritative read-like network evidence for the observed {request_method} request to {request_url}. Re-check the current page before branching to any external downstream surface."
-        )
-    } else if failed_request {
-        format!(
-            "The current runtime now has authoritative failed network evidence for the observed {request_method} request to {request_url}. Re-check the current page and the failed request before assuming any downstream effect."
-        )
-    } else if downstream_effect_like {
-        format!(
-            "The current runtime now has authoritative write-like network evidence for the observed {request_method} request to {request_url}. Keep this runtime available while you verify any downstream effect in the owning runtime or inbox/list surface."
-        )
-    } else if in_flight_write_like {
-        format!(
-            "The current runtime now has authoritative in-flight write-like network evidence for the observed {request_method} request to {request_url}. Keep this runtime available while the request reaches a terminal lifecycle and local state settles."
-        )
-    } else {
-        format!(
-            "The current runtime now has authoritative network evidence for the observed {request_method} request to {request_url}. Keep follow-up diagnosis and downstream checks anchored to this runtime."
-        )
-    };
-
-    Some(workflow_same_runtime_projection(
+    network::workflow_network_request_projection(
         command,
         session,
         rub_home,
-        signal,
-        &summary,
-        hints,
-        same_runtime_roles(
-            "observation_runtime",
-            "Keep using the current runtime as the observation surface while you interpret authoritative network evidence and decide the next workflow step.",
-        ),
-    ))
+        data,
+        include_request_lookup_hint,
+    )
+}
+
+fn workflow_network_request_registry_projection(
+    command: &str,
+    session: &str,
+    rub_home: &Path,
+    data: &Map<String, Value>,
+) -> Option<Value> {
+    network::workflow_network_request_registry_projection(command, session, rub_home, data)
+}
+
+fn network_evidence_observation(kind: &str, request: &Map<String, Value>) -> Value {
+    json!({
+        "kind": "network_evidence_observation",
+        "evidence_kind": kind,
+        "request_id": request.get("request_id").cloned().unwrap_or(Value::Null),
+        "method": request.get("method").cloned().unwrap_or(Value::Null),
+        "url": request.get("url").cloned().unwrap_or(Value::Null),
+        "status": request.get("status").cloned().unwrap_or(Value::Null),
+        "lifecycle": request.get("lifecycle").cloned().unwrap_or(Value::Null),
+        "resource_type": request.get("resource_type").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn network_registry_observation(
+    kind: &str,
+    total_requests: usize,
+    read_like_requests: usize,
+    write_like_requests: usize,
+    failed_requests: usize,
+    in_flight_write_like_requests: usize,
+    other_requests: usize,
+) -> Value {
+    json!({
+        "kind": "network_registry_observation",
+        "evidence_kind": kind,
+        "total_requests": total_requests,
+        "read_like_requests": read_like_requests,
+        "write_like_requests": write_like_requests,
+        "failed_requests": failed_requests,
+        "in_flight_write_like_requests": in_flight_write_like_requests,
+        "other_requests": other_requests,
+    })
 }
 
 fn follow_up_network_request_command_hint(last_request: &Map<String, Value>) -> Option<Value> {
@@ -635,42 +512,6 @@ fn parse_origin_url(url: &str) -> Option<reqwest::Url> {
     reqwest::Url::parse(url).ok()
 }
 
-fn matched_item_open_command_hint(matched_item: &Map<String, Value>) -> Option<Value> {
-    for key in ["activation_url", "target_url", "href", "url", "link"] {
-        let Some(value) = matched_item.get(key).and_then(Value::as_str) else {
-            continue;
-        };
-        let value = value.trim();
-        if value.is_empty() {
-            continue;
-        }
-        return Some(command_hint(
-            &format!("rub open {}", shell_double_quoted(value)),
-            &format!("continue directly from the extracted `{key}` field in the current runtime"),
-        ));
-    }
-    None
-}
-
-fn matched_item_text_command_hint(matched_item: &Map<String, Value>) -> Option<Value> {
-    for key in ["subject", "title", "name", "label", "text"] {
-        let Some(value) = matched_item.get(key).and_then(Value::as_str) else {
-            continue;
-        };
-        let value = value.trim();
-        if value.is_empty() {
-            continue;
-        }
-        return Some(command_hint(
-            &format!("rub click --target-text {}", shell_double_quoted(value)),
-            &format!(
-                "act on the newly observed item using the extracted `{key}` text anchor in the current runtime"
-            ),
-        ));
-    }
-    None
-}
-
 fn shell_double_quoted(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
 }
@@ -738,6 +579,7 @@ fn blocker_workflow_continuity_projection(
             next_command_hints,
             recommended_runtime,
             runtime_roles: Some(runtime_roles),
+            authority_observation: None,
         },
     ))
 }
@@ -751,24 +593,45 @@ fn workflow_same_runtime_projection(
     next_command_hints: Vec<Value>,
     runtime_roles: Value,
 ) -> Value {
-    workflow_continuity_base(
+    workflow_same_runtime_projection_with_observation(
         command,
         session,
         rub_home,
-        WorkflowContinuityDescriptor {
-            continuation_kind: "same_runtime",
-            signal,
-            summary,
-            next_command_hints,
-            recommended_runtime: json!({
-                "kind": "current_runtime",
-                "rub_home": rub_home.display().to_string(),
-                "session": session,
-                "reason": "same_runtime_authoritative_followup",
-            }),
-            runtime_roles: Some(runtime_roles),
-        },
+        workflow_same_runtime_descriptor(signal, summary, next_command_hints, runtime_roles, None),
     )
+}
+
+fn workflow_same_runtime_projection_with_observation(
+    command: &str,
+    session: &str,
+    rub_home: &Path,
+    mut descriptor: WorkflowContinuityDescriptor<'_>,
+) -> Value {
+    descriptor.recommended_runtime = json!({
+        "kind": "current_runtime",
+        "rub_home": rub_home.display().to_string(),
+        "session": session,
+        "reason": "same_runtime_authoritative_followup",
+    });
+    workflow_continuity_base(command, session, rub_home, descriptor)
+}
+
+fn workflow_same_runtime_descriptor<'a>(
+    signal: &'a str,
+    summary: &'a str,
+    next_command_hints: Vec<Value>,
+    runtime_roles: Value,
+    authority_observation: Option<Value>,
+) -> WorkflowContinuityDescriptor<'a> {
+    WorkflowContinuityDescriptor {
+        continuation_kind: "same_runtime",
+        signal,
+        summary,
+        next_command_hints,
+        recommended_runtime: Value::Null,
+        runtime_roles: Some(runtime_roles),
+        authority_observation,
+    }
 }
 
 fn workflow_fresh_home_projection(
@@ -804,6 +667,7 @@ fn workflow_fresh_home_projection(
                     "summary": "Use the fresh RUB_HOME as the primary continuation path for the next workflow step."
                 }
             })),
+            authority_observation: None,
         },
     )
 }
@@ -864,6 +728,7 @@ struct WorkflowContinuityDescriptor<'a> {
     next_command_hints: Vec<Value>,
     recommended_runtime: Value,
     runtime_roles: Option<Value>,
+    authority_observation: Option<Value>,
 }
 
 fn workflow_continuity_base(
@@ -895,6 +760,11 @@ fn workflow_continuity_base(
         && let Some(object) = payload.as_object_mut()
     {
         object.insert("runtime_roles".to_string(), runtime_roles);
+    }
+    if let Some(authority_observation) = descriptor.authority_observation
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert("authority_observation".to_string(), authority_observation);
     }
     payload
 }

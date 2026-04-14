@@ -4,10 +4,11 @@ use super::{
     humanize_budget_ms_for_command_args,
 };
 use crate::commands::{
-    Commands, CookiesSubcommand, EffectiveCli, ElementAddressArgs, ExplainSubcommand,
-    InspectSubcommand, InterceptSubcommand, ObservationProjectionArgs, ObservationScopeArgs,
-    OrchestrationSubcommand, RequestedLaunchPolicy, RuntimeSubcommand, StateFormatArg,
-    StorageSubcommand, TakeoverSubcommand, TriggerSubcommand, WaitAfterArgs,
+    BindingSubcommand, Commands, CookiesSubcommand, EffectiveCli, ElementAddressArgs,
+    ExplainSubcommand, InspectSubcommand, InterceptSubcommand, ObservationProjectionArgs,
+    ObservationScopeArgs, OrchestrationSubcommand, RequestedLaunchPolicy, RuntimeSubcommand,
+    SecretSubcommand, StateFormatArg, StorageSubcommand, TakeoverSubcommand, TriggerSubcommand,
+    WaitAfterArgs,
 };
 use rub_core::DEFAULT_WAIT_AFTER_TIMEOUT_MS;
 use rub_core::error::ErrorCode;
@@ -35,6 +36,7 @@ fn cli_with_with_home(command: Commands, rub_home: PathBuf) -> EffectiveCli {
         cdp_url: None,
         connect: false,
         profile: None,
+        use_alias: None,
         no_stealth: false,
         humanize: false,
         humanize_speed: "normal".to_string(),
@@ -163,6 +165,18 @@ fn local_only_commands_fail_fast_in_request_builder() {
         (Commands::Cleanup, "cleanup"),
         (Commands::Teardown, "teardown"),
         (Commands::Sessions, "sessions"),
+        (
+            Commands::Binding {
+                subcommand: BindingSubcommand::List,
+            },
+            "binding",
+        ),
+        (
+            Commands::Secret {
+                subcommand: SecretSubcommand::List,
+            },
+            "secret",
+        ),
         (Commands::Close { all: true }, "close --all"),
         (Commands::InternalDaemon, "internal daemon"),
     ] {

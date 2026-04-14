@@ -143,6 +143,14 @@ pub struct Cli {
     #[arg(long, global = true, help_heading = "Browser connection & launch")]
     pub profile: Option<String>,
 
+    /// Reuse one remembered binding/account/workspace alias for this browser-backed command
+    #[arg(
+        long = "use",
+        global = true,
+        help_heading = "Browser connection & launch"
+    )]
+    pub use_alias: Option<String>,
+
     /// Disable the L1 stealth baseline and launch-arg minimization while
     /// keeping DOM hygiene enabled for snapshot correctness
     #[arg(long, global = true, help_heading = "Browser connection & launch")]
@@ -198,6 +206,7 @@ pub struct EffectiveCli {
     pub cdp_url: Option<String>,
     pub connect: bool,
     pub profile: Option<String>,
+    pub use_alias: Option<String>,
     pub no_stealth: bool,
     pub humanize: bool,
     pub humanize_speed: String,
@@ -291,6 +300,7 @@ impl Cli {
             cdp_url: self.cdp_url,
             connect: self.connect,
             profile: self.profile,
+            use_alias: self.use_alias,
             no_stealth: effective_no_stealth,
             humanize: effective_humanize,
             humanize_speed: effective_humanize_speed,

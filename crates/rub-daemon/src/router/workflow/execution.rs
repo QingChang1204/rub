@@ -16,7 +16,9 @@ use crate::router::automation_fence::ensure_committed_automation_result;
 use crate::router::dispatch::execute_named_command_with_fence;
 use crate::router::request_args::parse_json_args;
 use crate::router::request_args::{LocatorParseOptions, parse_canonical_locator};
-use crate::router::secret_resolution::{redact_json_value, redact_rub_error};
+use crate::router::secret_resolution::{
+    attach_secret_resolution_projection, redact_json_value, redact_rub_error,
+};
 use crate::workflow_policy::{workflow_allowed_step_descriptions, workflow_request_allowed};
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 
@@ -81,6 +83,7 @@ async fn cmd_fill_with_policy(
         )
         .await
         .map_err(|error| redact_rub_error(error, &metadata))?;
+        attach_secret_resolution_projection(&mut data, &metadata);
         redact_json_value(&mut data, &metadata);
         return Ok(data);
     }
@@ -181,6 +184,7 @@ async fn cmd_fill_with_policy(
             "scope": "resolution_only",
         });
     }
+    attach_secret_resolution_projection(&mut data, &metadata);
     redact_json_value(&mut data, &metadata);
     Ok(data)
 }
@@ -851,6 +855,7 @@ async fn cmd_pipe_with_policy(
     let mut data = serde_json::json!({
         "steps": completed,
     });
+    attach_secret_resolution_projection(&mut data, &metadata);
     redact_json_value(&mut data, &metadata);
     Ok(data)
 }

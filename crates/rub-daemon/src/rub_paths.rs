@@ -85,6 +85,22 @@ impl RubPaths {
         self.home.join("registry.lock")
     }
 
+    pub fn bindings_path(&self) -> PathBuf {
+        self.home.join("bindings.json")
+    }
+
+    pub fn bindings_lock_path(&self) -> PathBuf {
+        self.home.join("bindings.lock")
+    }
+
+    pub fn remembered_bindings_path(&self) -> PathBuf {
+        self.home.join("remembered-bindings.json")
+    }
+
+    pub fn remembered_bindings_lock_path(&self) -> PathBuf {
+        self.home.join("remembered-bindings.lock")
+    }
+
     pub fn daemon_log_path(&self) -> PathBuf {
         self.logs_dir().join("daemon.log")
     }
@@ -111,6 +127,10 @@ impl RubPaths {
 
     pub fn secrets_env_path(&self) -> PathBuf {
         self.home.join("secrets.env")
+    }
+
+    pub fn secrets_env_lock_path(&self) -> PathBuf {
+        self.home.join("secrets.lock")
     }
 
     pub fn downloads_root(&self) -> PathBuf {
@@ -421,6 +441,22 @@ mod tests {
             PathBuf::from("/tmp/rub-home/registry.json")
         );
         assert_eq!(
+            paths.bindings_path(),
+            PathBuf::from("/tmp/rub-home/bindings.json")
+        );
+        assert_eq!(
+            paths.bindings_lock_path(),
+            PathBuf::from("/tmp/rub-home/bindings.lock")
+        );
+        assert_eq!(
+            paths.remembered_bindings_path(),
+            PathBuf::from("/tmp/rub-home/remembered-bindings.json")
+        );
+        assert_eq!(
+            paths.remembered_bindings_lock_path(),
+            PathBuf::from("/tmp/rub-home/remembered-bindings.lock")
+        );
+        assert_eq!(
             paths.daemon_log_path(),
             PathBuf::from("/tmp/rub-home/logs/daemon.log")
         );
@@ -431,6 +467,10 @@ mod tests {
         assert_eq!(
             paths.secrets_env_path(),
             PathBuf::from("/tmp/rub-home/secrets.env")
+        );
+        assert_eq!(
+            paths.secrets_env_lock_path(),
+            PathBuf::from("/tmp/rub-home/secrets.lock")
         );
     }
 

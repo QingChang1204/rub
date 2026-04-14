@@ -7,17 +7,6 @@ use super::identity::{normalize_cdp_identity, normalize_identity_path};
 pub(crate) fn parse_connection_request(
     cli: &EffectiveCli,
 ) -> Result<ConnectionRequest, rub_core::error::RubError> {
-    let connect_flag_count = [cli.cdp_url.is_some(), cli.connect, cli.profile.is_some()]
-        .into_iter()
-        .filter(|flag| *flag)
-        .count();
-    if connect_flag_count > 1 {
-        return Err(rub_core::error::RubError::domain(
-            ErrorCode::ConflictingConnectOptions,
-            "Use only one of --cdp-url, --connect, or --profile per command",
-        ));
-    }
-
     if cli.profile.is_some() && cli.requested_launch_policy.user_data_dir.is_some() {
         return Err(rub_core::error::RubError::domain_with_context(
             ErrorCode::InvalidInput,
@@ -37,6 +26,23 @@ pub(crate) fn parse_connection_request(
         ));
     }
 
+    let connect_flag_count = [
+        cli.cdp_url.is_some(),
+        cli.connect,
+        cli.profile.is_some(),
+        cli.requested_launch_policy.user_data_dir.is_some(),
+        cli.use_alias.is_some(),
+    ]
+    .into_iter()
+    .filter(|flag| *flag)
+    .count();
+    if connect_flag_count > 1 {
+        return Err(rub_core::error::RubError::domain(
+            ErrorCode::ConflictingConnectOptions,
+            "Use only one browser attachment selector per command",
+        ));
+    }
+
     if let Some(url) = &cli.cdp_url {
         return Ok(ConnectionRequest::CdpUrl {
             url: normalize_cdp_identity(url),
@@ -44,6 +50,18 @@ pub(crate) fn parse_connection_request(
     }
     if cli.connect {
         return Ok(ConnectionRequest::AutoDiscover);
+    }
+    if cli.requested_launch_policy.user_data_dir.is_some() {
+        let path = cli.user_data_dir.clone().ok_or_else(|| {
+            rub_core::error::RubError::domain_with_context(
+                ErrorCode::InvalidInput,
+                "Explicit user-data-dir request is missing an effective path",
+                serde_json::json!({
+                    "reason": "explicit_user_data_dir_missing_effective_path",
+                }),
+            )
+        })?;
+        return Ok(ConnectionRequest::UserDataDir { path });
     }
     if let Some(name) = &cli.profile {
         let profile = rub_cdp::profile::resolve_profile(name)?;
@@ -88,6 +106,9 @@ pub(crate) async fn materialize_connection_request(
             let candidate = rub_cdp::attachment::resolve_unique_local_cdp_candidate().await?;
             Ok(materialized_auto_discover_request(&candidate))
         }
+        ConnectionRequest::UserDataDir { path } => Ok(ConnectionRequest::UserDataDir {
+            path: normalize_identity_path(path),
+        }),
         ConnectionRequest::Profile {
             name,
             dir_name,

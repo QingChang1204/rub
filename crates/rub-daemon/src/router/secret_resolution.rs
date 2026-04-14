@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 
 use crate::rub_paths::RubPaths;
 use rub_core::error::{ErrorCode, RubError};
+use rub_core::secrets_env::{
+    SecretEffectiveSource, SecretReferenceProvenance, SecretReferenceProvenanceProjection,
+    load_secrets_env_file, parse_secret_placeholder,
+};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -63,7 +66,7 @@ struct SecretSources {
 impl SecretSources {
     fn load(rub_home: &Path) -> Result<Self, RubError> {
         let process_env = std::env::vars().collect::<BTreeMap<_, _>>();
-        let file_env = load_secrets_file(rub_home)?;
+        let file_env = load_secrets_env_file(&RubPaths::new(rub_home).secrets_env_path())?;
         Ok(Self {
             process_env,
             file_env,
@@ -142,6 +145,22 @@ pub(crate) fn redact_json_value(value: &mut Value, metadata: &SecretResolutionMe
     }
 }
 
+pub(crate) fn attach_secret_resolution_projection(
+    payload: &mut Value,
+    metadata: &SecretResolutionMetadata,
+) {
+    let Some(projection) = project_secret_resolution_projection(metadata) else {
+        return;
+    };
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "input_secret_references".to_string(),
+        serde_json::to_value(projection).expect("secret provenance should serialize"),
+    );
+}
+
 pub(crate) fn redact_json_value_from_secret_sources(
     value: &mut Value,
     rub_home: &Path,
@@ -170,6 +189,34 @@ pub(crate) fn redact_rub_error(error: RubError, metadata: &SecretResolutionMetad
             RubError::Internal(message)
         }
         other => other,
+    }
+}
+
+fn project_secret_resolution_projection(
+    metadata: &SecretResolutionMetadata,
+) -> Option<SecretReferenceProvenanceProjection> {
+    if metadata.is_empty() {
+        return None;
+    }
+    let mut items = metadata
+        .entries
+        .iter()
+        .map(|entry| SecretReferenceProvenance {
+            reference: entry.reference.clone(),
+            effective_source: project_secret_effective_source(&entry.source),
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| left.reference.cmp(&right.reference));
+    Some(SecretReferenceProvenanceProjection {
+        count: items.len(),
+        items,
+    })
+}
+
+fn project_secret_effective_source(source: &SecretSource) -> SecretEffectiveSource {
+    match source {
+        SecretSource::Environment => SecretEffectiveSource::Environment,
+        SecretSource::SecretsFile => SecretEffectiveSource::RubHomeSecretsEnv,
     }
 }
 
@@ -218,123 +265,6 @@ fn resolve_placeholders(
     }
 }
 
-fn parse_secret_placeholder(value: &str) -> Option<&str> {
-    let name = value.strip_prefix('$')?;
-    let mut chars = name.chars();
-    let first = chars.next()?;
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return None;
-    }
-    if chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
-        Some(name)
-    } else {
-        None
-    }
-}
-
-fn load_secrets_file(rub_home: &Path) -> Result<BTreeMap<String, String>, RubError> {
-    let path = RubPaths::new(rub_home).secrets_env_path();
-    if !path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    ensure_secure_secrets_permissions(&path)?;
-    let content = fs::read_to_string(&path).map_err(|error| {
-        RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            format!("Cannot read secrets file: {error}"),
-            serde_json::json!({ "path": path.display().to_string() }),
-        )
-    })?;
-    parse_secrets_env(&content, &path)
-}
-
-fn parse_secrets_env(content: &str, path: &Path) -> Result<BTreeMap<String, String>, RubError> {
-    let mut values = BTreeMap::new();
-    for (index, raw_line) in content.lines().enumerate() {
-        let line_no = index + 1;
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((raw_key, raw_value)) = line.split_once('=') else {
-            return Err(invalid_secrets_env_entry(
-                path,
-                line_no,
-                "expected KEY=VALUE",
-            ));
-        };
-        let key = raw_key.trim();
-        if parse_secret_placeholder(&format!("${key}")).is_none() {
-            return Err(invalid_secrets_env_entry(
-                path,
-                line_no,
-                "invalid secret name; use letters, digits, and underscores",
-            ));
-        }
-        let mut value = raw_value.trim().to_string();
-        if let Some(unquoted) = strip_matching_quotes(&value) {
-            value = unquoted.to_string();
-        }
-        values.insert(key.to_string(), value);
-    }
-    Ok(values)
-}
-
-fn strip_matching_quotes(value: &str) -> Option<&str> {
-    if value.len() < 2 {
-        return None;
-    }
-    let bytes = value.as_bytes();
-    let first = bytes.first().copied()?;
-    let last = bytes.last().copied()?;
-    if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
-        return Some(&value[1..value.len() - 1]);
-    }
-    None
-}
-
-fn invalid_secrets_env_entry(path: &Path, line: usize, reason: &str) -> RubError {
-    RubError::domain_with_context(
-        ErrorCode::InvalidInput,
-        format!("Invalid secrets.env entry on line {line}: {reason}"),
-        serde_json::json!({
-            "path": path.display().to_string(),
-            "line": line,
-        }),
-    )
-}
-
-#[cfg(unix)]
-fn ensure_secure_secrets_permissions(path: &Path) -> Result<(), RubError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let metadata = fs::metadata(path).map_err(|error| {
-        RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            format!("Cannot stat secrets file: {error}"),
-            serde_json::json!({ "path": path.display().to_string() }),
-        )
-    })?;
-    let mode = metadata.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            "Insecure permissions on secrets.env; expected chmod 600".to_string(),
-            serde_json::json!({
-                "path": path.display().to_string(),
-                "mode": format!("{mode:o}"),
-                "required_mode": "600",
-            }),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_secure_secrets_permissions(_path: &Path) -> Result<(), RubError> {
-    Ok(())
-}
-
 fn redact_string(text: &mut String, metadata: &SecretResolutionMetadata) {
     if text.is_empty() {
         return;
@@ -380,8 +310,8 @@ fn collect_secret_matches_and_redact_exact_leaves(
 #[cfg(test)]
 mod tests {
     use super::{
-        SecretResolutionMetadata, SecretSource, SecretSources, redact_json_value,
-        redact_json_value_from_secret_sources, redact_rub_error,
+        SecretResolutionMetadata, SecretSource, SecretSources, attach_secret_resolution_projection,
+        redact_json_value, redact_json_value_from_secret_sources, redact_rub_error,
         resolve_json_value_with_secret_resolution,
     };
     use crate::router::request_args::parse_json_spec;
@@ -506,6 +436,49 @@ mod tests {
             redacted.context.expect("context")["secret"],
             serde_json::json!("$RUB_PASSWORD")
         );
+    }
+
+    #[test]
+    fn attach_secret_resolution_projection_reports_reference_sources_without_values() {
+        let metadata = SecretResolutionMetadata {
+            entries: vec![
+                super::SecretResolutionEntry {
+                    reference: "$RUB_PASSWORD".to_string(),
+                    value: "hunter2".to_string(),
+                    source: SecretSource::SecretsFile,
+                },
+                super::SecretResolutionEntry {
+                    reference: "$RUB_USER".to_string(),
+                    value: "alice".to_string(),
+                    source: SecretSource::Environment,
+                },
+            ],
+        };
+        let mut payload = serde_json::json!({
+            "steps": []
+        });
+
+        attach_secret_resolution_projection(&mut payload, &metadata);
+
+        assert_eq!(payload["input_secret_references"]["count"], 2);
+        assert_eq!(
+            payload["input_secret_references"]["items"][0]["reference"],
+            "$RUB_PASSWORD"
+        );
+        assert_eq!(
+            payload["input_secret_references"]["items"][0]["effective_source"],
+            "rub_home_secrets_env"
+        );
+        assert_eq!(
+            payload["input_secret_references"]["items"][1]["reference"],
+            "$RUB_USER"
+        );
+        assert_eq!(
+            payload["input_secret_references"]["items"][1]["effective_source"],
+            "environment"
+        );
+        assert!(!payload.to_string().contains("hunter2"));
+        assert!(!payload.to_string().contains("alice"));
     }
 
     #[cfg(unix)]

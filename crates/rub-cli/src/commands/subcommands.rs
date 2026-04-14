@@ -14,8 +14,9 @@ mod runtime;
 pub use explain::ExplainSubcommand;
 pub use query::{GetSubcommand, InspectSubcommand};
 pub use runtime::{
-    CookiesSubcommand, DialogSubcommand, DownloadSubcommand, HandoffSubcommand,
-    InterceptSubcommand, InterferenceSubcommand, OrchestrationSubcommand, RuntimeSubcommand,
+    BindingCaptureAuthInputArg, BindingSubcommand, CookiesSubcommand, DialogSubcommand,
+    DownloadSubcommand, HandoffSubcommand, InterceptSubcommand, InterferenceSubcommand,
+    OrchestrationSubcommand, RememberedBindingAliasKindArg, RuntimeSubcommand, SecretSubcommand,
     StorageSubcommand, TakeoverSubcommand, TriggerSubcommand,
 };
 
@@ -31,10 +32,10 @@ You can mix locator styles in the same array.";
 const FILL_AFTER_LONG_HELP: &str = "\
 Spec formats:
   By index:
-    rub fill '[{\"index\":3,\"value\":\"alice@example.com\"},{\"index\":5,\"value\":\"secret\"}]'
+    rub fill '[{\"index\":3,\"value\":\"alice@example.com\"},{\"index\":5,\"value\":\"$RUB_PASSWORD\"}]'
 
   By label:
-    rub fill '[{\"label\":\"Email\",\"value\":\"alice@example.com\"},{\"label\":\"Password\",\"value\":\"secret\"}]'
+    rub fill '[{\"label\":\"Email\",\"value\":\"alice@example.com\"},{\"label\":\"Password\",\"value\":\"$RUB_PASSWORD\"}]'
 
   By selector:
     rub fill '[{\"selector\":\"#email\",\"value\":\"alice@example.com\"}]'
@@ -44,7 +45,7 @@ Spec formats:
 
 Examples:
   Fill and submit:
-    rub fill '[{\"label\":\"Email\",\"value\":\"user@example.com\"},{\"label\":\"Password\",\"value\":\"pass\"}]' --submit-label \"Log in\"
+    rub fill '[{\"label\":\"Email\",\"value\":\"user@example.com\"},{\"label\":\"Password\",\"value\":\"$RUB_PASSWORD\"}]' --submit-label \"Log in\"
 
   Load spec from a file:
     rub fill --file form.json --submit-label \"Submit\"
@@ -268,6 +269,18 @@ pub enum Commands {
 
     /// List active sessions
     Sessions,
+
+    /// Inspect and manage named authenticated-runtime bindings stored under RUB_HOME
+    Binding {
+        #[command(subcommand)]
+        subcommand: BindingSubcommand,
+    },
+
+    /// Inspect and manage explicit secret references stored under RUB_HOME/secrets.env
+    Secret {
+        #[command(subcommand)]
+        subcommand: SecretSubcommand,
+    },
 
     /// System health check
     Doctor,
@@ -643,10 +656,11 @@ pub enum Commands {
     ///   rub pipe '[{"command":"open","args":{"url":"https://example.com"}},{"command":"screenshot"}]'
     ///
     /// Form automation:
-    ///   rub pipe '[{"command":"open","args":{"url":"https://login.example.com"}},{"command":"fill","args":{"spec":[{"label":"Email","value":"user@example.com"},{"label":"Password","value":"pass"}],"submit_label":"Log in"}}]'
+    ///   rub pipe '[{"command":"open","args":{"url":"https://login.example.com"}},{"command":"fill","args":{"spec":[{"label":"Email","value":"user@example.com"},{"label":"Password","value":"$RUB_PASSWORD"}],"submit_label":"Log in"}}]'
     ///
     /// Named workflow (saved under RUB_HOME/workflows/<name>.json):
-    ///   rub pipe --workflow login --var email=user@example.com --var password=secret
+    ///   rub secret set RUB_PASSWORD --stdin
+    ///   rub pipe --workflow login --var email=user@example.com --var 'password=$RUB_PASSWORD'
     ///
     /// Step result references: Use {{prev.result.PATH}} to inject the previous step's
     /// result, or {{steps[N].result.PATH}} / {{steps[LABEL].result.PATH}} to reference
@@ -698,6 +712,8 @@ impl Commands {
             Self::Screenshot { .. } => CommandName::Screenshot.as_str(),
             Self::Close { .. } => CommandName::Close.as_str(),
             Self::Sessions => "sessions",
+            Self::Binding { .. } => "binding",
+            Self::Secret { .. } => CommandName::Secret.as_str(),
             Self::Doctor => CommandName::Doctor.as_str(),
             Self::Runtime { .. } => CommandName::Runtime.as_str(),
             Self::Trigger { .. } => CommandName::Trigger.as_str(),
@@ -769,6 +785,8 @@ impl Commands {
                 examples: Some(_), ..
             } => Some("extract built-in help"),
             Self::Sessions => Some("sessions"),
+            Self::Binding { .. } => Some("binding"),
+            Self::Secret { .. } => Some("secret"),
             Self::InternalDaemon => Some("internal daemon"),
             _ => None,
         }

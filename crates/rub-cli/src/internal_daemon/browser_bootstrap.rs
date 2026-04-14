@@ -85,8 +85,13 @@ pub(super) async fn attach_browser(
                 )
                 .await
         }
-        ConnectionRequest::Profile { .. } | ConnectionRequest::None => {
-            if matches!(connection_request, ConnectionRequest::None) {
+        ConnectionRequest::Profile { .. }
+        | ConnectionRequest::UserDataDir { .. }
+        | ConnectionRequest::None => {
+            if matches!(
+                connection_request,
+                ConnectionRequest::UserDataDir { .. } | ConnectionRequest::None
+            ) {
                 state
                     .set_connection_target(Some(ConnectionTarget::Managed))
                     .await;

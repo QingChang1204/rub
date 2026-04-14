@@ -1,6 +1,123 @@
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 
 use crate::commands::{DownloadWaitStateArg, InterferenceModeArg, StorageAreaArg};
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum BindingCaptureAuthInputArg {
+    Cli,
+    Mixed,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum RememberedBindingAliasKindArg {
+    Binding,
+    Account,
+    Workspace,
+}
+
+/// Subcommands for `rub secret`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum SecretSubcommand {
+    /// List secret names stored under the current RUB_HOME secret file
+    List,
+    /// Inspect one secret reference without printing its value
+    Inspect {
+        /// Secret name
+        name: String,
+    },
+    /// Set or update one secret entry under the current RUB_HOME secret file
+    Set {
+        /// Secret name
+        name: String,
+        /// Inline secret value (explicit, inspectable local input; not agent-blind)
+        #[arg(long, conflicts_with_all = ["from_env", "stdin"])]
+        value: Option<String>,
+        /// Read the secret value from one process environment variable
+        #[arg(long = "from-env", value_name = "ENV_NAME", conflicts_with_all = ["value", "stdin"])]
+        from_env: Option<String>,
+        /// Read the secret value from stdin; one trailing newline is trimmed
+        #[arg(long, conflicts_with_all = ["value", "from_env"])]
+        stdin: bool,
+    },
+    /// Remove one secret entry from the current RUB_HOME secret file
+    Remove {
+        /// Secret name
+        name: String,
+    },
+}
+
+/// Subcommands for `rub binding`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum BindingSubcommand {
+    /// List named bindings stored under the current RUB_HOME
+    List,
+    /// List remembered aliases that resolve to named bindings under the current RUB_HOME
+    Aliases,
+    /// Capture the current authenticated runtime after an explicit auth-completion fence
+    Capture {
+        /// Binding alias
+        alias: String,
+        /// Record the operator-declared CLI or mixed auth input mode for this
+        /// explicit capture without synthesizing a new auth-completion fence
+        #[arg(long = "auth-input", value_enum)]
+        auth_input: Option<BindingCaptureAuthInputArg>,
+    },
+    /// Bind the current runtime conservatively without claiming a fresh auth-completion fence
+    #[command(name = "bind-current")]
+    BindCurrent {
+        /// Binding alias
+        alias: String,
+    },
+    /// Inspect one named binding
+    Inspect {
+        /// Binding alias
+        alias: String,
+    },
+    /// Rename one binding alias
+    Rename {
+        /// Existing binding alias
+        alias: String,
+        /// New binding alias
+        new_alias: String,
+    },
+    /// Remove one named binding
+    Remove {
+        /// Binding alias
+        alias: String,
+    },
+    /// Create one remembered alias that resolves to a named binding
+    Remember {
+        /// Remembered alias
+        alias: String,
+        /// Target binding alias
+        #[arg(long = "binding")]
+        binding_alias: String,
+        /// Remembered alias kind
+        #[arg(long, value_enum, default_value = "binding")]
+        kind: RememberedBindingAliasKindArg,
+    },
+    /// Resolve one remembered alias to its target binding and projected live status
+    Resolve {
+        /// Remembered alias
+        alias: String,
+    },
+    /// Update one remembered alias to point at a different binding
+    Rebind {
+        /// Remembered alias
+        alias: String,
+        /// Target binding alias
+        #[arg(long = "binding")]
+        binding_alias: String,
+        /// Remembered alias kind
+        #[arg(long, value_enum)]
+        kind: Option<RememberedBindingAliasKindArg>,
+    },
+    /// Remove one remembered alias
+    Forget {
+        /// Remembered alias
+        alias: String,
+    },
+}
 
 /// Subcommands for `rub cookies`.
 #[derive(Debug, Clone, Subcommand)]

@@ -1253,6 +1253,74 @@ fn t412_412g_extract_grouped_scenario() {
     );
 }
 
+/// T412h: `extract --file` should project secret references without exposing resolved values.
+#[test]
+#[ignore]
+#[serial]
+fn t412h_extract_file_resolves_secret_references_and_projects_provenance() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home().to_string();
+    std::fs::create_dir_all(&home).unwrap();
+    write_secure_secrets_env(
+        &PathBuf::from(&home).join("secrets.env"),
+        "RUB_SELECTOR=#headline\n",
+    );
+
+    let (_rt, server) = start_test_server(vec![(
+        "/extract-secret",
+        "text/html",
+        r#"<!DOCTYPE html>
+<html>
+<head><title>Extract Secret Fixture</title></head>
+<body>
+  <h1 id="headline">Secret Extract Target</h1>
+</body>
+</html>"#,
+    )]);
+
+    let opened = parse_json(
+        &rub_cmd(&home)
+            .args(["open", &server.url_for("/extract-secret")])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+
+    let spec_path = format!("{home}/extract-secret-spec.json");
+    std::fs::write(
+        &spec_path,
+        r##"{"headline":{"selector":"$RUB_SELECTOR","kind":"text"}}"##,
+    )
+    .unwrap();
+
+    let extracted = parse_json(
+        &rub_cmd(&home)
+            .args(["extract", "--file", &spec_path])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(extracted["success"], true, "{extracted}");
+    assert_eq!(
+        extracted["data"]["result"]["fields"]["headline"], "Secret Extract Target",
+        "{extracted}"
+    );
+    assert_eq!(
+        extracted["data"]["input_secret_references"]["count"], 1,
+        "{extracted}"
+    );
+    assert_eq!(
+        extracted["data"]["input_secret_references"]["items"][0]["reference"], "$RUB_SELECTOR",
+        "{extracted}"
+    );
+    assert_eq!(
+        extracted["data"]["input_secret_references"]["items"][0]["effective_source"],
+        "rub_home_secrets_env",
+        "{extracted}"
+    );
+
+    let _ = std::fs::remove_file(spec_path);
+}
+
 /// T413/T413b/T413d/T413e: pipe workflow variants should reuse one browser-backed scenario.
 #[test]
 #[ignore]
@@ -1263,7 +1331,7 @@ fn t413_413b_d_e_pipe_grouped_scenario() {
     std::fs::create_dir_all(&home).unwrap();
     write_secure_secrets_env(
         &PathBuf::from(&home).join("secrets.env"),
-        "RUB_PASSWORD=file-pass\n",
+        "RUB_PASSWORD=file-pass\nRUB_USER=file-user\n",
     );
 
     let (_rt, server) = start_test_server(vec![
@@ -1505,6 +1573,28 @@ fn t413c_pipe_file_resolves_secret_references_and_redacts_output() {
         piped["data"]["steps"][4]["result"]["result"], "$RUB_USER:$RUB_PASSWORD",
         "{piped}"
     );
+    assert_eq!(
+        piped["data"]["input_secret_references"]["count"], 2,
+        "{piped}"
+    );
+    assert_eq!(
+        piped["data"]["input_secret_references"]["items"][0]["reference"], "$RUB_PASSWORD",
+        "{piped}"
+    );
+    assert_eq!(
+        piped["data"]["input_secret_references"]["items"][0]["effective_source"],
+        "rub_home_secrets_env",
+        "{piped}"
+    );
+    assert_eq!(
+        piped["data"]["input_secret_references"]["items"][1]["reference"], "$RUB_USER",
+        "{piped}"
+    );
+    assert_eq!(
+        piped["data"]["input_secret_references"]["items"][1]["effective_source"], "environment",
+        "{piped}"
+    );
+    assert!(!piped.to_string().contains("env-user:file-pass"), "{piped}");
 
     let actual = parse_json(
         &session
@@ -1518,6 +1608,107 @@ fn t413c_pipe_file_resolves_secret_references_and_redacts_output() {
     );
     assert_eq!(actual["success"], true, "{actual}");
     assert_eq!(actual["data"]["result"], true, "{actual}");
+    let _ = std::fs::remove_file(spec_path);
+}
+
+/// T411g: `fill --file` should project secret references without exposing resolved values.
+#[test]
+#[ignore]
+#[serial]
+fn t411g_fill_file_resolves_secret_references_and_projects_provenance() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home().to_string();
+    std::fs::create_dir_all(&home).unwrap();
+    write_secure_secrets_env(
+        &PathBuf::from(&home).join("secrets.env"),
+        "RUB_PASSWORD=file-pass\nRUB_USER=file-user\n",
+    );
+
+    let (_rt, server) = start_test_server(vec![(
+        "/fill-secret",
+        "text/html",
+        r#"<!DOCTYPE html>
+<html>
+<head><title>Fill Secret Fixture</title></head>
+<body>
+  <input id="user" value="" />
+  <input id="password" value="" />
+  <button id="submit" type="button">Submit</button>
+  <div id="status">idle</div>
+  <script>
+    document.getElementById('submit').addEventListener('click', () => {
+      document.getElementById('status').textContent =
+        document.getElementById('user').value + ':' + document.getElementById('password').value;
+    });
+  </script>
+</body>
+</html>"#,
+    )]);
+
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", &server.url_for("/fill-secret")])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+
+    let spec_path = format!("{home}/fill-secret-spec.json");
+    std::fs::write(
+        &spec_path,
+        r##"[{"selector":"#user","value":"$RUB_USER"},{"selector":"#password","value":"$RUB_PASSWORD"}]"##,
+    )
+    .unwrap();
+
+    let filled = parse_json(
+        &session
+            .cmd()
+            .args(["fill", "--file", &spec_path, "--submit-selector", "#submit"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(filled["success"], true, "{filled}");
+    assert_eq!(
+        filled["data"]["input_secret_references"]["count"], 2,
+        "{filled}"
+    );
+    assert_eq!(
+        filled["data"]["input_secret_references"]["items"][0]["reference"], "$RUB_PASSWORD",
+        "{filled}"
+    );
+    assert_eq!(
+        filled["data"]["input_secret_references"]["items"][0]["effective_source"],
+        "rub_home_secrets_env",
+        "{filled}"
+    );
+    assert_eq!(
+        filled["data"]["input_secret_references"]["items"][1]["reference"], "$RUB_USER",
+        "{filled}"
+    );
+    assert_eq!(
+        filled["data"]["input_secret_references"]["items"][1]["effective_source"],
+        "rub_home_secrets_env",
+        "{filled}"
+    );
+
+    let actual = parse_json(
+        &session
+            .cmd()
+            .args([
+                "exec",
+                "document.getElementById('status').textContent === 'file-user:file-pass'",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(actual["success"], true, "{actual}");
+    assert_eq!(actual["data"]["result"], true, "{actual}");
+    assert!(
+        !filled.to_string().contains("file-user:file-pass"),
+        "{filled}"
+    );
+
     let _ = std::fs::remove_file(spec_path);
 }
 
@@ -1736,6 +1927,19 @@ fn t414b_l_find_grouped_scenario() {
     );
     assert_eq!(
         content["data"]["result"]["matches"][0]["text"], "External links",
+        "{content}"
+    );
+    assert_eq!(
+        content["data"]["workflow_continuity"]["source_signal"], "find_content_anchor",
+        "{content}"
+    );
+    assert_eq!(
+        content["data"]["workflow_continuity"]["next_command_hints"][0]["command"],
+        "rub get text ...",
+        "{content}"
+    );
+    assert_eq!(
+        content["data"]["workflow_continuity"]["authority_observation"]["surface"], "content",
         "{content}"
     );
 

@@ -131,6 +131,10 @@ pub(super) async fn dispatch_named_command(
         Some(CommandName::Close) => runtime::cmd_close(router)
             .await
             .map(CommandDispatchOutcome::new),
+        Some(CommandName::Secret) => Err(RubError::domain(
+            ErrorCode::InvalidInput,
+            "Local-only command 'secret' cannot be projected through the daemon",
+        )),
         Some(CommandName::Keys) => interaction::cmd_keys(router, args, state)
             .await
             .map(CommandDispatchOutcome::new),

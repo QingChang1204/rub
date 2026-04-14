@@ -8,7 +8,7 @@ mod scan;
 mod spec;
 
 use super::projection::snapshot_entity;
-use super::secret_resolution::redact_json_value;
+use super::secret_resolution::{attach_secret_resolution_projection, redact_json_value};
 use super::snapshot::build_stable_snapshot;
 use super::*;
 use crate::router::addressing::load_snapshot;
@@ -131,6 +131,7 @@ pub(super) async fn cmd_extract(
                 }),
             )
         };
+        attach_secret_resolution_projection(&mut data, &metadata);
         redact_json_value(&mut data, &metadata);
         return Ok(data);
     }
@@ -172,6 +173,7 @@ pub(super) async fn cmd_extract(
                 },
             }),
         );
+        attach_secret_resolution_projection(&mut data, &metadata);
         redact_json_value(&mut data, &metadata);
         return Ok(data);
     }
@@ -233,6 +235,7 @@ pub(super) async fn cmd_extract(
             }),
         )
     };
+    attach_secret_resolution_projection(&mut data, &metadata);
     redact_json_value(&mut data, &metadata);
     Ok(data)
 }

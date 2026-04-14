@@ -326,8 +326,9 @@ rub pipe '[{"command": "open", "args": {"url": "https://example.com"}}, {"comman
 # Load from file
 rub pipe --file workflow.json
 
-# Parameterized workflows with secret resolution
-rub pipe --workflow login --var "username=admin" --var "password=secret"
+# Parameterized workflows with explicit secret references
+rub secret set RUB_PASSWORD --stdin
+rub pipe --workflow login --var "username=admin" --var 'password=$RUB_PASSWORD'
 
 # Nested command args now accept structured spec JSON directly
 rub pipe '[{"command":"open","args":{"url":"https://example.com"}},{"command":"extract","args":{"spec":{"title":"h1","price":{"selector":".price","kind":"text"}}}}]'
@@ -395,6 +396,33 @@ rub takeover elevate  # Re-launch a headless browser into a visible headed windo
 rub takeover resume   # Hand browser back to automation and unblock commands
 ```
 `elevate` is distinct from `start` — it physically makes the browser window visible for direct interaction, useful when the session was originally launched headless.
+
+**Remembered runtime bindings** — capture one authenticated runtime, then reuse
+it explicitly on later browser-backed commands:
+```bash
+rub binding capture old-admin
+rub binding inspect old-admin
+rub binding remember ops-admin --binding old-admin --kind account
+rub --use ops-admin open https://admin.example.com/dashboard
+rub binding resolve ops-admin
+rub binding forget ops-admin
+```
+If the login path was operator-driven via CLI or mixed human+CLI input, capture
+can record that input mode explicitly without inventing a new auth-completion
+fence:
+```bash
+rub binding capture old-admin --auth-input mixed
+```
+
+**Explicit local secret references** — keep secret values under `RUB_HOME`
+without teaching workflows to use raw password literals:
+```bash
+rub secret set RUB_PASSWORD --stdin
+rub secret list
+rub secret inspect RUB_PASSWORD
+rub pipe --workflow login --var "username=admin" --var 'password=$RUB_PASSWORD'
+rub secret remove RUB_PASSWORD
+```
 
 ### 🎭 Cross-Session Orchestration
 

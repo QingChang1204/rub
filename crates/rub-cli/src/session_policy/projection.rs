@@ -27,6 +27,15 @@ pub(super) fn requested_connection_projection(request: &ConnectionRequest) -> se
         ConnectionRequest::AutoDiscover => serde_json::json!({
             "source": "auto_discover",
         }),
+        ConnectionRequest::UserDataDir { path } => serde_json::json!({
+            "source": "user_data_dir",
+            "path": path,
+            "path_state": session_policy_path_state(
+                "cli.session_policy.requested_connection.path",
+                "requested_user_data_dir",
+                "managed_user_data_dir",
+            ),
+        }),
         ConnectionRequest::Profile {
             name,
             resolved_path,

@@ -3,7 +3,7 @@
 mod continuity;
 
 use self::continuity::attach_workflow_continuity;
-use rub_core::error::ErrorEnvelope;
+use rub_core::error::{ErrorCode, ErrorEnvelope};
 use rub_core::model::CommandResult;
 use rub_ipc::protocol::IpcResponse;
 use serde_json::{Map, Value, json};
@@ -37,7 +37,7 @@ pub fn format_response(
             session: session.to_string(),
             timing: response.timing,
             data: None,
-            error: Some(envelope),
+            error: Some(attach_authority_error_guidance(envelope)),
         };
         return if pretty {
             serde_json::to_string_pretty(&result)
@@ -56,7 +56,7 @@ pub fn format_response(
         session: session.to_string(),
         timing: response.timing,
         data: response.data.clone(),
-        error: response.error.clone(),
+        error: response.error.clone().map(attach_authority_error_guidance),
     };
     attach_interaction_trace(&mut result, trace_mode);
     attach_workflow_continuity(&mut result, rub_home);
@@ -98,7 +98,12 @@ pub fn format_cli_error(
     envelope: ErrorEnvelope,
     pretty: bool,
 ) -> String {
-    let result = CommandResult::error(command, session, uuid::Uuid::now_v7().to_string(), envelope);
+    let result = CommandResult::error(
+        command,
+        session,
+        uuid::Uuid::now_v7().to_string(),
+        attach_authority_error_guidance(envelope),
+    );
 
     if pretty {
         serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
@@ -128,7 +133,7 @@ pub fn format_post_commit_cli_error(
         session: session.to_string(),
         timing: response.timing,
         data,
-        error: Some(envelope),
+        error: Some(attach_authority_error_guidance(envelope)),
     };
 
     if pretty {
@@ -237,6 +242,151 @@ fn attach_interaction_trace(result: &mut CommandResult, trace_mode: InteractionT
     object.insert("interaction_trace".to_string(), Value::Object(trace));
 }
 
+fn attach_authority_error_guidance(mut envelope: ErrorEnvelope) -> ErrorEnvelope {
+    let Some(context) = envelope.context.as_mut() else {
+        return envelope;
+    };
+    let Some(guidance) = authority_error_guidance(envelope.code, context) else {
+        return envelope;
+    };
+    if let Some(object) = context.as_object_mut() {
+        object.insert("authority_guidance".to_string(), guidance);
+    }
+    envelope
+}
+
+fn authority_error_guidance(code: ErrorCode, context: &Value) -> Option<Value> {
+    let object = context.as_object()?;
+    let authority_state = object.get("authority_state").and_then(Value::as_str);
+    let reason = object.get("reason").and_then(Value::as_str);
+
+    match (code, authority_state, reason) {
+        (ErrorCode::StaleSnapshot, Some("selected_frame_context_drifted"), _) => {
+            Some(authority_guidance(
+                "selected_frame_context_drifted",
+                "The selected frame changed after the snapshot was captured. Re-select the current frame and refresh snapshot authority before continuing.",
+                vec![
+                    guidance_command_hint(
+                        "rub frames",
+                        "inspect the live frame inventory before choosing the current frame again",
+                    ),
+                    guidance_command_hint(
+                        "rub frame --top or rub frame --name <frame-name>",
+                        "restore the intended frame selection before taking a fresh snapshot",
+                    ),
+                    guidance_command_hint(
+                        "rub state",
+                        "capture a fresh snapshot after frame authority has been restored",
+                    ),
+                ],
+            ))
+        }
+        (ErrorCode::StaleSnapshot, Some("selected_frame_context_stale"), _) => {
+            Some(authority_guidance(
+                "selected_frame_context_stale",
+                "The selected frame context is no longer live. Re-establish frame authority and capture a fresh snapshot before continuing.",
+                vec![
+                    guidance_command_hint(
+                        "rub frames",
+                        "inspect the live frame inventory to confirm which frames still exist",
+                    ),
+                    guidance_command_hint(
+                        "rub frame --top or rub frame --name <frame-name>",
+                        "select the intended live frame again before retrying",
+                    ),
+                    guidance_command_hint(
+                        "rub state",
+                        "capture a fresh snapshot from the restored frame context",
+                    ),
+                ],
+            ))
+        }
+        (ErrorCode::StaleSnapshot, Some("explicit_frame_scope_mismatch"), _) => {
+            Some(authority_guidance(
+                "explicit_frame_scope_mismatch",
+                "The cached snapshot does not match the explicitly requested frame scope. Re-select the intended frame and capture a fresh snapshot before continuing.",
+                vec![
+                    guidance_command_hint(
+                        "rub frames",
+                        "inspect the live frame inventory and confirm the intended frame name or id",
+                    ),
+                    guidance_command_hint(
+                        "rub frame --name <frame-name> or rub frame --top",
+                        "restore the explicit frame scope before retrying the command",
+                    ),
+                    guidance_command_hint(
+                        "rub state",
+                        "capture a fresh snapshot after restoring the intended frame scope",
+                    ),
+                ],
+            ))
+        }
+        (ErrorCode::BrowserCrashed, _, Some("continuity_no_active_tab")) => {
+            Some(authority_guidance(
+                "continuity_no_active_tab",
+                "No active tab remained after the takeover transition. Re-establish tab authority before continuing automation.",
+                vec![
+                    guidance_command_hint(
+                        "rub tabs",
+                        "inspect the current tab registry and confirm which tab, if any, still owns the workflow",
+                    ),
+                    guidance_command_hint(
+                        "rub switch <index>",
+                        "restore the intended active tab before attempting to resume",
+                    ),
+                    guidance_command_hint(
+                        "rub runtime takeover",
+                        "re-check the takeover runtime surface after tab authority is restored",
+                    ),
+                ],
+            ))
+        }
+        (ErrorCode::BrowserCrashed, _, Some("continuity_frame_unavailable")) => {
+            Some(authority_guidance(
+                "continuity_frame_unavailable",
+                "Frame authority became unavailable after the takeover transition. Re-select the intended frame and refresh page authority before continuing.",
+                vec![
+                    guidance_command_hint(
+                        "rub frames",
+                        "inspect the live frame inventory before choosing the current frame again",
+                    ),
+                    guidance_command_hint(
+                        "rub frame --top or rub frame --name <frame-name>",
+                        "restore the intended frame selection before retrying",
+                    ),
+                    guidance_command_hint(
+                        "rub runtime takeover",
+                        "re-check the takeover runtime surface after frame authority is restored",
+                    ),
+                ],
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn authority_guidance(source_signal: &str, summary: &str, next_command_hints: Vec<Value>) -> Value {
+    json!({
+        "surface": "cli_authority_guidance",
+        "truth_level": "operator_projection",
+        "projection_kind": "authority_guidance",
+        "projection_authority": "cli.output.error_guidance",
+        "upstream_commit_truth": "error_context",
+        "control_role": "guidance_only",
+        "durability": "ephemeral",
+        "source_signal": source_signal,
+        "summary": summary,
+        "next_command_hints": next_command_hints,
+    })
+}
+
+fn guidance_command_hint(command: &str, reason: &str) -> Value {
+    json!({
+        "command": command,
+        "reason": reason,
+    })
+}
+
 fn copy_field(source: &Map<String, Value>, dest: &mut Map<String, Value>, key: &str) {
     if let Some(value) = source.get(key) {
         dest.insert(key.to_string(), value.clone());
@@ -269,8 +419,8 @@ fn summarize_observed_effects(
 #[cfg(test)]
 mod tests {
     use super::{
-        InteractionTraceMode, POST_COMMIT_LOCAL_FAILURE_STATE, format_exec_raw_response,
-        format_post_commit_cli_error, format_response,
+        InteractionTraceMode, POST_COMMIT_LOCAL_FAILURE_STATE, format_cli_error,
+        format_exec_raw_response, format_post_commit_cli_error, format_response,
     };
     use rub_core::error::ErrorEnvelope;
     use rub_core::model::Timing;
@@ -783,6 +933,73 @@ mod tests {
         assert_eq!(
             json["data"]["interaction_trace"]["observed_effects"]["custom_projection"]["value"],
             7
+        );
+    }
+
+    #[test]
+    fn format_response_attaches_frame_drift_authority_guidance_to_errors() {
+        let response = IpcResponse {
+            ipc_protocol_version: "1.0".to_string(),
+            command_id: Some("019-frame-drift".to_string()),
+            request_id: "019-request".to_string(),
+            status: ResponseStatus::Error,
+            data: None,
+            error: Some(
+                ErrorEnvelope::new(
+                    rub_core::error::ErrorCode::StaleSnapshot,
+                    "snapshot frame drifted",
+                )
+                .with_context(serde_json::json!({
+                    "snapshot_id": "snap-1",
+                    "authority_state": "selected_frame_context_drifted"
+                })),
+            ),
+            timing: Timing::default(),
+        };
+
+        let output = format_response(
+            &response,
+            "get",
+            "default",
+            rub_home(),
+            false,
+            InteractionTraceMode::Compact,
+        );
+        let json: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(json["success"], false);
+        assert_eq!(
+            json["error"]["context"]["authority_guidance"]["source_signal"],
+            "selected_frame_context_drifted"
+        );
+        assert_eq!(
+            json["error"]["context"]["authority_guidance"]["next_command_hints"][0]["command"],
+            "rub frames"
+        );
+    }
+
+    #[test]
+    fn format_cli_error_attaches_takeover_continuity_guidance() {
+        let output = format_cli_error(
+            "takeover",
+            "default",
+            ErrorEnvelope::new(
+                rub_core::error::ErrorCode::BrowserCrashed,
+                "No active tab remained after takeover transition",
+            )
+            .with_context(serde_json::json!({
+                "reason": "continuity_no_active_tab"
+            })),
+            false,
+        );
+        let json: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(json["success"], false);
+        assert_eq!(
+            json["error"]["context"]["authority_guidance"]["source_signal"],
+            "continuity_no_active_tab"
+        );
+        assert_eq!(
+            json["error"]["context"]["authority_guidance"]["next_command_hints"][0]["command"],
+            "rub tabs"
         );
     }
 

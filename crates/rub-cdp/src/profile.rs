@@ -121,12 +121,17 @@ pub fn list_profiles() -> Result<Vec<ChromeProfile>, RubError> {
 /// Resolve a profile name to its directory path.
 ///
 /// Matching priority:
-/// 1. Exact match on display name (case-insensitive)
-/// 2. Exact match on directory name (case-insensitive)
-/// 3. Prefix match on display name
+/// 1. Unique exact match on display name or directory name (case-insensitive)
+/// 2. Unique prefix match on display name
 pub fn resolve_profile(name: &str) -> Result<ChromeProfile, RubError> {
     let profiles = list_profiles()?;
+    resolve_profile_from_candidates(name, &profiles)
+}
 
+fn resolve_profile_from_candidates(
+    name: &str,
+    profiles: &[ChromeProfile],
+) -> Result<ChromeProfile, RubError> {
     if profiles.is_empty() {
         return Err(RubError::domain(
             ErrorCode::ProfileNotFound,
@@ -134,30 +139,57 @@ pub fn resolve_profile(name: &str) -> Result<ChromeProfile, RubError> {
         ));
     }
 
-    let name_lower = name.to_lowercase();
+    let name_lower = name.trim().to_lowercase();
 
-    // Exact display name match
-    if let Some(p) = profiles
+    // Exact display-name / dir-name match, but fail closed if the exact token
+    // resolves to multiple profiles across the two namespaces.
+    let exact_matches = profiles
         .iter()
-        .find(|p| p.display_name.to_lowercase() == name_lower)
-    {
-        return Ok(p.clone());
+        .filter(|p| {
+            p.display_name.to_lowercase() == name_lower || p.dir_name.to_lowercase() == name_lower
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if exact_matches.len() == 1 {
+        return Ok(exact_matches[0].clone());
+    }
+    if exact_matches.len() > 1 {
+        let candidates = exact_matches
+            .iter()
+            .map(|p| format!("'{}' ({})", p.display_name, p.dir_name))
+            .collect::<Vec<_>>();
+        return Err(RubError::domain(
+            ErrorCode::InvalidInput,
+            format!(
+                "Profile '{}' is ambiguous across display and directory names. Matches: {}",
+                name,
+                candidates.join(", ")
+            ),
+        ));
     }
 
-    // Exact dir name match
-    if let Some(p) = profiles
+    // Unique prefix match on display name
+    let prefix_matches = profiles
         .iter()
-        .find(|p| p.dir_name.to_lowercase() == name_lower)
-    {
-        return Ok(p.clone());
+        .filter(|p| p.display_name.to_lowercase().starts_with(&name_lower))
+        .cloned()
+        .collect::<Vec<_>>();
+    if prefix_matches.len() == 1 {
+        return Ok(prefix_matches[0].clone());
     }
-
-    // Prefix match on display name
-    if let Some(p) = profiles
-        .iter()
-        .find(|p| p.display_name.to_lowercase().starts_with(&name_lower))
-    {
-        return Ok(p.clone());
+    if prefix_matches.len() > 1 {
+        let candidates = prefix_matches
+            .iter()
+            .map(|p| format!("'{}' ({})", p.display_name, p.dir_name))
+            .collect::<Vec<_>>();
+        return Err(RubError::domain(
+            ErrorCode::InvalidInput,
+            format!(
+                "Profile '{}' is ambiguous. Matches: {}",
+                name,
+                candidates.join(", ")
+            ),
+        ));
     }
 
     let available: Vec<String> = profiles
@@ -172,4 +204,76 @@ pub fn resolve_profile(name: &str) -> Result<ChromeProfile, RubError> {
             available.join(", ")
         ),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChromeProfile, resolve_profile_from_candidates};
+    use rub_core::error::ErrorCode;
+    use std::path::PathBuf;
+
+    fn profile(dir_name: &str, display_name: &str) -> ChromeProfile {
+        ChromeProfile {
+            dir_name: dir_name.to_string(),
+            display_name: display_name.to_string(),
+            path: PathBuf::from(format!("/tmp/chrome/{dir_name}")),
+        }
+    }
+
+    #[test]
+    fn resolve_profile_prefers_exact_matches() {
+        let profiles = vec![
+            profile("Profile 1", "Work"),
+            profile("Profile 2", "Work Finance"),
+        ];
+
+        let resolved = resolve_profile_from_candidates("Work", &profiles).unwrap();
+        assert_eq!(resolved.dir_name, "Profile 1");
+
+        let resolved_dir = resolve_profile_from_candidates("profile 2", &profiles).unwrap();
+        assert_eq!(resolved_dir.display_name, "Work Finance");
+    }
+
+    #[test]
+    fn resolve_profile_rejects_ambiguous_prefix_matches() {
+        let profiles = vec![
+            profile("Profile 1", "Work"),
+            profile("Profile 2", "Work Finance"),
+        ];
+
+        let error = resolve_profile_from_candidates("wo", &profiles)
+            .expect_err("ambiguous prefix should fail closed")
+            .into_envelope();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        assert!(error.message.contains("ambiguous"), "{}", error.message);
+        assert!(error.message.contains("Work"), "{}", error.message);
+        assert!(error.message.contains("Work Finance"), "{}", error.message);
+    }
+
+    #[test]
+    fn resolve_profile_accepts_unique_prefix_match() {
+        let profiles = vec![
+            profile("Profile 1", "Personal"),
+            profile("Profile 2", "Work Finance"),
+        ];
+
+        let resolved = resolve_profile_from_candidates("work f", &profiles).unwrap();
+        assert_eq!(resolved.dir_name, "Profile 2");
+    }
+
+    #[test]
+    fn resolve_profile_rejects_exact_cross_namespace_collision() {
+        let profiles = vec![
+            profile("Profile 2", "Personal"),
+            profile("Profile 3", "Profile 2"),
+        ];
+
+        let error = resolve_profile_from_candidates("profile 2", &profiles)
+            .expect_err("cross-namespace exact collision should fail closed")
+            .into_envelope();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        assert!(error.message.contains("ambiguous"), "{}", error.message);
+        assert!(error.message.contains("Profile 2"), "{}", error.message);
+        assert!(error.message.contains("Profile 3"), "{}", error.message);
+    }
 }

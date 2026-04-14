@@ -1,4 +1,5 @@
 mod automation;
+mod binding;
 mod command;
 mod diff;
 mod interaction;
@@ -6,6 +7,7 @@ mod runtime;
 mod session;
 
 pub use automation::*;
+pub use binding::*;
 pub use command::*;
 pub use diff::*;
 pub use interaction::*;

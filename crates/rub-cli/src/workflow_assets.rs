@@ -36,6 +36,7 @@ mod tests {
             cdp_url: None,
             connect: false,
             profile: None,
+            use_alias: None,
             no_stealth: false,
             humanize: false,
             humanize_speed: "normal".to_string(),

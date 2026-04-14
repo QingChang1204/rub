@@ -1,4 +1,7 @@
-use super::{Commands, ExplainSubcommand, InspectSubcommand, render_nested_subcommand_long_help};
+use super::{
+    BindingSubcommand, Commands, ExplainSubcommand, InspectSubcommand, SecretSubcommand,
+    render_nested_subcommand_long_help,
+};
 use crate::commands::Cli;
 use clap::{CommandFactory, Parser};
 
@@ -35,6 +38,20 @@ fn canonical_name_single_sources_public_command_strings() {
         rub_core::command::CommandName::Doctor.as_str()
     );
     assert_eq!(Commands::Sessions.canonical_name(), "sessions");
+    assert_eq!(
+        Commands::Binding {
+            subcommand: BindingSubcommand::List
+        }
+        .canonical_name(),
+        "binding"
+    );
+    assert_eq!(
+        Commands::Secret {
+            subcommand: SecretSubcommand::List
+        }
+        .canonical_name(),
+        "secret"
+    );
     assert_eq!(Commands::InternalDaemon.canonical_name(), "__daemon");
 }
 
@@ -56,6 +73,20 @@ fn local_projection_surface_marks_local_only_variants() {
         Commands::InternalDaemon.local_projection_surface(),
         Some("internal daemon")
     );
+    assert_eq!(
+        Commands::Binding {
+            subcommand: BindingSubcommand::List
+        }
+        .local_projection_surface(),
+        Some("binding")
+    );
+    assert_eq!(
+        Commands::Secret {
+            subcommand: SecretSubcommand::List
+        }
+        .local_projection_surface(),
+        Some("secret")
+    );
     assert_eq!(Commands::Downloads.local_projection_surface(), None);
 }
 
@@ -73,6 +104,11 @@ fn pipe_help_examples_use_command_step_key() {
     assert!(help.contains("{command, args} step objects"), "{help}");
     assert!(!help.contains("\"cmd\":\"open\""), "{help}");
     assert!(!help.contains("`cmd` key"), "{help}");
+    assert!(
+        help.contains("rub secret set RUB_PASSWORD --stdin"),
+        "{help}"
+    );
+    assert!(help.contains("password=$RUB_PASSWORD"), "{help}");
 }
 
 #[test]
@@ -82,6 +118,37 @@ fn exec_help_marks_raw_as_explicit_non_json_surface() {
         help.contains("Print the result directly instead of the standard JSON envelope"),
         "{help}"
     );
+}
+
+#[test]
+fn binding_help_mentions_explicit_auth_input_capture_override() {
+    let help = render_nested_subcommand_long_help("binding", "capture");
+    assert!(help.contains("--auth-input"), "{help}");
+    assert!(
+        help.contains("without synthesizing a new auth-completion fence"),
+        "{help}"
+    );
+}
+
+#[test]
+fn binding_remember_help_mentions_binding_target_and_kind() {
+    let help = render_nested_subcommand_long_help("binding", "remember");
+    assert!(help.contains("--binding"), "{help}");
+    assert!(help.contains("Remembered alias kind"), "{help}");
+}
+
+#[test]
+fn secret_set_help_mentions_supported_input_modes() {
+    let help = render_nested_subcommand_long_help("secret", "set");
+    assert!(help.contains("--value"), "{help}");
+    assert!(help.contains("--from-env"), "{help}");
+    assert!(help.contains("--stdin"), "{help}");
+}
+
+#[test]
+fn secret_inspect_help_mentions_no_value_echo() {
+    let help = render_nested_subcommand_long_help("secret", "inspect");
+    assert!(help.contains("without printing its value"), "{help}");
 }
 
 #[test]
@@ -110,6 +177,8 @@ fn root_help_surfaces_quick_start_and_task_map() {
     assert!(help.contains("Quick start:"), "{help}");
     assert!(help.contains("Task map:"), "{help}");
     assert!(help.contains("rub teardown"), "{help}");
+    assert!(help.contains("--use <USE_ALIAS>"), "{help}");
+    assert!(help.contains("browser-backed command"), "{help}");
 }
 
 #[test]

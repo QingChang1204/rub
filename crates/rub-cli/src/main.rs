@@ -1,5 +1,8 @@
 //! rub — Rust Browser Automation CLI entry point.
 
+mod binding_ctl;
+mod binding_execution_ctl;
+mod binding_memory_ctl;
 mod cleanup_ctl;
 mod commands;
 mod connection_hardening;
@@ -12,6 +15,7 @@ mod internal_daemon;
 mod orchestration_assets;
 mod output;
 mod persisted_artifacts;
+mod secret_ctl;
 mod session_policy;
 mod teardown_ctl;
 mod timeout_budget;
@@ -50,15 +54,45 @@ async fn main() {
         }
     };
     let rub_home = cli.rub_home.clone();
-    let session = session_name.as_str();
     let pretty = cli.json_pretty;
     let timeout = cli.timeout;
+    let session = session_name.as_str();
+
+    if let Some(error) = use_alias_local_surface_error(&cli) {
+        println!(
+            "{}",
+            output::format_cli_error(command_name.as_str(), session, error, pretty,)
+        );
+        std::process::exit(1);
+    }
 
     if matches!(&cli.command, Commands::Sessions) {
         if let Err(error) = handle_sessions(&rub_home, session, pretty) {
             println!(
                 "{}",
                 output::format_cli_error("sessions", session, error.into_envelope(), pretty)
+            );
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if let Commands::Binding { subcommand } = &cli.command {
+        if let Err(error) = binding_ctl::handle_binding_command(&cli, subcommand).await {
+            println!(
+                "{}",
+                output::format_cli_error("binding", session, error.into_envelope(), pretty)
+            );
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if let Commands::Secret { subcommand } = &cli.command {
+        if let Err(error) = secret_ctl::handle_secret_command(&cli, subcommand) {
+            println!(
+                "{}",
+                output::format_cli_error("secret", session, error.into_envelope(), pretty)
             );
             std::process::exit(1);
         }
@@ -116,6 +150,25 @@ async fn main() {
             }
         }
     }
+
+    let binding_execution = match binding_execution_ctl::resolve_command_execution_binding(&cli) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            println!(
+                "{}",
+                output::format_cli_error(
+                    command_name.as_str(),
+                    session,
+                    error.into_envelope(),
+                    pretty,
+                )
+            );
+            std::process::exit(1);
+        }
+    };
+    let binding_execution_projection = binding_execution.projection;
+    let cli = binding_execution.cli;
+    let session = cli.session.as_str();
 
     if let Commands::Explain {
         subcommand: ExplainSubcommand::Extract { .. },
@@ -650,6 +703,12 @@ async fn main() {
                 );
                 std::process::exit(1);
             }
+            if let Some(projection) = binding_execution_projection.as_ref() {
+                binding_execution_ctl::attach_binding_execution_projection(
+                    &mut response.data,
+                    projection,
+                );
+            }
             let output = if exec_raw_requested(&cli.command) {
                 output::format_exec_raw_response(&response, pretty).unwrap_or_else(|| {
                     output::format_response(
@@ -687,6 +746,25 @@ async fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn use_alias_local_surface_error(cli: &EffectiveCli) -> Option<ErrorEnvelope> {
+    let alias = cli.use_alias.as_deref()?;
+    let surface = cli.command.local_projection_surface()?;
+    Some(
+        rub_core::error::RubError::domain_with_context(
+            ErrorCode::InvalidInput,
+            format!(
+                "Remembered alias reuse with --use is only available for browser-backed commands; local-only surface '{surface}' cannot reuse a runtime binding"
+            ),
+            serde_json::json!({
+                "alias": alias,
+                "surface": surface,
+                "reason": "binding_execution_unavailable_for_local_surface",
+            }),
+        )
+        .into_envelope(),
+    )
 }
 
 fn command_timeout_envelope(timeout_ms: u64) -> ErrorEnvelope {
@@ -879,6 +957,10 @@ pub(crate) fn daemon_args(cli: &EffectiveCli, request: &ConnectionRequest) -> Ve
         }
         ConnectionRequest::AutoDiscover => {
             args.push("--connect".to_string());
+        }
+        ConnectionRequest::UserDataDir { path } => {
+            args.push("--user-data-dir".to_string());
+            args.push(path.clone());
         }
         ConnectionRequest::Profile { name, .. } => {
             args.push("--profile".to_string());

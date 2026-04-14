@@ -38,6 +38,9 @@ pub(crate) enum ConnectionRequest {
         url: String,
     },
     AutoDiscover,
+    UserDataDir {
+        path: String,
+    },
     Profile {
         name: String,
         dir_name: String,
@@ -69,6 +72,7 @@ mod tests {
             cdp_url: None,
             connect: false,
             profile: None,
+            use_alias: None,
             no_stealth: false,
             humanize: false,
             humanize_speed: "normal".to_string(),
@@ -291,6 +295,22 @@ mod tests {
         assert!(matches!(request, ConnectionRequest::Profile { .. }));
 
         let _ = std::fs::remove_dir_all(mock_home);
+    }
+
+    #[test]
+    fn parse_connection_request_treats_explicit_user_data_dir_as_connection_request() {
+        let mut cli = cli_with(Commands::Doctor);
+        cli.user_data_dir = Some("./profiles/default".to_string());
+        cli.requested_launch_policy.user_data_dir = Some("./profiles/default".to_string());
+        cli.effective_launch_policy.user_data_dir = Some("./profiles/default".to_string());
+
+        let request = parse_connection_request(&cli).expect("user-data-dir request should parse");
+        match request {
+            ConnectionRequest::UserDataDir { path } => {
+                assert_eq!(path, "./profiles/default");
+            }
+            other => panic!("expected explicit user-data-dir request, got {other:?}"),
+        }
     }
 
     #[test]
@@ -549,6 +569,19 @@ mod tests {
         assert_eq!(
             projection["resolved_path_state"]["path_authority"],
             "cli.session_policy.requested_connection.resolved_path"
+        );
+    }
+
+    #[test]
+    fn requested_connection_projection_marks_explicit_user_data_dir_path_state() {
+        let projection = requested_connection_projection(&ConnectionRequest::UserDataDir {
+            path: "/tmp/profile-root".to_string(),
+        });
+        assert_eq!(projection["source"], "user_data_dir");
+        assert_eq!(projection["path"], "/tmp/profile-root");
+        assert_eq!(
+            projection["path_state"]["path_authority"],
+            "cli.session_policy.requested_connection.path"
         );
     }
 

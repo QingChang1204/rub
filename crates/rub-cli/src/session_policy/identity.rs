@@ -8,6 +8,7 @@ pub(crate) fn requested_user_data_dir(
 ) -> Option<String> {
     match request {
         ConnectionRequest::Profile { user_data_root, .. } => Some(user_data_root.clone()),
+        ConnectionRequest::UserDataDir { path } => Some(normalize_identity_path(path)),
         // Only managed sessions own a local user-data-dir authority. External
         // CDP attachment must not inherit local profile state from config
         // defaults because that would pollute shutdown/profile ownership.
@@ -26,6 +27,9 @@ pub(crate) fn requested_attachment_identity(
         }
         ConnectionRequest::CdpUrl { url } => Some(format!("cdp:{}", normalize_cdp_identity(url))),
         ConnectionRequest::AutoDiscover => Some("auto_discover:local_cdp".to_string()),
+        ConnectionRequest::UserDataDir { path } => {
+            Some(format!("user_data_dir:{}", normalize_identity_path(path)))
+        }
         ConnectionRequest::None => requested_user_data_dir(cli, request)
             .map(|path| format!("user_data_dir:{}", normalize_identity_path(&path))),
     }
@@ -39,6 +43,7 @@ fn request_attachment_kind(request: &ConnectionRequest) -> Option<&'static str> 
     match request {
         ConnectionRequest::None => None,
         ConnectionRequest::CdpUrl { .. } | ConnectionRequest::AutoDiscover => Some("cdp"),
+        ConnectionRequest::UserDataDir { .. } => Some("user_data_dir"),
         ConnectionRequest::Profile { .. } => Some("profile"),
     }
 }
@@ -71,6 +76,10 @@ pub(crate) async fn resolve_attachment_identity(
                 rub_cdp::attachment::canonical_external_browser_identity(&candidate.ws_url).await?
             )))
         }
+        ConnectionRequest::UserDataDir { path } => Ok(Some(format!(
+            "user_data_dir:{}",
+            normalize_identity_path(path)
+        ))),
         ConnectionRequest::None => {
             let effective_path = effective_user_data_dir
                 .map(str::to_string)

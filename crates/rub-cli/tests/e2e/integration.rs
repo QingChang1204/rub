@@ -2823,6 +2823,40 @@ fn t232i_j_network_detail_and_wait_grouped_scenario() {
         network["data"]["subject"]["kind"], "network_request_registry",
         "{network}"
     );
+    assert_eq!(
+        network["data"]["workflow_continuity"]["source_signal"], "network_request_registry",
+        "{network}"
+    );
+    assert_eq!(
+        network["data"]["workflow_continuity"]["runtime_roles"]["current_runtime"]["role"],
+        "observation_runtime",
+        "{network}"
+    );
+    assert_eq!(
+        network["data"]["workflow_continuity"]["next_command_hints"][1]["command"],
+        "rub find --content ...",
+        "{network}"
+    );
+    assert_eq!(
+        network["data"]["workflow_continuity"]["next_command_hints"][2]["command"],
+        "rub extract ...",
+        "{network}"
+    );
+    assert_eq!(
+        network["data"]["workflow_continuity"]["next_command_hints"][3]["command"],
+        "rub inspect list ... --wait-field ... --wait-contains ...",
+        "{network}"
+    );
+    assert_eq!(
+        network["data"]["workflow_continuity"]["next_command_hints"][4]["command"],
+        "rub explain blockers",
+        "{network}"
+    );
+    assert_eq!(
+        network["data"]["workflow_continuity"]["authority_observation"]["evidence_kind"],
+        "mixed_network_registry",
+        "{network}"
+    );
     let requests = network["data"]["result"]["items"].as_array().unwrap();
     assert!(
         requests.iter().any(|request| {
@@ -2882,6 +2916,12 @@ fn t232i_j_network_detail_and_wait_grouped_scenario() {
         1,
         "{filtered}"
     );
+    let missing_id = requests
+        .iter()
+        .find(|request| request["url"].as_str() == Some(server.url_for("/api/missing").as_str()))
+        .and_then(|request| request["request_id"].as_str())
+        .unwrap()
+        .to_string();
 
     let detail = parse_json(
         &session
@@ -2919,6 +2959,39 @@ fn t232i_j_network_detail_and_wait_grouped_scenario() {
         detail["data"]["result"]["request"]["response_body"]["preview"],
         "{\"ok\":true,\"orderId\":42}",
         "{detail}"
+    );
+
+    let read_detail = parse_json(
+        &session
+            .cmd()
+            .args(["inspect", "network", "--id", &missing_id])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(read_detail["success"], true, "{read_detail}");
+    assert_eq!(
+        read_detail["data"]["workflow_continuity"]["source_signal"], "network_request_record",
+        "{read_detail}"
+    );
+    assert_eq!(
+        read_detail["data"]["workflow_continuity"]["runtime_roles"]["current_runtime"]["role"],
+        "content_runtime",
+        "{read_detail}"
+    );
+    assert_eq!(
+        read_detail["data"]["workflow_continuity"]["next_command_hints"][1]["command"],
+        "rub find --content ...",
+        "{read_detail}"
+    );
+    assert_eq!(
+        read_detail["data"]["workflow_continuity"]["next_command_hints"][2]["command"],
+        "rub extract ...",
+        "{read_detail}"
+    );
+    assert_eq!(
+        read_detail["data"]["workflow_continuity"]["authority_observation"]["evidence_kind"],
+        "read_like_network_request",
+        "{read_detail}"
     );
 
     let curl = parse_json(

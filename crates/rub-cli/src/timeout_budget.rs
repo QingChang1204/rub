@@ -381,6 +381,8 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
         Commands::Cleanup => Err(local_only_command_projection_error(&cli.command)),
         Commands::Teardown => Err(local_only_command_projection_error(&cli.command)),
         Commands::Sessions => Err(local_only_command_projection_error(&cli.command)),
+        Commands::Binding { .. } => Err(local_only_command_projection_error(&cli.command)),
+        Commands::Secret { .. } => Err(local_only_command_projection_error(&cli.command)),
         Commands::History {
             last: _,
             from: _,
