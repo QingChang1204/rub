@@ -1,12 +1,46 @@
 use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::dom::BackendNodeId;
-use chromiumoxide::cdp::js_protocol::runtime::{ExecutionContextId, RemoteObjectId};
+use chromiumoxide::cdp::js_protocol::runtime::{
+    EvaluateParams, ExecutionContextId, RemoteObjectId,
+};
 use rub_core::error::RubError;
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::time::Duration;
 
 const OBSERVATION_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+const PAGE_OBSERVATION_SCRIPT: &str = r#"(() => {
+                const normalize = (value) => String(value || '')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                const hash = (value) => {
+                    let h = 2166136261 >>> 0;
+                    for (let i = 0; i < value.length; i++) {
+                        h ^= value.charCodeAt(i);
+                        h = Math.imul(h, 16777619) >>> 0;
+                    }
+                    return h >>> 0;
+                };
+                const root = document.body || document.documentElement;
+                const normalizedText = normalize(
+                    (root && (root.innerText || root.textContent)) || ''
+                );
+                return {
+                    url: location.href,
+                    title: document.title,
+                    element_count: document.querySelectorAll('*').length,
+                    text_hash: hash(normalizedText),
+                    text_length: normalizedText.length,
+                    markup_hash: hash((document.documentElement && document.documentElement.outerHTML) || '')
+                };
+            })()"#;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EditableProjectionKind {
+    Value,
+    Text,
+}
 
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 pub(crate) struct ElementObservation {
@@ -16,6 +50,7 @@ pub(crate) struct ElementObservation {
     pub(crate) selected_text: Option<String>,
     pub(crate) file_names: Option<Vec<String>>,
     pub(crate) text: Option<String>,
+    pub(crate) editable_projection: Option<EditableProjectionKind>,
     pub(crate) disabled: Option<bool>,
     pub(crate) open: Option<bool>,
     pub(crate) aria_expanded: Option<String>,
@@ -109,7 +144,7 @@ pub(crate) async fn capture_active_interaction_baseline_in_context(
         before_active: observe_active_element_in_context(page, context_id)
             .await
             .ok(),
-        before_page: observe_page(page).await,
+        before_page: observe_page_in_context(page, context_id).await,
     }
 }
 
@@ -185,6 +220,25 @@ pub(crate) fn typed_effect_contradicted(
     )
 }
 
+pub(crate) fn observed_editable_content(observed: &ElementObservation) -> Option<String> {
+    match observed.editable_projection {
+        Some(EditableProjectionKind::Value) => observed.value.clone(),
+        Some(EditableProjectionKind::Text) => Some(observed.text.clone().unwrap_or_default()),
+        None => None,
+    }
+}
+
+pub(crate) fn editable_effect_matches_expected(
+    observed: &ElementObservation,
+    expected: &str,
+) -> bool {
+    observed_editable_content(observed).as_deref() == Some(expected)
+}
+
+pub(crate) fn editable_effect_contradicted(observed: &ElementObservation, expected: &str) -> bool {
+    observed_editable_content(observed).is_some_and(|observed| observed != expected)
+}
+
 pub(crate) async fn observe_element(
     page: &Arc<Page>,
     object_id: &RemoteObjectId,
@@ -204,6 +258,18 @@ pub(crate) async fn observe_element(
                         : null,
                     file_names: this.files ? Array.from(this.files).map(file => String(file.name || '')) : null,
                     text: (this.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200) || null,
+                    editable_projection: (() => {
+                        const tag = String(this.tagName || '').toLowerCase();
+                        if (this.isContentEditable) return 'text';
+                        if (tag === 'textarea') return 'value';
+                        const inputType = tag === 'input'
+                            ? String(this.getAttribute('type') || '').toLowerCase()
+                            : '';
+                        const textLikeInput =
+                            tag === 'input'
+                            && !['checkbox', 'radio', 'file', 'submit', 'button', 'reset', 'image', 'color', 'range', 'hidden'].includes(inputType);
+                        return textLikeInput ? 'value' : null;
+                    })(),
                     disabled: typeof this.disabled === 'boolean' ? this.disabled : null,
                     open: typeof this.open === 'boolean' ? this.open : null,
                     aria_expanded: this.getAttribute ? this.getAttribute('aria-expanded') : null,
@@ -307,35 +373,16 @@ pub(crate) fn active_element_changed(
 }
 
 pub(crate) async fn observe_page(page: &Arc<Page>) -> PageObservation {
+    observe_page_in_context(page, None).await
+}
+
+pub(crate) async fn observe_page_in_context(
+    page: &Arc<Page>,
+    context_id: Option<ExecutionContextId>,
+) -> PageObservation {
     let probe_result = tokio::time::timeout(
         OBSERVATION_PROBE_TIMEOUT,
-        page.evaluate(
-            r#"(() => {
-                const normalize = (value) => String(value || '')
-                    .replace(/\s+/g, ' ')
-                    .trim();
-                const hash = (value) => {
-                    let h = 2166136261 >>> 0;
-                    for (let i = 0; i < value.length; i++) {
-                        h ^= value.charCodeAt(i);
-                        h = Math.imul(h, 16777619) >>> 0;
-                    }
-                    return h >>> 0;
-                };
-                const root = document.body || document.documentElement;
-                const normalizedText = normalize(
-                    (root && (root.innerText || root.textContent)) || ''
-                );
-                return {
-                    url: location.href,
-                    title: document.title,
-                    element_count: document.querySelectorAll('*').length,
-                    text_hash: hash(normalizedText),
-                    text_length: normalizedText.length,
-                    markup_hash: hash((document.documentElement && document.documentElement.outerHTML) || '')
-                };
-            })()"#,
-        ),
+        page.evaluate(build_page_observation_params(context_id)),
     )
     .await;
 
@@ -349,6 +396,18 @@ pub(crate) async fn observe_page(page: &Arc<Page>) -> PageObservation {
     };
 
     page_observation_from_probe(probe, context_replaced)
+}
+
+pub(crate) fn build_page_observation_params(
+    context_id: Option<ExecutionContextId>,
+) -> EvaluateParams {
+    let mut builder = EvaluateParams::builder().expression(PAGE_OBSERVATION_SCRIPT.to_string());
+    if let Some(context_id) = context_id {
+        builder = builder.context_id(context_id);
+    }
+    builder
+        .build()
+        .expect("page observation evaluate params should build")
 }
 
 pub(crate) async fn observe_related_page(

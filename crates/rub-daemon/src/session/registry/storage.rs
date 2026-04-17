@@ -20,6 +20,9 @@ pub(super) fn ensure_rub_home(home: &Path) -> std::io::Result<()> {
 }
 
 pub(super) fn read_registry(home: &Path) -> std::io::Result<RegistryData> {
+    if !home.exists() {
+        return Ok(RegistryData::default());
+    }
     with_registry_lock(home, false, |path| load_registry_for_home(home, path))
 }
 

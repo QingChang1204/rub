@@ -28,6 +28,9 @@ pub(crate) struct ReplayCacheEntry {
 pub(crate) struct PostCommitProjection {
     pub(crate) request: rub_ipc::protocol::IpcRequest,
     pub(crate) response: rub_ipc::protocol::IpcResponse,
+    pub(crate) workflow_capture_response: rub_ipc::protocol::IpcResponse,
+    pub(crate) workflow_capture_delivery_state:
+        crate::workflow_capture::WorkflowCaptureDeliveryState,
     pub(crate) approx_bytes: usize,
 }
 
@@ -43,6 +46,7 @@ pub(crate) struct ReplayProtocolState {
     pub(crate) cache: HashMap<String, ReplayCacheEntry>,
     pub(crate) order: VecDeque<String>,
     pub(crate) in_flight: HashMap<String, ReplayInFlightEntry>,
+    pub(crate) spent: HashMap<String, ReplaySpentEntry>,
     pub(crate) total_bytes: usize,
 }
 
@@ -50,6 +54,11 @@ pub(crate) struct ReplayProtocolState {
 pub(crate) struct ReplayInFlightEntry {
     pub(crate) fingerprint: String,
     pub(crate) sender: tokio::sync::watch::Sender<ReplayFenceState>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReplaySpentEntry {
+    pub(crate) fingerprint: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,5 +186,6 @@ pub enum ReplayCommandClaim {
     Owner,
     Cached(Box<rub_ipc::protocol::IpcResponse>),
     Wait(tokio::sync::watch::Receiver<ReplayFenceState>),
+    SpentWithoutCachedResponse,
     Conflict,
 }

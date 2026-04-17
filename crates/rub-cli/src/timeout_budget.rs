@@ -1,15 +1,21 @@
 mod budget;
 pub(crate) mod helpers;
+mod projection_support;
 mod subcommands;
+mod workflow_budget;
 
 use crate::commands::ExplainSubcommand;
 use crate::commands::{Commands, EffectiveCli, ElementAddressArgs};
 use rub_core::error::{ErrorCode, RubError};
 use rub_ipc::protocol::IpcRequest;
-use serde_json::Value;
 
 pub(crate) use self::budget::WAIT_IPC_BUFFER_MS;
-use self::budget::{command_timeout_ms, humanize_budget_ms_for_command_args};
+#[cfg(test)]
+pub(crate) use self::budget::humanize_budget_ms_for_command_args;
+pub(crate) use self::budget::{
+    command_timeout_ms, deadline_from_start, ensure_remaining_budget, remaining_budget_duration,
+    run_with_remaining_budget,
+};
 use self::helpers::{
     WaitProbeArgs, element_address_args, input_path_reference_state, merge_json_objects,
     mutating_request, observation_projection_args, observation_scope_args,
@@ -17,41 +23,19 @@ use self::helpers::{
     resolve_inspect_list_spec_source, resolve_json_spec_source, resolve_pipe_spec,
     wait_command_args, with_wait_after,
 };
+use self::projection_support::{local_only_command_projection_error, resolve_type_text};
 use self::subcommands::{
     build_cookies_request, build_dialog_request, build_download_request, build_get_request,
     build_handoff_request, build_history_request, build_inspect_request, build_intercept_request,
     build_interference_request, build_orchestration_request, build_runtime_request,
     build_storage_request, build_takeover_request, build_trigger_request,
 };
+use self::workflow_budget::{
+    fill_workflow_budget_ms, pipe_workflow_budget_ms, validate_click_projection_inputs,
+    validate_scroll_projection_inputs,
+};
 
 const ATOMIC_FILL_ROLLBACK_RESERVE_MS_PER_STEP: u64 = 1_000;
-
-fn local_only_command_projection_error(command: &Commands) -> RubError {
-    let surface = command
-        .local_projection_surface()
-        .unwrap_or_else(|| command.canonical_name());
-    RubError::domain(
-        ErrorCode::InternalError,
-        format!("{surface} must be handled locally before IPC request projection"),
-    )
-}
-
-fn resolve_type_text<'a>(
-    text: Option<&'a str>,
-    text_flag: Option<&'a str>,
-) -> Result<&'a str, RubError> {
-    match (text, text_flag) {
-        (Some(_), Some(_)) => Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            "type text is ambiguous; provide either positional TEXT or `--text`, not both",
-        )),
-        (Some(text), None) | (None, Some(text)) => Ok(text),
-        (None, None) => Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            "type requires text; provide positional TEXT or `--text`",
-        )),
-    }
-}
 
 pub(crate) fn align_embedded_timeout_authority(request: &mut IpcRequest) {
     let embedded_timeout_ms = match request.command.as_str() {
@@ -697,166 +681,5 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
         Commands::InternalDaemon => Err(local_only_command_projection_error(&cli.command)),
     }
 }
-
-fn validate_click_projection_inputs(
-    index: Option<u32>,
-    target: &ElementAddressArgs,
-    xy: Option<&[f64]>,
-) -> Result<(), RubError> {
-    if xy.is_none() {
-        return Ok(());
-    }
-    let has_locator_target = index.is_some()
-        || target.snapshot.is_some()
-        || target.element_ref.is_some()
-        || target.selector.is_some()
-        || target.target_text.is_some()
-        || target.role.is_some()
-        || target.label.is_some()
-        || target.testid.is_some()
-        || target.first
-        || target.last
-        || target.nth.is_some();
-    if has_locator_target {
-        return Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            "`click --xy` cannot be combined with index, ref, selector, target-text, role, label, testid, snapshot, or match-selection targeting",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_scroll_projection_inputs(direction: &str, y: Option<i32>) -> Result<(), RubError> {
-    if y.is_some() && !direction.eq_ignore_ascii_case("down") {
-        return Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            "`scroll --y` cannot be combined with an explicit direction argument",
-        ));
-    }
-    Ok(())
-}
-
-fn fill_workflow_budget_ms(
-    resolved_spec: &Value,
-    humanize: bool,
-    humanize_speed: &str,
-    has_submit: bool,
-    atomic: bool,
-) -> u64 {
-    let mut extra = rub_core::automation_timeout::fill_workflow_additional_timeout_ms(
-        resolved_spec,
-        has_submit,
-    );
-    let Some(steps) = resolved_spec.as_array() else {
-        return humanize_budget_ms_for_command_args(
-            "click",
-            &serde_json::json!({}),
-            humanize && has_submit,
-            humanize_speed,
-        );
-    };
-
-    for step in steps {
-        if let Some(value) = step.get("value").and_then(Value::as_str) {
-            extra = extra.saturating_add(humanize_budget_ms_for_command_args(
-                "type",
-                &serde_json::json!({ "text": value }),
-                humanize,
-                humanize_speed,
-            ));
-        } else if step
-            .get("activate")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            extra = extra.saturating_add(humanize_budget_ms_for_command_args(
-                "click",
-                &serde_json::json!({}),
-                humanize,
-                humanize_speed,
-            ));
-        }
-    }
-
-    if has_submit {
-        extra = extra.saturating_add(humanize_budget_ms_for_command_args(
-            "click",
-            &serde_json::json!({}),
-            humanize,
-            humanize_speed,
-        ));
-    }
-
-    if atomic {
-        extra = extra.saturating_add(atomic_fill_rollback_budget_ms(resolved_spec));
-    }
-
-    extra
-}
-
-fn atomic_fill_rollback_budget_ms(resolved_spec: &Value) -> u64 {
-    let step_count = resolved_spec
-        .as_array()
-        .map(|steps| steps.len() as u64)
-        .filter(|count| *count > 0)
-        .unwrap_or(1);
-    step_count.saturating_mul(ATOMIC_FILL_ROLLBACK_RESERVE_MS_PER_STEP)
-}
-
-fn pipe_workflow_budget_ms(resolved_spec: &Value, humanize: bool, humanize_speed: &str) -> u64 {
-    let mut extra =
-        rub_core::automation_timeout::pipe_workflow_additional_timeout_ms(resolved_spec);
-    let Some(steps) = resolved_spec
-        .as_array()
-        .or_else(|| resolved_spec.get("steps").and_then(Value::as_array))
-    else {
-        return 0;
-    };
-
-    for step in steps {
-        let command = step
-            .get("command")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let args = step.get("args").unwrap_or(&Value::Null);
-
-        extra = extra.saturating_add(humanize_budget_ms_for_command_args(
-            command,
-            args,
-            humanize,
-            humanize_speed,
-        ));
-        if command == "fill"
-            && let Some(fill_spec) = args.get("spec")
-        {
-            let has_submit = [
-                "submit_index",
-                "submit_selector",
-                "submit_target_text",
-                "submit_ref",
-                "submit_role",
-                "submit_label",
-                "submit_testid",
-            ]
-            .into_iter()
-            .any(|key| args.get(key).is_some_and(|value| !value.is_null()));
-            extra = extra.saturating_add(fill_workflow_budget_ms(
-                fill_spec,
-                humanize,
-                humanize_speed,
-                has_submit,
-                args.get("atomic").and_then(Value::as_bool).unwrap_or(false),
-            ));
-            extra = extra.saturating_sub(
-                rub_core::automation_timeout::fill_workflow_additional_timeout_ms(
-                    fill_spec, has_submit,
-                ),
-            );
-        }
-    }
-
-    extra
-}
-
 #[cfg(test)]
 mod tests;

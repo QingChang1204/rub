@@ -168,6 +168,7 @@ mod tests {
             headless: true,
             ignore_cert_errors: false,
             user_data_dir: None,
+            managed_profile_ephemeral: false,
             download_dir: None,
             profile_directory: None,
             hide_infobars: true,

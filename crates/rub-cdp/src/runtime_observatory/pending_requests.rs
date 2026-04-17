@@ -407,10 +407,11 @@ pub(super) fn unknown_request_method() -> String {
     String::new()
 }
 
-pub(super) fn build_request_record(pending: &PendingRequest) -> NetworkRequestRecord {
-    NetworkRequestRecord {
+pub(super) fn build_request_record(
+    pending: &PendingRequest,
+) -> rub_core::model::ObservedNetworkRequestRecord {
+    rub_core::model::ObservedNetworkRequestRecord {
         request_id: pending.request_id.clone(),
-        sequence: 0,
         lifecycle: pending.lifecycle,
         url: pending.url.clone(),
         method: pending.method.clone(),

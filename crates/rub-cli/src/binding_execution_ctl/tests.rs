@@ -4,6 +4,7 @@ use crate::binding_memory_ctl::remember_binding_alias;
 use crate::commands::{
     Commands, EffectiveCli, RememberedBindingAliasKindArg, RequestedLaunchPolicy,
 };
+use crate::session_policy::ConnectionRequest;
 use rub_core::error::ErrorCode;
 use rub_core::model::{
     BindingAuthInputMode, BindingAuthProvenance, BindingCreatedVia, BindingExecutionMode,
@@ -289,6 +290,15 @@ fn remembered_alias_no_live_match_launches_bound_profile_without_collapsing_to_r
     assert_eq!(resolved.cli.profile.as_deref(), Some("Profile 3"));
     assert!(resolved.cli.user_data_dir.is_none());
     assert!(resolved.cli.requested_launch_policy.user_data_dir.is_none());
+    assert_eq!(
+        resolved.connection_request_override,
+        Some(ConnectionRequest::Profile {
+            name: "Profile 3".to_string(),
+            dir_name: "Profile 3".to_string(),
+            resolved_path: "/tmp/work/Profile 3".to_string(),
+            user_data_root: "/tmp/work".to_string(),
+        })
+    );
     let projection = resolved.projection.expect("projection");
     assert_eq!(projection.mode, BindingExecutionMode::LaunchBoundProfile);
     assert_eq!(
@@ -301,7 +311,7 @@ fn remembered_alias_no_live_match_launches_bound_profile_without_collapsing_to_r
 }
 
 #[test]
-fn remembered_alias_profile_binding_without_profile_dir_fails_closed() {
+fn remembered_alias_profile_binding_reuses_attachment_identity_without_profile_projection() {
     let home = temp_home();
     std::fs::create_dir_all(&home).unwrap();
     write_profile_binding(&home, BindingPersistencePolicy::RubHomeLocalDurable);
@@ -310,13 +320,42 @@ fn remembered_alias_profile_binding_without_profile_dir_fails_closed() {
     registry.bindings[0].profile_directory_reference = None;
     crate::binding_ctl::write_binding_registry(&home, &registry).unwrap();
 
-    let error = resolve_command_execution_binding(&cli(&home))
-        .expect_err("profile binding without reusable profile dir should fail closed")
-        .into_envelope();
-    assert_eq!(error.code, ErrorCode::InvalidInput);
+    let resolved = resolve_command_execution_binding(&cli(&home))
+        .expect("profile binding should reuse attachment identity without projection fallback");
     assert_eq!(
-        error.context.expect("error context")["reason"],
-        "remembered_alias_has_no_reusable_launch_target"
+        resolved.connection_request_override,
+        Some(ConnectionRequest::Profile {
+            name: "Profile 3".to_string(),
+            dir_name: "Profile 3".to_string(),
+            resolved_path: "/tmp/work/Profile 3".to_string(),
+            user_data_root: "/tmp/work".to_string(),
+        })
+    );
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn remembered_alias_profile_binding_reuses_captured_attachment_authority_when_current_field_is_missing()
+ {
+    let home = temp_home();
+    std::fs::create_dir_all(&home).unwrap();
+    write_profile_binding(&home, BindingPersistencePolicy::RubHomeLocalDurable);
+
+    let mut registry = crate::binding_ctl::read_binding_registry(&home).unwrap();
+    registry.bindings[0].attachment_identity = None;
+    crate::binding_ctl::write_binding_registry(&home, &registry).unwrap();
+
+    let resolved = resolve_command_execution_binding(&cli(&home))
+        .expect("profile binding should reuse capture-time profile authority");
+    assert_eq!(
+        resolved.connection_request_override,
+        Some(ConnectionRequest::Profile {
+            name: "Profile 3".to_string(),
+            dir_name: "Profile 3".to_string(),
+            resolved_path: "/tmp/work/Profile 3".to_string(),
+            user_data_root: "/tmp/work".to_string(),
+        })
     );
 
     let _ = std::fs::remove_dir_all(home);

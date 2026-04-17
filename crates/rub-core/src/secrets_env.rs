@@ -1,5 +1,5 @@
 use crate::error::{ErrorCode, RubError};
-use crate::fs::atomic_write_bytes;
+use crate::fs::{FileCommitOutcome, atomic_write_bytes, remove_file_with_sync};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -23,6 +23,30 @@ pub struct SecretReferenceProvenance {
 pub struct SecretReferenceProvenanceProjection {
     pub count: usize,
     pub items: Vec<SecretReferenceProvenance>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretsEnvPersistOutcome {
+    Written(FileCommitOutcome),
+    Removed(FileCommitOutcome),
+    AlreadyAbsent,
+}
+
+impl SecretsEnvPersistOutcome {
+    pub fn durability(self) -> Option<FileCommitOutcome> {
+        match self {
+            Self::Written(outcome) | Self::Removed(outcome) => Some(outcome),
+            Self::AlreadyAbsent => None,
+        }
+    }
+
+    pub fn action(self) -> &'static str {
+        match self {
+            Self::Written(_) => "written",
+            Self::Removed(_) => "removed",
+            Self::AlreadyAbsent => "already_absent",
+        }
+    }
 }
 
 pub fn parse_secret_placeholder(value: &str) -> Option<&str> {
@@ -101,22 +125,24 @@ pub fn render_secrets_env(values: &BTreeMap<String, String>) -> String {
 pub fn write_secrets_env_file(
     path: &Path,
     values: &BTreeMap<String, String>,
-) -> Result<(), RubError> {
+) -> Result<SecretsEnvPersistOutcome, RubError> {
     let content = render_secrets_env(values);
-    atomic_write_bytes(path, content.as_bytes(), 0o600).map_err(|error| {
+    let outcome = atomic_write_bytes(path, content.as_bytes(), 0o600).map_err(|error| {
         RubError::domain_with_context(
             ErrorCode::IoError,
             format!("Failed to write secrets file: {error}"),
             serde_json::json!({ "path": path.display().to_string() }),
         )
     })?;
-    Ok(())
+    Ok(SecretsEnvPersistOutcome::Written(outcome))
 }
 
-pub fn remove_secrets_env_file(path: &Path) -> Result<(), RubError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+pub fn remove_secrets_env_file(path: &Path) -> Result<SecretsEnvPersistOutcome, RubError> {
+    match remove_file_with_sync(path) {
+        Ok(outcome) => Ok(SecretsEnvPersistOutcome::Removed(outcome)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(SecretsEnvPersistOutcome::AlreadyAbsent)
+        }
         Err(error) => Err(RubError::domain_with_context(
             ErrorCode::IoError,
             format!("Failed to remove secrets file: {error}"),
@@ -213,10 +239,11 @@ fn should_emit_quoted_secret_value(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_secure_secrets_permissions, is_valid_secret_name, load_secrets_env_file,
-        parse_secret_placeholder, parse_secrets_env, remove_secrets_env_file, render_secrets_env,
-        write_secrets_env_file,
+        SecretsEnvPersistOutcome, ensure_secure_secrets_permissions, is_valid_secret_name,
+        load_secrets_env_file, parse_secret_placeholder, parse_secrets_env,
+        remove_secrets_env_file, render_secrets_env, write_secrets_env_file,
     };
+    use crate::fs::FileCommitOutcome;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -251,7 +278,11 @@ mod tests {
         values.insert("RUB_B".to_string(), " spaced value ".to_string());
         values.insert("RUB_C".to_string(), "line with \"quotes\"".to_string());
 
-        write_secrets_env_file(&path, &values).expect("write should succeed");
+        let outcome = write_secrets_env_file(&path, &values).expect("write should succeed");
+        assert_eq!(
+            outcome,
+            SecretsEnvPersistOutcome::Written(FileCommitOutcome::Durable)
+        );
         let loaded = load_secrets_env_file(&path).expect("load should succeed");
 
         assert_eq!(loaded, values);
@@ -270,7 +301,10 @@ mod tests {
     #[test]
     fn remove_secrets_env_file_is_idempotent() {
         let path = unique_temp_path("secrets.env");
-        remove_secrets_env_file(&path).expect("missing file removal should succeed");
+        assert_eq!(
+            remove_secrets_env_file(&path).expect("missing file removal should succeed"),
+            SecretsEnvPersistOutcome::AlreadyAbsent
+        );
     }
 
     #[cfg(unix)]

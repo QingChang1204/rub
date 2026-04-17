@@ -18,7 +18,7 @@ use crate::request_correlation::{
     RequestCorrelation, RequestCorrelationRegistry, normalize_header_name,
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct NetworkRuleRuntime {
     rules: Vec<NetworkRule>,
     fetch_enabled_targets: HashSet<String>,

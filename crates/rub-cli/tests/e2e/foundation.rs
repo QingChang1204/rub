@@ -237,6 +237,12 @@ fn t052_065_navigation_state_and_json_contract_grouped_scenario() {
         "request_id should be hyphenated UUID"
     );
     assert!(
+        open_json
+            .get("command_id")
+            .is_none_or(|value| value.is_null() || value.is_string()),
+        "command_id must be omitted/null or a string"
+    );
+    assert!(
         open_json["data"]["result"]["page"]["url"]
             .as_str()
             .unwrap()

@@ -4,18 +4,21 @@ use rub_core::error::{ErrorCode, RubError};
 use rub_core::fs::atomic_write_bytes;
 use serde_json::{Value, json};
 
+use crate::local_asset_paths::LocalAssetPathIdentity;
 use crate::persisted_artifacts::annotate_local_persisted_artifact;
 
 use super::local_workflow_asset_path_state;
 
 pub(super) struct PendingAssetWrite {
     pub(super) path: PathBuf,
+    authority: LocalAssetPathIdentity,
     pub(super) contents: Vec<u8>,
     pub(super) artifact: Value,
 }
 
 struct CommittedAssetWrite {
     path: PathBuf,
+    authority: LocalAssetPathIdentity,
     previous_state: PreviousAssetState,
     committed_contents: Vec<u8>,
 }
@@ -30,19 +33,20 @@ pub(super) fn commit_asset_writes(writes: Vec<PendingAssetWrite>) -> Result<Vec<
     let mut artifacts = Vec::new();
 
     for write in writes {
-        if committed
-            .iter()
-            .any(|existing: &CommittedAssetWrite| existing.path == write.path)
-        {
+        if committed.iter().any(|existing: &CommittedAssetWrite| {
+            existing.authority.conflicts_with(&write.authority)
+        }) {
             return Err(asset_write_error_at_path(
                 format!("Duplicate workflow export path {}", write.path.display()),
                 &write.path,
+                Some(write.authority.authority_path()),
                 "workflow_asset_duplicate_export_path",
                 rollback_asset_writes(&committed).err(),
             ));
         }
 
-        let previous_state = match read_previous_asset_state(&write.path) {
+        let authority_path = write.authority.authority_path();
+        let previous_state = match read_previous_asset_state(authority_path) {
             Ok(state) => state,
             Err(error) => {
                 return Err(asset_write_error_from_source(
@@ -51,15 +55,16 @@ pub(super) fn commit_asset_writes(writes: Vec<PendingAssetWrite>) -> Result<Vec<
                 ));
             }
         };
-        let commit_outcome = match atomic_write_bytes(&write.path, &write.contents, 0o600) {
+        let commit_outcome = match atomic_write_bytes(authority_path, &write.contents, 0o600) {
             Ok(outcome) => outcome,
             Err(error) => {
                 return Err(asset_write_error_at_path(
                     format!(
                         "Failed to write workflow asset {}: {error}",
-                        write.path.display()
+                        authority_path.display()
                     ),
                     &write.path,
+                    Some(authority_path),
                     "workflow_asset_write_failed",
                     rollback_asset_writes(&committed).err(),
                 ));
@@ -74,6 +79,7 @@ pub(super) fn commit_asset_writes(writes: Vec<PendingAssetWrite>) -> Result<Vec<
 
         committed.push(CommittedAssetWrite {
             path: write.path,
+            authority: write.authority,
             previous_state,
             committed_contents: write.contents,
         });
@@ -112,11 +118,12 @@ fn rollback_asset_writes(committed: &[CommittedAssetWrite]) -> Result<(), Vec<St
     for write in committed.iter().rev() {
         let rollback_result = match &write.previous_state {
             PreviousAssetState::Readable(previous) => {
-                atomic_write_bytes(&write.path, previous, 0o600).map(|_| ())
+                atomic_write_bytes(write.authority.authority_path(), previous, 0o600).map(|_| ())
             }
-            PreviousAssetState::Absent => {
-                remove_newly_created_asset_if_matches(&write.path, &write.committed_contents)
-            }
+            PreviousAssetState::Absent => remove_newly_created_asset_if_matches(
+                write.authority.authority_path(),
+                &write.committed_contents,
+            ),
         };
         if let Err(error) = rollback_result {
             rollback_errors.push(format!(
@@ -167,6 +174,7 @@ fn remove_newly_created_asset_if_matches(
 fn asset_write_error_at_path(
     message: String,
     path: &Path,
+    authority_path: Option<&Path>,
     reason: &str,
     rollback_errors: Option<Vec<String>>,
 ) -> RubError {
@@ -181,11 +189,50 @@ fn asset_write_error_at_path(
         ),
         ("reason".to_string(), json!(reason)),
     ]);
+    if let Some(authority_path) = authority_path
+        && authority_path != path
+    {
+        context.insert(
+            "authority_path".to_string(),
+            json!(authority_path.display().to_string()),
+        );
+    }
     if let Some(errors) = rollback_errors {
         context.insert("rollback_failed".to_string(), json!(true));
         context.insert("rollback_errors".to_string(), json!(errors));
     }
     RubError::domain_with_context(ErrorCode::InvalidInput, message, Value::Object(context))
+}
+
+pub(super) fn pending_asset_write(
+    path: PathBuf,
+    contents: Vec<u8>,
+    mut artifact: Value,
+) -> Result<PendingAssetWrite, RubError> {
+    let authority = LocalAssetPathIdentity::resolve(&path).map_err(|error| {
+        asset_write_error_at_path(
+            format!(
+                "Failed to resolve workflow export path {} to a stable local asset authority: {error}",
+                path.display()
+            ),
+            &path,
+            None,
+            "workflow_asset_path_resolution_failed",
+            None,
+        )
+    })?;
+    if let Some(object) = artifact.as_object_mut() {
+        object.insert(
+            "path".to_string(),
+            json!(authority.authority_path().display().to_string()),
+        );
+    }
+    Ok(PendingAssetWrite {
+        path,
+        authority,
+        contents,
+        artifact,
+    })
 }
 
 fn asset_write_error_from_source(

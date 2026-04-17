@@ -1,7 +1,9 @@
 use super::projection::{runtime_projection_state, runtime_surface_payload};
 use super::*;
 use crate::router::request_args::subcommand_arg;
-use crate::runtime_refresh::{refresh_live_runtime_and_interference, refresh_takeover_runtime};
+use crate::runtime_refresh::{
+    InterferenceRefreshIntent, refresh_live_runtime_and_interference, refresh_takeover_runtime,
+};
 use rub_core::model::{
     FrameContextStatus, HumanVerificationHandoffStatus, IntegrationRuntimeStatus,
     IntegrationSurface, ReadinessStatus, TakeoverRuntimeStatus, TakeoverTransitionKind,
@@ -296,15 +298,19 @@ async fn verify_takeover_continuity(
     router: &DaemonRouter,
     state: &Arc<SessionState>,
 ) -> Result<(), RubError> {
-    let tabs = refresh_live_runtime_and_interference(&router.browser, state)
-        .await
-        .map_err(|error| {
-            RubError::domain_with_context(
-                ErrorCode::BrowserCrashed,
-                format!("Takeover continuity fence failed while refreshing runtime: {error}"),
-                serde_json::json!({ "phase": "runtime_refresh" }),
-            )
-        })?;
+    let tabs = refresh_live_runtime_and_interference(
+        &router.browser,
+        state,
+        InterferenceRefreshIntent::ReadOnly,
+    )
+    .await
+    .map_err(|error| {
+        RubError::domain_with_context(
+            ErrorCode::BrowserCrashed,
+            format!("Takeover continuity fence failed while refreshing runtime: {error}"),
+            serde_json::json!({ "phase": "runtime_refresh" }),
+        )
+    })?;
 
     let active_tab = tabs.iter().any(|tab| tab.active);
     let frame_runtime = state.frame_runtime().await;

@@ -45,6 +45,47 @@ mod tests {
     }
 
     #[test]
+    fn command_result_contract_rejects_blank_command_id() {
+        let result = CommandResult::success(
+            "open",
+            "default",
+            "req-123",
+            serde_json::json!({"ok": true}),
+        )
+        .with_command_id("   ");
+        let error = result
+            .contract_error_envelope()
+            .expect("blank command_id should violate stdout contract");
+        assert_eq!(error.code, crate::error::ErrorCode::IpcProtocolError);
+        assert_eq!(
+            error.context.expect("context")["field"],
+            serde_json::json!("command_id")
+        );
+    }
+
+    #[test]
+    fn command_result_contract_rejects_success_with_error() {
+        let mut result = CommandResult::success(
+            "open",
+            "default",
+            "req-123",
+            serde_json::json!({"ok": true}),
+        );
+        result.error = Some(crate::error::ErrorEnvelope::new(
+            crate::error::ErrorCode::InvalidInput,
+            "invalid",
+        ));
+        let error = result
+            .contract_error_envelope()
+            .expect("success with error should violate stdout contract");
+        assert_eq!(error.code, crate::error::ErrorCode::IpcProtocolError);
+        assert_eq!(
+            error.context.expect("context")["status"],
+            serde_json::json!("success")
+        );
+    }
+
+    #[test]
     fn load_strategy_serializes() {
         assert_eq!(
             serde_json::to_string(&LoadStrategy::DomContentLoaded).unwrap(),

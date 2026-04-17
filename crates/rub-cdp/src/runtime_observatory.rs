@@ -14,7 +14,7 @@ use chromiumoxide::cdp::js_protocol::runtime::{
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{
     ConsoleErrorEvent, NetworkBodyPreview, NetworkFailureEvent, NetworkRequestLifecycle,
-    NetworkRequestRecord, PageErrorEvent, RequestSummaryEvent,
+    ObservedNetworkRequestRecord, PageErrorEvent, RequestSummaryEvent,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -41,10 +41,71 @@ type ConsoleCallback = Arc<dyn Fn(ConsoleErrorEvent) + Send + Sync>;
 type PageErrorCallback = Arc<dyn Fn(PageErrorEvent) + Send + Sync>;
 type NetworkFailureCallback = Arc<dyn Fn(NetworkFailureEvent) + Send + Sync>;
 type RequestSummaryCallback = Arc<dyn Fn(RequestSummaryEvent) + Send + Sync>;
-type RequestRecordCallback = Arc<dyn Fn(NetworkRequestRecord) + Send + Sync>;
+type RequestRecordCallback = Arc<dyn Fn(ObservedNetworkRequestRecord) + Send + Sync>;
 type ObservatoryDegradedCallback = Arc<dyn Fn(String) + Send + Sync>;
 
 const PENDING_REQUEST_RETENTION_LIMIT: usize = 1_024;
+
+async fn peek_request_correlation_with_degraded(
+    request_correlation: &Arc<Mutex<RequestCorrelationRegistry>>,
+    request_id: &str,
+    url: &str,
+    method: &str,
+    request_headers: Option<&BTreeMap<String, String>>,
+    tab_target_id: Option<&str>,
+    on_runtime_degraded: &Option<ObservatoryDegradedCallback>,
+) -> Option<RequestCorrelation> {
+    let (correlation, degraded_reasons) = {
+        let mut request_correlation = request_correlation.lock().await;
+        let correlation = request_correlation.peek_for_request(
+            request_id,
+            url,
+            method,
+            request_headers,
+            tab_target_id,
+        );
+        let degraded_reasons = request_correlation.take_degraded_reasons();
+        (correlation, degraded_reasons)
+    };
+    notify_request_correlation_degraded(degraded_reasons, on_runtime_degraded);
+    correlation
+}
+
+async fn take_request_correlation_with_degraded(
+    request_correlation: &Arc<Mutex<RequestCorrelationRegistry>>,
+    request_id: &str,
+    url: &str,
+    method: &str,
+    request_headers: Option<&BTreeMap<String, String>>,
+    tab_target_id: Option<&str>,
+    on_runtime_degraded: &Option<ObservatoryDegradedCallback>,
+) -> Option<RequestCorrelation> {
+    let (correlation, degraded_reasons) = {
+        let mut request_correlation = request_correlation.lock().await;
+        let correlation = request_correlation.take_for_request(
+            request_id,
+            url,
+            method,
+            request_headers,
+            tab_target_id,
+        );
+        let degraded_reasons = request_correlation.take_degraded_reasons();
+        (correlation, degraded_reasons)
+    };
+    notify_request_correlation_degraded(degraded_reasons, on_runtime_degraded);
+    correlation
+}
+
+fn notify_request_correlation_degraded(
+    degraded_reasons: Vec<&'static str>,
+    on_runtime_degraded: &Option<ObservatoryDegradedCallback>,
+) {
+    if let Some(callback) = on_runtime_degraded {
+        for reason in degraded_reasons {
+            callback(reason.to_string());
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct ObservatoryCallbacks {
@@ -157,13 +218,16 @@ pub(crate) async fn ensure_page_observatory(
             {
                 let request_id = event.request_id.as_ref().to_string();
                 let request_headers = headers_to_map(&event.request.headers);
-                let correlation = request_correlation.lock().await.peek_for_request(
+                let correlation = peek_request_correlation_with_degraded(
+                    &request_correlation,
                     &request_id,
                     &event.request.url,
                     event.request.method.as_str(),
                     Some(&request_headers),
                     Some(&tab_target_id),
-                );
+                    &on_runtime_degraded,
+                )
+                .await;
                 let pending = PendingRequest {
                     request_id: request_id.clone(),
                     lifecycle: NetworkRequestLifecycle::Pending,
@@ -229,21 +293,27 @@ pub(crate) async fn ensure_page_observatory(
             {
                 let request_id = event.request_id.as_ref().to_string();
                 let correlation = if on_request_record.is_some() {
-                    request_correlation.lock().await.peek_for_request(
+                    peek_request_correlation_with_degraded(
+                        &request_correlation,
                         &request_id,
                         &event.response.url,
                         &unknown_request_method(),
                         None,
                         Some(&tab_target_id),
+                        &on_runtime_degraded,
                     )
+                    .await
                 } else {
-                    request_correlation.lock().await.take_for_request(
+                    take_request_correlation_with_degraded(
+                        &request_correlation,
                         &request_id,
                         &event.response.url,
                         &unknown_request_method(),
                         None,
                         Some(&tab_target_id),
+                        &on_runtime_degraded,
                     )
+                    .await
                 };
                 let current = {
                     let mut pending_registry = pending_registry.lock().await;
@@ -290,6 +360,7 @@ pub(crate) async fn ensure_page_observatory(
         let pending_registry = pending_registry.clone();
         let page = page.clone();
         let request_correlation = request_correlation.clone();
+        let on_runtime_degraded = callbacks.on_runtime_degraded.clone();
         let tab_target_id = tab_target_id.clone();
         let generation_rx = listener_generation_rx.clone();
         tokio::spawn(async move {
@@ -314,13 +385,16 @@ pub(crate) async fn ensure_page_observatory(
                         &tab_target_id,
                     )
                 });
-                let correlation = request_correlation.lock().await.take_for_request(
+                let correlation = take_request_correlation_with_degraded(
+                    &request_correlation,
                     &request_id,
                     terminal_correlation_lookup_url(Some(&pending), terminal_identity.as_ref()),
                     terminal_correlation_lookup_method(Some(&pending), terminal_identity.as_ref()),
                     terminal_correlation_lookup_headers(Some(&pending), terminal_identity.as_ref()),
                     Some(&tab_target_id),
-                );
+                    &on_runtime_degraded,
+                )
+                .await;
                 apply_terminal_correlation(
                     &mut pending,
                     &request_id,
@@ -356,6 +430,7 @@ pub(crate) async fn ensure_page_observatory(
         let pending_registry = pending_registry.clone();
         let request_correlation = request_correlation.clone();
         let on_request_record = callbacks.on_request_record.clone();
+        let on_runtime_degraded = callbacks.on_runtime_degraded.clone();
         let tab_target_id = tab_target_id.clone();
         let generation_rx = listener_generation_rx.clone();
         tokio::spawn(async move {
@@ -371,7 +446,8 @@ pub(crate) async fn ensure_page_observatory(
                     .lock()
                     .await
                     .take_terminal_state(&request_id);
-                let correlation = request_correlation.lock().await.take_for_request(
+                let correlation = take_request_correlation_with_degraded(
+                    &request_correlation,
                     &request_id,
                     terminal_correlation_lookup_url(pending.as_ref(), terminal_identity.as_ref()),
                     terminal_correlation_lookup_method(
@@ -383,7 +459,9 @@ pub(crate) async fn ensure_page_observatory(
                         terminal_identity.as_ref(),
                     ),
                     Some(&tab_target_id),
-                );
+                    &on_runtime_degraded,
+                )
+                .await;
                 let fallback = pending_request_from_terminal(
                     &request_id,
                     NetworkRequestLifecycle::Failed,
@@ -416,10 +494,7 @@ pub(crate) async fn ensure_page_observatory(
                     callback(NetworkFailureEvent {
                         request_id: request_id.clone(),
                         url: current_url.clone(),
-                        method: pending
-                            .as_ref()
-                            .map(|request| request.method.clone())
-                            .unwrap_or_else(unknown_request_method),
+                        method: terminal_failure_method(pending.as_ref(), &fallback),
                         error_text: event.error_text.clone(),
                         original_url: original_url.clone(),
                         rewritten_url: rewritten_url.clone(),
@@ -431,10 +506,7 @@ pub(crate) async fn ensure_page_observatory(
                         request_id: request_id.clone(),
                         lifecycle: NetworkRequestLifecycle::Failed,
                         url: current_url,
-                        method: pending
-                            .as_ref()
-                            .map(|request| request.method.clone())
-                            .unwrap_or_else(|| fallback.method.clone()),
+                        method: terminal_failure_method(pending.as_ref(), &fallback),
                         tab_target_id: pending
                             .as_ref()
                             .and_then(|request| request.tab_target_id.clone())
@@ -532,4 +604,11 @@ fn exception_message(event: &EventExceptionThrown) -> String {
         .as_ref()
         .and_then(|exception| exception.description.clone())
         .unwrap_or_else(|| event.exception_details.text.clone())
+}
+
+fn terminal_failure_method(pending: Option<&PendingRequest>, fallback: &PendingRequest) -> String {
+    pending
+        .as_ref()
+        .map(|request| request.method.clone())
+        .unwrap_or_else(|| fallback.method.clone())
 }

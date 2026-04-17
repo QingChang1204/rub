@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use super::*;
+use rub_core::model::ObservedNetworkRequestRecord;
 
 struct ObservatoryDropCounts {
     total: u64,
@@ -135,8 +136,21 @@ impl SessionState {
     }
 
     /// Upsert a detailed request lifecycle record into the network inspection registry.
+    #[cfg(test)]
     pub async fn upsert_network_request_record(&self, record: NetworkRequestRecord) {
         self.observatory.write().await.upsert_request_record(record);
+        self.network_request_notify.notify_waiters();
+    }
+
+    /// Upsert a pre-authority request observation and let the observatory assign sequence truth.
+    pub async fn upsert_observed_network_request_record(
+        &self,
+        record: ObservedNetworkRequestRecord,
+    ) {
+        self.observatory
+            .write()
+            .await
+            .upsert_observed_request_record(record);
         self.network_request_notify.notify_waiters();
     }
 

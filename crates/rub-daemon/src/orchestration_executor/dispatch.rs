@@ -15,7 +15,10 @@ use super::action_request::{
     orchestration_step_command_id,
 };
 use super::protocol::align_orchestration_timeout_authority;
-use super::retry::{orchestration_retry_policy, run_with_orchestration_retry};
+use super::retry::{
+    OrchestrationRetryFailure, OrchestrationRetryPolicy, orchestration_retry_policy,
+    run_with_orchestration_retry,
+};
 use super::target::dispatch_action_to_target_session;
 use super::*;
 
@@ -33,17 +36,34 @@ pub(super) async fn dispatch_orchestration_action(
                 attempts: 1,
             }
         })?;
-    let command_id = orchestration_step_command_id(context.rule, context.execution_id, step_index);
-    let (result, attempts) =
-        run_with_orchestration_retry(orchestration_retry_policy(context.rule), || async {
-            let request = build_dispatchable_orchestration_action_request(
+    let command_id = orchestration_step_command_id(
+        context.rule,
+        context.command_identity_key,
+        context.execution_id,
+        step_index,
+    );
+    let retry_policy = orchestration_retry_policy(context.rule);
+    let (frozen_request, materialization_attempts) =
+        run_with_orchestration_retry(retry_policy, || async {
+            build_dispatchable_orchestration_action_request(
                 context,
                 session,
                 action,
                 step_index,
                 &command_id,
             )
-            .await?;
+            .await
+        })
+        .await
+        .map_err(|failure| OrchestrationActionFailure {
+            action: Some(action_info.clone()),
+            error: failure.error,
+            attempts: failure.attempts,
+        })?;
+    let (result, attempts) = run_with_frozen_orchestration_request_retry(
+        retry_policy,
+        frozen_request,
+        |request| async move {
             let command = request.command.clone();
             let response = dispatch_action_to_target_session(
                 context.router,
@@ -55,13 +75,14 @@ pub(super) async fn dispatch_orchestration_action(
             .await?;
             ensure_committed_automation_result(&command, response.data.as_ref())?;
             Ok(response.data)
-        })
-        .await
-        .map_err(|failure| OrchestrationActionFailure {
-            action: Some(action_info.clone()),
-            error: failure.error,
-            attempts: failure.attempts,
-        })?;
+        },
+    )
+    .await
+    .map_err(|failure| OrchestrationActionFailure {
+        action: Some(action_info.clone()),
+        error: failure.error,
+        attempts: total_orchestration_attempts(materialization_attempts, failure.attempts),
+    })?;
 
     Ok(OrchestrationStepResultInfo {
         step_index,
@@ -71,7 +92,7 @@ pub(super) async fn dispatch_orchestration_action(
             step_index + 1,
             orchestration_action_label(&action_info)
         ),
-        attempts,
+        attempts: total_orchestration_attempts(materialization_attempts, attempts),
         action: Some(action_info),
         result,
         error_code: None,
@@ -93,6 +114,28 @@ async fn build_dispatchable_orchestration_action_request(
         build_orchestration_action_request(context, action, step_index, command_id).await?;
     trim_action_request_timeout_after_pre_dispatch(&mut request, step_started_at, step_index)?;
     Ok(request)
+}
+
+async fn run_with_frozen_orchestration_request_retry<T, F, Fut>(
+    policy: OrchestrationRetryPolicy,
+    request: IpcRequest,
+    mut operation: F,
+) -> Result<(T, u32), OrchestrationRetryFailure>
+where
+    F: FnMut(IpcRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<T, ErrorEnvelope>>,
+{
+    run_with_orchestration_retry(policy, || {
+        let request = request.clone();
+        operation(request)
+    })
+    .await
+}
+
+fn total_orchestration_attempts(materialization_attempts: u32, dispatch_attempts: u32) -> u32 {
+    materialization_attempts
+        .saturating_add(dispatch_attempts)
+        .saturating_sub(1)
 }
 
 async fn reserve_source_materialization_authority<'a>(
@@ -205,9 +248,16 @@ pub(super) fn action_requires_source_materialization(action: &TriggerActionSpec)
 
 #[cfg(test)]
 mod tests {
-    use super::trim_action_request_timeout_after_pre_dispatch;
-    use rub_core::error::ErrorCode;
+    use super::{
+        OrchestrationRetryPolicy, run_with_frozen_orchestration_request_retry,
+        total_orchestration_attempts, trim_action_request_timeout_after_pre_dispatch,
+    };
+    use rub_core::error::{ErrorCode, ErrorEnvelope};
     use rub_ipc::protocol::IpcRequest;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Mutex;
 
     #[test]
     fn trim_action_request_timeout_after_pre_dispatch_projects_remaining_budget() {
@@ -249,5 +299,65 @@ mod tests {
                 .is_some_and(|elapsed| elapsed >= 50),
             "elapsed pre-dispatch budget should record the consumed wait time"
         );
+    }
+
+    #[tokio::test]
+    async fn frozen_orchestration_request_retry_reuses_same_payload_and_command_id() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let request = IpcRequest::new("pipe", serde_json::json!({ "value": "frozen" }), 500)
+            .with_command_id("step-cmd")
+            .expect("command id should validate");
+
+        let (request, attempts_used) = run_with_frozen_orchestration_request_retry(
+            OrchestrationRetryPolicy {
+                max_retries: 1,
+                delay: Duration::from_millis(0),
+            },
+            request,
+            {
+                let attempts = attempts.clone();
+                let seen_requests = seen_requests.clone();
+                move |mut request| {
+                    let attempts = attempts.clone();
+                    let seen_requests = seen_requests.clone();
+                    async move {
+                        seen_requests.lock().await.push(request.clone());
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            request.args["value"] = serde_json::json!("mutated");
+                            return Err(ErrorEnvelope::new(
+                                ErrorCode::IpcProtocolError,
+                                "transient dispatch failure",
+                            )
+                            .with_context(serde_json::json!({
+                                "reason": "orchestration_target_dispatch_transport_failed",
+                            })));
+                        }
+                        Ok(request)
+                    }
+                }
+            },
+        )
+        .await
+        .expect("second retry attempt should succeed with the frozen request");
+
+        assert_eq!(attempts_used, 2);
+        assert_eq!(request.command_id.as_deref(), Some("step-cmd"));
+        assert_eq!(request.args["value"], "frozen");
+
+        let seen_requests = seen_requests.lock().await;
+        assert_eq!(seen_requests.len(), 2);
+        assert_eq!(seen_requests[0].command_id.as_deref(), Some("step-cmd"));
+        assert_eq!(seen_requests[1].command_id.as_deref(), Some("step-cmd"));
+        assert_eq!(seen_requests[0].args["value"], "frozen");
+        assert_eq!(seen_requests[1].args["value"], "frozen");
+    }
+
+    #[test]
+    fn total_orchestration_attempts_merges_materialization_and_dispatch_retries() {
+        assert_eq!(total_orchestration_attempts(1, 1), 1);
+        assert_eq!(total_orchestration_attempts(2, 1), 2);
+        assert_eq!(total_orchestration_attempts(1, 3), 3);
+        assert_eq!(total_orchestration_attempts(2, 2), 3);
     }
 }

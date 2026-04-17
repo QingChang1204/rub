@@ -1,7 +1,10 @@
 use crate::commands::{EffectiveCli, RequestedLaunchPolicy};
 use crate::daemon_ctl;
+use crate::main_support::command_timeout_error;
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{ConnectionTarget, LaunchPolicyInfo};
+use rub_ipc::client::IpcClient;
+use std::time::Instant;
 
 use super::ConnectionRequest;
 use super::identity::{
@@ -10,30 +13,53 @@ use super::identity::{
 };
 use super::projection::{requested_connection_projection, requested_session_policy_projection};
 
+#[derive(Debug, Clone)]
+struct ExistingSessionAuthority {
+    daemon_session_id: String,
+    launch_policy: LaunchPolicyInfo,
+    attachment_identity: Option<String>,
+}
+
+#[cfg(test)]
 pub(crate) async fn validate_existing_session_connection_request(
     cli: &EffectiveCli,
     request: &ConnectionRequest,
+    client: &mut IpcClient,
+    expected_daemon_session_id: Option<&str>,
+) -> Result<(), rub_core::error::RubError> {
+    validate_existing_session_connection_request_with_deadline(
+        cli,
+        request,
+        client,
+        expected_daemon_session_id,
+        None,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn validate_existing_session_connection_request_with_deadline(
+    cli: &EffectiveCli,
+    request: &ConnectionRequest,
+    client: &mut IpcClient,
+    expected_daemon_session_id: Option<&str>,
+    deadline: Option<Instant>,
+    timeout_ms: Option<u64>,
 ) -> Result<(), rub_core::error::RubError> {
     if !requires_existing_session_validation(true, request, cli) {
         return Ok(());
     }
 
-    let launch_policy =
-        daemon_ctl::fetch_launch_policy_for_session(&cli.rub_home, &cli.session).await?;
-    let current_attachment_identity =
-        rub_daemon::session::authoritative_entry_by_session_name(&cli.rub_home, &cli.session)
-            .map_err(|error| {
-                RubError::domain(
-                    ErrorCode::InternalError,
-                    format!(
-                        "Failed to read current session authority for '{}': {error}",
-                        cli.session
-                    ),
-                )
-            })?
-            .and_then(|entry| entry.attachment_identity);
+    let authority = fetch_existing_session_authority(
+        client,
+        expected_daemon_session_id,
+        &cli.session,
+        deadline,
+        timeout_ms,
+    )
+    .await?;
     let requested_attachment_identity = if request_needs_live_attachment_resolution(
-        current_attachment_identity.as_deref(),
+        authority.attachment_identity.as_deref(),
         request,
     ) {
         resolve_attachment_identity(cli, request, None).await?
@@ -41,11 +67,11 @@ pub(crate) async fn validate_existing_session_connection_request(
         requested_attachment_identity(cli, request)
     };
     if attachment_identity_matches_request(
-        &current_attachment_identity,
+        &authority.attachment_identity,
         requested_attachment_identity.as_deref(),
-        launch_policy.connection_target.as_ref(),
+        authority.launch_policy.connection_target.as_ref(),
         request,
-    ) && launch_policy_matches_session_policy(&launch_policy, request, cli)
+    ) && launch_policy_matches_session_policy(&authority.launch_policy, request, cli)
     {
         return Ok(());
     }
@@ -58,12 +84,59 @@ pub(crate) async fn validate_existing_session_connection_request(
         ),
         serde_json::json!({
             "requested_attachment_identity": requested_attachment_identity,
-            "current_attachment_identity": current_attachment_identity,
+            "current_attachment_identity": authority.attachment_identity,
             "requested_connection": requested_connection_projection(request),
             "requested_session_policy": requested_session_policy_projection(request, cli),
-            "current_launch_policy": launch_policy,
+            "current_launch_policy": authority.launch_policy,
+            "daemon_session_id": authority.daemon_session_id,
         }),
     ))
+}
+
+async fn fetch_existing_session_authority(
+    client: &mut IpcClient,
+    expected_daemon_session_id: Option<&str>,
+    session_name: &str,
+    deadline: Option<Instant>,
+    timeout_ms: Option<u64>,
+) -> Result<ExistingSessionAuthority, RubError> {
+    let handshake_timeout_ms = match (deadline, timeout_ms) {
+        (Some(deadline), Some(timeout_ms)) => {
+            let remaining = daemon_ctl::remaining_budget_ms(deadline);
+            if remaining == 0 {
+                return Err(command_timeout_error(
+                    timeout_ms,
+                    "existing_session_validation",
+                ));
+            }
+            remaining.max(1)
+        }
+        _ => 3_000,
+    };
+    let handshake =
+        daemon_ctl::fetch_handshake_info_with_timeout(client, handshake_timeout_ms).await?;
+    if let Some(expected) = expected_daemon_session_id
+        && handshake.daemon_session_id != expected
+    {
+        return Err(RubError::domain_with_context(
+            ErrorCode::IpcProtocolError,
+            format!(
+                "Existing-session validation for '{}' bound to daemon '{}' but handshake returned '{}'",
+                session_name, expected, handshake.daemon_session_id
+            ),
+            serde_json::json!({
+                "reason": "existing_session_validation_authority_mismatch",
+                "expected_daemon_session_id": expected,
+                "handshake_daemon_session_id": handshake.daemon_session_id,
+            }),
+        ));
+    }
+
+    Ok(ExistingSessionAuthority {
+        daemon_session_id: handshake.daemon_session_id,
+        launch_policy: handshake.launch_policy,
+        attachment_identity: handshake.attachment_identity,
+    })
 }
 
 pub(crate) fn requires_existing_session_validation(
@@ -133,4 +206,188 @@ pub(crate) fn compatibility_launch_policy(
         requested.humanize_speed = None;
     }
     requested
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::{Commands, RequestedLaunchPolicy};
+    use rub_ipc::client::IpcClient;
+    use rub_ipc::protocol::{IpcRequest, IpcResponse};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use tokio::net::UnixListener;
+
+    fn temp_home() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("rsv-{nonce:x}"))
+    }
+
+    fn cli_with(command: Commands, home: &std::path::Path) -> EffectiveCli {
+        EffectiveCli {
+            session: "default".to_string(),
+            session_id: None,
+            rub_home: home.to_path_buf(),
+            timeout: 30_000,
+            headed: false,
+            ignore_cert_errors: false,
+            user_data_dir: None,
+            hide_infobars: true,
+            json_pretty: false,
+            verbose: false,
+            trace: false,
+            command,
+            cdp_url: None,
+            connect: false,
+            profile: None,
+            use_alias: None,
+            no_stealth: false,
+            humanize: false,
+            humanize_speed: "normal".to_string(),
+            requested_launch_policy: RequestedLaunchPolicy::default(),
+            effective_launch_policy: RequestedLaunchPolicy::default(),
+        }
+    }
+
+    fn spawn_handshake_server(
+        socket_path: &std::path::Path,
+        daemon_session_id: &str,
+        attachment_identity: Option<&str>,
+    ) -> tokio::task::JoinHandle<()> {
+        let _ = std::fs::remove_file(socket_path);
+        let listener = UnixListener::bind(socket_path).expect("bind handshake socket");
+        let daemon_session_id = daemon_session_id.to_string();
+        let attachment_identity = attachment_identity.map(str::to_string);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept handshake client");
+            let std_stream: StdUnixStream =
+                stream.into_std().expect("convert tokio unix stream to std");
+            let mut reader =
+                BufReader::new(std_stream.try_clone().expect("clone handshake stream"));
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read handshake request");
+            let request: IpcRequest =
+                serde_json::from_str(line.trim_end()).expect("decode handshake request");
+            assert_eq!(request.command, "_handshake");
+
+            let mut writer = std_stream;
+            let response = IpcResponse::success(
+                "req-1",
+                serde_json::json!({
+                    "daemon_session_id": daemon_session_id,
+                    "launch_policy": {
+                        "headless": true,
+                        "ignore_cert_errors": false,
+                        "hide_infobars": true,
+                        "user_data_dir": "/tmp/live",
+                        "connection_target": null,
+                        "stealth_level": "L1",
+                        "stealth_patches": [],
+                        "stealth_default_enabled": true,
+                        "humanize_enabled": false,
+                        "humanize_speed": "normal",
+                        "stealth_coverage": null,
+                    },
+                    "attachment_identity": attachment_identity,
+                }),
+            );
+            serde_json::to_writer(&mut writer, &response).expect("encode handshake response");
+            writer.write_all(b"\n").expect("newline handshake response");
+        })
+    }
+
+    #[tokio::test]
+    async fn existing_session_validation_prefers_bound_daemon_authority_over_local_snapshot() {
+        let home = temp_home();
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let socket_path = home.join("v.sock");
+        let server = spawn_handshake_server(
+            &socket_path,
+            "sess-live",
+            Some("profile:/tmp/live/Profile 1"),
+        );
+
+        let mut cli = cli_with(Commands::Doctor, &home);
+        cli.profile = Some("Profile 1".to_string());
+        let request = ConnectionRequest::Profile {
+            name: "Profile 1".to_string(),
+            dir_name: "Profile 1".to_string(),
+            resolved_path: "/tmp/live/Profile 1".to_string(),
+            user_data_root: "/tmp/live".to_string(),
+        };
+
+        let client = IpcClient::connect(&socket_path)
+            .await
+            .expect("connect validation client");
+        let mut client = client
+            .bind_daemon_session_id("sess-live")
+            .expect("bind daemon session authority");
+
+        validate_existing_session_connection_request(
+            &cli,
+            &request,
+            &mut client,
+            Some("sess-live"),
+        )
+        .await
+        .expect("live daemon authority should validate request");
+
+        server.await.expect("join handshake server");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn existing_session_validation_uses_remaining_command_budget_for_handshake() {
+        let home = temp_home();
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let socket_path = home.join("v.sock");
+        let server = spawn_handshake_server(
+            &socket_path,
+            "sess-live",
+            Some("profile:/tmp/live/Profile 1"),
+        );
+
+        let mut cli = cli_with(Commands::Doctor, &home);
+        cli.profile = Some("Profile 1".to_string());
+        let request = ConnectionRequest::Profile {
+            name: "Profile 1".to_string(),
+            dir_name: "Profile 1".to_string(),
+            resolved_path: "/tmp/live/Profile 1".to_string(),
+            user_data_root: "/tmp/live".to_string(),
+        };
+
+        let mut client = IpcClient::connect(&socket_path)
+            .await
+            .expect("connect validation client");
+
+        let error = validate_existing_session_connection_request_with_deadline(
+            &cli,
+            &request,
+            &mut client,
+            Some("sess-live"),
+            Some(Instant::now() - Duration::from_millis(1)),
+            Some(1_500),
+        )
+        .await
+        .expect_err("expired command budget should fail before handshake send");
+
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::IpcTimeout);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|value| value.get("phase"))
+                .and_then(|value| value.as_str()),
+            Some("existing_session_validation")
+        );
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

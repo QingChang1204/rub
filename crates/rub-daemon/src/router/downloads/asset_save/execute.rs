@@ -106,10 +106,11 @@ pub(super) async fn save_one(
             bytes_written = bytes_written.saturating_add(chunk.len() as u64);
         }
         file.flush().await.map_err(|error| error.to_string())?;
-        drop(file);
+        let tmp_file = file.into_std().await;
         Ok(SaveOneOutcome::Prepared {
             output_path,
             tmp_path,
+            tmp_file,
             bytes_written,
         })
     };
@@ -118,6 +119,7 @@ pub(super) async fn save_one(
         Ok(Ok(SaveOneOutcome::Prepared {
             output_path,
             tmp_path,
+            tmp_file,
             bytes_written,
         })) => {
             if context
@@ -136,11 +138,12 @@ pub(super) async fn save_one(
             match tokio::task::spawn_blocking({
                 let tmp_path = tmp_path.clone();
                 let output_path = output_path.clone();
+                let tmp_file = tmp_file;
                 move || {
                     if context.overwrite {
-                        commit_temporary_file(&tmp_path, &output_path)
+                        commit_temporary_file(&tmp_file, &tmp_path, &output_path)
                     } else {
-                        commit_temporary_file_no_clobber(&tmp_path, &output_path)
+                        commit_temporary_file_no_clobber(&tmp_file, &tmp_path, &output_path)
                     }
                 }
             })
@@ -268,6 +271,7 @@ enum SaveOneOutcome {
     Prepared {
         output_path: PathBuf,
         tmp_path: PathBuf,
+        tmp_file: std::fs::File,
         bytes_written: u64,
     },
     SkippedExisting {

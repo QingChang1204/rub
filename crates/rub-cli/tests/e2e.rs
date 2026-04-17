@@ -1,8 +1,11 @@
 //! End-to-end tests for rub CLI.
 //! These tests require Chrome to be installed.
+//! They are browser-backed opt-in coverage, not standing default validation.
 //! Run with: cargo test --test e2e -- --ignored
 
 use rub_daemon::rub_paths::RubPaths;
+use rub_ipc::client::IpcClient;
+use rub_ipc::protocol::{IpcRequest, IpcResponse};
 pub(crate) use rub_test_harness::browser_session::*;
 use rub_test_harness::fixtures::{DownloadFixtureServer, NetworkInspectionFixtureServer};
 use rub_test_harness::server::TestServer;
@@ -15,18 +18,11 @@ use std::process::Command;
 use std::time::Duration;
 
 fn rub_binary() -> String {
-    // Try env var set by cargo for integration tests
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_rub") {
-        return path;
-    }
-    // Fallback: walk up from crate manifest dir to workspace target
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    let workspace = std::path::Path::new(&manifest)
-        .parent()
-        .and_then(|p| p.parent())
-        .unwrap_or(std::path::Path::new("."));
-    let path = workspace.join("target/debug/rub");
-    path.to_string_lossy().to_string()
+    resolve_test_rub_binary_path(
+        std::env::var("RUB_TEST_BINARY").ok().as_deref(),
+        std::env::var("CARGO_BIN_EXE_rub").ok().as_deref(),
+        std::env::var("CARGO_MANIFEST_DIR").ok().as_deref(),
+    )
 }
 
 fn rub_cmd(rub_home: &str) -> Command {
@@ -59,6 +55,173 @@ fn doctor_result(json: &serde_json::Value) -> &serde_json::Value {
 
 fn doctor_runtime(json: &serde_json::Value) -> &serde_json::Value {
     &json["data"]["runtime"]
+}
+
+fn prepare_rub_home(home: &str) {
+    std::fs::create_dir_all(home).unwrap();
+}
+
+fn prepare_rub_home_secrets(home: &str, contents: &str) {
+    prepare_rub_home(home);
+    write_secure_secrets_env(&PathBuf::from(home).join("secrets.env"), contents);
+}
+
+fn open_and_assert_success(mut cmd: Command, url: &str) -> serde_json::Value {
+    let opened = parse_json(&cmd.args(["open", url]).output().unwrap());
+    assert_eq!(opened["success"], true, "{opened}");
+    opened
+}
+
+fn assert_input_secret_references(json: &serde_json::Value, expected: &[(&str, &str)]) {
+    let references = &json["data"]["input_secret_references"];
+    assert_eq!(references["count"], expected.len(), "{json}");
+    let items = references["items"]
+        .as_array()
+        .expect("input_secret_references.items must be an array");
+    assert_eq!(items.len(), expected.len(), "{json}");
+    for (index, (reference, effective_source)) in expected.iter().enumerate() {
+        assert_eq!(items[index]["reference"], *reference, "{json}");
+        assert_eq!(
+            items[index]["effective_source"], *effective_source,
+            "{json}"
+        );
+    }
+}
+
+fn wait_for_no_live_sessions(home: &str) -> serde_json::Value {
+    wait_for_no_live_sessions_with_timeout(home, Duration::from_secs(5))
+}
+
+fn wait_for_no_live_sessions_with_timeout(home: &str, timeout: Duration) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
+        if sessions["success"] == true
+            && sessions["data"]["result"]["items"]
+                .as_array()
+                .is_some_and(|items| items.is_empty())
+        {
+            return sessions;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "Timed out waiting for close --all to leave no live sessions within {:?}",
+        timeout
+    );
+}
+
+fn teardown_and_cleanup(home: &str) {
+    let torn_down = parse_json(&rub_cmd(home).arg("teardown").output().unwrap());
+    assert_eq!(torn_down["success"], true, "{torn_down}");
+    cleanup(home);
+}
+
+fn bind_current_and_remember_alias(
+    mut bind_cmd: Command,
+    mut remember_cmd: Command,
+    binding_alias: &str,
+    remembered_alias: &str,
+    kind: &str,
+) {
+    let bound = parse_json(
+        &bind_cmd
+            .args(["binding", "bind-current", binding_alias])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(bound["success"], true, "{bound}");
+
+    let remembered = parse_json(
+        &remember_cmd
+            .args([
+                "binding",
+                "remember",
+                remembered_alias,
+                "--binding",
+                binding_alias,
+                "--kind",
+                kind,
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(remembered["success"], true, "{remembered}");
+}
+
+fn assert_binding_result_auth(
+    json: &serde_json::Value,
+    mode: &str,
+    alias: &str,
+    created_via: &str,
+    auth_input_mode: &str,
+    capture_fence: Option<&str>,
+) {
+    assert_eq!(json["success"], true, "{json}");
+    assert_eq!(json["data"]["result"]["mode"], mode, "{json}");
+    assert_eq!(json["data"]["result"]["binding"]["alias"], alias, "{json}");
+    assert_eq!(
+        json["data"]["result"]["binding"]["auth_provenance"]["created_via"], created_via,
+        "{json}"
+    );
+    assert_eq!(
+        json["data"]["result"]["binding"]["auth_provenance"]["auth_input_mode"], auth_input_mode,
+        "{json}"
+    );
+    match capture_fence {
+        Some(expected) => assert_eq!(
+            json["data"]["result"]["binding"]["auth_provenance"]["capture_fence"], expected,
+            "{json}"
+        ),
+        None => assert!(
+            json["data"]["result"]["binding"]["auth_provenance"]["capture_fence"].is_null(),
+            "{json}"
+        ),
+    }
+}
+
+fn assert_binding_capture_candidate(
+    json: &serde_json::Value,
+    status: &str,
+    capture_fence: Option<&str>,
+    persistence_policy: Option<&str>,
+    durability_scope: Option<&str>,
+    reattachment_mode: Option<&str>,
+) {
+    assert_eq!(
+        json["data"]["result"]["capture_candidate"]["capture_fence"]["status"], status,
+        "{json}"
+    );
+    match capture_fence {
+        Some(expected) => assert_eq!(
+            json["data"]["result"]["capture_candidate"]["capture_fence"]["capture_fence"], expected,
+            "{json}"
+        ),
+        None => assert!(
+            json["data"]["result"]["capture_candidate"]["capture_fence"]["capture_fence"].is_null(),
+            "{json}"
+        ),
+    }
+    if let Some(expected) = persistence_policy {
+        assert_eq!(
+            json["data"]["result"]["capture_candidate"]["durability"]["persistence_policy"],
+            expected,
+            "{json}"
+        );
+    }
+    if let Some(expected) = durability_scope {
+        assert_eq!(
+            json["data"]["result"]["capture_candidate"]["durability"]["durability_scope"], expected,
+            "{json}"
+        );
+    }
+    if let Some(expected) = reattachment_mode {
+        assert_eq!(
+            json["data"]["result"]["capture_candidate"]["durability"]["reattachment_mode"],
+            expected,
+            "{json}"
+        );
+    }
 }
 
 fn wait_for_pending_dialog(home: &str) -> serde_json::Value {
@@ -238,6 +401,36 @@ fn session_id_by_name(sessions_json: &serde_json::Value, name: &str) -> String {
         .and_then(|session| session["id"].as_str())
         .unwrap_or_else(|| panic!("session '{name}' should be present in sessions output"))
         .to_string()
+}
+
+fn registry_socket_path_by_session_id(home: &str, session_id: &str) -> String {
+    rub_daemon::session::read_registry(Path::new(home))
+        .unwrap_or_else(|error| panic!("registry should be readable for {home}: {error}"))
+        .sessions
+        .into_iter()
+        .find(|entry| entry.session_id == session_id)
+        .unwrap_or_else(|| panic!("session '{session_id}' should be present in registry"))
+        .socket_path
+}
+
+fn send_bound_ipc_request(
+    runtime: &tokio::runtime::Runtime,
+    socket_path: &str,
+    daemon_session_id: &str,
+    request: &IpcRequest,
+) -> IpcResponse {
+    runtime.block_on(async {
+        let mut client = IpcClient::connect(Path::new(socket_path))
+            .await
+            .unwrap_or_else(|error| panic!("ipc connect should succeed for {socket_path}: {error}"))
+            .bind_daemon_session_id(daemon_session_id.to_string())
+            .unwrap_or_else(|error| {
+                panic!("ipc client should bind daemon_session_id '{daemon_session_id}': {error}")
+            });
+        client.send(request).await.unwrap_or_else(|error| {
+            panic!("ipc send should succeed for daemon session '{daemon_session_id}': {error}")
+        })
+    })
 }
 
 fn frame_id_by_name(frames_json: &serde_json::Value, name: &str) -> String {
@@ -627,6 +820,7 @@ fn verify_home_cleanup_ignores_unrelated_pid_artifacts_without_browser_authority
     let home_string = home.to_string_lossy().to_string();
     let observed = HomeCleanupObservation {
         daemon_root_pids: vec![9_999_991],
+        managed_profile_dirs: Vec::new(),
     };
 
     let verification = verify_home_cleanup_complete(&home_string, &observed)
@@ -638,14 +832,17 @@ fn verify_home_cleanup_ignores_unrelated_pid_artifacts_without_browser_authority
 fn verify_home_cleanup_complete_detects_managed_profile_residue_for_observed_daemon() {
     let fake_pid = 400_000u32 + (uuid::Uuid::now_v7().as_u128() % 100_000) as u32;
     let home = format!("/tmp/rub-e2e-cleanup-residue-{fake_pid}");
-    let profile_dir = managed_browser_profile_dir_for_daemon(fake_pid);
+    let profile_dir = rub_core::managed_profile::projected_managed_profile_path_for_session(
+        "sess-cleanup-residue",
+    );
     let _ = std::fs::remove_dir_all(&profile_dir);
-    std::fs::create_dir_all(&profile_dir).unwrap();
+    rub_core::managed_profile::sync_temp_owned_managed_profile_marker(&profile_dir, true).unwrap();
 
     let result = verify_home_cleanup_complete(
         &home,
         &HomeCleanupObservation {
             daemon_root_pids: vec![fake_pid],
+            managed_profile_dirs: vec![profile_dir.clone()],
         },
     );
 
@@ -750,6 +947,13 @@ fn expected_function_set(entries: &[(&str, &str)]) -> std::collections::BTreeSet
     entries
         .iter()
         .map(|(module, name)| format!("{module}::{name}"))
+        .collect()
+}
+
+fn mounted_e2e_modules() -> std::collections::BTreeSet<String> {
+    MOUNTED_E2E_MODULES
+        .iter()
+        .map(|module| (*module).to_string())
         .collect()
 }
 
@@ -923,23 +1127,35 @@ fn grouped_browser_scenarios_default_to_one_managed_session() {
     }
 }
 
-#[path = "e2e/foundation.rs"]
-mod foundation;
+#[test]
+fn browser_backed_e2e_source_files_match_mounted_modules() {
+    let scanned = browser_backed_e2e_functions()
+        .into_iter()
+        .map(|function| function.module)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mounted = mounted_e2e_modules();
+    assert_eq!(
+        scanned, mounted,
+        "tests/e2e/*.rs source files must exactly match the mounted #[path] module list so new browser-backed suites cannot drift out of compilation"
+    );
+}
 
-#[path = "e2e/integration.rs"]
-mod integration;
+macro_rules! mount_e2e_modules {
+    ($(($module:ident, $path:literal)),+ $(,)?) => {
+        const MOUNTED_E2E_MODULES: &[&str] = &[$(stringify!($module)),+];
+        $(
+            #[path = $path]
+            mod $module;
+        )+
+    };
+}
 
-#[path = "e2e/state_workflow.rs"]
-mod state_workflow;
-
-#[path = "e2e/runtime_integration.rs"]
-mod runtime_integration;
-
-#[path = "e2e/workflow_extract_storage.rs"]
-mod workflow_extract_storage;
-
-#[path = "e2e/trigger_runtime.rs"]
-mod trigger_runtime;
-
-#[path = "e2e/orchestration_runtime.rs"]
-mod orchestration_runtime;
+mount_e2e_modules!(
+    (foundation, "e2e/foundation.rs"),
+    (integration, "e2e/integration.rs"),
+    (state_workflow, "e2e/state_workflow.rs"),
+    (runtime_integration, "e2e/runtime_integration.rs"),
+    (workflow_extract_storage, "e2e/workflow_extract_storage.rs"),
+    (trigger_runtime, "e2e/trigger_runtime.rs"),
+    (orchestration_runtime, "e2e/orchestration_runtime.rs"),
+);

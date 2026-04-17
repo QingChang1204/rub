@@ -1,5 +1,7 @@
 use super::*;
-use crate::scheduler_policy::AUTOMATION_QUEUE_SHUTDOWN_POLL_INTERVAL_MS;
+use crate::scheduler_policy::{
+    AUTOMATION_QUEUE_SHUTDOWN_POLL_INTERVAL_MS, AUTOMATION_QUEUE_WAIT_BUDGET_MS,
+};
 
 #[derive(Clone, Copy)]
 enum AutomationWorkerKind {
@@ -109,13 +111,14 @@ impl SessionState {
                 "orchestration_worker_cycle_entry": "orchestration_worker.run_orchestration_cycle",
                 "trigger_worker_pre_queue_gate": "none",
                 "orchestration_worker_pre_queue_gate": "none",
-                "automation_reservation_fence": "router.begin_automation_transaction_until_shutdown_owned",
+                "automation_reservation_fence": "router.begin_automation_reservation_transaction_owned",
                 "orchestration_source_materialization_reservation_fence": "router.begin_automation_transaction_with_wait_budget",
                 "shutdown_drain_fence": "daemon.shutdown.wait_for_transaction_drain",
             },
             "reservation_wait_policy": {
                 "worker_cycle": {
-                    "mode": "persistent_queue_contender",
+                    "mode": "bounded_worker_cycle_budget",
+                    "wait_budget_ms": AUTOMATION_QUEUE_WAIT_BUDGET_MS,
                     "shutdown_poll_interval_ms": AUTOMATION_QUEUE_SHUTDOWN_POLL_INTERVAL_MS,
                 },
                 "active_orchestration_step": {

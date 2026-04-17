@@ -14,6 +14,7 @@ publish = false
 [dependencies]
 rub-core = { version = "0.1.0", path = "../rub-core" }
 rub-daemon = { version = "0.1.0", path = "../rub-daemon" }
+rub-ipc = { version = "0.1.0", path = "../rub-ipc" }
 tokio.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

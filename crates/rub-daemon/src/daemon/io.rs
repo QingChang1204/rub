@@ -61,8 +61,18 @@ async fn handle_connection_inner(
 
     info!(command = %request.command, command_id = ?request.command_id, "Received request");
 
-    let response = router.dispatch(request, state).await;
-    write_response_with_timeout(&mut writer, &response).await?;
+    let pending = router.dispatch_for_external_delivery(request, state).await;
+    match write_response_with_timeout(&mut writer, pending.response()).await {
+        Ok(()) => {
+            pending.commit_after_delivery(state).await;
+        }
+        Err(error) => {
+            pending
+                .commit_after_delivery_failure(state, error.to_string())
+                .await;
+            return Err(error);
+        }
+    }
 
     Ok(())
 }

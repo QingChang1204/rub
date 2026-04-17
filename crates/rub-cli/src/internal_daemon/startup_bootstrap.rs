@@ -1,8 +1,19 @@
 use crate::commands::EffectiveCli;
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 use rub_core::model::PathReferenceState;
+use serde_json::{Map, Value};
+use std::path::Path;
 
 pub(super) const SESSION_ID_ENV: &str = "RUB_SESSION_ID";
+
+pub(super) struct InternalDaemonPathContext<'a> {
+    pub path_key: &'a str,
+    pub path: &'a Path,
+    pub path_authority: &'a str,
+    pub upstream_truth: &'a str,
+    pub path_kind: &'a str,
+    pub reason: &'a str,
+}
 
 pub(super) fn internal_daemon_path_state(
     path_authority: &str,
@@ -47,6 +58,46 @@ pub(super) fn daemon_runtime_error(rub_home: &std::path::Path, message: String) 
         ),
         "reason": "daemon_runtime_failed",
     }))
+}
+
+pub(super) fn internal_daemon_local_io_error(
+    rub_home: &Path,
+    message: impl Into<String>,
+    path_context: InternalDaemonPathContext<'_>,
+) -> ErrorEnvelope {
+    let mut context = Map::new();
+    context.insert(
+        "rub_home".to_string(),
+        Value::String(rub_home.display().to_string()),
+    );
+    context.insert(
+        "rub_home_state".to_string(),
+        serde_json::to_value(internal_daemon_path_state(
+            "cli.internal_daemon.rub_home",
+            "cli_rub_home",
+            "rub_home_directory",
+        ))
+        .expect("rub_home_state serializes"),
+    );
+    context.insert(
+        path_context.path_key.to_string(),
+        Value::String(path_context.path.display().to_string()),
+    );
+    context.insert(
+        format!("{}_state", path_context.path_key),
+        serde_json::to_value(internal_daemon_path_state(
+            path_context.path_authority,
+            path_context.upstream_truth,
+            path_context.path_kind,
+        ))
+        .expect("internal_daemon_path_state serializes"),
+    );
+    context.insert(
+        "reason".to_string(),
+        Value::String(path_context.reason.to_string()),
+    );
+    ErrorEnvelope::new(ErrorCode::DaemonStartFailed, message.into())
+        .with_context(Value::Object(context))
 }
 
 pub(super) fn resolve_startup_session_id() -> Result<String, ErrorEnvelope> {

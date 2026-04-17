@@ -441,11 +441,11 @@ async fn handle_trigger_reservation_completion(
             let _ = state
                 .record_trigger_outcome(
                     reserved.trigger.id,
-                    TriggerStatus::Fired,
                     Some(reserved.evidence),
                     TriggerResultInfo {
                         trigger_id: reserved.trigger.id,
                         status: TriggerStatus::Fired,
+                        next_status: next_trigger_status_after_success(&reserved.trigger),
                         summary,
                         command_id: Some(command_id),
                         action: Some(trigger_action_execution_info(
@@ -463,6 +463,12 @@ async fn handle_trigger_reservation_completion(
                 commit_trigger_network_progress(worker, reserved.network_progress);
             }
         }
+    }
+}
+
+fn next_trigger_status_after_success(trigger: &TriggerInfo) -> TriggerStatus {
+    match trigger.mode {
+        rub_core::model::TriggerMode::Once => TriggerStatus::Fired,
     }
 }
 

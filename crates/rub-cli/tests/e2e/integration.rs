@@ -276,11 +276,22 @@ fn t117_browser_crash_recovery() {
         .unwrap();
     assert_eq!(parse_json(&out)["success"], true);
 
-    // Kill all Chrome processes spawned by this daemon
-    // (The daemon should recover on next command)
-    let _ = std::process::Command::new("pkill")
-        .args(["-f", &format!("rub-chrome-{}", std::process::id())])
-        .output();
+    // Kill the exact managed browser authority owned by this daemon.
+    let daemon_pid: u32 = std::fs::read_to_string(default_session_pid_path(home))
+        .expect("default session pid file")
+        .trim()
+        .parse()
+        .expect("daemon pid should parse");
+    let browser_pids = browser_processes_for_daemon_pid(daemon_pid);
+    assert!(
+        !browser_pids.is_empty(),
+        "managed browser crash-recovery guardrail must target the real session-scoped browser authority"
+    );
+    for pid in browser_pids {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
     // Wait for process to die
     std::thread::sleep(std::time::Duration::from_secs(2));
 

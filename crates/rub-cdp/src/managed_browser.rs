@@ -7,6 +7,11 @@ use std::time::Duration;
 use chromiumoxide::Browser;
 use chromiumoxide::cdp::browser_protocol::browser::CloseParams as BrowserCloseParams;
 use rub_core::error::{ErrorCode, RubError};
+use rub_core::managed_profile::{
+    managed_profile_paths_equivalent,
+    projected_managed_profile_path_for_scope as shared_projected_managed_profile_path_for_scope,
+    sync_temp_owned_managed_profile_marker,
+};
 use rub_core::process::{
     ProcessInfo, extract_flag_value, is_browser_root_process, is_process_alive,
     process_snapshot as collect_process_snapshot, process_tree,
@@ -20,21 +25,78 @@ pub(crate) struct ManagedProfileDir {
     pub ephemeral: bool,
 }
 
-pub(crate) fn resolve_managed_profile_dir(explicit: Option<PathBuf>) -> ManagedProfileDir {
+pub(crate) fn projected_managed_profile_path_for_scope(scope: &str) -> PathBuf {
+    shared_projected_managed_profile_path_for_scope(scope)
+}
+
+pub(crate) fn resolve_managed_profile_dir(
+    explicit: Option<PathBuf>,
+    explicit_ephemeral: bool,
+) -> ManagedProfileDir {
     match explicit {
         Some(path) => ManagedProfileDir {
             path,
-            ephemeral: false,
+            ephemeral: explicit_ephemeral,
         },
         None => ManagedProfileDir {
-            path: std::env::temp_dir().join(format!("rub-chrome-{}", std::process::id())),
+            path: projected_managed_profile_path_for_scope(&format!("pid-{}", std::process::id())),
             ephemeral: true,
         },
     }
 }
 
+pub(crate) fn prepare_managed_profile_ownership_prelaunch(
+    profile: &ManagedProfileDir,
+) -> Result<(), RubError> {
+    if !profile.ephemeral {
+        return Ok(());
+    }
+    sync_temp_owned_managed_profile_marker(&profile.path, true).map_err(|error| {
+        managed_profile_ownership_error(
+            profile,
+            "prepare managed profile temp-owned marker before launch",
+            error,
+        )
+    })
+}
+
+pub(crate) fn commit_managed_profile_ownership(
+    profile: &ManagedProfileDir,
+) -> Result<(), RubError> {
+    sync_temp_owned_managed_profile_marker(&profile.path, profile.ephemeral).map_err(|error| {
+        managed_profile_ownership_error(
+            profile,
+            "commit managed profile ownership after browser authority install",
+            error,
+        )
+    })
+}
+
+pub fn projected_managed_profile_path_for_session(session_id: &str) -> PathBuf {
+    projected_managed_profile_path_for_scope(&format!("session-{session_id}"))
+}
+
 pub fn projected_managed_profile_path(explicit: Option<PathBuf>) -> PathBuf {
-    resolve_managed_profile_dir(explicit).path
+    resolve_managed_profile_dir(explicit, false).path
+}
+
+fn managed_profile_ownership_error(
+    profile: &ManagedProfileDir,
+    operation: &str,
+    error: std::io::Error,
+) -> RubError {
+    RubError::domain_with_context(
+        ErrorCode::BrowserLaunchFailed,
+        format!(
+            "Failed to {operation} for {}: {error}",
+            profile.path.display()
+        ),
+        serde_json::json!({
+            "user_data_dir": profile.path.display().to_string(),
+            "managed_profile_ephemeral": profile.ephemeral,
+            "operation": operation,
+        }),
+    )
 }
 
 pub(crate) async fn shutdown_managed_browser(
@@ -66,6 +128,25 @@ pub(crate) async fn shutdown_managed_browser(
         }
     }
 
+    enforce_managed_browser_process_fence(profile, root_pid).await
+}
+
+pub async fn cleanup_managed_profile_authority(
+    profile_dir: impl Into<PathBuf>,
+    ephemeral: bool,
+) -> Result<(), RubError> {
+    let profile = ManagedProfileDir {
+        path: profile_dir.into(),
+        ephemeral,
+    };
+    let root_pid = find_managed_browser_root_pid(&profile.path)?;
+    enforce_managed_browser_process_fence(&profile, root_pid).await
+}
+
+async fn enforce_managed_browser_process_fence(
+    profile: &ManagedProfileDir,
+    root_pid: Option<u32>,
+) -> Result<(), RubError> {
     if let Some(root_pid) = root_pid {
         wait_for_process_exit(root_pid, Duration::from_secs(2)).await;
         if is_process_alive(root_pid) {
@@ -154,7 +235,10 @@ fn find_root_pid_in_snapshot(snapshot: &[ProcessInfo], profile_dir: &Path) -> Op
                 && extract_flag_value(&process.command, "--user-data-dir")
                     .as_deref()
                     .map(Path::new)
-                    == Some(profile_dir)
+                    .is_some_and(|candidate| {
+                        candidate == profile_dir
+                            || managed_profile_paths_equivalent(candidate, profile_dir)
+                    })
         })
         .map(|process| process.pid)
 }
@@ -172,7 +256,10 @@ fn authoritative_process_tree(
                 && extract_flag_value(&process.command, "--user-data-dir")
                     .as_deref()
                     .map(Path::new)
-                    == Some(profile_dir)
+                    .is_some_and(|candidate| {
+                        candidate == profile_dir
+                            || managed_profile_paths_equivalent(candidate, profile_dir)
+                    })
         })
         .map(|process| process_tree(snapshot, process.pid))
 }
@@ -232,28 +319,33 @@ async fn wait_for_profile_release(profile_dir: &Path, budget: Duration) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        ManagedProfileDir, authoritative_process_tree, find_root_pid_in_snapshot,
-        resolve_managed_profile_dir,
+        ManagedProfileDir, authoritative_process_tree, cleanup_managed_profile_authority,
+        commit_managed_profile_ownership, find_root_pid_in_snapshot,
+        prepare_managed_profile_ownership_prelaunch, resolve_managed_profile_dir,
+    };
+    use rub_core::managed_profile::{
+        has_temp_owned_managed_profile_marker, sync_temp_owned_managed_profile_marker,
     };
     use rub_core::process::{ProcessInfo, extract_flag_value, parse_process_snapshot_line};
     use std::path::{Path, PathBuf};
 
     #[test]
     fn generated_profile_dir_is_ephemeral() {
-        let profile = resolve_managed_profile_dir(None);
+        let profile = resolve_managed_profile_dir(None, false);
         assert!(profile.ephemeral);
         assert!(
             profile
                 .path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("rub-chrome-"))
+                .is_some_and(|name| name.starts_with("rub-chrome-pid-"))
         );
     }
 
     #[test]
     fn explicit_profile_dir_is_not_ephemeral() {
-        let profile = resolve_managed_profile_dir(Some(PathBuf::from("/tmp/custom-profile")));
+        let profile =
+            resolve_managed_profile_dir(Some(PathBuf::from("/tmp/custom-profile")), false);
         assert_eq!(
             profile,
             ManagedProfileDir {
@@ -261,6 +353,61 @@ mod tests {
                 ephemeral: false,
             }
         );
+    }
+
+    #[test]
+    fn explicit_profile_dir_can_remain_ephemeral_when_authority_was_derived_upstream() {
+        let profile =
+            resolve_managed_profile_dir(Some(PathBuf::from("/tmp/derived-profile")), true);
+        assert_eq!(
+            profile,
+            ManagedProfileDir {
+                path: PathBuf::from("/tmp/derived-profile"),
+                ephemeral: true,
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_durable_prelaunch_does_not_clear_existing_temp_owned_marker() {
+        let profile = resolve_managed_profile_dir(
+            Some(
+                std::env::temp_dir().join(format!("rub-chrome-prelaunch-{}", uuid::Uuid::now_v7())),
+            ),
+            false,
+        );
+        let _ = std::fs::remove_dir_all(&profile.path);
+        sync_temp_owned_managed_profile_marker(&profile.path, true)
+            .expect("seed temp-owned marker");
+
+        prepare_managed_profile_ownership_prelaunch(&profile)
+            .expect("explicit durable prelaunch should be a no-op");
+        assert!(
+            has_temp_owned_managed_profile_marker(&profile.path),
+            "prelaunch durable path must not revoke existing temp-owned cleanup authority"
+        );
+
+        let _ = std::fs::remove_dir_all(&profile.path);
+    }
+
+    #[test]
+    fn durable_ownership_commit_clears_temp_owned_marker_only_after_commit() {
+        let profile = resolve_managed_profile_dir(
+            Some(std::env::temp_dir().join(format!("rub-chrome-commit-{}", uuid::Uuid::now_v7()))),
+            false,
+        );
+        let _ = std::fs::remove_dir_all(&profile.path);
+        sync_temp_owned_managed_profile_marker(&profile.path, true)
+            .expect("seed temp-owned marker");
+
+        commit_managed_profile_ownership(&profile)
+            .expect("durable ownership commit should clear the marker");
+        assert!(
+            !has_temp_owned_managed_profile_marker(&profile.path),
+            "durable ownership adoption should clear temp-owned proof only at commit time"
+        );
+
+        let _ = std::fs::remove_dir_all(&profile.path);
     }
 
     #[test]
@@ -358,6 +505,20 @@ mod tests {
         assert_eq!(
             extract_flag_value(&parsed.command, "--user-data-dir"),
             Some("/tmp/rub chrome 300".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_managed_profile_authority_is_noop_when_no_browser_owns_profile() {
+        let profile_dir =
+            std::env::temp_dir().join(format!("rub-managed-cleanup-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+        cleanup_managed_profile_authority(&profile_dir, true)
+            .await
+            .expect("cleanup should succeed without owned browser");
+        assert!(
+            !profile_dir.exists(),
+            "ephemeral profile authority should be removed once cleanup completes"
         );
     }
 }

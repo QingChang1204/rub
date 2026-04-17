@@ -71,6 +71,18 @@ pub async fn pending_dialog(runtime: &SharedDialogRuntime) -> Option<PendingDial
     runtime.read().await.pending_dialog.clone()
 }
 
+pub(crate) fn pending_dialog_matches_target(dialog: &PendingDialogInfo, target_id: &str) -> bool {
+    dialog.tab_target_id.as_deref() == Some(target_id)
+}
+
+pub async fn pending_dialog_for_target(
+    runtime: &SharedDialogRuntime,
+    target_id: &str,
+) -> Option<PendingDialogInfo> {
+    let dialog = pending_dialog(runtime).await?;
+    pending_dialog_matches_target(&dialog, target_id).then_some(dialog)
+}
+
 /// Whether a pre-registered intercept policy should be consumed by the
 /// listener task running on a page identified by `tab_target_id`.
 ///
@@ -351,7 +363,8 @@ mod tests {
     use super::{
         BrowserDialogOpening, DialogCallbacks, DialogRuntimeInfo, DialogRuntimeStatus,
         OpeningCallback, apply_dialog_runtime_status, commit_dialog_hook_install_projection,
-        new_shared_dialog_runtime, publish_dialog_opening,
+        new_shared_dialog_runtime, pending_dialog_for_target, pending_dialog_matches_target,
+        publish_dialog_opening,
     };
     use rub_core::model::DialogKind;
     use std::sync::{Arc, Mutex};
@@ -421,6 +434,35 @@ mod tests {
                 .as_ref()
                 .and_then(|dialog| dialog.tab_target_id.as_deref()),
             Some("target-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn target_scoped_pending_dialog_requires_matching_tab_authority() {
+        let runtime = new_shared_dialog_runtime();
+        {
+            let mut state = runtime.write().await;
+            state.pending_dialog = Some(rub_core::model::PendingDialogInfo {
+                kind: DialogKind::Alert,
+                message: "Background dialog".to_string(),
+                url: "https://example.com".to_string(),
+                tab_target_id: Some("target-1".to_string()),
+                frame_id: None,
+                default_prompt: None,
+                has_browser_handler: true,
+                opened_at: "2026-01-01T00:00:00Z".to_string(),
+            });
+        }
+
+        let matching = pending_dialog_for_target(&runtime, "target-1")
+            .await
+            .expect("matching target should retain dialog authority");
+        assert!(pending_dialog_matches_target(&matching, "target-1"));
+        assert!(
+            pending_dialog_for_target(&runtime, "target-2")
+                .await
+                .is_none(),
+            "foreign target must not consume session-scoped pending dialog authority"
         );
     }
 

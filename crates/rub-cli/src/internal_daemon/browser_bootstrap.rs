@@ -16,6 +16,7 @@ pub(super) fn build_browser_manager(
             headless: !cli.headed,
             ignore_cert_errors: cli.ignore_cert_errors,
             user_data_dir: effective_user_data_dir.map(PathBuf::from),
+            managed_profile_ephemeral: matches!(connection_request, ConnectionRequest::None),
             download_dir: Some(download_dir),
             profile_directory: match connection_request {
                 ConnectionRequest::Profile { dir_name, .. } => Some(dir_name.clone()),

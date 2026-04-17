@@ -42,6 +42,7 @@ impl InterferenceRuntimeState {
         readiness: &ReadinessInfo,
         handoff: &HumanVerificationHandoffInfo,
     ) -> InterferenceRuntimeInfo {
+        self.prime_baseline_from_tabs(tabs);
         let classified = classify(
             &self.projection,
             &self.baseline,

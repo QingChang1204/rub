@@ -6,7 +6,7 @@ use tokio::sync::Notify;
 
 use crate::rub_paths::RubPaths;
 
-use super::SessionState;
+use super::{PendingExternalDomChangeState, SessionState};
 
 impl SessionState {
     /// Get Arc reference to dom_epoch for sharing with adapter.
@@ -69,47 +69,88 @@ impl SessionState {
     }
 
     /// External CDP events only advance the epoch when no command transaction owns the commit.
-    pub fn observe_external_dom_change(&self) -> Option<u64> {
+    pub fn observe_external_dom_change(&self, target_id: Option<&str>) -> Option<u64> {
         if self.in_flight_count.load(Ordering::SeqCst) == 0 {
             Some(self.increment_epoch())
         } else {
             self.pending_external_dom_change
-                .store(true, Ordering::SeqCst);
+                .lock()
+                .expect("pending external DOM-change mutex should not be poisoned")
+                .mark(target_id);
             None
         }
     }
 
     /// Drain the pending external DOM-change marker captured during an in-flight transaction.
     pub fn take_pending_external_dom_change(&self) -> bool {
+        !self.take_pending_external_dom_change_scope().is_empty()
+    }
+
+    pub(crate) fn take_pending_external_dom_change_scope(&self) -> PendingExternalDomChangeState {
+        let mut pending = self
+            .pending_external_dom_change
+            .lock()
+            .expect("pending external DOM-change mutex should not be poisoned");
+        std::mem::take(&mut *pending)
+    }
+
+    pub(crate) fn merge_pending_external_dom_change_scope(
+        &self,
+        scope: PendingExternalDomChangeState,
+    ) {
+        if scope.is_empty() {
+            return;
+        }
         self.pending_external_dom_change
-            .swap(false, Ordering::SeqCst)
+            .lock()
+            .expect("pending external DOM-change mutex should not be poisoned")
+            .merge(scope);
     }
 
     /// Check whether an in-flight transaction observed an external DOM change.
     pub fn has_pending_external_dom_change(&self) -> bool {
-        self.pending_external_dom_change.load(Ordering::SeqCst)
+        !self
+            .pending_external_dom_change
+            .lock()
+            .expect("pending external DOM-change mutex should not be poisoned")
+            .is_empty()
+    }
+
+    pub fn pending_external_dom_change_affects_target(&self, target_id: Option<&str>) -> bool {
+        self.pending_external_dom_change
+            .lock()
+            .expect("pending external DOM-change mutex should not be poisoned")
+            .affects_target(target_id)
     }
 
     /// Restore the pending external DOM-change marker when a transaction cannot publish a stable result.
     pub fn mark_pending_external_dom_change(&self) {
         self.pending_external_dom_change
-            .store(true, Ordering::SeqCst);
+            .lock()
+            .expect("pending external DOM-change mutex should not be poisoned")
+            .mark(None);
     }
 
     /// Clear any pending external DOM-change marker after a command-owned epoch commit.
     pub fn clear_pending_external_dom_change(&self) {
-        self.pending_external_dom_change
-            .store(false, Ordering::SeqCst);
+        self.take_pending_external_dom_change_scope();
     }
 
     /// Mark the session as shutting down so new command transactions are rejected.
     pub fn request_shutdown(&self) {
-        self.shutdown_requested.store(true, Ordering::SeqCst);
+        let was_requested = self.shutdown_requested.swap(true, Ordering::SeqCst);
+        if !was_requested {
+            self.shutdown_notify.notify_waiters();
+        }
     }
 
     /// Whether the session is currently draining for shutdown.
     pub fn is_shutdown_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn shutdown_notifier(&self) -> Arc<Notify> {
+        self.shutdown_notify.clone()
     }
 
     /// Check if session is idle for auto-upgrade (INV-007).

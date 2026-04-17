@@ -198,6 +198,7 @@ fn export_step(entry: WorkflowCaptureEntry) -> WorkflowExportStep {
             "request_id": entry.request_id,
             "command_id": entry.command_id,
             "capture_class": entry.capture_class,
+            "delivery_state": entry.delivery_state,
         }),
     }
 }

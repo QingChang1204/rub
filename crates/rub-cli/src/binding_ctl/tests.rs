@@ -1,3 +1,4 @@
+use super::capture::binding_capture_candidate_request;
 use super::{
     BindingWriteMode, build_binding_record_from_candidate, normalize_binding_alias,
     project_binding_inspect, project_binding_list, project_live_status, read_binding_registry,
@@ -8,11 +9,12 @@ use crate::commands::BindingCaptureAuthInputArg;
 use crate::commands::RememberedBindingAliasKindArg;
 use rub_core::model::{
     AuthState, BindingAuthInputMode, BindingAuthProvenance, BindingCaptureAttachmentInfo,
-    BindingCaptureAuthEvidence, BindingCaptureCandidateInfo, BindingCaptureDurabilityInfo,
-    BindingCaptureFenceInfo, BindingCaptureFenceStatus, BindingCaptureLiveCorrelation,
-    BindingCaptureSessionInfo, BindingCreatedVia, BindingDurabilityScope, BindingPersistencePolicy,
-    BindingReattachmentMode, BindingRecord, BindingRegistryData, BindingResolution, BindingScope,
-    BindingSessionReference, BindingSessionReferenceKind, BindingStatus, StateInspectorStatus,
+    BindingCaptureAuthEvidence, BindingCaptureCandidateInfo, BindingCaptureDiagnostics,
+    BindingCaptureDurabilityInfo, BindingCaptureFenceInfo, BindingCaptureFenceStatus,
+    BindingCaptureLiveCorrelation, BindingCaptureSessionInfo, BindingCreatedVia,
+    BindingDurabilityScope, BindingPersistencePolicy, BindingReattachmentMode, BindingRecord,
+    BindingRegistryData, BindingResolution, BindingScope, BindingSessionReference,
+    BindingSessionReferenceKind, BindingStatus, StateInspectorStatus,
 };
 use rub_daemon::session::{
     RegistryAuthoritySnapshot, RegistryEntry, RegistryEntryLiveness, RegistryEntrySnapshot,
@@ -63,6 +65,18 @@ fn read_binding_registry_defaults_to_v1_empty_registry() {
     assert_eq!(registry.schema_version, 1);
     assert!(registry.bindings.is_empty());
     let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn binding_capture_candidate_request_carries_command_id_for_replay_recovery() {
+    let request = binding_capture_candidate_request(1_500);
+    assert_eq!(request.command, "runtime");
+    assert_eq!(request.args["sub"], "binding-capture-candidate");
+    assert_eq!(request.timeout_ms, 1_500);
+    assert!(
+        request.command_id.is_some(),
+        "binding capture candidate request must carry command_id before entering replay recovery"
+    );
 }
 
 #[test]
@@ -349,6 +363,7 @@ fn build_binding_record_from_capture_candidate_preserves_capture_provenance() {
             captured_from_session: Some("default".to_string()),
             captured_from_attachment_identity: Some("profile:Work".to_string()),
         },
+        diagnostics: BindingCaptureDiagnostics::default(),
     };
 
     let binding = build_binding_record_from_candidate(
@@ -421,6 +436,7 @@ fn build_binding_record_from_bind_current_drops_capture_claim() {
             captured_from_session: Some("default".to_string()),
             captured_from_attachment_identity: Some("profile:Work".to_string()),
         },
+        diagnostics: BindingCaptureDiagnostics::default(),
     };
 
     let binding =
@@ -490,6 +506,7 @@ fn build_binding_record_from_explicit_cli_capture_uses_operator_cli_fence() {
             captured_from_session: Some("default".to_string()),
             captured_from_attachment_identity: Some("profile:Work".to_string()),
         },
+        diagnostics: BindingCaptureDiagnostics::default(),
     };
 
     let binding = build_binding_record_from_candidate(
@@ -560,6 +577,7 @@ fn build_binding_record_from_explicit_mixed_capture_preserves_real_capture_fence
             captured_from_session: Some("default".to_string()),
             captured_from_attachment_identity: Some("profile:Work".to_string()),
         },
+        diagnostics: BindingCaptureDiagnostics::default(),
     };
 
     let binding = build_binding_record_from_candidate(

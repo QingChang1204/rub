@@ -80,6 +80,19 @@ pub struct BindingCaptureLiveCorrelation {
     pub attachment_identity: Option<String>,
 }
 
+/// Additive diagnostics for a composite binding-capture projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BindingCaptureDiagnostics {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consistency_warnings: Vec<String>,
+}
+
+impl BindingCaptureDiagnostics {
+    pub fn is_empty(&self) -> bool {
+        self.consistency_warnings.is_empty()
+    }
+}
+
 /// Live runtime projection used to create or validate one binding capture.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BindingCaptureCandidateInfo {
@@ -90,4 +103,6 @@ pub struct BindingCaptureCandidateInfo {
     pub durability: BindingCaptureDurabilityInfo,
     pub live_correlation: BindingCaptureLiveCorrelation,
     pub auth_provenance_hint: BindingAuthProvenance,
+    #[serde(default, skip_serializing_if = "BindingCaptureDiagnostics::is_empty")]
+    pub diagnostics: BindingCaptureDiagnostics,
 }

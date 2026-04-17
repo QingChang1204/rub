@@ -1,22 +1,25 @@
+mod support;
+mod value;
+
 use chromiumoxide::Page;
 use chromiumoxide::cdp::js_protocol::runtime::{ExecutionContextId, RemoteObjectId};
-use rub_core::model::{
-    ElementTag, InteractionConfirmation, InteractionConfirmationKind, InteractionConfirmationStatus,
-};
+use rub_core::model::{ElementTag, InteractionConfirmation, InteractionConfirmationKind};
 use serde_json::json;
 use std::sync::Arc;
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::Instant;
 
+use self::support::{
+    OBSERVATION_WINDOW, confirmed, contradicted, degraded, sleep_observation_step, unconfirmed,
+};
+pub(crate) use self::value::{confirm_input, confirm_select, confirm_upload};
 use super::observation::{
     ActiveInteractionBaseline, InteractionBaseline, active_element_changed, active_element_matches,
     confirmation_observation_degraded, element_state_changed, observe_active_element,
-    observe_active_element_in_context, observe_element, observe_page, observe_related_page,
-    page_changed, page_mutated, typed_effect_contradicted, typed_effect_observed,
+    observe_active_element_in_context, observe_element, observe_page, observe_page_in_context,
+    observe_related_page, page_changed, page_mutated, typed_effect_contradicted,
+    typed_effect_observed,
 };
-use crate::dialogs::{SharedDialogRuntime, pending_dialog};
-
-const OBSERVATION_WINDOW: Duration = Duration::from_millis(1_500);
-const OBSERVATION_INTERVAL: Duration = Duration::from_millis(25);
+use crate::dialogs::{SharedDialogRuntime, pending_dialog_for_target};
 
 pub(crate) async fn confirm_click(
     page: &Arc<Page>,
@@ -25,13 +28,15 @@ pub(crate) async fn confirm_click(
     baseline: InteractionBaseline,
     dialog_runtime: &SharedDialogRuntime,
 ) -> InteractionConfirmation {
+    let target_id = page.target_id().as_ref().to_string();
     let before_element = baseline.before_element;
     let before_page = baseline.before_page;
     let deadline = Instant::now() + OBSERVATION_WINDOW;
     let mut pending_focus_change: Option<serde_json::Value> = None;
+    let mut poll_count = 0u32;
 
     loop {
-        if let Some(dialog) = pending_dialog(dialog_runtime).await {
+        if let Some(dialog) = pending_dialog_for_target(dialog_runtime, &target_id).await {
             return confirmed(
                 InteractionConfirmationKind::DialogOpened,
                 json!({
@@ -82,7 +87,7 @@ pub(crate) async fn confirm_click(
             }
         }
 
-        let after_page = observe_page(page).await;
+        let after_page = observe_related_page(page, object_id).await;
         if page_changed(&before_page, &after_page) {
             return confirmed(
                 InteractionConfirmationKind::ContextChange,
@@ -146,7 +151,7 @@ pub(crate) async fn confirm_click(
             }));
         }
 
-        sleep(OBSERVATION_INTERVAL).await;
+        sleep_observation_step(&mut poll_count).await;
     }
 }
 
@@ -155,10 +160,12 @@ pub(crate) async fn confirm_click_xy(
     before_page: super::observation::PageObservation,
     dialog_runtime: &SharedDialogRuntime,
 ) -> InteractionConfirmation {
+    let target_id = page.target_id().as_ref().to_string();
     let deadline = Instant::now() + OBSERVATION_WINDOW;
+    let mut poll_count = 0u32;
 
     loop {
-        if let Some(dialog) = pending_dialog(dialog_runtime).await {
+        if let Some(dialog) = pending_dialog_for_target(dialog_runtime, &target_id).await {
             return confirmed(
                 InteractionConfirmationKind::DialogOpened,
                 json!({
@@ -209,7 +216,7 @@ pub(crate) async fn confirm_click_xy(
             }));
         }
 
-        sleep(OBSERVATION_INTERVAL).await;
+        sleep_observation_step(&mut poll_count).await;
     }
 }
 
@@ -221,6 +228,7 @@ pub(crate) async fn confirm_hover(
     let before_element = baseline.before_element;
     let before_page = baseline.before_page;
     let deadline = Instant::now() + OBSERVATION_WINDOW;
+    let mut poll_count = 0u32;
 
     loop {
         if let (Some(before), Some(after)) = (
@@ -248,7 +256,7 @@ pub(crate) async fn confirm_hover(
             }
         }
 
-        let after_page = observe_page(page).await;
+        let after_page = observe_related_page(page, object_id).await;
         if page_changed(&before_page, &after_page) {
             return confirmed(
                 InteractionConfirmationKind::ContextChange,
@@ -306,190 +314,7 @@ pub(crate) async fn confirm_hover(
             }));
         }
 
-        sleep(OBSERVATION_INTERVAL).await;
-    }
-}
-
-pub(crate) async fn confirm_input(
-    page: &Arc<Page>,
-    object_id: &RemoteObjectId,
-    expected: &str,
-    before_page: super::observation::PageObservation,
-) -> InteractionConfirmation {
-    let deadline = Instant::now() + OBSERVATION_WINDOW;
-
-    loop {
-        let observed = observe_element(page, object_id).await.ok();
-        if let Some(observed) = observed.as_ref()
-            && observed.value.as_deref() == Some(expected)
-        {
-            return confirmed(
-                InteractionConfirmationKind::ValueApplied,
-                json!({
-                    "value": observed.value,
-                    "active": observed.active,
-                }),
-            );
-        }
-
-        if Instant::now() >= deadline {
-            let after_page = observe_related_page(page, object_id).await;
-            if observed.is_none() {
-                return degraded(
-                    Some(InteractionConfirmationKind::ValueApplied),
-                    json!({
-                        "expected": expected,
-                        "observed": observed,
-                        "context_changed": page_changed(&before_page, &after_page),
-                        "before_page": before_page,
-                        "after_page": after_page,
-                    }),
-                );
-            }
-            if let Some(observed) = observed.as_ref()
-                && observed.value.as_deref() != Some(expected)
-            {
-                return contradicted(
-                    InteractionConfirmationKind::ValueApplied,
-                    json!({
-                        "expected": expected,
-                        "observed": observed,
-                    }),
-                );
-            }
-            return unconfirmed(json!({
-                "expected": expected,
-                "observed": observed,
-            }));
-        }
-
-        sleep(OBSERVATION_INTERVAL).await;
-    }
-}
-
-pub(crate) async fn confirm_select(
-    page: &Arc<Page>,
-    object_id: &RemoteObjectId,
-    expected_value: &str,
-    expected_text: &str,
-    before_page: super::observation::PageObservation,
-) -> InteractionConfirmation {
-    let deadline = Instant::now() + OBSERVATION_WINDOW;
-
-    loop {
-        let observed = observe_element(page, object_id).await.ok();
-        if let Some(observed) = observed.as_ref()
-            && observed.value.as_deref() == Some(expected_value)
-            && observed.selected_text.as_deref() == Some(expected_text)
-        {
-            return confirmed(
-                InteractionConfirmationKind::SelectionApplied,
-                json!({
-                    "selected_value": observed.value,
-                    "selected_text": observed.selected_text,
-                }),
-            );
-        }
-
-        if Instant::now() >= deadline {
-            let after_page = observe_related_page(page, object_id).await;
-            if observed.is_none() {
-                return degraded(
-                    Some(InteractionConfirmationKind::SelectionApplied),
-                    json!({
-                        "expected_value": expected_value,
-                        "expected_text": expected_text,
-                        "observed": observed,
-                        "context_changed": page_changed(&before_page, &after_page),
-                        "before_page": before_page,
-                        "after_page": after_page,
-                    }),
-                );
-            }
-            if let Some(observed) = observed.as_ref()
-                && (observed.value.as_deref() != Some(expected_value)
-                    || observed.selected_text.as_deref() != Some(expected_text))
-            {
-                return contradicted(
-                    InteractionConfirmationKind::SelectionApplied,
-                    json!({
-                        "expected_value": expected_value,
-                        "expected_text": expected_text,
-                        "observed": observed,
-                    }),
-                );
-            }
-            return unconfirmed(json!({
-                "expected_value": expected_value,
-                "expected_text": expected_text,
-                "observed": observed,
-            }));
-        }
-
-        sleep(OBSERVATION_INTERVAL).await;
-    }
-}
-
-pub(crate) async fn confirm_upload(
-    page: &Arc<Page>,
-    object_id: &RemoteObjectId,
-    expected_file_name: &str,
-    before_page: super::observation::PageObservation,
-) -> InteractionConfirmation {
-    let deadline = Instant::now() + OBSERVATION_WINDOW;
-
-    loop {
-        let observed = observe_element(page, object_id).await.ok();
-        if let Some(observed) = observed.as_ref()
-            && observed
-                .file_names
-                .as_ref()
-                .is_some_and(|names| names.iter().any(|name| name == expected_file_name))
-        {
-            return confirmed(
-                InteractionConfirmationKind::FilesAttached,
-                json!({
-                    "file_names": observed.file_names,
-                    "value": observed.value,
-                }),
-            );
-        }
-
-        if Instant::now() >= deadline {
-            let after_page = observe_related_page(page, object_id).await;
-            if observed.is_none() {
-                return degraded(
-                    Some(InteractionConfirmationKind::FilesAttached),
-                    json!({
-                        "expected_file_name": expected_file_name,
-                        "observed": observed,
-                        "context_changed": page_changed(&before_page, &after_page),
-                        "before_page": before_page,
-                        "after_page": after_page,
-                    }),
-                );
-            }
-            if let Some(observed) = observed.as_ref()
-                && observed
-                    .file_names
-                    .as_ref()
-                    .is_some_and(|names| !names.is_empty())
-            {
-                return contradicted(
-                    InteractionConfirmationKind::FilesAttached,
-                    json!({
-                        "expected_file_name": expected_file_name,
-                        "observed": observed,
-                    }),
-                );
-            }
-            return unconfirmed(json!({
-                "expected_file_name": expected_file_name,
-                "observed": observed,
-            }));
-        }
-
-        sleep(OBSERVATION_INTERVAL).await;
+        sleep_observation_step(&mut poll_count).await;
     }
 }
 
@@ -500,6 +325,7 @@ pub(crate) async fn confirm_key_combo(
     let before_active = baseline.before_active;
     let before_page = baseline.before_page;
     let deadline = Instant::now() + OBSERVATION_WINDOW;
+    let mut poll_count = 0u32;
 
     loop {
         let after_active = observe_active_element(page).await.ok();
@@ -582,7 +408,7 @@ pub(crate) async fn confirm_key_combo(
             }));
         }
 
-        sleep(OBSERVATION_INTERVAL).await;
+        sleep_observation_step(&mut poll_count).await;
     }
 }
 
@@ -603,6 +429,7 @@ pub(crate) async fn confirm_typed_text_in_context(
     let before_active = baseline.before_active;
     let before_page = baseline.before_page;
     let deadline = Instant::now() + OBSERVATION_WINDOW;
+    let mut poll_count = 0u32;
 
     loop {
         let after_active = observe_active_element_in_context(page, context_id)
@@ -622,7 +449,7 @@ pub(crate) async fn confirm_typed_text_in_context(
             );
         }
 
-        let after_page = observe_page(page).await;
+        let after_page = observe_page_in_context(page, context_id).await;
         if page_changed(&before_page, &after_page) {
             return confirmed(
                 InteractionConfirmationKind::ContextChange,
@@ -685,47 +512,9 @@ pub(crate) async fn confirm_typed_text_in_context(
             }));
         }
 
-        sleep(OBSERVATION_INTERVAL).await;
+        sleep_observation_step(&mut poll_count).await;
     }
 }
 
-fn confirmed(
-    kind: InteractionConfirmationKind,
-    details: serde_json::Value,
-) -> InteractionConfirmation {
-    InteractionConfirmation {
-        status: InteractionConfirmationStatus::Confirmed,
-        kind: Some(kind),
-        details: Some(details),
-    }
-}
-
-fn unconfirmed(details: serde_json::Value) -> InteractionConfirmation {
-    InteractionConfirmation {
-        status: InteractionConfirmationStatus::Unconfirmed,
-        kind: None,
-        details: Some(details),
-    }
-}
-
-fn contradicted(
-    kind: InteractionConfirmationKind,
-    details: serde_json::Value,
-) -> InteractionConfirmation {
-    InteractionConfirmation {
-        status: InteractionConfirmationStatus::Contradicted,
-        kind: Some(kind),
-        details: Some(details),
-    }
-}
-
-fn degraded(
-    kind: Option<InteractionConfirmationKind>,
-    details: serde_json::Value,
-) -> InteractionConfirmation {
-    InteractionConfirmation {
-        status: InteractionConfirmationStatus::Degraded,
-        kind,
-        details: Some(details),
-    }
-}
+#[cfg(test)]
+mod tests;

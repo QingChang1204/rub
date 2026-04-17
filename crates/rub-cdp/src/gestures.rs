@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::time::{Duration, Instant};
 use tracing::info;
 
-use crate::dialogs::SharedDialogRuntime;
+use crate::dialogs::{SharedDialogRuntime, pending_dialog_for_target};
 use crate::humanize::HumanizeConfig;
 
 const DIALOG_ACTUATION_TIMEOUT: Duration = Duration::from_millis(500);
@@ -37,6 +37,7 @@ pub(crate) async fn click(
     }
     let baseline =
         crate::interaction::capture_interaction_baseline(page, &resolved.remote_object_id).await;
+    let expected_target_id = page.target_id().as_ref().to_string();
 
     if prefers_semantic_click(element.tag, humanize.enabled) {
         // Semantic `.click()` still needs the same visibility/occlusion fence as a
@@ -57,9 +58,10 @@ pub(crate) async fn click(
             },
             dialog_runtime.clone(),
             "semantic_click",
+            &expected_target_id,
         )
         .await?;
-        if let Some(confirmation) = dialog_confirmation(dialog_runtime).await {
+        if let Some(confirmation) = dialog_confirmation(dialog_runtime, &expected_target_id).await {
             return Ok(InteractionOutcome {
                 semantic_class: click_semantic_class(element.tag),
                 element_verified: resolved.verified,
@@ -115,9 +117,10 @@ pub(crate) async fn click(
         },
         dialog_runtime.clone(),
         "pointer_click",
+        &expected_target_id,
     )
     .await?;
-    if let Some(confirmation) = dialog_confirmation(dialog_runtime).await {
+    if let Some(confirmation) = dialog_confirmation(dialog_runtime, &expected_target_id).await {
         return Ok(InteractionOutcome {
             semantic_class: click_semantic_class(element.tag),
             element_verified: resolved.verified,
@@ -166,6 +169,7 @@ pub(crate) async fn click_xy(
     dialog_runtime: &SharedDialogRuntime,
 ) -> Result<InteractionOutcome, RubError> {
     let baseline = crate::interaction::capture_page_baseline(page).await;
+    let expected_target_id = page.target_id().as_ref().to_string();
     crate::pointer::move_to(page, x, y, humanize).await?;
     let page_for_click = page.clone();
     let fence =
@@ -175,9 +179,10 @@ pub(crate) async fn click_xy(
             },
             dialog_runtime.clone(),
             "pointer_click_xy",
+            &expected_target_id,
         )
         .await?;
-    if let Some(confirmation) = dialog_confirmation(dialog_runtime).await {
+    if let Some(confirmation) = dialog_confirmation(dialog_runtime, &expected_target_id).await {
         return Ok(InteractionOutcome {
             semantic_class: InteractionSemanticClass::Activate,
             element_verified: false,
@@ -218,6 +223,7 @@ pub(crate) async fn dblclick_xy(
     dialog_runtime: &SharedDialogRuntime,
 ) -> Result<InteractionOutcome, RubError> {
     let baseline = crate::interaction::capture_page_baseline(page).await;
+    let expected_target_id = page.target_id().as_ref().to_string();
     crate::pointer::move_to(page, x, y, humanize).await?;
     let page_for_click = page.clone();
     let fence =
@@ -227,9 +233,10 @@ pub(crate) async fn dblclick_xy(
             },
             dialog_runtime.clone(),
             "pointer_dblclick_xy",
+            &expected_target_id,
         )
         .await?;
-    if let Some(confirmation) = dialog_confirmation(dialog_runtime).await {
+    if let Some(confirmation) = dialog_confirmation(dialog_runtime, &expected_target_id).await {
         return Ok(InteractionOutcome {
             semantic_class: InteractionSemanticClass::Activate,
             element_verified: false,
@@ -270,6 +277,7 @@ pub(crate) async fn rightclick_xy(
     dialog_runtime: &SharedDialogRuntime,
 ) -> Result<InteractionOutcome, RubError> {
     let baseline = crate::interaction::capture_page_baseline(page).await;
+    let expected_target_id = page.target_id().as_ref().to_string();
     crate::pointer::move_to(page, x, y, humanize).await?;
     let page_for_click = page.clone();
     let fence = await_actuation_or_dialog(
@@ -278,9 +286,10 @@ pub(crate) async fn rightclick_xy(
         },
         dialog_runtime.clone(),
         "pointer_rightclick_xy",
+        &expected_target_id,
     )
     .await?;
-    if let Some(confirmation) = dialog_confirmation(dialog_runtime).await {
+    if let Some(confirmation) = dialog_confirmation(dialog_runtime, &expected_target_id).await {
         return Ok(InteractionOutcome {
             semantic_class: InteractionSemanticClass::Activate,
             element_verified: false,
@@ -359,6 +368,7 @@ pub(crate) async fn dblclick(
     let point = crate::targeting::resolve_pointer_point(page, &target).await?;
     let baseline =
         crate::interaction::capture_interaction_baseline(page, &resolved.remote_object_id).await;
+    let expected_target_id = page.target_id().as_ref().to_string();
 
     crate::pointer::move_to(page, point.x, point.y, humanize).await?;
     let page_for_first_click = page.clone();
@@ -375,9 +385,10 @@ pub(crate) async fn dblclick(
         },
         dialog_runtime.clone(),
         "pointer_dblclick_first",
+        &expected_target_id,
     )
     .await?;
-    if let Some(confirmation) = dialog_confirmation(dialog_runtime).await {
+    if let Some(confirmation) = dialog_confirmation(dialog_runtime, &expected_target_id).await {
         return Ok(InteractionOutcome {
             semantic_class: click_semantic_class(element.tag),
             element_verified: resolved.verified,
@@ -423,9 +434,10 @@ pub(crate) async fn dblclick(
         },
         dialog_runtime.clone(),
         "pointer_dblclick_second",
+        &expected_target_id,
     )
     .await?;
-    if let Some(confirmation) = dialog_confirmation(dialog_runtime).await {
+    if let Some(confirmation) = dialog_confirmation(dialog_runtime, &expected_target_id).await {
         return Ok(InteractionOutcome {
             semantic_class: click_semantic_class(element.tag),
             element_verified: resolved.verified,
@@ -480,6 +492,7 @@ pub(crate) async fn rightclick(
     let point = crate::targeting::resolve_pointer_point(page, &target).await?;
     let baseline =
         crate::interaction::capture_interaction_baseline(page, &resolved.remote_object_id).await;
+    let expected_target_id = page.target_id().as_ref().to_string();
 
     crate::pointer::move_to(page, point.x, point.y, humanize).await?;
     let page_for_click = page.clone();
@@ -490,9 +503,10 @@ pub(crate) async fn rightclick(
         },
         dialog_runtime.clone(),
         "pointer_rightclick",
+        &expected_target_id,
     )
     .await?;
-    if let Some(confirmation) = dialog_confirmation(dialog_runtime).await {
+    if let Some(confirmation) = dialog_confirmation(dialog_runtime, &expected_target_id).await {
         return Ok(InteractionOutcome {
             semantic_class: click_semantic_class(element.tag),
             element_verified: resolved.verified,
@@ -563,6 +577,7 @@ async fn await_actuation_or_dialog<F>(
     actuation: F,
     dialog_runtime: SharedDialogRuntime,
     label: &'static str,
+    expected_target_id: &str,
 ) -> Result<ActuationFence, RubError>
 where
     F: std::future::Future<Output = Result<(), RubError>> + Send + 'static,
@@ -581,7 +596,7 @@ where
             );
             let deadline = Instant::now() + DIALOG_ACTUATION_GRACE_PERIOD;
             loop {
-                if crate::dialogs::pending_dialog(&dialog_runtime)
+                if pending_dialog_for_target(&dialog_runtime, expected_target_id)
                     .await
                     .is_some()
                 {
@@ -609,8 +624,9 @@ where
 
 async fn dialog_confirmation(
     dialog_runtime: &SharedDialogRuntime,
+    expected_target_id: &str,
 ) -> Option<InteractionConfirmation> {
-    let dialog = crate::dialogs::pending_dialog(dialog_runtime).await?;
+    let dialog = pending_dialog_for_target(dialog_runtime, expected_target_id).await?;
     Some(InteractionConfirmation {
         status: InteractionConfirmationStatus::Confirmed,
         kind: Some(InteractionConfirmationKind::DialogOpened),
@@ -644,42 +660,4 @@ fn indeterminate_actuation_confirmation(label: &'static str) -> InteractionConfi
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        ActuationFence, DIALOG_ACTUATION_GRACE_PERIOD, DIALOG_ACTUATION_TIMEOUT,
-        await_actuation_or_dialog,
-    };
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::time::{Duration, sleep};
-
-    #[tokio::test]
-    async fn timed_out_actuation_reports_indeterminate_when_browser_side_commit_may_still_land() {
-        let committed = Arc::new(AtomicBool::new(false));
-        let committed_task = committed.clone();
-
-        let result = await_actuation_or_dialog(
-            async move {
-                sleep(DIALOG_ACTUATION_TIMEOUT + Duration::from_millis(250)).await;
-                committed_task.store(true, Ordering::SeqCst);
-                Ok(())
-            },
-            crate::dialogs::new_shared_dialog_runtime(),
-            "click",
-        )
-        .await;
-
-        assert!(
-            matches!(
-                result.expect("timed out actuation should stay truthful"),
-                ActuationFence::Completed | ActuationFence::Indeterminate
-            ),
-            "local timeout must not fabricate a rollback fence"
-        );
-        sleep(DIALOG_ACTUATION_GRACE_PERIOD + Duration::from_millis(300)).await;
-        assert!(
-            committed.load(Ordering::SeqCst),
-            "browser-side actuation may still late-commit after the local timeout fence"
-        );
-    }
-}
+mod tests;

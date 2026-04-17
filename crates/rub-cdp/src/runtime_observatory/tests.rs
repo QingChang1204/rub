@@ -6,14 +6,14 @@ use super::pending_requests::{
 };
 use super::{
     ObservatoryCallbacks, PENDING_REQUEST_RETENTION_LIMIT, RequestCorrelation, console_message,
-    exception_message, remote_object_summary,
+    exception_message, remote_object_summary, terminal_failure_method,
 };
 use chromiumoxide::cdp::js_protocol::runtime::{
     EventExceptionThrown, ExceptionDetails, RemoteObject, RemoteObjectType, Timestamp,
 };
 use rub_core::model::{NetworkRequestLifecycle, NetworkRuleEffect, NetworkRuleEffectKind};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
 fn sample_pending_request(request_id: &str) -> PendingRequest {
@@ -397,6 +397,45 @@ fn degraded_only_callbacks_are_not_empty() {
     assert!(
         !callbacks.is_empty(),
         "degraded-only observatory installs must still keep listeners alive"
+    );
+}
+
+#[test]
+fn request_correlation_degraded_reasons_are_forwarded_to_runtime_callback() {
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+    let sink = observed.clone();
+    let callback = Arc::new(move |reason: String| {
+        sink.lock().expect("degraded sink lock").push(reason);
+    });
+
+    super::notify_request_correlation_degraded(
+        vec![
+            "request_correlation_registry_evicted",
+            "request_correlation_unresolved_fallback",
+        ],
+        &Some(callback),
+    );
+
+    assert_eq!(
+        observed.lock().expect("degraded sink lock").as_slice(),
+        [
+            "request_correlation_registry_evicted",
+            "request_correlation_unresolved_fallback",
+        ]
+    );
+}
+
+#[test]
+fn terminal_failure_method_reuses_fallback_method_when_pending_is_missing() {
+    let fallback = PendingRequest {
+        method: "POST".to_string(),
+        ..sample_pending_request("req-fallback")
+    };
+
+    assert_eq!(terminal_failure_method(None, &fallback), "POST");
+    assert_eq!(
+        terminal_failure_method(Some(&sample_pending_request("req-live")), &fallback),
+        "GET"
     );
 }
 

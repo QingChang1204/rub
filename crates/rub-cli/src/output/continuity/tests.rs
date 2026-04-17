@@ -248,6 +248,66 @@ fn format_response_adds_fresh_home_continuity_for_provider_gate() {
 }
 
 #[test]
+fn format_response_uses_top_level_doctor_for_degraded_runtime_guidance() {
+    let response = IpcResponse {
+        ipc_protocol_version: "1.0".to_string(),
+        command_id: Some("019-blockers".to_string()),
+        request_id: "019-request".to_string(),
+        status: ResponseStatus::Success,
+        data: Some(serde_json::json!({
+            "subject": { "kind": "blocker_explain" },
+            "result": {
+                "diagnosis": {
+                    "class": "degraded_runtime",
+                    "authoritative": false,
+                    "summary": "runtime degraded",
+                    "workflow_guidance": {
+                        "continuation_kind": "same_runtime",
+                        "summary": "inspect degraded surfaces in the current runtime",
+                        "runtime_roles": {
+                            "current_runtime": {
+                                "role": "observation_runtime",
+                                "summary": "inspect here"
+                            },
+                            "recommended_runtime": {
+                                "role": "observation_runtime",
+                                "summary": "stay here"
+                            }
+                        },
+                        "recommended_runtime": {
+                            "kind": "current_runtime",
+                            "reason": "same_runtime_authoritative_followup"
+                        },
+                        "next_command_hints": [
+                            {
+                                "command": "rub doctor",
+                                "reason": "inspect degraded runtime surfaces in the same session"
+                            }
+                        ]
+                    }
+                }
+            }
+        })),
+        error: None,
+        timing: Timing::default(),
+    };
+
+    let output = format_response(
+        &response,
+        "explain",
+        "forum",
+        rub_home(),
+        false,
+        InteractionTraceMode::Compact,
+    );
+    let json: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(
+        json["data"]["workflow_continuity"]["next_command_hints"][0]["command"],
+        "rub doctor"
+    );
+}
+
+#[test]
 fn format_response_keeps_active_handoff_in_same_runtime() {
     let response = IpcResponse {
         ipc_protocol_version: "1.0".to_string(),

@@ -22,6 +22,8 @@ pub(crate) mod target;
 #[cfg(test)]
 use action_request::orchestration_action_execution_info;
 #[cfg(test)]
+use action_request::orchestration_step_command_id;
+#[cfg(test)]
 use action_request::resolve_orchestration_workflow_spec;
 #[cfg(test)]
 use dispatch::action_requires_source_materialization;
@@ -55,6 +57,7 @@ struct OrchestrationExecutionContext<'a> {
     runtime: &'a OrchestrationRuntimeInfo,
     rule: &'a OrchestrationRuleInfo,
     execution_id: &'a str,
+    command_identity_key: Option<&'a str>,
     rub_home: &'a Path,
 }
 
@@ -63,6 +66,7 @@ pub(crate) async fn execute_orchestration_rule(
     state: &Arc<SessionState>,
     runtime: &OrchestrationRuntimeInfo,
     rule: &OrchestrationRuleInfo,
+    command_identity_key: Option<&str>,
 ) -> OrchestrationResultInfo {
     let total_steps = rule.actions.len() as u32;
     let mut steps = Vec::new();
@@ -79,6 +83,7 @@ pub(crate) async fn execute_orchestration_rule(
         runtime,
         rule,
         execution_id: &execution_id,
+        command_identity_key,
         rub_home: &state.rub_home,
     };
     let target_session = match resolve_target_session(runtime, rule) {

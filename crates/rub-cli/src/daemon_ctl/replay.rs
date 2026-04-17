@@ -6,8 +6,9 @@ use std::time::Instant;
 
 use super::{
     BootstrapClient, DaemonConnection, TransientSocketPolicy, bootstrap_client,
-    detect_or_connect_hardened, ipc_budget_exhausted_error, ipc_timeout_error, ipc_transport_error,
-    project_request_onto_deadline, remaining_budget_ms, replay_recoverable_transport_reason,
+    detect_or_connect_hardened_until, ipc_budget_exhausted_error, ipc_timeout_error,
+    ipc_transport_error, project_request_onto_deadline, remaining_budget_ms,
+    replay_recoverable_transport_reason,
 };
 
 pub(crate) async fn send_existing_request_with_replay_recovery(
@@ -223,10 +224,12 @@ impl<'a> ReplaySendLifecycle<'a> {
 
         match self.strategy {
             ReplayReconnectStrategy::Existing { rub_home, session } => {
-                match detect_or_connect_hardened(
+                match detect_or_connect_hardened_until(
                     rub_home,
                     session,
                     TransientSocketPolicy::FailAfterLock,
+                    self.deadline,
+                    attempt.original_timeout_ms,
                 )
                 .await
                 {
@@ -264,6 +267,7 @@ impl<'a> ReplaySendLifecycle<'a> {
                 recovery.rub_home,
                 recovery.session,
                 self.deadline,
+                attempt.original_timeout_ms,
                 recovery.daemon_args,
                 recovery.attachment_identity,
             )

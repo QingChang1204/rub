@@ -5,7 +5,7 @@ use rub_core::model::{
     OrchestrationExecutionPolicyInfo, OrchestrationRegistrationSpec, OrchestrationRuleInfo,
     OrchestrationRuleStatus,
 };
-use uuid::Uuid;
+use rub_ipc::protocol::IpcRequest;
 
 use crate::runtime_refresh::refresh_orchestration_runtime;
 use crate::session::SessionState;
@@ -54,12 +54,12 @@ pub(super) async fn cmd_orchestration_add(
     )
     .await?;
 
-    let correlation_key = spec
-        .correlation_key
-        .unwrap_or_else(|| Uuid::now_v7().to_string());
-    let idempotency_key = spec
-        .idempotency_key
-        .unwrap_or_else(|| Uuid::now_v7().to_string());
+    let default_correlation_key =
+        default_orchestration_registration_key("correlation", &spec, args.paused);
+    let default_idempotency_key =
+        default_orchestration_registration_key("idempotency", &spec, args.paused);
+    let correlation_key = spec.correlation_key.unwrap_or(default_correlation_key);
+    let idempotency_key = spec.idempotency_key.unwrap_or(default_idempotency_key);
     let rule = state
         .register_orchestration_rule(OrchestrationRuleInfo {
             id: 0,
@@ -204,4 +204,183 @@ pub(super) async fn cmd_orchestration_export(
         }),
         &runtime,
     ))
+}
+
+fn default_orchestration_registration_key(
+    kind: &str,
+    spec: &OrchestrationRegistrationSpec,
+    paused: bool,
+) -> String {
+    let identity = orchestration_registration_request_identity(spec, paused);
+    format!("orchestration_{kind}\u{1f}{identity}")
+}
+
+fn orchestration_registration_request_identity(
+    spec: &OrchestrationRegistrationSpec,
+    paused: bool,
+) -> String {
+    let request = IpcRequest::new(
+        "orchestration.add",
+        serde_json::json!({
+            "paused": paused,
+            "spec": spec,
+        }),
+        0,
+    );
+    crate::router::transaction::replay_request_fingerprint(&request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        default_orchestration_registration_key, orchestration_registration_request_identity,
+    };
+    use crate::session::SessionState;
+    use rub_core::model::{
+        OrchestrationAddressInfo, OrchestrationExecutionPolicyInfo, OrchestrationRegistrationSpec,
+        OrchestrationRuleInfo, OrchestrationRuleStatus,
+    };
+    use std::path::PathBuf;
+
+    fn parse_registration_spec(json: &str) -> OrchestrationRegistrationSpec {
+        serde_json::from_str(json).expect("registration spec should parse")
+    }
+
+    #[test]
+    fn omitted_registration_keys_derive_stable_identity_across_object_key_order() {
+        let spec_a = parse_registration_spec(
+            r#"{
+                "source": { "session_id": "sess-source" },
+                "target": { "session_id": "sess-target" },
+                "condition": { "kind": "text_present", "text": "Ready" },
+                "actions": [
+                    {
+                        "kind": "browser_command",
+                        "command": "pipe",
+                        "payload": {
+                            "timeout_ms": 1000,
+                            "steps": [
+                                { "command": "state", "args": { "format": "json", "verbose": true } }
+                            ]
+                        }
+                    }
+                ]
+            }"#,
+        );
+        let spec_b = parse_registration_spec(
+            r#"{
+                "source": { "session_id": "sess-source" },
+                "target": { "session_id": "sess-target" },
+                "actions": [
+                    {
+                        "payload": {
+                            "steps": [
+                                { "args": { "verbose": true, "format": "json" }, "command": "state" }
+                            ],
+                            "timeout_ms": 1000
+                        },
+                        "command": "pipe",
+                        "kind": "browser_command"
+                    }
+                ],
+                "condition": { "text": "Ready", "kind": "text_present" }
+            }"#,
+        );
+
+        assert_eq!(
+            orchestration_registration_request_identity(&spec_a, false),
+            orchestration_registration_request_identity(&spec_b, false)
+        );
+        assert_eq!(
+            default_orchestration_registration_key("correlation", &spec_a, false),
+            default_orchestration_registration_key("correlation", &spec_b, false)
+        );
+        assert_eq!(
+            default_orchestration_registration_key("idempotency", &spec_a, false),
+            default_orchestration_registration_key("idempotency", &spec_b, false)
+        );
+    }
+
+    fn rule_from_spec(
+        spec: &OrchestrationRegistrationSpec,
+        correlation_key: String,
+        idempotency_key: String,
+    ) -> OrchestrationRuleInfo {
+        OrchestrationRuleInfo {
+            id: 0,
+            status: OrchestrationRuleStatus::Armed,
+            source: OrchestrationAddressInfo {
+                session_id: spec.source.session_id.clone(),
+                session_name: "source".to_string(),
+                tab_index: spec.source.tab_index,
+                tab_target_id: spec.source.tab_target_id.clone(),
+                frame_id: spec.source.frame_id.clone(),
+            },
+            target: OrchestrationAddressInfo {
+                session_id: spec.target.session_id.clone(),
+                session_name: "target".to_string(),
+                tab_index: spec.target.tab_index,
+                tab_target_id: spec.target.tab_target_id.clone(),
+                frame_id: spec.target.frame_id.clone(),
+            },
+            mode: spec.mode,
+            execution_policy: OrchestrationExecutionPolicyInfo::default(),
+            condition: spec.condition.clone(),
+            actions: spec.actions.clone(),
+            correlation_key,
+            idempotency_key,
+            unavailable_reason: None,
+            last_condition_evidence: None,
+            last_result: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stable_omitted_registration_identity_prevents_duplicate_live_rule_on_retry() {
+        let state = SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-orchestration-add-stable-id"),
+            None,
+        );
+        let spec = parse_registration_spec(
+            r##"{
+                "source": { "session_id": "sess-source" },
+                "target": { "session_id": "sess-target" },
+                "condition": { "kind": "text_present", "text": "Ready" },
+                "actions": [
+                    {
+                        "kind": "browser_command",
+                        "command": "click",
+                        "payload": { "selector": "#continue" }
+                    }
+                ]
+            }"##,
+        );
+        let correlation_key = default_orchestration_registration_key("correlation", &spec, false);
+        let idempotency_key = default_orchestration_registration_key("idempotency", &spec, false);
+
+        let first = state
+            .register_orchestration_rule(rule_from_spec(
+                &spec,
+                correlation_key.clone(),
+                idempotency_key.clone(),
+            ))
+            .await
+            .expect("first rule should register");
+        let duplicate = state
+            .register_orchestration_rule(rule_from_spec(
+                &spec,
+                correlation_key.clone(),
+                idempotency_key.clone(),
+            ))
+            .await
+            .expect_err("stable omitted registration identity should reject duplicate retry");
+
+        assert_eq!(first.id, 1);
+        assert_eq!(duplicate, 1);
+        let runtime = state.orchestration_runtime().await;
+        assert_eq!(runtime.rules.len(), 1);
+        assert_eq!(runtime.rules[0].idempotency_key, idempotency_key);
+        assert_eq!(runtime.rules[0].correlation_key, correlation_key);
+    }
 }

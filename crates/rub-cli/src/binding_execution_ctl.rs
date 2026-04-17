@@ -1,5 +1,6 @@
 use crate::binding_memory_ctl::resolve_remembered_alias_target;
 use crate::commands::EffectiveCli;
+use crate::session_policy::{ConnectionRequest, normalize_identity_path};
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{
     BindingExecutionMode, BindingExecutionResolutionInfo, BindingExecutionSourceKind,
@@ -13,12 +14,20 @@ use std::path::Path;
 pub(crate) struct BindingExecutionContext {
     pub(crate) cli: EffectiveCli,
     pub(crate) projection: Option<BindingExecutionResolutionInfo>,
+    pub(crate) connection_request_override: Option<ConnectionRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BindingLaunchTarget {
-    Profile { dir_name: String },
-    UserDataDir { path: String },
+    Profile {
+        name: String,
+        dir_name: String,
+        resolved_path: String,
+        user_data_root: String,
+    },
+    UserDataDir {
+        path: String,
+    },
 }
 
 pub(crate) fn resolve_command_execution_binding(
@@ -28,6 +37,7 @@ pub(crate) fn resolve_command_execution_binding(
         return Ok(BindingExecutionContext {
             cli: cli.clone(),
             projection: None,
+            connection_request_override: None,
         });
     };
     if cli.cdp_url.is_some()
@@ -98,6 +108,7 @@ pub(crate) fn resolve_command_execution_binding(
                     available_refresh_paths: refresh_paths_for_binding(&binding),
                 }),
                 cli: resolved_cli,
+                connection_request_override: None,
             })
         }
         BindingResolution::NoLiveMatch
@@ -110,8 +121,13 @@ pub(crate) fn resolve_command_execution_binding(
             let launch_target = reusable_launch_target(&binding).expect("checked above");
             resolved_cli.use_alias = None;
             match launch_target {
-                BindingLaunchTarget::Profile { dir_name } => {
-                    resolved_cli.profile = Some(dir_name.clone());
+                BindingLaunchTarget::Profile {
+                    name,
+                    dir_name,
+                    resolved_path,
+                    user_data_root,
+                } => {
+                    resolved_cli.profile = Some(name.clone());
                     resolved_cli.user_data_dir = None;
                     resolved_cli.requested_launch_policy.user_data_dir = None;
                     resolved_cli.effective_launch_policy.user_data_dir = None;
@@ -125,13 +141,19 @@ pub(crate) fn resolve_command_execution_binding(
                             mode: BindingExecutionMode::LaunchBoundProfile,
                             effective_session_name: resolved_cli.session.clone(),
                             effective_session_id: None,
-                            effective_profile_dir_name: Some(dir_name),
+                            effective_profile_dir_name: Some(dir_name.clone()),
                             effective_user_data_dir: None,
                             live_status,
                             resolution,
                             available_refresh_paths: refresh_paths_for_binding(&binding),
                         }),
                         cli: resolved_cli,
+                        connection_request_override: Some(ConnectionRequest::Profile {
+                            name,
+                            dir_name,
+                            resolved_path,
+                            user_data_root,
+                        }),
                     })
                 }
                 BindingLaunchTarget::UserDataDir { path } => {
@@ -155,6 +177,7 @@ pub(crate) fn resolve_command_execution_binding(
                             available_refresh_paths: refresh_paths_for_binding(&binding),
                         }),
                         cli: resolved_cli,
+                        connection_request_override: None,
                     })
                 }
             }
@@ -185,13 +208,16 @@ pub(crate) fn attach_binding_execution_projection(
 }
 
 fn reusable_launch_target(binding: &BindingRecord) -> Option<BindingLaunchTarget> {
-    let is_profile_binding = binding
+    let profile_identity = binding
         .attachment_identity
         .as_deref()
-        .is_some_and(|identity| identity.starts_with("profile:"));
-    if is_profile_binding {
-        return reusable_profile_dir_name(binding)
-            .map(|dir_name| BindingLaunchTarget::Profile { dir_name });
+        .or(binding
+            .auth_provenance
+            .captured_from_attachment_identity
+            .as_deref())
+        .filter(|identity| identity.starts_with("profile:"));
+    if let Some(profile_identity) = profile_identity {
+        return reusable_profile_launch_target(profile_identity);
     }
     binding
         .user_data_dir_reference
@@ -199,28 +225,18 @@ fn reusable_launch_target(binding: &BindingRecord) -> Option<BindingLaunchTarget
         .map(|path| BindingLaunchTarget::UserDataDir { path })
 }
 
-fn reusable_profile_dir_name(binding: &BindingRecord) -> Option<String> {
-    let is_profile_binding = binding
-        .attachment_identity
-        .as_deref()
-        .is_some_and(|identity| identity.starts_with("profile:"));
-    if !is_profile_binding {
-        return None;
-    }
-    let reference = binding.profile_directory_reference.as_deref()?;
-    Path::new(reference)
-        .file_name()
-        .or_else(|| {
-            Path::new(reference)
-                .components()
-                .next_back()
-                .and_then(|component| match component {
-                    std::path::Component::Normal(value) => Some(value),
-                    _ => None,
-                })
-        })
-        .and_then(|value| value.to_str())
-        .map(str::to_string)
+fn reusable_profile_launch_target(profile_identity: &str) -> Option<BindingLaunchTarget> {
+    let resolved_path = profile_identity.strip_prefix("profile:")?;
+    let normalized_resolved_path = normalize_identity_path(resolved_path);
+    let resolved_path = Path::new(&normalized_resolved_path);
+    let dir_name = resolved_path.file_name()?.to_str()?.to_string();
+    let user_data_root = resolved_path.parent()?.to_str()?.to_string();
+    Some(BindingLaunchTarget::Profile {
+        name: dir_name.clone(),
+        dir_name,
+        resolved_path: normalized_resolved_path,
+        user_data_root,
+    })
 }
 
 fn refresh_paths_for_binding(binding: &BindingRecord) -> Vec<BindingRefreshPath> {

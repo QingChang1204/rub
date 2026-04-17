@@ -1306,6 +1306,7 @@ dependencies = [
  "libc",
  "rub-core",
  "rub-daemon",
+ "rub-ipc",
  "serde_json",
  "tokio",
  "uuid",

@@ -1,31 +1,34 @@
-use crate::connection_hardening::{
-    AttemptError, RetryFailure, RetryPolicy, classify_error_code, classify_io_transient,
-    run_with_bounded_retry,
-};
+use crate::connection_hardening::{AttemptError, classify_error_code, classify_io_transient};
+use crate::main_support::command_timeout_error;
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::LaunchPolicyInfo;
 use rub_ipc::client::{IpcClient, IpcClientError};
 use rub_ipc::protocol::{IpcRequest, ResponseStatus};
-use std::path::Path;
-
-use super::{connect_ipc_with_retry, preferred_socket_path_for_session};
-
+use std::time::Instant;
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct HandshakePayload {
     pub(crate) daemon_session_id: String,
     pub(crate) launch_policy: LaunchPolicyInfo,
-}
-
-pub(crate) async fn fetch_launch_policy(
-    client: &mut IpcClient,
-) -> Result<LaunchPolicyInfo, RubError> {
-    Ok(fetch_handshake_info(client).await?.launch_policy)
+    pub(crate) attachment_identity: Option<String>,
 }
 
 pub(crate) async fn fetch_handshake_info(
     client: &mut IpcClient,
 ) -> Result<HandshakePayload, RubError> {
     fetch_handshake_info_with_timeout(client, 3_000).await
+}
+
+pub(crate) async fn fetch_handshake_info_until(
+    client: &mut IpcClient,
+    deadline: Instant,
+    timeout_ms: u64,
+    phase: &'static str,
+) -> Result<HandshakePayload, RubError> {
+    let remaining_timeout_ms = super::remaining_budget_ms(deadline);
+    if remaining_timeout_ms == 0 {
+        return Err(command_timeout_error(timeout_ms, phase));
+    }
+    fetch_handshake_info_with_timeout(client, remaining_timeout_ms.max(1)).await
 }
 
 pub(crate) async fn fetch_handshake_info_with_timeout(
@@ -52,30 +55,6 @@ pub(crate) async fn fetch_handshake_info_with_timeout(
             format!("Invalid handshake payload: {e}"),
         )
     })
-}
-
-pub(crate) async fn fetch_launch_policy_for_session(
-    rub_home: &Path,
-    session: &str,
-) -> Result<LaunchPolicyInfo, RubError> {
-    let socket_path = preferred_socket_path_for_session(rub_home, session)?;
-    let (launch_policy, _attribution) = run_with_bounded_retry(RetryPolicy::default(), || async {
-        let (mut client, _connect_attr) = connect_ipc_with_retry(
-            &socket_path,
-            ErrorCode::IpcProtocolError,
-            format!("Failed to connect to session '{session}' for launch policy check"),
-            "daemon_ctl.launch_policy.socket_path",
-            "preferred_socket_path_for_session",
-        )
-        .await
-        .map_err(RetryFailure::into_attempt_error)?;
-        fetch_launch_policy(&mut client)
-            .await
-            .map_err(handshake_attempt_error)
-    })
-    .await
-    .map_err(RetryFailure::into_error)?;
-    Ok(launch_policy)
 }
 
 fn handshake_send_error(error: IpcClientError) -> RubError {

@@ -18,7 +18,8 @@ mod surfaces;
 #[cfg(test)]
 use interference::apply_policy_driven_handoff;
 pub(crate) use interference::{
-    refresh_live_interference_state, refresh_live_runtime_and_interference,
+    InterferenceRefreshIntent, refresh_live_interference_state,
+    refresh_live_runtime_and_interference,
 };
 pub(crate) use orchestration::refresh_orchestration_runtime;
 pub(crate) use surfaces::{
@@ -33,7 +34,9 @@ mod tests {
     use std::sync::Arc;
     use std::thread::JoinHandle;
 
-    use super::{apply_policy_driven_handoff, refresh_orchestration_runtime};
+    use super::{
+        InterferenceRefreshIntent, apply_policy_driven_handoff, refresh_orchestration_runtime,
+    };
     use crate::rub_paths::RubPaths;
     use crate::session::SessionState;
     use crate::session::{RegistryData, RegistryEntry, write_registry};
@@ -143,7 +146,13 @@ mod tests {
             ..InterferenceRuntimeInfo::default()
         };
 
-        apply_policy_driven_handoff(&state, &runtime, &headed_launch_policy()).await;
+        apply_policy_driven_handoff(
+            InterferenceRefreshIntent::PolicyDriven,
+            &state,
+            &runtime,
+            &headed_launch_policy(),
+        )
+        .await;
 
         let handoff = state.human_verification_handoff().await;
         let takeover = state.takeover_runtime().await;
@@ -174,7 +183,13 @@ mod tests {
             ..InterferenceRuntimeInfo::default()
         };
 
-        apply_policy_driven_handoff(&state, &runtime, &headed_launch_policy()).await;
+        apply_policy_driven_handoff(
+            InterferenceRefreshIntent::PolicyDriven,
+            &state,
+            &runtime,
+            &headed_launch_policy(),
+        )
+        .await;
 
         let handoff = state.human_verification_handoff().await;
         assert_eq!(handoff.status, HumanVerificationHandoffStatus::Unavailable);
@@ -200,11 +215,55 @@ mod tests {
             ..InterferenceRuntimeInfo::default()
         };
 
-        apply_policy_driven_handoff(&state, &runtime, &headed_launch_policy()).await;
+        apply_policy_driven_handoff(
+            InterferenceRefreshIntent::PolicyDriven,
+            &state,
+            &runtime,
+            &headed_launch_policy(),
+        )
+        .await;
 
         let handoff = state.human_verification_handoff().await;
         assert_eq!(handoff.status, HumanVerificationHandoffStatus::Available);
         assert!(!handoff.automation_paused);
+    }
+
+    #[tokio::test]
+    async fn read_only_interference_refresh_does_not_activate_policy_handoff() {
+        let state = Arc::new(SessionState::new("default", temp_home(), None));
+        state.set_handoff_available(true).await;
+
+        let runtime = InterferenceRuntimeInfo {
+            mode: InterferenceMode::PublicWebStable,
+            status: InterferenceRuntimeStatus::Active,
+            current_interference: Some(InterferenceObservation {
+                kind: InterferenceKind::HumanVerificationRequired,
+                summary: "human verification checkpoint detected".to_string(),
+                current_url: Some("https://example.com/challenge".to_string()),
+                primary_url: Some("https://example.com".to_string()),
+            }),
+            active_policies: vec![
+                "safe_recovery".to_string(),
+                "handoff_escalation".to_string(),
+            ],
+            handoff_required: true,
+            ..InterferenceRuntimeInfo::default()
+        };
+
+        apply_policy_driven_handoff(
+            InterferenceRefreshIntent::ReadOnly,
+            &state,
+            &runtime,
+            &headed_launch_policy(),
+        )
+        .await;
+
+        let handoff = state.human_verification_handoff().await;
+        let takeover = state.takeover_runtime().await;
+        assert_eq!(handoff.status, HumanVerificationHandoffStatus::Available);
+        assert!(!handoff.automation_paused);
+        assert_eq!(takeover.status, TakeoverRuntimeStatus::Unavailable);
+        assert!(!takeover.automation_paused);
     }
 
     #[tokio::test]

@@ -1,8 +1,9 @@
 use crate::commands::{BindingCaptureAuthInputArg, EffectiveCli};
 use crate::daemon_ctl;
 use crate::session_policy::{
-    materialize_connection_request, parse_connection_request, requested_attachment_identity,
-    requires_existing_session_validation, validate_existing_session_connection_request,
+    materialize_connection_request_with_deadline, parse_connection_request,
+    requested_attachment_identity, requires_existing_session_validation,
+    validate_existing_session_connection_request_with_deadline,
 };
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{
@@ -12,9 +13,10 @@ use rub_core::model::{
 use rub_ipc::protocol::{IpcRequest, ResponseStatus};
 use serde_json::{Value, json};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use uuid::Uuid;
 
 use super::{
     binding_alias_subject, load_live_registry_snapshot, normalize_binding_alias,
@@ -130,8 +132,15 @@ fn validate_capture_mode(
 async fn fetch_binding_capture_candidate(
     cli: &EffectiveCli,
 ) -> Result<BindingCaptureCandidateInfo, RubError> {
-    let connection_request =
-        materialize_connection_request(&parse_connection_request(cli)?).await?;
+    let timeout_ms = cli.timeout.max(1);
+    let started_at = Instant::now();
+    let deadline = crate::timeout_budget::deadline_from_start(started_at, timeout_ms);
+    let connection_request = materialize_connection_request_with_deadline(
+        &parse_connection_request(cli)?,
+        Some(deadline),
+        Some(timeout_ms),
+    )
+    .await?;
     let daemon_args = crate::daemon_args(cli, &connection_request);
     let attachment_identity = requested_attachment_identity(cli, &connection_request);
 
@@ -163,16 +172,18 @@ async fn fetch_binding_capture_candidate(
     };
 
     if requires_existing_session_validation(true, &connection_request, cli) {
-        validate_existing_session_connection_request(cli, &connection_request).await?;
+        validate_existing_session_connection_request_with_deadline(
+            cli,
+            &connection_request,
+            &mut client,
+            daemon_session_id.as_deref(),
+            Some(deadline),
+            Some(timeout_ms),
+        )
+        .await?;
     }
 
-    let timeout_ms = cli.timeout.max(1);
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let request = IpcRequest::new(
-        "runtime",
-        json!({ "sub": "binding-capture-candidate" }),
-        timeout_ms,
-    );
+    let request = binding_capture_candidate_request(timeout_ms);
     let response = daemon_ctl::send_existing_request_with_replay_recovery(
         &mut client,
         &request,
@@ -229,6 +240,16 @@ async fn fetch_binding_capture_candidate(
             )
         })),
     }
+}
+
+pub(super) fn binding_capture_candidate_request(timeout_ms: u64) -> IpcRequest {
+    IpcRequest::new(
+        "runtime",
+        json!({ "sub": "binding-capture-candidate" }),
+        timeout_ms,
+    )
+    .with_command_id(Uuid::now_v7().to_string())
+    .expect("UUID command_id must be valid")
 }
 
 fn binding_capture_unavailable_error(

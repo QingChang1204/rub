@@ -12,6 +12,12 @@ use crate::session::SessionState;
 const NAVIGATION_PROJECTION_SETTLE_RETRIES: usize = 6;
 const NAVIGATION_PROJECTION_SETTLE_DELAY_MS: u64 = 100;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ActiveTabProjection {
+    pub tab: Option<serde_json::Value>,
+    pub degraded_reason: Option<&'static str>,
+}
+
 pub(super) async fn settle_navigation_projection(
     router: &DaemonRouter,
     state: &Arc<SessionState>,
@@ -81,12 +87,71 @@ async fn active_tab_and_frame_runtime_converged(
         })
 }
 
-pub(super) async fn active_tab_entity(
-    router: &DaemonRouter,
-) -> Result<serde_json::Value, RubError> {
-    let tabs = router.browser.list_tabs().await?;
-    let active_tab = tabs.iter().find(|tab| tab.active).ok_or_else(|| {
-        RubError::Internal("navigation completed without an active tab".to_string())
-    })?;
-    Ok(crate::router::projection::tab_entity(active_tab))
+pub(super) async fn active_tab_projection(router: &DaemonRouter) -> ActiveTabProjection {
+    match router.browser.list_tabs().await {
+        Ok(tabs) => active_tab_projection_from_tabs(&tabs),
+        Err(_) => degraded_active_tab_projection("active_tab_probe_failed"),
+    }
+}
+
+fn active_tab_projection_from_tabs(tabs: &[TabInfo]) -> ActiveTabProjection {
+    match tabs.iter().find(|tab| tab.active) {
+        Some(active_tab) => ActiveTabProjection {
+            tab: Some(crate::router::projection::tab_entity(active_tab)),
+            degraded_reason: None,
+        },
+        None => degraded_active_tab_projection("active_tab_unavailable"),
+    }
+}
+
+fn degraded_active_tab_projection(reason: &'static str) -> ActiveTabProjection {
+    ActiveTabProjection {
+        tab: None,
+        degraded_reason: Some(reason),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{active_tab_projection_from_tabs, degraded_active_tab_projection};
+    use rub_core::model::TabInfo;
+
+    fn tab(index: u32, target_id: &str, active: bool) -> TabInfo {
+        TabInfo {
+            index,
+            target_id: target_id.to_string(),
+            url: format!("https://example.com/{index}"),
+            title: format!("Tab {index}"),
+            active,
+        }
+    }
+
+    #[test]
+    fn active_tab_projection_from_tabs_returns_active_tab_without_degradation() {
+        let projection =
+            active_tab_projection_from_tabs(&[tab(0, "tab-a", false), tab(1, "tab-b", true)]);
+        assert!(projection.degraded_reason.is_none());
+        assert_eq!(
+            projection
+                .tab
+                .as_ref()
+                .and_then(|tab| tab.get("target_id"))
+                .and_then(|value| value.as_str()),
+            Some("tab-b")
+        );
+    }
+
+    #[test]
+    fn active_tab_projection_from_tabs_degrades_when_no_active_tab_is_reported() {
+        let projection = active_tab_projection_from_tabs(&[tab(0, "tab-a", false)]);
+        assert!(projection.tab.is_none());
+        assert_eq!(projection.degraded_reason, Some("active_tab_unavailable"));
+    }
+
+    #[test]
+    fn degraded_active_tab_projection_clears_tab_payload() {
+        let projection = degraded_active_tab_projection("active_tab_probe_failed");
+        assert!(projection.tab.is_none());
+        assert_eq!(projection.degraded_reason, Some("active_tab_probe_failed"));
+    }
 }

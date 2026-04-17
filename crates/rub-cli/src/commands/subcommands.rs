@@ -1,6 +1,5 @@
 use clap::Subcommand;
 use rub_core::DEFAULT_WAIT_TIMEOUT_MS;
-use rub_core::command::CommandName;
 
 use super::{
     ElementAddressArgs, ObservationProjectionArgs, ObservationScopeArgs, StateFormatArg,
@@ -8,9 +7,13 @@ use super::{
 };
 
 mod explain;
+mod help;
+mod meta;
 mod query;
 mod runtime;
 
+#[cfg(test)]
+pub(crate) use self::meta::render_nested_subcommand_long_help;
 pub use explain::ExplainSubcommand;
 pub use query::{GetSubcommand, InspectSubcommand};
 pub use runtime::{
@@ -19,67 +22,6 @@ pub use runtime::{
     OrchestrationSubcommand, RememberedBindingAliasKindArg, RuntimeSubcommand, SecretSubcommand,
     StorageSubcommand, TakeoverSubcommand, TriggerSubcommand,
 };
-
-const FILL_LONG_ABOUT: &str = "\
-Fill multiple form fields through the canonical interaction runtime.
-
-Use `fill` when you already know the fields you want to set and want one
-command to apply them, optionally followed by a canonical submit click.
-
-The spec is a JSON array. Each entry targets one field and sets its value.
-You can mix locator styles in the same array.";
-
-const FILL_AFTER_LONG_HELP: &str = "\
-Spec formats:
-  By index:
-    rub fill '[{\"index\":3,\"value\":\"alice@example.com\"},{\"index\":5,\"value\":\"$RUB_PASSWORD\"}]'
-
-  By label:
-    rub fill '[{\"label\":\"Email\",\"value\":\"alice@example.com\"},{\"label\":\"Password\",\"value\":\"$RUB_PASSWORD\"}]'
-
-  By selector:
-    rub fill '[{\"selector\":\"#email\",\"value\":\"alice@example.com\"}]'
-
-  By text:
-    rub fill '[{\"target_text\":\"Email address\",\"value\":\"alice@example.com\"}]'
-
-Examples:
-  Fill and submit:
-    rub fill '[{\"label\":\"Email\",\"value\":\"user@example.com\"},{\"label\":\"Password\",\"value\":\"$RUB_PASSWORD\"}]' --submit-label \"Log in\"
-
-  Load spec from a file:
-    rub fill --file form.json --submit-label \"Submit\"
-
-Notes:
-  Mixed locators are allowed in the same spec array.
-  Use `--snapshot` when you want strict preflight continuity against one captured snapshot.
-  Use the \"Submit action\" options to click a follow-up button after filling.
-  Use the \"Post-action wait\" options when you need an explicit confirmation fence.";
-
-const EXTRACT_LONG_ABOUT: &str = "\
-Extract structured data through the canonical query surface.
-
-Use `extract` to turn page content into stable JSON fields without dropping
-down to ad hoc JavaScript for common scraping/query tasks.";
-
-const EXTRACT_AFTER_LONG_HELP: &str = "\
-Examples:
-  Shorthand field-to-selector mapping:
-    rub extract '{\"title\":\"h1\",\"price\":\".price\",\"desc\":\".desc\"}'
-
-  Explicit extraction kind:
-    rub extract '{\"title\":{\"selector\":\"h1\",\"kind\":\"text\"}}'
-
-  Attribute extraction:
-    rub extract '{\"link\":{\"selector\":\"a.main\",\"kind\":\"attribute\",\"attr\":\"href\"}}'
-
-  Collection extraction:
-    rub extract '{\"items\":{\"collection\":\"li.item\",\"fields\":{\"name\":{\"kind\":\"text\"},\"price\":{\"selector\":\".price\"}}}}'
-
-Output shape:
-  {\"result\":{\"fields\":{\"title\":\"...\"},\"field_count\":N}}
-
-Use --snapshot when you want strict continuity against a previously captured snapshot.";
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
@@ -124,20 +66,7 @@ pub enum Commands {
     },
 
     /// Atomically capture a token-friendly page summary plus screenshot.
-    ///
-    /// Produces an element index map and screenshot in one round trip.
-    /// The `element_map` in the result lists all visible interactive elements
-    /// with their numeric index — use that index with `click`, `type`, `hover`,
-    /// and `fill` to interact with the page.
-    ///
-    /// After `observe`, interact using the index numbers in element_map:
-    ///   rub observe --path /tmp/page.png
-    ///   rub click 3                    # click element #3 from element_map
-    ///   rub type --index 5 "hello"     # type into element #5
-    ///   rub fill '[{"index":3,"value":"hello"},{"index":5,"value":"world"}]'
-    ///
-    /// Screenshot is base64 in JSON by default; use --path to save to disk.
-    /// Use --compact for a token-efficient text summary instead of full a11y tree.
+    #[command(long_about = help::OBSERVE_LONG_ABOUT)]
     Observe {
         /// Save the screenshot to a file path (otherwise base64 in JSON)
         #[arg(long)]
@@ -322,18 +251,7 @@ pub enum Commands {
     Cleanup,
 
     /// Canonical lifecycle exit for one RUB_HOME.
-    ///
-    /// `teardown` is the operator-facing wrapper over:
-    ///   1. `close --all`
-    ///   2. `cleanup`
-    ///
-    /// It closes active sessions for the target RUB_HOME, waits for daemon
-    /// shutdown fences, then sweeps orphaned temporary browser profiles and
-    /// stale temp-owned homes for that same authority.
-    ///
-    /// Examples:
-    ///   rub teardown
-    ///   rub --rub-home /tmp/rub-bench teardown
+    #[command(long_about = help::TEARDOWN_LONG_ABOUT)]
     Teardown,
 
     /// Show recent session-scoped command history
@@ -547,7 +465,10 @@ pub enum Commands {
     },
 
     /// Fill multiple form fields through the canonical interaction runtime
-    #[command(long_about = FILL_LONG_ABOUT, after_long_help = FILL_AFTER_LONG_HELP)]
+    #[command(
+        long_about = help::FILL_LONG_ABOUT,
+        after_long_help = help::FILL_AFTER_LONG_HELP
+    )]
     Fill {
         /// Inline JSON fill specification (array of field descriptors)
         #[arg(conflicts_with = "file", help_heading = "Fill spec input")]
@@ -604,7 +525,10 @@ pub enum Commands {
     },
 
     /// Extract structured data through the canonical query surface
-    #[command(long_about = EXTRACT_LONG_ABOUT, after_long_help = EXTRACT_AFTER_LONG_HELP)]
+    #[command(
+        long_about = help::EXTRACT_LONG_ABOUT,
+        after_long_help = help::EXTRACT_AFTER_LONG_HELP
+    )]
     Extract {
         /// Inline JSON extract specification
         #[arg(
@@ -647,28 +571,7 @@ pub enum Commands {
     },
 
     /// Execute a workflow pipeline over existing canonical commands.
-    ///
-    /// SPEC is a JSON array of step objects, each with a `command` key and optional
-    /// `args` object. Steps run sequentially; each step result is included in the
-    /// final response under `steps[n].result`.
-    ///
-    /// Minimal example (open and take screenshot):
-    ///   rub pipe '[{"command":"open","args":{"url":"https://example.com"}},{"command":"screenshot"}]'
-    ///
-    /// Form automation:
-    ///   rub pipe '[{"command":"open","args":{"url":"https://login.example.com"}},{"command":"fill","args":{"spec":[{"label":"Email","value":"user@example.com"},{"label":"Password","value":"$RUB_PASSWORD"}],"submit_label":"Log in"}}]'
-    ///
-    /// Named workflow (saved under RUB_HOME/workflows/<name>.json):
-    ///   rub secret set RUB_PASSWORD --stdin
-    ///   rub pipe --workflow login --var email=user@example.com --var 'password=$RUB_PASSWORD'
-    ///
-    /// Step result references: Use {{prev.result.PATH}} to inject the previous step's
-    /// result, or {{steps[N].result.PATH}} / {{steps[LABEL].result.PATH}} to reference
-    /// any completed prior step by index or label:
-    ///   rub pipe '[{"command":"extract","args":{"spec":"{\"title\":\"h1\"}"},"label":"get_title"},{"command":"exec","args":{"code":"document.title = \"{{prev.result.fields.title}}\""}}]'
-    ///
-    /// Allowed commands in pipe: open, state, click, type, exec, scroll, back,
-    ///   keys, wait, tabs, switch, close-tab, get, hover, upload, select, fill, extract
+    #[command(long_about = help::PIPE_LONG_ABOUT)]
     Pipe {
         /// JSON pipeline specification (array of {command, args} step objects)
         #[arg(conflicts_with_all = ["file", "workflow", "list_workflows"])]
@@ -693,124 +596,6 @@ pub enum Commands {
     #[command(hide = true)]
     #[command(name = "__daemon")]
     InternalDaemon,
-}
-
-impl Commands {
-    pub(crate) fn canonical_name(&self) -> &'static str {
-        match self {
-            Self::Open { .. } => CommandName::Open.as_str(),
-            Self::State { .. } => CommandName::State.as_str(),
-            Self::Observe { .. } => CommandName::Observe.as_str(),
-            Self::Find { .. } => CommandName::Find.as_str(),
-            Self::Click { .. } => CommandName::Click.as_str(),
-            Self::Exec { .. } => CommandName::Exec.as_str(),
-            Self::Explain { .. } => "explain",
-            Self::Scroll { .. } => CommandName::Scroll.as_str(),
-            Self::Back { .. } => CommandName::Back.as_str(),
-            Self::Forward { .. } => CommandName::Forward.as_str(),
-            Self::Reload { .. } => CommandName::Reload.as_str(),
-            Self::Screenshot { .. } => CommandName::Screenshot.as_str(),
-            Self::Close { .. } => CommandName::Close.as_str(),
-            Self::Sessions => "sessions",
-            Self::Binding { .. } => "binding",
-            Self::Secret { .. } => CommandName::Secret.as_str(),
-            Self::Doctor => CommandName::Doctor.as_str(),
-            Self::Runtime { .. } => CommandName::Runtime.as_str(),
-            Self::Trigger { .. } => CommandName::Trigger.as_str(),
-            Self::Orchestration { .. } => CommandName::Orchestration.as_str(),
-            Self::Frames => CommandName::Frames.as_str(),
-            Self::Frame { .. } => CommandName::Frame.as_str(),
-            Self::Cleanup => "cleanup",
-            Self::Teardown => "teardown",
-            Self::History { .. } => CommandName::History.as_str(),
-            Self::Downloads => CommandName::Downloads.as_str(),
-            Self::Download { .. } => CommandName::Download.as_str(),
-            Self::Storage(_) => CommandName::Storage.as_str(),
-            Self::Handoff { .. } => CommandName::Handoff.as_str(),
-            Self::Takeover { .. } => CommandName::Takeover.as_str(),
-            Self::Dialog { .. } => CommandName::Dialog.as_str(),
-            Self::Intercept { .. } => CommandName::Intercept.as_str(),
-            Self::Interference { .. } => CommandName::Interference.as_str(),
-            Self::Keys { .. } => CommandName::Keys.as_str(),
-            Self::Type { .. } => CommandName::Type.as_str(),
-            Self::Wait { .. } => CommandName::Wait.as_str(),
-            Self::Tabs => CommandName::Tabs.as_str(),
-            Self::Switch { .. } => CommandName::Switch.as_str(),
-            Self::CloseTab { .. } => CommandName::CloseTab.as_str(),
-            Self::Get(_) => CommandName::Get.as_str(),
-            Self::Inspect(_) => CommandName::Inspect.as_str(),
-            Self::Hover { .. } => CommandName::Hover.as_str(),
-            Self::Cookies(_) => CommandName::Cookies.as_str(),
-            Self::Upload { .. } => CommandName::Upload.as_str(),
-            Self::Select { .. } => CommandName::Select.as_str(),
-            Self::Fill { .. } => CommandName::Fill.as_str(),
-            Self::Extract { .. } => CommandName::Extract.as_str(),
-            Self::Pipe { .. } => CommandName::Pipe.as_str(),
-            Self::InternalDaemon => "__daemon",
-        }
-    }
-
-    pub(crate) fn wait_after_args(&self) -> Option<&WaitAfterArgs> {
-        match self {
-            Self::Open { wait_after, .. }
-            | Self::Back { wait_after }
-            | Self::Forward { wait_after }
-            | Self::Reload { wait_after, .. }
-            | Self::Keys { wait_after, .. }
-            | Self::Type { wait_after, .. }
-            | Self::Switch { wait_after, .. }
-            | Self::Hover { wait_after, .. }
-            | Self::Upload { wait_after, .. }
-            | Self::Select { wait_after, .. }
-            | Self::Fill { wait_after, .. }
-            | Self::Pipe { wait_after, .. }
-            | Self::Click { wait_after, .. } => Some(wait_after),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn local_projection_surface(&self) -> Option<&'static str> {
-        match self {
-            Self::Close { all: true } => Some("close --all"),
-            Self::Cleanup => Some("cleanup"),
-            Self::Teardown => Some("teardown"),
-            Self::Inspect(InspectSubcommand::List {
-                builder_help: true, ..
-            }) => Some("inspect list built-in help"),
-            Self::Explain {
-                subcommand: ExplainSubcommand::Extract { .. },
-            } => Some("explain extract"),
-            Self::Extract { schema: true, .. } => Some("extract built-in help"),
-            Self::Extract {
-                examples: Some(_), ..
-            } => Some("extract built-in help"),
-            Self::Sessions => Some("sessions"),
-            Self::Binding { .. } => Some("binding"),
-            Self::Secret { .. } => Some("secret"),
-            Self::InternalDaemon => Some("internal daemon"),
-            _ => None,
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn render_nested_subcommand_long_help(parent: &str, child: &str) -> String {
-    use clap::CommandFactory;
-
-    let mut root = super::Cli::command();
-    let mut parent_command = root
-        .find_subcommand_mut(parent)
-        .unwrap_or_else(|| panic!("missing subcommand {parent}"))
-        .clone();
-    let mut child_command = parent_command
-        .find_subcommand_mut(child)
-        .unwrap_or_else(|| panic!("missing subcommand {parent} {child}"))
-        .clone();
-    let mut buffer = Vec::new();
-    child_command
-        .write_long_help(&mut buffer)
-        .expect("help should render");
-    String::from_utf8(buffer).expect("help should be valid utf-8")
 }
 
 #[cfg(test)]

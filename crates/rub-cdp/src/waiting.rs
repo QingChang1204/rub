@@ -5,10 +5,38 @@ use rub_core::model::{WaitCondition, WaitKind, WaitState};
 use std::sync::Arc;
 use tokio::time::{Duration, Instant};
 
+use crate::frame_runtime::ResolvedFrameContext;
 use crate::live_dom_locator::LOCATOR_JS_HELPERS;
 
 const POLL_INTERVAL_MS: u64 = 100;
+const TRANSIENT_RETRY_FLOOR_MS: u64 = 50;
+const TRANSIENT_RETRY_CEILING_MS: u64 = 150;
 const INVALID_SELECTOR_SENTINEL: &str = "__rub_invalid_selector__";
+const AMBIGUOUS_LOCATOR_SENTINEL: &str = "__rub_ambiguous_locator__";
+
+#[derive(Debug, Default, Clone)]
+struct WaitFrameContextCache {
+    requested_frame_id: Option<String>,
+    context: Option<ResolvedFrameContext>,
+}
+
+impl WaitFrameContextCache {
+    fn get(&self, frame_id: Option<&str>) -> Option<ResolvedFrameContext> {
+        (self.requested_frame_id.as_deref() == frame_id)
+            .then(|| self.context.clone())
+            .flatten()
+    }
+
+    fn store(&mut self, frame_id: Option<&str>, context: ResolvedFrameContext) {
+        self.requested_frame_id = frame_id.map(ToOwned::to_owned);
+        self.context = Some(context);
+    }
+
+    fn clear(&mut self) {
+        self.requested_frame_id = None;
+        self.context = None;
+    }
+}
 
 pub(crate) async fn wait_for_condition(
     page: &Arc<Page>,
@@ -16,12 +44,16 @@ pub(crate) async fn wait_for_condition(
 ) -> Result<(), RubError> {
     let deadline = Instant::now() + Duration::from_millis(condition.timeout_ms);
     let js_check = wait_check_script(condition)?;
+    let mut frame_context_cache = WaitFrameContextCache::default();
+    let requested_frame_id = condition.frame_id.as_deref();
+    let mut transient_retry_count = 0u32;
 
     loop {
-        let frame_context =
-            match crate::frame_runtime::resolve_frame_context(page, condition.frame_id.as_deref())
-                .await
-            {
+        let frame_context = if let Some(frame_context) = frame_context_cache.get(requested_frame_id)
+        {
+            frame_context
+        } else {
+            match crate::frame_runtime::resolve_frame_context(page, requested_frame_id).await {
                 Ok(frame_context) => frame_context,
                 Err(error) => {
                     if frame_context_error_is_deterministic(&error) {
@@ -36,10 +68,13 @@ pub(crate) async fn wait_for_condition(
                             format!("Wait condition not met within {}ms", condition.timeout_ms),
                         ));
                     }
-                    tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+                    tokio::time::sleep(transient_retry_delay(transient_retry_count)).await;
+                    transient_retry_count = transient_retry_count.saturating_add(1);
                     continue;
                 }
-            };
+            }
+        };
+        frame_context_cache.store(requested_frame_id, frame_context.clone());
 
         match crate::js::evaluate_returning_string_in_context(
             page,
@@ -50,7 +85,9 @@ pub(crate) async fn wait_for_condition(
         {
             Ok(result) => match serde_json::from_str::<bool>(&result) {
                 Ok(true) => return Ok(()),
-                Ok(false) => {}
+                Ok(false) => {
+                    transient_retry_count = 0;
+                }
                 Err(error) => {
                     if serde_json::from_str::<String>(&result).ok().as_deref()
                         == Some(INVALID_SELECTOR_SENTINEL)
@@ -58,6 +95,17 @@ pub(crate) async fn wait_for_condition(
                         return Err(RubError::domain(
                             ErrorCode::InvalidInput,
                             "Invalid CSS selector in wait locator",
+                        ));
+                    }
+                    if let Some(match_count) = serde_json::from_str::<String>(&result)
+                        .ok()
+                        .as_deref()
+                        .and_then(parse_ambiguous_locator_sentinel)
+                    {
+                        return Err(wait_locator_ambiguity_error(
+                            condition,
+                            match_count,
+                            &frame_context.frame.frame_id,
                         ));
                     }
                     return Err(RubError::domain_with_context(
@@ -74,7 +122,17 @@ pub(crate) async fn wait_for_condition(
                 if let Some(terminal) = classify_terminal_wait_error(error.to_string()) {
                     return Err(terminal);
                 }
+                frame_context_cache.clear();
+                if Instant::now() >= deadline {
+                    return Err(RubError::domain(
+                        ErrorCode::WaitTimeout,
+                        format!("Wait condition not met within {}ms", condition.timeout_ms),
+                    ));
+                }
+                tokio::time::sleep(transient_retry_delay(transient_retry_count)).await;
+                transient_retry_count = transient_retry_count.saturating_add(1);
                 // The page may be navigating or briefly unavailable during poll.
+                continue;
             }
         }
 
@@ -87,6 +145,15 @@ pub(crate) async fn wait_for_condition(
 
         tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
     }
+}
+
+fn transient_retry_delay(retry_count: u32) -> Duration {
+    let delay_ms = match retry_count {
+        0 => TRANSIENT_RETRY_FLOOR_MS,
+        1 => POLL_INTERVAL_MS,
+        _ => TRANSIENT_RETRY_CEILING_MS,
+    };
+    Duration::from_millis(delay_ms)
 }
 
 fn classify_terminal_wait_error(message: String) -> Option<RubError> {
@@ -114,6 +181,55 @@ fn classify_terminal_wait_error(message: String) -> Option<RubError> {
 
 fn frame_context_error_is_deterministic(error: &RubError) -> bool {
     matches!(error, RubError::Domain(envelope) if envelope.code == ErrorCode::InvalidInput)
+}
+
+fn parse_ambiguous_locator_sentinel(value: &str) -> Option<usize> {
+    value
+        .strip_prefix(AMBIGUOUS_LOCATOR_SENTINEL)
+        .and_then(|suffix| suffix.strip_prefix(':'))
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn wait_locator_ambiguity_error(
+    condition: &WaitCondition,
+    match_count: usize,
+    frame_id: &str,
+) -> RubError {
+    let (kind, locator) = match &condition.kind {
+        WaitKind::Locator { locator, .. } => ("locator", locator),
+        WaitKind::LocatorDescriptionContains { locator, .. } => {
+            ("locator_description_contains", locator)
+        }
+        _ => {
+            return RubError::domain(
+                ErrorCode::InvalidInput,
+                "Wait locator ambiguity was reported without a locator-backed wait condition",
+            );
+        }
+    };
+    RubError::domain_with_context_and_suggestion(
+        ErrorCode::InvalidInput,
+        format!("Wait {kind} matched {match_count} live DOM elements; refine the locator"),
+        serde_json::json!({
+            "reason": "wait_locator_ambiguous",
+            "kind": kind,
+            "locator": locator,
+            "match_count": match_count,
+            "frame_id": frame_id,
+        }),
+        wait_locator_ambiguity_suggestion(locator),
+    )
+}
+
+fn wait_locator_ambiguity_suggestion(locator: &CanonicalLocator) -> &'static str {
+    match locator {
+        CanonicalLocator::Selector { .. } => {
+            "Refine the selector, or add --first, --last, or --nth to select a single match before waiting"
+        }
+        _ => {
+            "Refine the locator, or add --first, --last, or --nth to select a single match before waiting"
+        }
+    }
 }
 
 fn wait_check_script(condition: &WaitCondition) -> Result<String, RubError> {
@@ -147,25 +263,17 @@ fn locator_wait_script(locator: &CanonicalLocator, state: WaitState) -> Result<S
             format!("Failed to serialize wait selector sentinel: {error}"),
         )
     })?;
+    let ambiguous_locator = serde_json::to_string(AMBIGUOUS_LOCATOR_SENTINEL).map_err(|error| {
+        RubError::domain(
+            ErrorCode::InvalidInput,
+            format!("Failed to serialize wait ambiguity sentinel: {error}"),
+        )
+    })?;
     Ok(format!(
         r#"(() =>{{
             const locator = {locator};
             const state = {state};
             {LOCATOR_JS_HELPERS}
-            const pickSelection = (elements, selection) =>{{
-                if (!selection) return elements[0] || null;
-                switch (selection) {{
-                    case 'first':
-                        return elements[0] || null;
-                    case 'last':
-                        return elements.length ? elements[elements.length - 1] : null;
-                    default:
-                        if (typeof selection === 'object' && selection !== null && Number.isInteger(selection.nth)) {{
-                            return elements[selection.nth] || null;
-                        }}
-                        return elements[0] || null;
-                }}
-            }};
             const isVisible = (el) =>{{
                 if (!el) return false;
                 const style = getComputedStyle(el);
@@ -200,7 +308,11 @@ fn locator_wait_script(locator: &CanonicalLocator, state: WaitState) -> Result<S
             if (typeof matches === 'string' && matches === {invalid_selector}) {{
                 return JSON.stringify(matches);
             }}
-            const selected = pickSelection(matches, locator.selection);
+            if (!locator.selection && matches.length > 1) {{
+                return JSON.stringify({ambiguous_locator} + ":" + matches.length);
+            }}
+            const selectedMatches = selectMatches(matches, locator.selection);
+            const selected = selectedMatches[0] || null;
             switch (state) {{
                 case 'attached':
                     return JSON.stringify(selected !== null);
@@ -216,7 +328,8 @@ fn locator_wait_script(locator: &CanonicalLocator, state: WaitState) -> Result<S
                     return JSON.stringify(selected !== null && isVisible(selected));
             }}
         }})()"#,
-        invalid_selector = invalid_selector
+        invalid_selector = invalid_selector,
+        ambiguous_locator = ambiguous_locator
     ))
 }
 
@@ -242,25 +355,17 @@ fn locator_description_wait_script(
             format!("Failed to serialize wait selector sentinel: {error}"),
         )
     })?;
+    let ambiguous_locator = serde_json::to_string(AMBIGUOUS_LOCATOR_SENTINEL).map_err(|error| {
+        RubError::domain(
+            ErrorCode::InvalidInput,
+            format!("Failed to serialize wait ambiguity sentinel: {error}"),
+        )
+    })?;
     Ok(format!(
         r#"(() => {{
             const locator = {locator};
             {LOCATOR_JS_HELPERS}
             const needle = normalize({value});
-            const pickSelection = (elements, selection) => {{
-                if (!selection) return elements[0] || null;
-                switch (selection) {{
-                    case 'first':
-                        return elements[0] || null;
-                    case 'last':
-                        return elements.length ? elements[elements.length - 1] : null;
-                    default:
-                        if (typeof selection === 'object' && selection !== null && Number.isInteger(selection.nth)) {{
-                            return elements[selection.nth] || null;
-                        }}
-                        return elements[0] || null;
-                }}
-            }};
             const matches = (() => {{
                 try {{
                     return resolveLocatorMatches(locator);
@@ -271,11 +376,16 @@ fn locator_description_wait_script(
             if (typeof matches === 'string' && matches === {invalid_selector}) {{
                 return JSON.stringify(matches);
             }}
-            const selected = pickSelection(matches, locator.selection);
+            if (!locator.selection && matches.length > 1) {{
+                return JSON.stringify({ambiguous_locator} + ":" + matches.length);
+            }}
+            const selectedMatches = selectMatches(matches, locator.selection);
+            const selected = selectedMatches[0] || null;
             const haystack = normalize(accessibleDescription(selected));
             return JSON.stringify(needle.length > 0 && haystack.includes(needle));
         }})()"#,
-        invalid_selector = invalid_selector
+        invalid_selector = invalid_selector,
+        ambiguous_locator = ambiguous_locator
     ))
 }
 
@@ -345,11 +455,56 @@ fn title_wait_script(value: &str) -> Result<String, RubError> {
 }
 
 #[cfg(test)]
+mod cache_tests {
+    use super::WaitFrameContextCache;
+    use crate::frame_runtime::ResolvedFrameContext;
+    use rub_core::model::FrameContextInfo;
+
+    #[test]
+    fn wait_frame_context_cache_reuses_same_requested_frame() {
+        let mut cache = WaitFrameContextCache::default();
+        let context = sample_context("main", None);
+        cache.store(None, context.clone());
+
+        assert_eq!(cache.get(None).unwrap().frame.frame_id, "main");
+        assert!(cache.get(Some("child")).is_none());
+    }
+
+    #[test]
+    fn wait_frame_context_cache_clear_drops_cached_context() {
+        let mut cache = WaitFrameContextCache::default();
+        cache.store(Some("child"), sample_context("child", Some(7)));
+        cache.clear();
+
+        assert!(cache.get(Some("child")).is_none());
+        assert!(cache.get(None).is_none());
+    }
+
+    fn sample_context(frame_id: &str, execution_context_id: Option<i64>) -> ResolvedFrameContext {
+        ResolvedFrameContext {
+            frame: FrameContextInfo {
+                frame_id: frame_id.to_string(),
+                name: Some(frame_id.to_string()),
+                parent_frame_id: None,
+                target_id: Some("target-1".to_string()),
+                url: Some("https://example.test".to_string()),
+                depth: 0,
+                same_origin_accessible: Some(true),
+            },
+            lineage: vec![frame_id.to_string()],
+            execution_context_id: execution_context_id
+                .map(chromiumoxide::cdp::js_protocol::runtime::ExecutionContextId::new),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        INVALID_SELECTOR_SENTINEL, classify_terminal_wait_error,
+        AMBIGUOUS_LOCATOR_SENTINEL, INVALID_SELECTOR_SENTINEL, classify_terminal_wait_error,
         frame_context_error_is_deterministic, locator_description_wait_script, locator_wait_script,
-        text_wait_script, title_wait_script, url_wait_script,
+        parse_ambiguous_locator_sentinel, text_wait_script, title_wait_script,
+        transient_retry_delay, url_wait_script,
     };
     use rub_core::error::{ErrorCode, RubError};
     use rub_core::locator::{CanonicalLocator, LocatorSelection};
@@ -421,6 +576,34 @@ mod tests {
     }
 
     #[test]
+    fn locator_wait_script_fails_closed_on_ambiguous_match_without_selection() {
+        let script = locator_wait_script(
+            &CanonicalLocator::Selector {
+                css: ".ready".to_string(),
+                selection: None,
+            },
+            WaitState::Visible,
+        )
+        .expect("selector locator should serialize");
+        assert!(script.contains("matches.length > 1"), "{script}");
+        assert!(script.contains(AMBIGUOUS_LOCATOR_SENTINEL), "{script}");
+        assert!(
+            !script.contains("if (!selection) return elements[0]"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_locator_sentinel_round_trips_match_count() {
+        let sentinel = format!("{AMBIGUOUS_LOCATOR_SENTINEL}:7");
+        assert_eq!(parse_ambiguous_locator_sentinel(&sentinel), Some(7));
+        assert_eq!(
+            parse_ambiguous_locator_sentinel(AMBIGUOUS_LOCATOR_SENTINEL),
+            None
+        );
+    }
+
+    #[test]
     fn locator_interactable_wait_script_checks_disabled_and_readonly_controls() {
         let script = locator_wait_script(
             &CanonicalLocator::Selector {
@@ -482,5 +665,13 @@ mod tests {
             ErrorCode::BrowserCrashed,
             "transient context replacement",
         )));
+    }
+
+    #[test]
+    fn transient_retry_delay_uses_bounded_backoff() {
+        assert_eq!(transient_retry_delay(0).as_millis(), 50);
+        assert_eq!(transient_retry_delay(1).as_millis(), 100);
+        assert_eq!(transient_retry_delay(2).as_millis(), 150);
+        assert_eq!(transient_retry_delay(7).as_millis(), 150);
     }
 }

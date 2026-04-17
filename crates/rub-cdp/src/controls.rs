@@ -1,11 +1,13 @@
 use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::dom::SetFileInputFilesParams;
+use chromiumoxide::cdp::js_protocol::runtime::RemoteObjectId;
 use rub_core::InteractionOutcome;
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{Element, InteractionActuation, InteractionSemanticClass, SelectOutcome};
 use std::sync::Arc;
 
 use crate::humanize::HumanizeConfig;
+use crate::interaction::EditableProjectionKind;
 
 pub(crate) async fn input_text(
     page: &Arc<Page>,
@@ -15,29 +17,15 @@ pub(crate) async fn input_text(
     humanize: &HumanizeConfig,
 ) -> Result<InteractionOutcome, RubError> {
     let resolved = crate::targeting::resolve_element(page, element).await?;
-    ensure_text_control_editable(page, &resolved.remote_object_id).await?;
-    let before_page =
-        crate::interaction::capture_related_page_baseline(page, &resolved.remote_object_id).await;
-
-    crate::interaction::prepare_text_input(page, &resolved.remote_object_id, clear).await?;
-    crate::keyboard::focus_pause(humanize).await;
-
-    if clear && text.is_empty() {
-        crate::interaction::clear_text_input(page, &resolved.remote_object_id).await?;
-    } else {
-        crate::keyboard::type_text(page, text, humanize).await?;
-    }
-
-    let confirmation =
-        crate::interaction::confirm_input(page, &resolved.remote_object_id, text, before_page)
-            .await;
-
-    Ok(InteractionOutcome {
-        semantic_class: InteractionSemanticClass::SetValue,
-        element_verified: resolved.verified,
-        actuation: Some(InteractionActuation::Keyboard),
-        confirmation: Some(confirmation),
-    })
+    input_text_with_resolved_target(
+        page,
+        &resolved.remote_object_id,
+        resolved.verified,
+        text,
+        clear,
+        humanize,
+    )
+    .await
 }
 
 pub(crate) async fn type_into(
@@ -48,36 +36,15 @@ pub(crate) async fn type_into(
     humanize: &HumanizeConfig,
 ) -> Result<InteractionOutcome, RubError> {
     let resolved = crate::targeting::resolve_element(page, element).await?;
-    ensure_text_control_editable(page, &resolved.remote_object_id).await?;
-    let before_page =
-        crate::interaction::capture_related_page_baseline(page, &resolved.remote_object_id).await;
-
-    crate::interaction::prepare_text_input(page, &resolved.remote_object_id, clear).await?;
-    crate::keyboard::focus_pause(humanize).await;
-
-    let focused_target =
-        crate::interaction::observe_element(page, &resolved.remote_object_id).await?;
-    if !focused_target.active {
-        return Err(RubError::domain(
-            ErrorCode::ElementNotInteractable,
-            "Element could not be focused for typing",
-        ));
-    }
-
-    let confirmation = if clear && text.is_empty() {
-        crate::interaction::clear_text_input(page, &resolved.remote_object_id).await?;
-        crate::interaction::confirm_input(page, &resolved.remote_object_id, "", before_page).await
-    } else {
-        crate::keyboard::type_text(page, text, humanize).await?;
-        crate::interaction::confirm_input(page, &resolved.remote_object_id, text, before_page).await
-    };
-
-    Ok(InteractionOutcome {
-        semantic_class: InteractionSemanticClass::SetValue,
-        element_verified: resolved.verified,
-        actuation: Some(InteractionActuation::Keyboard),
-        confirmation: Some(confirmation),
-    })
+    input_text_with_resolved_target(
+        page,
+        &resolved.remote_object_id,
+        resolved.verified,
+        text,
+        clear,
+        humanize,
+    )
+    .await
 }
 
 pub(crate) async fn upload_file(
@@ -265,8 +232,8 @@ async fn ensure_control_enabled(
 
 async fn ensure_text_control_editable(
     page: &Arc<Page>,
-    object_id: &chromiumoxide::cdp::js_protocol::runtime::RemoteObjectId,
-) -> Result<(), RubError> {
+    object_id: &RemoteObjectId,
+) -> Result<EditableProjectionKind, RubError> {
     let state = crate::js::call_function_returning_string(
         page,
         object_id,
@@ -281,7 +248,15 @@ async fn ensure_text_control_editable(
             if (disabledFieldset) return 'FIELDSET_DISABLED';
             if (disabledAncestor && disabledAncestor !== this) return 'ARIA_DISABLED';
             if (typeof this.readOnly === 'boolean' && this.readOnly) return 'READONLY';
-            return 'OK';
+            const tag = String(this.tagName || '').toLowerCase();
+            if (this.isContentEditable) return 'TEXT';
+            if (tag === 'textarea') return 'VALUE';
+            const inputType = tag === 'input' ? String(this.getAttribute('type') || '').toLowerCase() : '';
+            const textLikeInput =
+                tag === 'input'
+                && !['checkbox', 'radio', 'file', 'submit', 'button', 'reset', 'image', 'color', 'range', 'hidden'].includes(inputType);
+            if (textLikeInput) return 'VALUE';
+            return 'NOT_EDITABLE';
         }"#,
     )
     .await?;
@@ -299,8 +274,60 @@ async fn ensure_text_control_editable(
             ErrorCode::ElementNotInteractable,
             "Element is readonly",
         )),
-        _ => Ok(()),
+        "VALUE" => Ok(EditableProjectionKind::Value),
+        "TEXT" => Ok(EditableProjectionKind::Text),
+        _ => Err(RubError::domain(
+            ErrorCode::ElementNotInteractable,
+            "Element is not an editable text target",
+        )),
     }
+}
+
+async fn input_text_with_resolved_target(
+    page: &Arc<Page>,
+    object_id: &RemoteObjectId,
+    element_verified: bool,
+    text: &str,
+    clear: bool,
+    humanize: &HumanizeConfig,
+) -> Result<InteractionOutcome, RubError> {
+    let editable_projection = ensure_text_control_editable(page, object_id).await?;
+    let before_page = crate::interaction::capture_related_page_baseline(page, object_id).await;
+
+    crate::interaction::prepare_text_input(page, object_id, clear).await?;
+    crate::keyboard::focus_pause(humanize).await;
+    ensure_text_target_focus_committed(page, object_id, editable_projection).await?;
+
+    if clear && text.is_empty() {
+        crate::interaction::clear_text_input(page, object_id).await?;
+    } else {
+        crate::keyboard::type_text(page, text, humanize).await?;
+    }
+
+    let confirmation = crate::interaction::confirm_input(page, object_id, text, before_page).await;
+
+    Ok(InteractionOutcome {
+        semantic_class: InteractionSemanticClass::SetValue,
+        element_verified,
+        actuation: Some(InteractionActuation::Keyboard),
+        confirmation: Some(confirmation),
+    })
+}
+
+async fn ensure_text_target_focus_committed(
+    page: &Arc<Page>,
+    object_id: &RemoteObjectId,
+    editable_projection: EditableProjectionKind,
+) -> Result<(), RubError> {
+    let focused_target = crate::interaction::observe_element(page, object_id).await?;
+    if focused_target.active && focused_target.editable_projection == Some(editable_projection) {
+        return Ok(());
+    }
+
+    Err(RubError::domain(
+        ErrorCode::ElementNotInteractable,
+        "Element could not be focused as an editable typing target",
+    ))
 }
 
 #[cfg(test)]

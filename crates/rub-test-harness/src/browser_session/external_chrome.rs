@@ -259,7 +259,9 @@ pub fn terminate_external_chrome(child: &mut std::process::Child, profile_dir: &
     }
     let _ = std::fs::remove_dir_all(profile_dir);
     match verify_external_chrome_cleanup_complete(pid, profile_dir) {
-        Ok(CleanupVerification::Verified) => unregister_external_chrome(pid),
+        Ok(CleanupVerification::Verified | CleanupVerification::VerifiedWithHarnessFallback) => {
+            unregister_external_chrome(pid)
+        }
         Ok(CleanupVerification::SkippedDuringPanic) => {}
         Err(message) => panic!("{message}"),
     }

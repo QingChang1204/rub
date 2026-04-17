@@ -1,9 +1,9 @@
 use super::CleanupResult;
 use super::temp_runtime::{
     cleanup_temp_daemon_registry_state, extract_temp_browser_root, is_rub_daemon_command,
-    is_temp_rub_home, orphan_temp_browser_pids_for_roots, orphan_temp_browser_roots,
-    process_snapshot, root_has_live_browser_process, temp_daemon_processes, temp_roots,
-    terminate_process_tree, terminate_revalidated_temp_daemon,
+    is_temp_rub_home, orphan_roots_contain_equivalent, orphan_temp_browser_pids_for_roots,
+    orphan_temp_browser_roots, process_snapshot, root_has_live_browser_process,
+    temp_daemon_processes, temp_roots, terminate_process_tree, terminate_revalidated_temp_daemon,
 };
 use super::upgrade_probe::{fetch_upgrade_status_for_session, wait_for_shutdown_paths};
 use crate::daemon_ctl::send_existing_request_with_replay_recovery;
@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rub_core::error::RubError;
+use rub_core::managed_profile::{
+    is_temp_owned_managed_profile_path, managed_profile_paths_equivalent,
+};
 use rub_core::process::{ProcessInfo, is_process_alive, process_has_ancestor};
 use rub_daemon::rub_paths::RubPaths;
 use rub_ipc::client::IpcClient;
@@ -113,11 +116,18 @@ pub(super) async fn sweep_orphan_temp_browsers(
         let Some(root) = extract_temp_browser_root(&process.command) else {
             continue;
         };
-        if process_has_ancestor(snapshot, process.pid, &daemon_pids) {
-            orphan_roots.remove(&root);
+        if !is_temp_owned_managed_profile_path(&root) {
             continue;
         }
-        orphan_pids.insert(process.pid);
+        if process_has_ancestor(snapshot, process.pid, &daemon_pids) {
+            orphan_roots.retain(|candidate| {
+                candidate != &root && !managed_profile_paths_equivalent(candidate, &root)
+            });
+            continue;
+        }
+        if orphan_roots_contain_equivalent(&orphan_roots, &root) {
+            orphan_pids.insert(process.pid);
+        }
     }
 
     if !orphan_pids.is_empty() {
@@ -160,9 +170,11 @@ pub(super) fn sweep_stale_temp_homes(
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path == current_rub_home
+            if temp_home_paths_equivalent(&path, current_rub_home)
                 || !is_temp_rub_home(&path)
-                || active_temp_homes.contains(&path)
+                || active_temp_homes
+                    .iter()
+                    .any(|active| temp_home_paths_equivalent(&path, active))
             {
                 continue;
             }
@@ -171,4 +183,25 @@ pub(super) fn sweep_stale_temp_homes(
             }
         }
     }
+}
+
+fn temp_home_paths_equivalent(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    canonical_temp_home_path(left)
+        .zip(canonical_temp_home_path(right))
+        .is_some_and(|(left, right)| left == right)
+}
+
+fn canonical_temp_home_path(path: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(path)
+        .ok()
+        .or_else(|| strip_private_prefix(path))
+        .or_else(|| Some(path.to_path_buf()))
+}
+
+fn strip_private_prefix(path: &Path) -> Option<PathBuf> {
+    let stripped = path.strip_prefix("/private").ok()?;
+    Some(PathBuf::from("/").join(stripped))
 }

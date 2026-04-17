@@ -10,6 +10,7 @@ use crate::orchestration_executor::execute_orchestration_rule;
 use crate::orchestration_probe::{
     dispatch_remote_orchestration_probe, evaluate_orchestration_probe_for_tab,
 };
+use crate::orchestration_worker::orchestration_evidence_key;
 use crate::runtime_refresh::refresh_orchestration_runtime;
 use crate::session::SessionState;
 
@@ -89,8 +90,16 @@ pub(super) async fn cmd_orchestration_execute(
         ));
     }
 
+    let manual_command_identity_key = execution_evidence.as_ref().map(orchestration_evidence_key);
     let runtime = state.orchestration_runtime().await;
-    let result = execute_orchestration_rule(router, state, &runtime, &rule).await;
+    let result = execute_orchestration_rule(
+        router,
+        state,
+        &runtime,
+        &rule,
+        manual_command_identity_key.as_deref(),
+    )
+    .await;
     let rule = state
         .record_orchestration_outcome(id, execution_evidence, result.clone())
         .await

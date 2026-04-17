@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::interference_recovery;
-use crate::runtime_refresh::refresh_live_runtime_and_interference;
+use crate::runtime_refresh::{InterferenceRefreshIntent, refresh_live_runtime_and_interference};
 use crate::session::SessionState;
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::InterferenceMode;
@@ -50,7 +50,12 @@ pub(super) async fn cmd_interference(
             ))
         }
         "status" => {
-            let _ = refresh_live_runtime_and_interference(&router.browser, state).await;
+            let _ = refresh_live_runtime_and_interference(
+                &router.browser,
+                state,
+                InterferenceRefreshIntent::ReadOnly,
+            )
+            .await;
             let runtime = state.interference_runtime().await;
             Ok(interference_payload(
                 serde_json::json!({

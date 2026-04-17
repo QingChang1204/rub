@@ -79,6 +79,8 @@ targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-
 tap = "QingChang1204/homebrew-tap"
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
+# Read release notes from CHANGELOG.md (populated by git-cliff before each release)
+changelog = "CHANGELOG.md"
 
 [profile.release]
 lto = true

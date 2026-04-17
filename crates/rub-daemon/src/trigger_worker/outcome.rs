@@ -40,11 +40,11 @@ pub(super) async fn record_trigger_failure(
     let _ = state
         .record_trigger_outcome(
             trigger.id,
-            result_status,
             evidence,
             TriggerResultInfo {
                 trigger_id: trigger.id,
                 status: result_status,
+                next_status: trigger.status,
                 summary,
                 command_id,
                 action: Some(trigger_action_execution_info(trigger, &state.rub_home)),

@@ -9,9 +9,7 @@ pub(crate) const AUTOMATION_WORKER_POLL_INTERVAL: Duration =
 /// Worker-owned automation reservations may wait long enough to span a normal
 /// foreground command, but must still yield within one worker cycle so a single
 /// queued rule does not stall all later evaluations.
-#[cfg(test)]
 pub(crate) const AUTOMATION_QUEUE_WAIT_BUDGET_MS: u64 = AUTOMATION_WORKER_POLL_INTERVAL_MS;
-#[cfg(test)]
 pub(crate) const AUTOMATION_QUEUE_WAIT_BUDGET: Duration =
     Duration::from_millis(AUTOMATION_QUEUE_WAIT_BUDGET_MS);
 

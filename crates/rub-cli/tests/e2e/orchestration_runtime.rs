@@ -339,7 +339,169 @@ fn t437m_n_orchestration_registry_and_idempotency_grouped_scenario() {
         "{listed}"
     );
 
-    cleanup(home);
+    teardown_and_cleanup(home);
+}
+
+/// T437q: committed orchestration add should replay under the same command_id without
+/// duplicating the live rule after commit.
+#[test]
+#[ignore]
+#[serial]
+fn t437q_orchestration_add_replay_after_commit_grouped_scenario() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
+    let (rt, server) = start_standard_site_fixture();
+
+    assert_eq!(
+        parse_json(
+            &rub_cmd(home)
+                .args(["--session", "source", "open", &server.url()])
+                .output()
+                .unwrap()
+        )["success"],
+        true
+    );
+    assert_eq!(
+        parse_json(
+            &rub_cmd(home)
+                .args(["--session", "target", "open", &server.url()])
+                .output()
+                .unwrap()
+        )["success"],
+        true
+    );
+
+    let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
+    assert_eq!(sessions["success"], true, "{sessions}");
+    let source_session_id = session_id_by_name(&sessions, "source");
+    let target_session_id = session_id_by_name(&sessions, "target");
+    let socket_path = registry_socket_path_by_session_id(home, &source_session_id);
+
+    let request = rub_ipc::protocol::IpcRequest::new(
+        "orchestration",
+        json!({
+            "sub": "add",
+            "spec": {
+                "source": {
+                    "session_id": source_session_id.clone(),
+                    "tab_index": 0
+                },
+                "target": {
+                    "session_id": target_session_id.clone(),
+                    "tab_index": 0
+                },
+                "mode": "once",
+                "condition": {
+                    "kind": "text_present",
+                    "text": "Ready"
+                },
+                "actions": [
+                    {
+                        "kind": "workflow",
+                        "payload": {
+                            "workflow_name": "reply_flow"
+                        }
+                    }
+                ]
+            },
+            "paused": false
+        }),
+        10_000,
+    )
+    .with_command_id("t437q-orchestration-add-replay")
+    .expect("test command_id should be valid");
+
+    let first = send_bound_ipc_request(&rt, &socket_path, &source_session_id, &request);
+    assert_eq!(
+        first.status,
+        rub_ipc::protocol::ResponseStatus::Success,
+        "{first:?}"
+    );
+    assert_eq!(
+        first.command_id.as_deref(),
+        Some("t437q-orchestration-add-replay"),
+        "{first:?}"
+    );
+    let first_rule_id = first
+        .data
+        .as_ref()
+        .and_then(|data| data["result"]["rule"]["id"].as_u64())
+        .expect("first orchestration add should return a rule id");
+
+    let replayed = send_bound_ipc_request(&rt, &socket_path, &source_session_id, &request);
+    assert_eq!(
+        replayed.status,
+        rub_ipc::protocol::ResponseStatus::Success,
+        "{replayed:?}"
+    );
+    assert_eq!(
+        replayed.command_id.as_deref(),
+        Some("t437q-orchestration-add-replay"),
+        "{replayed:?}"
+    );
+    let replayed_rule_id = replayed
+        .data
+        .as_ref()
+        .and_then(|data| data["result"]["rule"]["id"].as_u64())
+        .expect("replayed orchestration add should preserve the committed rule id");
+    assert_eq!(replayed_rule_id, first_rule_id, "{replayed:?}");
+
+    let listed = parse_json(
+        &rub_cmd(home)
+            .args(["--session", "source", "orchestration", "list"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(listed["success"], true, "{listed}");
+    let items = listed["data"]["result"]["items"]
+        .as_array()
+        .expect("orchestration list should return items");
+    assert_eq!(items.len(), 1, "{listed}");
+    assert_eq!(items[0]["id"].as_u64(), Some(first_rule_id), "{listed}");
+    assert_eq!(listed["data"]["runtime"]["active_rule_count"], 1, "{listed}");
+
+    let trace = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "source",
+                "orchestration",
+                "trace",
+                "--last",
+                "10",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(trace["success"], true, "{trace}");
+    let registered_events = trace["data"]["result"]["events"]
+        .as_array()
+        .expect("orchestration trace should return events")
+        .iter()
+        .filter(|event| {
+            event["kind"] == "registered" && event["rule_id"].as_u64() == Some(first_rule_id)
+        })
+        .count();
+    assert_eq!(
+        registered_events, 1,
+        "replayed orchestration add must not register a second live rule: {trace}"
+    );
+
+    let removed = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "source",
+                "orchestration",
+                "remove",
+                &first_rule_id.to_string(),
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(removed["success"], true, "{removed}");
+
+    teardown_and_cleanup(home);
 }
 
 /// T437o/T437p: orchestration execute should truthfully classify fired vs partial-blocked
@@ -718,7 +880,7 @@ fn t437o_p_orchestration_execute_grouped_scenario() {
         "{inspected_value}"
     );
 
-    cleanup(home);
+    teardown_and_cleanup(home);
 }
 
 /// T437q/T437r: workflow-managed orchestration and history export should share one browser-backed
@@ -1049,7 +1211,7 @@ fn t437q_r_pipe_workflow_and_history_export_grouped_scenario() {
         "{exported}"
     );
 
-    cleanup(home);
+    teardown_and_cleanup(home);
 }
 
 /// T437aa/T437ab: orchestration asset export/replay and embedded watch registration should reuse
@@ -1596,7 +1758,7 @@ fn t437aa_ab_orchestration_assets_and_embedded_watch_grouped_scenario() {
         "{inspected}"
     );
 
-    cleanup(home);
+    teardown_and_cleanup(home);
 }
 
 /// T437s/T437y: manual repeat re-arm/cooldown and reactive repeat evidence latching
@@ -2134,7 +2296,7 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
         .count();
     assert_eq!(fired_count, 2, "{trace}");
 
-    cleanup(home);
+    teardown_and_cleanup(home);
 }
 
 /// T437t/T437u: orchestration should truthfully distinguish target-tab continuity loss from
@@ -2537,7 +2699,7 @@ fn t437t_u_orchestration_target_availability_grouped_scenario() {
         "{inspected}"
     );
 
-    cleanup(home);
+    teardown_and_cleanup(home);
 }
 
 /// T437v/T437z: reactive cross-session orchestration should preserve both remote source/target
@@ -2959,7 +3121,7 @@ fn t437v_z_reactive_orchestration_remote_and_frame_grouped_scenario() {
         "{inspected}"
     );
 
-    cleanup(home);
+    teardown_and_cleanup(home);
 }
 
 /// T437w/T437x: reactive cross-session orchestration workflow source-vars success and blocked
@@ -3333,5 +3495,5 @@ fn t437w_x_reactive_orchestration_workflow_source_vars_grouped_scenario() {
         "{blocked_target}"
     );
 
-    cleanup(home);
+    teardown_and_cleanup(home);
 }

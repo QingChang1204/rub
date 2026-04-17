@@ -31,6 +31,7 @@ fn test_router() -> Arc<DaemonRouter> {
             headless: true,
             ignore_cert_errors: false,
             user_data_dir: None,
+            managed_profile_ephemeral: false,
             download_dir: None,
             profile_directory: None,
             hide_infobars: true,
@@ -277,7 +278,7 @@ async fn ready_orchestration_reservation_completion_releases_idle_queue_permit()
         None,
     ));
     let reserved = router
-        .begin_automation_transaction_until_shutdown_owned(&state, "queued_orchestration")
+        .begin_automation_reservation_transaction_owned(&state, "queued_orchestration")
         .await
         .expect("queued orchestration reservation should acquire immediately in test");
     let mut worker_state = HashMap::new();
@@ -421,7 +422,7 @@ async fn complete_network_request_orchestration_reservation_fails_closed_on_sema
         .await
         .expect("rule should register");
     let transaction = router
-        .begin_automation_transaction_until_shutdown_owned(&state, "queued_orchestration")
+        .begin_automation_reservation_transaction_owned(&state, "queued_orchestration")
         .await
         .expect("reservation should acquire");
     let mut worker_entry = OrchestrationWorkerEntry {

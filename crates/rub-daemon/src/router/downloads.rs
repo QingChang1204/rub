@@ -21,6 +21,10 @@ use self::projection::{
     download_wait_timeout_error,
 };
 
+const DOWNLOAD_POLL_FLOOR_MS: u64 = 50;
+const DOWNLOAD_POLL_STEP_MS: u64 = 50;
+const DOWNLOAD_POLL_CEILING_MS: u64 = 200;
+
 pub(super) async fn cmd_downloads(
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
@@ -43,12 +47,13 @@ pub(super) fn annotate_download_runtime_path_states(runtime: &mut serde_json::Va
 pub(super) async fn cmd_download(
     router: &DaemonRouter,
     args: &serde_json::Value,
+    deadline: super::TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     match DownloadCommand::parse(args)? {
         DownloadCommand::Wait(args) => cmd_download_wait(args, state).await,
         DownloadCommand::Cancel(args) => cmd_download_cancel(router, args, state).await,
-        DownloadCommand::Save(args) => asset_save::cmd_download_save(router, args).await,
+        DownloadCommand::Save(args) => asset_save::cmd_download_save(router, args, deadline).await,
     }
 }
 
@@ -59,8 +64,8 @@ async fn cmd_download_wait(
     let desired_state = parse_wait_state(args.state.as_deref())?;
     let cursor = state.download_cursor().await;
     let started = Instant::now();
-    let poll_interval = Duration::from_millis(50);
     let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(30_000));
+    let mut poll_count = 0u32;
 
     let initial_runtime = state.download_runtime().await;
     let mut target_guid = args.id.clone().or_else(|| {
@@ -119,7 +124,8 @@ async fn cmd_download_wait(
             ));
         }
 
-        tokio::time::sleep(poll_interval).await;
+        tokio::time::sleep(download_poll_delay(poll_count)).await;
+        poll_count = poll_count.saturating_add(1);
     }
 }
 
@@ -132,6 +138,7 @@ async fn cmd_download_cancel(
     router.browser.cancel_download(&guid).await?;
 
     let deadline = Instant::now() + Duration::from_secs(2);
+    let mut poll_count = 0u32;
     loop {
         let runtime = state.download_runtime().await;
         if let Some(download) = state.download_entry(&guid).await
@@ -165,15 +172,25 @@ async fn cmd_download_cancel(
                 context,
             ));
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(download_poll_delay(poll_count)).await;
+        poll_count = poll_count.saturating_add(1);
     }
+}
+
+fn download_poll_delay(poll_count: u32) -> Duration {
+    let delay_ms = DOWNLOAD_POLL_FLOOR_MS
+        .saturating_add(DOWNLOAD_POLL_STEP_MS.saturating_mul(u64::from(poll_count)));
+    Duration::from_millis(delay_ms.min(DOWNLOAD_POLL_CEILING_MS))
 }
 
 #[cfg(test)]
 mod tests {
     use super::args::DownloadWaitState;
     use super::projection::download_wait_timeout_error;
-    use super::{annotate_download_runtime_path_states, matches_wait_state, parse_wait_state};
+    use super::{
+        annotate_download_runtime_path_states, download_poll_delay, matches_wait_state,
+        parse_wait_state,
+    };
     use rub_core::error::ErrorCode;
     use rub_core::model::{DownloadEntry, DownloadMode, DownloadRuntimeInfo, DownloadState};
     use std::time::Duration;
@@ -285,5 +302,14 @@ mod tests {
             runtime["download_dir_state"]["path_kind"],
             "managed_download_directory"
         );
+    }
+
+    #[test]
+    fn download_poll_delay_uses_bounded_backoff() {
+        assert_eq!(download_poll_delay(0), Duration::from_millis(50));
+        assert_eq!(download_poll_delay(1), Duration::from_millis(100));
+        assert_eq!(download_poll_delay(2), Duration::from_millis(150));
+        assert_eq!(download_poll_delay(3), Duration::from_millis(200));
+        assert_eq!(download_poll_delay(9), Duration::from_millis(200));
     }
 }

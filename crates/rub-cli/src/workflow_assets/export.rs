@@ -1,11 +1,9 @@
-use std::path::{Path, PathBuf};
-
 use rub_core::error::{ErrorCode, RubError};
 use serde_json::{Value, json};
 
 use crate::commands::{Commands, EffectiveCli};
 
-use super::write::{PendingAssetWrite, commit_asset_writes};
+use super::write::{commit_asset_writes, pending_asset_write};
 use super::{normalize_workflow_name, resolve_named_workflow_path};
 
 pub fn persist_history_export_asset(cli: &EffectiveCli, data: &mut Value) -> Result<(), RubError> {
@@ -48,6 +46,7 @@ pub fn persist_history_export_asset(cli: &EffectiveCli, data: &mut Value) -> Res
         .ok_or_else(|| {
             RubError::domain(ErrorCode::IpcProtocolError, "history export missing format")
         })?;
+    validate_history_export_persistability(result)?;
     let mut persisted_artifacts = result
         .get("persisted_artifacts")
         .and_then(Value::as_array)
@@ -58,31 +57,31 @@ pub fn persist_history_export_asset(cli: &EffectiveCli, data: &mut Value) -> Res
     if let Some(name) = save_as {
         let path = resolve_named_workflow_path(&cli.rub_home, name)?;
         let serialized = render_export_asset(result, true)?;
-        pending_writes.push(PendingAssetWrite {
-            path: path.clone(),
-            contents: serialized,
-            artifact: json!({
+        pending_writes.push(pending_asset_write(
+            path.clone(),
+            serialized,
+            json!({
                 "kind": "workflow_asset",
                 "role": "output",
                 "path": path.display().to_string(),
                 "workflow_name": normalize_workflow_name(name)?,
             }),
-        });
+        )?);
     }
 
     if let Some(output_path) = output {
-        let path = resolve_cli_path(output_path);
+        let path = std::path::Path::new(output_path).to_path_buf();
         let serialized = render_export_asset(result, false)?;
-        pending_writes.push(PendingAssetWrite {
-            path: path.clone(),
-            contents: serialized,
-            artifact: json!({
+        pending_writes.push(pending_asset_write(
+            path.clone(),
+            serialized,
+            json!({
                 "kind": "history_export_file",
                 "role": "output",
                 "path": path.display().to_string(),
                 "format": format,
             }),
-        });
+        )?);
     }
 
     if !pending_writes.is_empty() {
@@ -97,6 +96,56 @@ pub fn persist_history_export_asset(cli: &EffectiveCli, data: &mut Value) -> Res
     }
 
     Ok(())
+}
+
+fn validate_history_export_persistability(
+    result: &serde_json::Map<String, Value>,
+) -> Result<(), RubError> {
+    let projection_state = result
+        .get("projection_state")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            RubError::domain_with_context(
+                ErrorCode::InvalidInput,
+                "history export cannot be persisted because the response does not declare a durable projection contract",
+                json!({
+                    "reason": "history_export_projection_state_missing",
+                }),
+            )
+        })?;
+
+    let control_role = projection_state
+        .get("control_role")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let durability = projection_state
+        .get("durability")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let lossy = projection_state
+        .get("lossy")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let complete = result
+        .get("complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let persistable =
+        control_role != "display_only" && durability == "durable" && !lossy && complete;
+    if persistable {
+        return Ok(());
+    }
+
+    Err(RubError::domain_with_context(
+        ErrorCode::InvalidInput,
+        "history export cannot be persisted as a durable workflow asset because the export surface is display-only, lossy, or not durably authoritative",
+        json!({
+            "reason": "history_export_projection_not_durable",
+            "projection_state": projection_state,
+            "complete": complete,
+        }),
+    ))
 }
 
 fn render_export_asset(
@@ -172,15 +221,4 @@ fn replayable_pipe_step_json(entry: &Value) -> Result<Value, RubError> {
         step.insert("label".to_string(), Value::String(label.to_string()));
     }
     Ok(Value::Object(step))
-}
-
-fn resolve_cli_path(path: &str) -> PathBuf {
-    let raw = Path::new(path);
-    if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(raw)
-    }
 }

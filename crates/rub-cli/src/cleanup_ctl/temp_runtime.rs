@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rub_core::error::{ErrorCode, RubError};
+use rub_core::managed_profile::{
+    extract_managed_profile_path_from_command, is_temp_owned_managed_profile_path,
+    managed_profile_paths_equivalent, managed_profile_temp_roots,
+};
 use rub_core::process::{
     ProcessInfo, extract_flag_value, is_chromium_browser_command, is_process_alive,
     process_has_ancestor, process_snapshot as collect_process_snapshot, process_tree,
@@ -16,6 +20,7 @@ pub(super) struct TempDaemonProcess {
     pub(super) session_name: String,
     pub(super) session_id: String,
     pub(super) rub_home: PathBuf,
+    pub(super) user_data_dir: Option<PathBuf>,
 }
 
 pub(super) fn process_snapshot() -> Result<Vec<ProcessInfo>, RubError> {
@@ -46,11 +51,15 @@ pub(super) fn temp_daemon_processes(snapshot: &[ProcessInfo]) -> Vec<TempDaemonP
         let Some(session_id) = extract_flag_value(&process.command, "--session-id") else {
             continue;
         };
+        let user_data_dir =
+            super::upgrade_probe::registry_entry_for_home_session_id(&rub_home, &session_id)
+                .and_then(|entry| entry.user_data_dir.map(PathBuf::from));
         daemons.push(TempDaemonProcess {
             pid: process.pid,
             session_name,
             session_id,
             rub_home,
+            user_data_dir,
         });
     }
     daemons
@@ -107,7 +116,7 @@ pub(super) fn orphan_temp_browser_pids_for_roots(
         let Some(root) = extract_temp_browser_root(&process.command) else {
             continue;
         };
-        if !orphan_roots.contains(&root)
+        if !orphan_roots_contain_equivalent(orphan_roots, &root)
             || process_has_ancestor(snapshot, process.pid, &daemon_pids)
         {
             continue;
@@ -121,23 +130,23 @@ pub(super) fn orphan_temp_browser_roots(snapshot: &[ProcessInfo]) -> HashSet<Pat
     let mut roots = HashSet::new();
     for process in snapshot {
         if let Some(root) = extract_temp_browser_root(&process.command) {
+            if !is_temp_owned_managed_profile_path(&root) {
+                continue;
+            }
             roots.insert(root);
         }
     }
 
-    for temp_root in temp_roots() {
+    for temp_root in managed_profile_temp_roots() {
         let Ok(entries) = std::fs::read_dir(&temp_root) else {
             continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            if !path.is_dir() || !is_temp_owned_managed_profile_path(&path) {
                 continue;
             }
-            let Some(pid) = temp_browser_root_authority_pid(&path) else {
-                continue;
-            };
-            if is_process_alive(pid) {
+            if root_has_live_browser_process(snapshot, &path) {
                 continue;
             }
             roots.insert(path);
@@ -151,7 +160,9 @@ pub(super) fn root_has_live_browser_process(snapshot: &[ProcessInfo], root: &Pat
     snapshot.iter().any(|process| {
         extract_temp_browser_root(&process.command)
             .as_deref()
-            .is_some_and(|candidate| candidate == root)
+            .is_some_and(|candidate| {
+                candidate == root || managed_profile_paths_equivalent(candidate, root)
+            })
     })
 }
 
@@ -205,26 +216,16 @@ pub(super) fn extract_temp_browser_root(command: &str) -> Option<PathBuf> {
     if !is_chromium_browser_command(command) {
         return None;
     }
-    let user_data_dir = PathBuf::from(extract_flag_value(command, "--user-data-dir")?);
-    let file_name = user_data_dir.file_name().and_then(|name| name.to_str())?;
-    if file_name.starts_with("rub-chrome-")
-        && temp_roots()
-            .into_iter()
-            .any(|root| user_data_dir.starts_with(root))
-    {
-        return Some(user_data_dir);
-    }
-    None
+    extract_managed_profile_path_from_command(command)
 }
 
-pub(super) fn temp_browser_root_authority_pid(root: &Path) -> Option<u32> {
-    let file_name = root.file_name()?.to_str()?;
-    let pid = file_name.strip_prefix("rub-chrome-")?;
-    temp_roots()
-        .into_iter()
-        .any(|temp_root| root.starts_with(temp_root))
-        .then_some(pid.parse::<u32>().ok())
-        .flatten()
+pub(super) fn orphan_roots_contain_equivalent(
+    orphan_roots: &HashSet<PathBuf>,
+    candidate_root: &Path,
+) -> bool {
+    orphan_roots.iter().any(|root| {
+        root == candidate_root || managed_profile_paths_equivalent(root, candidate_root)
+    })
 }
 
 pub(super) fn cleanup_temp_daemon_registry_state(daemon: &TempDaemonProcess) {
@@ -241,7 +242,10 @@ pub(super) fn cleanup_temp_daemon_registry_state(daemon: &TempDaemonProcess) {
         socket_path: runtime.socket_path().display().to_string(),
         created_at: String::new(),
         ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
-        user_data_dir: None,
+        user_data_dir: daemon
+            .user_data_dir
+            .as_ref()
+            .map(|path| path.display().to_string()),
         attachment_identity: None,
         connection_target: None,
     });

@@ -224,19 +224,18 @@ impl SessionState {
             .set_condition_evidence(id, evidence)
     }
 
-    /// Record the terminal result for one trigger entry and update the
+    /// Record the most recent trigger execution outcome and update the
     /// canonical runtime-wide last-result projection.
     pub async fn record_trigger_outcome(
         &self,
         id: u32,
-        status: rub_core::model::TriggerStatus,
         evidence: Option<rub_core::model::TriggerEvidenceInfo>,
         result: rub_core::model::TriggerResultInfo,
     ) -> Option<rub_core::model::TriggerInfo> {
         self.trigger_runtime
             .write()
             .await
-            .record_outcome(id, status, evidence, result)
+            .record_outcome(id, evidence, result)
     }
 
     /// Remove one configured trigger rule.

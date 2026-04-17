@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use chromiumoxide::Page;
@@ -148,17 +147,19 @@ pub(crate) async fn find_snapshot_elements_in_observation_scope(
         ));
     }
 
-    let mut snapshot_by_index = HashMap::new();
-    for element in &snapshot.elements {
-        snapshot_by_index.insert(element.index, element);
-    }
-
-    let mut resolved = Vec::new();
-    for matched in payload.match_entries {
-        if let Some(element) = snapshot_by_index.get(&matched.index) {
-            let mut element = (*element).clone();
-            element.depth = Some(matched.depth);
-            resolved.push((element.index, element));
+    let snapshot_by_index = crate::snapshot_lookup::build_snapshot_index_lookup(snapshot);
+    let mut resolved = crate::snapshot_lookup::clone_snapshot_elements_by_index(
+        &snapshot_by_index,
+        payload.match_entries.iter().map(|matched| matched.index),
+    );
+    let depth_by_index = payload
+        .match_entries
+        .into_iter()
+        .map(|matched| (matched.index, matched.depth))
+        .collect::<std::collections::HashMap<_, _>>();
+    for (index, element) in &mut resolved {
+        if let Some(depth) = depth_by_index.get(index) {
+            element.depth = Some(*depth);
         }
     }
 

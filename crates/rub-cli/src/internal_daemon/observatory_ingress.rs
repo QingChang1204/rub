@@ -1,5 +1,5 @@
 use rub_core::model::{
-    ConsoleErrorEvent, NetworkFailureEvent, NetworkRequestRecord, PageErrorEvent,
+    ConsoleErrorEvent, NetworkFailureEvent, ObservedNetworkRequestRecord, PageErrorEvent,
     RequestSummaryEvent,
 };
 use std::sync::Arc;
@@ -38,8 +38,8 @@ pub(super) fn enqueue_observatory_mutation(
 }
 
 pub(super) fn enqueue_network_request_record(
-    tx: &tokio::sync::mpsc::Sender<Box<NetworkRequestRecord>>,
-    record: NetworkRequestRecord,
+    tx: &tokio::sync::mpsc::Sender<Box<ObservedNetworkRequestRecord>>,
+    record: ObservedNetworkRequestRecord,
     state: &Arc<rub_daemon::session::SessionState>,
     overflowed: &Arc<AtomicBool>,
 ) {

@@ -31,10 +31,10 @@ pub(super) async fn settle_external_dom_fence(
     command_name: &str,
     deadline: Option<TransactionDeadline>,
 ) -> ExternalDomFenceOutcome {
-    state.clear_pending_external_dom_change();
+    let mut pending_scope = state.take_pending_external_dom_change_scope();
     for attempt in 0..SNAPSHOT_SETTLE_RETRIES {
         if !sleep_full_settle_window(deadline, SNAPSHOT_SETTLE_DELAY_MS).await {
-            state.mark_pending_external_dom_change();
+            state.merge_pending_external_dom_change_scope(pending_scope);
             tracing::debug!(
                 attempt,
                 command = command_name,
@@ -42,11 +42,13 @@ pub(super) async fn settle_external_dom_fence(
             );
             return ExternalDomFenceOutcome::IncompleteDueToDeadline;
         }
-        if !state.take_pending_external_dom_change() {
+        let observed_scope = state.take_pending_external_dom_change_scope();
+        if observed_scope.is_empty() {
             return ExternalDomFenceOutcome::Settled;
         }
+        pending_scope.merge(observed_scope);
         if attempt + 1 == SNAPSHOT_SETTLE_RETRIES {
-            state.mark_pending_external_dom_change();
+            state.merge_pending_external_dom_change_scope(pending_scope);
             tracing::debug!(
                 attempt,
                 command = command_name,
@@ -111,7 +113,7 @@ pub(super) async fn build_stable_snapshot(
         selected_frame_id
     };
 
-    state.clear_pending_external_dom_change();
+    let mut pending_scope = state.take_pending_external_dom_change_scope();
 
     for attempt in 0..SNAPSHOT_SETTLE_RETRIES {
         let snapshot = if listeners {
@@ -132,7 +134,7 @@ pub(super) async fn build_stable_snapshot(
         };
 
         if !sleep_full_settle_window(Some(deadline), SNAPSHOT_SETTLE_DELAY_MS).await {
-            state.mark_pending_external_dom_change();
+            state.merge_pending_external_dom_change_scope(pending_scope);
             return Err(RubError::domain_with_context(
                 ErrorCode::StaleSnapshot,
                 "Snapshot could not stabilize before the authoritative deadline expired",
@@ -146,12 +148,14 @@ pub(super) async fn build_stable_snapshot(
             ));
         }
 
-        if !state.take_pending_external_dom_change() {
+        let observed_scope = state.take_pending_external_dom_change_scope();
+        if observed_scope.is_empty() {
             return Ok(snapshot);
         }
+        pending_scope.merge(observed_scope);
 
         if attempt + 1 == SNAPSHOT_SETTLE_RETRIES {
-            state.mark_pending_external_dom_change();
+            state.merge_pending_external_dom_change_scope(pending_scope);
             return Err(RubError::domain_with_context(
                 ErrorCode::StaleSnapshot,
                 "Snapshot could not stabilize before publish fence",
@@ -298,5 +302,26 @@ mod tests {
             state.has_pending_external_dom_change(),
             "near-timeout settle must preserve the pending marker instead of pretending stability"
         );
+    }
+
+    #[tokio::test]
+    async fn settle_external_dom_fence_preserves_target_scoped_pending_authority() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-router-snapshot-fence-scoped"),
+            None,
+        ));
+        state
+            .in_flight_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        state.observe_external_dom_change(Some("target-1"));
+
+        let outcome =
+            settle_external_dom_fence(&state, "open", Some(TransactionDeadline::new(50))).await;
+
+        assert_eq!(outcome, ExternalDomFenceOutcome::IncompleteDueToDeadline);
+        let pending_scope = state.take_pending_external_dom_change_scope();
+        assert!(pending_scope.affects_target(Some("target-1")));
+        assert!(!pending_scope.affects_target(Some("target-2")));
     }
 }

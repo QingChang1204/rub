@@ -89,7 +89,6 @@ impl TriggerRuntimeState {
     pub fn record_outcome(
         &mut self,
         id: u32,
-        status: TriggerStatus,
         evidence: Option<TriggerEvidenceInfo>,
         result: TriggerResultInfo,
     ) -> Option<TriggerInfo> {
@@ -99,7 +98,7 @@ impl TriggerRuntimeState {
                 .triggers
                 .iter_mut()
                 .find(|trigger| trigger.id == id)?;
-            trigger.status = status;
+            trigger.status = result.next_status;
             trigger.last_condition_evidence = evidence;
             trigger.consumed_evidence_fingerprint = result.consumed_evidence_fingerprint.clone();
             trigger.last_action_result = Some(result.clone());
@@ -111,7 +110,7 @@ impl TriggerRuntimeState {
                 .last_action_result
                 .as_ref()
                 .map(|result| result.status)
-                .unwrap_or(status),
+                .unwrap_or(trigger.status),
         );
         self.push_event(TriggerEventInfo {
             sequence: 0,
@@ -121,7 +120,9 @@ impl TriggerRuntimeState {
                 .last_action_result
                 .as_ref()
                 .map(|result| result.summary.clone())
-                .unwrap_or_else(|| format!("trigger {} {:?}", trigger.id, status).to_lowercase()),
+                .unwrap_or_else(|| {
+                    format!("trigger {} {:?}", trigger.id, trigger.status).to_lowercase()
+                }),
             unavailable_reason: trigger.unavailable_reason.clone(),
             evidence: trigger.last_condition_evidence.clone(),
             result: trigger.last_action_result.clone(),

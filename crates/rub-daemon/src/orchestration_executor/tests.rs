@@ -3,11 +3,14 @@ use super::{
     bind_orchestration_daemon_authority, classify_orchestration_error_status,
     decode_orchestration_success_payload_field, decode_orchestration_success_result_items,
     dispatch_remote_orchestration_request, orchestration_action_execution_info,
-    orchestration_failure_result, resolve_orchestration_workflow_spec,
+    orchestration_failure_result, orchestration_step_command_id,
+    resolve_orchestration_workflow_spec,
 };
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 use rub_core::model::{
-    OrchestrationRuleStatus, OrchestrationStepStatus, TabInfo, TriggerActionKind, TriggerActionSpec,
+    OrchestrationAddressInfo, OrchestrationExecutionPolicyInfo, OrchestrationMode,
+    OrchestrationRuleInfo, OrchestrationRuleStatus, OrchestrationStepStatus, TabInfo,
+    TriggerActionKind, TriggerActionSpec, TriggerConditionKind, TriggerConditionSpec,
 };
 use rub_ipc::protocol::{IpcRequest, IpcResponse};
 
@@ -51,6 +54,74 @@ fn orchestration_failure_result_blocks_rearm_after_partial_commit() {
     assert_eq!(result.steps.len(), 2);
     assert_eq!(result.steps[1].status, OrchestrationStepStatus::Blocked);
     assert_eq!(result.steps[1].attempts, 1);
+}
+
+fn sample_rule() -> OrchestrationRuleInfo {
+    OrchestrationRuleInfo {
+        id: 7,
+        status: OrchestrationRuleStatus::Armed,
+        source: OrchestrationAddressInfo {
+            session_id: "source".to_string(),
+            session_name: "Source".to_string(),
+            tab_index: Some(0),
+            tab_target_id: Some("source-tab".to_string()),
+            frame_id: None,
+        },
+        target: OrchestrationAddressInfo {
+            session_id: "target".to_string(),
+            session_name: "Target".to_string(),
+            tab_index: Some(0),
+            tab_target_id: Some("target-tab".to_string()),
+            frame_id: None,
+        },
+        mode: OrchestrationMode::Repeat,
+        execution_policy: OrchestrationExecutionPolicyInfo::default(),
+        condition: TriggerConditionSpec {
+            kind: TriggerConditionKind::TextPresent,
+            locator: None,
+            text: Some("ready".to_string()),
+            url_pattern: None,
+            readiness_state: None,
+            method: None,
+            status_code: None,
+            storage_area: None,
+            key: None,
+            value: None,
+        },
+        actions: Vec::new(),
+        correlation_key: "corr-demo".to_string(),
+        idempotency_key: "idem-demo".to_string(),
+        unavailable_reason: None,
+        last_condition_evidence: None,
+        last_result: None,
+    }
+}
+
+#[test]
+fn orchestration_step_command_id_is_stable_across_execution_attempts_when_identity_key_present() {
+    let rule = sample_rule();
+    let first = orchestration_step_command_id(&rule, Some("evidence-key"), "exec-a", 1);
+    let second = orchestration_step_command_id(&rule, Some("evidence-key"), "exec-b", 1);
+
+    assert_eq!(first, second);
+}
+
+#[test]
+fn orchestration_step_command_id_changes_when_evidence_identity_changes() {
+    let rule = sample_rule();
+    let first = orchestration_step_command_id(&rule, Some("evidence-a"), "exec-a", 1);
+    let second = orchestration_step_command_id(&rule, Some("evidence-b"), "exec-a", 1);
+
+    assert_ne!(first, second);
+}
+
+#[test]
+fn orchestration_step_command_id_falls_back_to_execution_attempt_without_identity_key() {
+    let rule = sample_rule();
+    let first = orchestration_step_command_id(&rule, None, "exec-a", 1);
+    let second = orchestration_step_command_id(&rule, None, "exec-b", 1);
+
+    assert_ne!(first, second);
 }
 
 #[test]

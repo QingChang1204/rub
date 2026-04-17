@@ -50,7 +50,7 @@ When a language model drives a browser through Playwright or Puppeteer, it runs 
 
 **Errors tell the agent exactly what to do next.** Every error response has a `code` (machine-readable), a `message` (human-readable), a `suggestion` (actionable), and a `context` object (structured data for the failure). When `inspect text` matched 51 elements instead of one, the error said: `"suggestion": "use --first, --last, or --nth to select a single match"`. When `open` timed out, it said: `"suggestion": "use --load-strategy domcontentloaded"`. This is the contract: errors never just fail — they tell the agent what to try next.
 
-**Retry is structurally safe.** A mutating command (click, type, fill, submit) that carries a `command_id` is deduplicated inside the daemon. If the network drops between the command dispatch and the response, the agent can retry with the same `command_id`. The daemon returns the cached original response. The action never runs twice. This works without any coordination logic on the agent side.
+**Retry is structurally safe.** A mutating command (click, type, fill, submit) that carries a `command_id` is deduplicated inside the daemon. If the network drops between the command dispatch and the response, the agent can retry with the same `command_id`. While the original post-commit response is still retained, the daemon returns that exact cached response; after bounded retention eviction, it returns an explicit "already executed / original response no longer retained" failure instead of rerunning the action. The action never runs twice. This works without any coordination logic on the agent side.
 
 **One call gives a health dashboard.** `rub runtime summary` returns the status of every subsystem in one round trip: dialog state (is a JS alert blocking?), frame context (am I in an iframe?), download progress, handoff state, interference mode, network observatory health, orchestration connectivity. When something is wrong and I don't know why, this is the first call I make.
 
@@ -247,7 +247,7 @@ rub cookies import cookies.json       # Restore cookies (session portability)
 rub storage get my_key                # Search both areas
 rub storage get my_key --area local   # Explicit localStorage
 rub storage get my_key --area session # Explicit sessionStorage
-rub storage set token abc123          # Set in both areas (defaults to local)
+rub storage set token abc123          # Set in localStorage by default
 rub storage remove token              # Remove from both areas
 rub storage clear --area local        # Clear only localStorage
 rub storage clear                     # Clear both areas
@@ -689,11 +689,11 @@ Both are measured independently and returned in every response as `timing.queue_
 
 Mutating commands that carry a `command_id` field participate in the **replay fence**:
 
-1. First arrival: daemon claims `command_id` ownership via a `watch` channel, executes the command, caches the exact response.
-2. Concurrent duplicate: waits on the same `watch` channel until the first execution completes, then returns the cached response directly — no double execution.
+1. First arrival: daemon claims `command_id` ownership via a `watch` channel, executes the command, marks that `command_id` as spent for the session lifetime, and caches the exact response while bounded replay retention allows.
+2. Concurrent duplicate: waits on the same `watch` channel until the first execution completes, then returns the cached response directly when it is still retained — otherwise it fails closed with an explicit "already executed / response evicted" replay result, never a silent rerun.
 3. Conflicting fingerprint: same `command_id` but different command/args — rejected with `IpcVersionMismatch`.
 
-The cached response stored is the **post-commit** shaped response (after frame-limit enforcement and timing injection), ensuring any replay observes exactly the same wire format as the original caller.
+The cached response stored is the **post-commit** shaped response (after frame-limit enforcement and timing injection), ensuring any retained replay observes exactly the same wire format as the original caller.
 
 ### Snapshot Authority & DOM Epoch
 

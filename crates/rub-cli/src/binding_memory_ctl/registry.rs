@@ -1,13 +1,12 @@
 use super::{binding_path_state, normalize_binding_alias, remembered_binding_registry_io_error};
+use crate::local_registry::{
+    ensure_directory, load_json_file_with_create, with_file_lock, write_pretty_json_file,
+};
 use rub_core::error::{ErrorCode, RubError};
-use rub_core::fs::atomic_write_bytes;
 use rub_core::model::RememberedBindingAliasRegistryData;
 use rub_daemon::rub_paths::RubPaths;
 use serde_json::json;
 use std::collections::BTreeSet;
-use std::fs::OpenOptions;
-use std::io::Read;
-use std::os::fd::AsRawFd;
 use std::path::Path;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -16,53 +15,39 @@ pub(super) fn read_remembered_alias_registry(
     rub_home: &Path,
 ) -> Result<RememberedBindingAliasRegistryData, RubError> {
     with_remembered_bindings_lock(rub_home, false, |path| {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|error| {
+        let registry = load_json_file_with_create(
+            path,
+            |path, reason, error| {
                 remembered_binding_registry_io_error(
                     rub_home,
                     path,
-                    "remembered_binding_registry_open_failed",
+                    match reason {
+                        "open_failed" => "remembered_binding_registry_open_failed",
+                        "read_failed" => "remembered_binding_registry_read_failed",
+                        _ => "remembered_binding_registry_io_failed",
+                    },
                     error,
                 )
-            })?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents).map_err(|error| {
-            remembered_binding_registry_io_error(
-                rub_home,
-                path,
-                "remembered_binding_registry_read_failed",
-                error,
-            )
-        })?;
-        let registry = if contents.trim().is_empty() {
-            RememberedBindingAliasRegistryData::default()
-        } else {
-            serde_json::from_str::<RememberedBindingAliasRegistryData>(&contents).map_err(
-                |error| {
-                    RubError::domain_with_context(
-                        ErrorCode::JsonError,
-                        format!(
-                            "Failed to parse remembered binding registry {}: {error}",
-                            path.display()
+            },
+            |path, error| {
+                RubError::domain_with_context(
+                    ErrorCode::JsonError,
+                    format!(
+                        "Failed to parse remembered binding registry {}: {error}",
+                        path.display()
+                    ),
+                    json!({
+                        "registry_path": path.display().to_string(),
+                        "registry_path_state": binding_path_state(
+                            "cli.remembered_binding.subject.registry_path",
+                            "cli_remembered_binding_registry",
+                            "remembered_binding_registry_file",
                         ),
-                        json!({
-                            "registry_path": path.display().to_string(),
-                            "registry_path_state": binding_path_state(
-                                "cli.remembered_binding.subject.registry_path",
-                                "cli_remembered_binding_registry",
-                                "remembered_binding_registry_file",
-                            ),
-                            "reason": "remembered_binding_registry_parse_failed",
-                        }),
-                    )
-                },
-            )?
-        };
+                        "reason": "remembered_binding_registry_parse_failed",
+                    }),
+                )
+            },
+        )?;
         validate_remembered_alias_registry(&registry)?;
         Ok(registry)
     })
@@ -78,12 +63,15 @@ pub(super) fn write_remembered_alias_registry(
             .aliases
             .sort_by(|left, right| left.alias.cmp(&right.alias));
         validate_remembered_alias_registry(&normalized)?;
-        let json = serde_json::to_vec_pretty(&normalized).map_err(RubError::from)?;
-        atomic_write_bytes(path, &json, 0o600).map_err(|error| {
+        write_pretty_json_file(path, &normalized, 0o600, |path, reason, error| {
             remembered_binding_registry_io_error(
                 rub_home,
                 path,
-                "remembered_binding_registry_write_failed",
+                match reason {
+                    "serialize_failed" => "remembered_binding_registry_serialize_failed",
+                    "write_failed" => "remembered_binding_registry_write_failed",
+                    _ => "remembered_binding_registry_io_failed",
+                },
                 error,
             )
         })?;
@@ -167,7 +155,7 @@ fn with_remembered_bindings_lock<T>(
     exclusive: bool,
     f: impl FnOnce(&Path) -> Result<T, RubError>,
 ) -> Result<T, RubError> {
-    std::fs::create_dir_all(rub_home).map_err(|error| {
+    ensure_directory(rub_home).map_err(|error| {
         RubError::domain_with_context(
             ErrorCode::IoError,
             format!("Failed to create RUB_HOME {}: {error}", rub_home.display()),
@@ -186,63 +174,13 @@ fn with_remembered_bindings_lock<T>(
     let paths = RubPaths::new(rub_home);
     let registry_path = paths.remembered_bindings_path();
     let lock_path = paths.remembered_bindings_lock_path();
-    let lock_file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|error| {
-            remembered_binding_registry_io_error(
-                rub_home,
-                &lock_path,
-                "remembered_binding_registry_lock_open_failed",
-                error,
-            )
-        })?;
-
-    flock(&lock_file, exclusive).map_err(|error| {
-        remembered_binding_registry_io_error(
-            rub_home,
-            &lock_path,
-            "remembered_binding_registry_lock_failed",
-            error,
-        )
-    })?;
-    let result = f(&registry_path);
-    let unlock_result = unlock(&lock_file);
-
-    match (result, unlock_result) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(remembered_binding_registry_io_error(
-            rub_home,
-            &lock_path,
-            "remembered_binding_registry_unlock_failed",
-            error,
-        )),
-        (Err(error), Err(_)) => Err(error),
-    }
-}
-
-fn flock(file: &std::fs::File, exclusive: bool) -> std::io::Result<()> {
-    let operation = if exclusive {
-        libc::LOCK_EX
-    } else {
-        libc::LOCK_SH
-    };
-    let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-fn unlock(file: &std::fs::File) -> std::io::Result<()> {
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    with_file_lock(
+        &lock_path,
+        exclusive,
+        "remembered_binding_registry_lock_open_failed",
+        "remembered_binding_registry_lock_failed",
+        "remembered_binding_registry_unlock_failed",
+        |path, reason, error| remembered_binding_registry_io_error(rub_home, path, reason, error),
+        || f(&registry_path),
+    )
 }

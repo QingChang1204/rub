@@ -4,6 +4,7 @@ pub mod error;
 pub mod fs;
 pub mod json_spec;
 pub mod locator;
+pub mod managed_profile;
 pub mod model;
 pub mod observation;
 pub mod port;

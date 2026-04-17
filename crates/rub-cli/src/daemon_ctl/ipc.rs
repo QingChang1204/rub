@@ -1,4 +1,5 @@
 use crate::connection_hardening::{classify_io_transient, classify_transport_message};
+use rub_core::error::ErrorEnvelope;
 use rub_core::error::{ErrorCode, RubError};
 use rub_ipc::client::IpcClientError;
 use rub_ipc::protocol::IpcRequest;
@@ -12,13 +13,27 @@ pub(crate) fn replay_recoverable_transport_reason(
     if let Some(client_error) = error.downcast_ref::<IpcClientError>() {
         return match client_error {
             IpcClientError::Transport(io_error) => classify_io_transient(io_error),
-            IpcClientError::Protocol(_) => None,
+            IpcClientError::Protocol(envelope) => replay_recoverable_protocol_reason(envelope),
         };
     }
     error
         .downcast_ref::<std::io::Error>()
         .and_then(classify_io_transient)
         .or_else(|| classify_transport_message(&error.to_string()))
+}
+
+fn replay_recoverable_protocol_reason(envelope: &ErrorEnvelope) -> Option<&'static str> {
+    match envelope
+        .context
+        .as_ref()
+        .and_then(|context| context.get("reason"))
+        .and_then(|value| value.as_str())
+    {
+        Some("ipc_response_timeout_after_request_commit") => {
+            Some("response_timeout_after_request_commit")
+        }
+        _ => None,
+    }
 }
 
 fn ipc_protocol_envelope_from_error<'a>(
@@ -166,6 +181,23 @@ mod tests {
         assert_eq!(
             replay_recoverable_transport_reason(&error),
             Some("unexpected_eof")
+        );
+    }
+
+    #[test]
+    fn replay_recovery_recognizes_post_commit_timeout_protocol_failures() {
+        let error = IpcClientError::Protocol(
+            rub_core::error::ErrorEnvelope::new(
+                rub_core::error::ErrorCode::IpcTimeout,
+                "response timed out after request commit",
+            )
+            .with_context(serde_json::json!({
+                "reason": "ipc_response_timeout_after_request_commit",
+            })),
+        );
+        assert_eq!(
+            replay_recoverable_transport_reason(&error),
+            Some("response_timeout_after_request_commit")
         );
     }
 }

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::error::ErrorEnvelope;
+use crate::error::{ErrorCode, ErrorEnvelope};
 
 use super::runtime::Timing;
 
@@ -76,6 +76,115 @@ impl CommandResult {
         self.timing = timing;
         self
     }
+
+    pub fn contract_error_envelope(&self) -> Option<ErrorEnvelope> {
+        match self.stdout_schema_version.as_str() {
+            version if version != Self::STDOUT_SCHEMA_VERSION => Some(
+                ErrorEnvelope::new(
+                    ErrorCode::IpcProtocolError,
+                    format!(
+                        "stdout result schema mismatch: expected {}, got {}",
+                        Self::STDOUT_SCHEMA_VERSION,
+                        self.stdout_schema_version
+                    ),
+                )
+                .with_context(serde_json::json!({
+                    "reason": "invalid_stdout_result_contract",
+                    "field": "stdout_schema_version",
+                    "expected_stdout_schema_version": Self::STDOUT_SCHEMA_VERSION,
+                    "actual_stdout_schema_version": self.stdout_schema_version,
+                })),
+            ),
+            _ if self.request_id.trim().is_empty() => Some(
+                ErrorEnvelope::new(
+                    ErrorCode::IpcProtocolError,
+                    "stdout result request_id must be non-empty and non-whitespace",
+                )
+                .with_context(serde_json::json!({
+                    "reason": "invalid_stdout_result_contract",
+                    "field": "request_id",
+                })),
+            ),
+            _ if self
+                .command_id
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty()) => Some(
+                ErrorEnvelope::new(
+                    ErrorCode::IpcProtocolError,
+                    "stdout result command_id must be non-empty and non-whitespace when present",
+                )
+                .with_context(serde_json::json!({
+                    "reason": "invalid_stdout_result_contract",
+                    "field": "command_id",
+                })),
+            ),
+            _ if self.success && self.error.is_some() => Some(
+                ErrorEnvelope::new(
+                    ErrorCode::IpcProtocolError,
+                    "stdout success result carried an error envelope",
+                )
+                .with_context(serde_json::json!({
+                    "reason": "invalid_stdout_result_contract",
+                    "status": "success",
+                    "has_data": self.data.is_some(),
+                    "has_error": self.error.is_some(),
+                })),
+            ),
+            _ if self.success && self.data.is_none() => Some(
+                ErrorEnvelope::new(
+                    ErrorCode::IpcProtocolError,
+                    "stdout success result omitted success data",
+                )
+                .with_context(serde_json::json!({
+                    "reason": "invalid_stdout_result_contract",
+                    "status": "success",
+                    "has_data": self.data.is_some(),
+                    "has_error": self.error.is_some(),
+                })),
+            ),
+            _ if !self.success && self.error.is_none() => Some(
+                ErrorEnvelope::new(
+                    ErrorCode::IpcProtocolError,
+                    "stdout error result omitted the error envelope",
+                )
+                .with_context(serde_json::json!({
+                    "reason": "invalid_stdout_result_contract",
+                    "status": "error",
+                    "has_data": self.data.is_some(),
+                    "has_error": self.error.is_some(),
+                })),
+            ),
+            _ if !self.success
+                && self
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| !is_post_commit_local_failure_data(data)) =>
+            Some(
+                ErrorEnvelope::new(
+                    ErrorCode::IpcProtocolError,
+                    "stdout error result carried success data",
+                )
+                .with_context(serde_json::json!({
+                    "reason": "invalid_stdout_result_contract",
+                    "status": "error",
+                    "has_data": self.data.is_some(),
+                    "has_error": self.error.is_some(),
+                })),
+            ),
+            _ => None,
+        }
+    }
+
+    pub fn validate_contract(&self) -> Result<(), ErrorEnvelope> {
+        self.contract_error_envelope().map_or(Ok(()), Err)
+    }
+}
+
+fn is_post_commit_local_failure_data(data: &serde_json::Value) -> bool {
+    data.as_object()
+        .and_then(|object| object.get("commit_state"))
+        .and_then(|value| value.as_str())
+        == Some("daemon_committed_local_followup_failed")
 }
 
 /// Load strategy for page navigation.

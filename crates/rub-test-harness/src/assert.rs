@@ -35,6 +35,11 @@ macro_rules! assert_json_success {
             "Missing request_id"
         );
         assert!(
+            json.get("command_id")
+                .is_none_or(|value| value.is_null() || value.is_string()),
+            "Expected command_id to be null/absent or a string"
+        );
+        assert!(
             json.get("command").is_some_and(|value| value.is_string()),
             "Missing command"
         );
@@ -96,6 +101,11 @@ macro_rules! assert_json_error {
             json.get("request_id")
                 .is_some_and(|value| value.is_string()),
             "Missing request_id"
+        );
+        assert!(
+            json.get("command_id")
+                .is_none_or(|value| value.is_null() || value.is_string()),
+            "Expected command_id to be null/absent or a string"
         );
         assert!(
             json.get("command").is_some_and(|value| value.is_string()),
@@ -196,6 +206,11 @@ macro_rules! assert_post_commit_local_failure {
             json.get("request_id")
                 .is_some_and(|value| value.is_string()),
             "Missing request_id"
+        );
+        assert!(
+            json.get("command_id")
+                .is_none_or(|value| value.is_null() || value.is_string()),
+            "Expected command_id to be null/absent or a string"
         );
         assert!(
             json.get("command").is_some_and(|value| value.is_string()),
@@ -625,5 +640,21 @@ mod tests {
             "IPC_PROTOCOL_ERROR",
             "invalid_ipc_response_contract"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "Expected command_id to be null/absent or a string")]
+    fn success_macro_rejects_non_string_command_id() {
+        let json = serde_json::json!({
+            "success": true,
+            "command": "open",
+            "stdout_schema_version": "3.0",
+            "request_id": "req-1",
+            "command_id": 7,
+            "session": "default",
+            "timing": {},
+            "data": { "ok": true }
+        });
+        crate::assert_json_success!(json);
     }
 }

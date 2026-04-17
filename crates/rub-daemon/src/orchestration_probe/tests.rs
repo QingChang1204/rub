@@ -129,6 +129,7 @@ impl BrowserPort for ReadinessProbeBrowser {
 
     async fn scroll(
         &self,
+        _frame_id: Option<&str>,
         _direction: ScrollDirection,
         _amount: Option<u32>,
     ) -> Result<ScrollPosition, RubError> {

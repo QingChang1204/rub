@@ -49,7 +49,7 @@ pub(super) fn reconcile_worker_state(
     }
 }
 
-pub(super) fn orchestration_evidence_key(evidence: &TriggerEvidenceInfo) -> String {
+pub(crate) fn orchestration_evidence_key(evidence: &TriggerEvidenceInfo) -> String {
     match evidence.fingerprint.as_deref() {
         Some(fingerprint) if !fingerprint.is_empty() => {
             format!("{}::{fingerprint}", evidence.summary)

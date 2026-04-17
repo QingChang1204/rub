@@ -15,14 +15,15 @@ pub(super) fn response_dom_epoch(
             state.clear_pending_external_dom_change();
         }
         Some(state.increment_epoch())
-    } else if matches!(
-        command,
-        "scroll" | "fill" | "pipe" | "_trigger_fill" | "_trigger_pipe"
-    ) {
+    } else if matches!(command, "scroll" | "fill" | "_trigger_fill") {
         Some(state.current_epoch())
     } else {
         None
     }
+}
+
+pub(super) fn command_invalidates_cached_snapshots_without_epoch_bump(command: &str) -> bool {
+    matches!(command, "scroll" | "fill" | "_trigger_fill")
 }
 
 fn dialog_action_commits_epoch(command: &str, args: &serde_json::Value) -> bool {

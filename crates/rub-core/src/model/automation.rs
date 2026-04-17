@@ -161,6 +161,7 @@ pub type TriggerActionExecutionInfo = AutomationActionInfo;
 pub struct TriggerResultInfo {
     pub trigger_id: u32,
     pub status: TriggerStatus,
+    pub next_status: TriggerStatus,
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_id: Option<String>,

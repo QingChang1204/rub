@@ -327,35 +327,21 @@ fn t388_389c_external_handoff_and_takeover_grouped_scenario() {
             .output()
             .unwrap(),
     );
-    assert_eq!(handoff_binding["success"], true, "{handoff_binding}");
-    assert_eq!(handoff_binding["data"]["result"]["mode"], "capture");
-    assert_eq!(
-        handoff_binding["data"]["result"]["binding"]["alias"],
-        "external-handoff"
+    assert_binding_result_auth(
+        &handoff_binding,
+        "capture",
+        "external-handoff",
+        "handoff_completed",
+        "human",
+        Some("handoff_complete"),
     );
-    assert_eq!(
-        handoff_binding["data"]["result"]["binding"]["auth_provenance"]["created_via"],
-        "handoff_completed"
-    );
-    assert_eq!(
-        handoff_binding["data"]["result"]["binding"]["auth_provenance"]["auth_input_mode"],
-        "human"
-    );
-    assert_eq!(
-        handoff_binding["data"]["result"]["binding"]["auth_provenance"]["capture_fence"],
-        "handoff_complete"
-    );
-    assert_eq!(
-        handoff_binding["data"]["result"]["capture_candidate"]["capture_fence"]["status"],
-        "capture_ready"
-    );
-    assert_eq!(
-        handoff_binding["data"]["result"]["capture_candidate"]["durability"]["persistence_policy"],
-        "external_reattachment_required"
-    );
-    assert_eq!(
-        handoff_binding["data"]["result"]["capture_candidate"]["durability"]["reattachment_mode"],
-        "external_reattach_required"
+    assert_binding_capture_candidate(
+        &handoff_binding,
+        "capture_ready",
+        Some("handoff_complete"),
+        Some("external_reattachment_required"),
+        None,
+        Some("external_reattach_required"),
     );
 
     let runtime = parse_json(
@@ -446,31 +432,21 @@ fn t388_389c_external_handoff_and_takeover_grouped_scenario() {
             .output()
             .unwrap(),
     );
-    assert_eq!(takeover_binding["success"], true, "{takeover_binding}");
-    assert_eq!(takeover_binding["data"]["result"]["mode"], "capture");
-    assert_eq!(
-        takeover_binding["data"]["result"]["binding"]["alias"],
-        "external-takeover"
+    assert_binding_result_auth(
+        &takeover_binding,
+        "capture",
+        "external-takeover",
+        "takeover_resumed",
+        "human",
+        Some("takeover_resume"),
     );
-    assert_eq!(
-        takeover_binding["data"]["result"]["binding"]["auth_provenance"]["created_via"],
-        "takeover_resumed"
-    );
-    assert_eq!(
-        takeover_binding["data"]["result"]["binding"]["auth_provenance"]["auth_input_mode"],
-        "human"
-    );
-    assert_eq!(
-        takeover_binding["data"]["result"]["binding"]["auth_provenance"]["capture_fence"],
-        "takeover_resume"
-    );
-    assert_eq!(
-        takeover_binding["data"]["result"]["capture_candidate"]["capture_fence"]["status"],
-        "capture_ready"
-    );
-    assert_eq!(
-        takeover_binding["data"]["result"]["capture_candidate"]["capture_fence"]["capture_fence"],
-        "takeover_resume"
+    assert_binding_capture_candidate(
+        &takeover_binding,
+        "capture_ready",
+        Some("takeover_resume"),
+        None,
+        None,
+        None,
     );
 
     let _ = session.cmd().arg("close").output();
@@ -582,14 +558,7 @@ fn t389e_takeover_elevate_promotes_managed_headless_session_to_visible_control()
     let session = ManagedBrowserSession::new();
     let _home = session.home();
 
-    let opened = parse_json(
-        &session
-            .cmd()
-            .args(["open", server.url().as_str()])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(opened["success"], true, "{opened}");
+    let _opened = open_and_assert_success(session.cmd(), server.url().as_str());
 
     let status = parse_json(&session.cmd().args(["takeover", "status"]).output().unwrap());
     assert_eq!(status["success"], true, "{status}");
@@ -699,14 +668,7 @@ fn t389f_bind_current_marks_temp_home_runtime_ephemeral() {
     let session = ManagedBrowserSession::new();
     let _home = session.home();
 
-    let opened = parse_json(
-        &session
-            .cmd()
-            .args(["open", server.url().as_str()])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(opened["success"], true, "{opened}");
+    let _opened = open_and_assert_success(session.cmd(), server.url().as_str());
 
     let bound = parse_json(
         &session
@@ -715,36 +677,25 @@ fn t389f_bind_current_marks_temp_home_runtime_ephemeral() {
             .output()
             .unwrap(),
     );
-    assert_eq!(bound["success"], true, "{bound}");
-    assert_eq!(bound["data"]["result"]["mode"], "bind_current");
-    assert_eq!(bound["data"]["result"]["binding"]["alias"], "temp-home");
-    assert_eq!(
-        bound["data"]["result"]["binding"]["auth_provenance"]["created_via"],
-        "bound_existing_runtime"
-    );
-    assert!(
-        bound["data"]["result"]["binding"]["auth_provenance"]["capture_fence"].is_null(),
-        "{bound}"
+    assert_binding_result_auth(
+        &bound,
+        "bind_current",
+        "temp-home",
+        "bound_existing_runtime",
+        "unknown",
+        None,
     );
     assert_eq!(
         bound["data"]["result"]["binding"]["persistence_policy"],
         "rub_home_local_ephemeral"
     );
-    assert_eq!(
-        bound["data"]["result"]["capture_candidate"]["capture_fence"]["status"],
-        "bind_current_only"
-    );
-    assert_eq!(
-        bound["data"]["result"]["capture_candidate"]["durability"]["persistence_policy"],
-        "rub_home_local_ephemeral"
-    );
-    assert_eq!(
-        bound["data"]["result"]["capture_candidate"]["durability"]["durability_scope"],
-        "rub_home_local_ephemeral"
-    );
-    assert_eq!(
-        bound["data"]["result"]["capture_candidate"]["durability"]["reattachment_mode"],
-        "temp_home_ephemeral"
+    assert_binding_capture_candidate(
+        &bound,
+        "bind_current_only",
+        None,
+        Some("rub_home_local_ephemeral"),
+        Some("rub_home_local_ephemeral"),
+        Some("temp_home_ephemeral"),
     );
 
     let _ = session.cmd().arg("close").output();
@@ -759,14 +710,7 @@ fn t389g_capture_after_cli_auth_completion_uses_explicit_cli_fence() {
     let session = ManagedBrowserSession::new();
     let _home = session.home();
 
-    let opened = parse_json(
-        &session
-            .cmd()
-            .args(["open", server.url().as_str()])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(opened["success"], true, "{opened}");
+    let _opened = open_and_assert_success(session.cmd(), server.url().as_str());
 
     let scripted = parse_json(
         &session
@@ -788,29 +732,15 @@ fn t389g_capture_after_cli_auth_completion_uses_explicit_cli_fence() {
             .output()
             .unwrap(),
     );
-    assert_eq!(captured["success"], true, "{captured}");
-    assert_eq!(captured["data"]["result"]["mode"], "capture");
-    assert_eq!(captured["data"]["result"]["binding"]["alias"], "cli-auth");
-    assert_eq!(
-        captured["data"]["result"]["binding"]["auth_provenance"]["created_via"],
-        "cli_auth_completed"
+    assert_binding_result_auth(
+        &captured,
+        "capture",
+        "cli-auth",
+        "cli_auth_completed",
+        "cli",
+        Some("explicit_cli_auth_capture"),
     );
-    assert_eq!(
-        captured["data"]["result"]["binding"]["auth_provenance"]["auth_input_mode"],
-        "cli"
-    );
-    assert_eq!(
-        captured["data"]["result"]["binding"]["auth_provenance"]["capture_fence"],
-        "explicit_cli_auth_capture"
-    );
-    assert_eq!(
-        captured["data"]["result"]["capture_candidate"]["capture_fence"]["status"],
-        "bind_current_only"
-    );
-    assert!(
-        captured["data"]["result"]["capture_candidate"]["capture_fence"]["capture_fence"].is_null(),
-        "{captured}"
-    );
+    assert_binding_capture_candidate(&captured, "bind_current_only", None, None, None, None);
 
     let _ = session.cmd().arg("close").output();
 }
@@ -833,31 +763,13 @@ fn t389h_use_alias_reuses_live_binding_through_top_level_route() {
     );
     assert_eq!(opened["success"], true, "{opened}");
 
-    let bound = parse_json(
-        &session
-            .cmd()
-            .args(["binding", "bind-current", "old-admin"])
-            .output()
-            .unwrap(),
+    bind_current_and_remember_alias(
+        session.cmd(),
+        session.cmd(),
+        "old-admin",
+        "finance",
+        "workspace",
     );
-    assert_eq!(bound["success"], true, "{bound}");
-
-    let remembered = parse_json(
-        &session
-            .cmd()
-            .args([
-                "binding",
-                "remember",
-                "finance",
-                "--binding",
-                "old-admin",
-                "--kind",
-                "workspace",
-            ])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(remembered["success"], true, "{remembered}");
 
     let doctor = parse_json(
         &session
@@ -898,18 +810,14 @@ fn t389i_use_alias_launches_bound_runtime_when_no_live_match() {
     let home = session.home().to_string();
     let profile_root = format!("{home}/remembered-runtime");
 
-    let opened = parse_json(
-        &rub_cmd(&home)
-            .args([
-                "--user-data-dir",
-                &profile_root,
-                "open",
-                server.url().as_str(),
-            ])
-            .output()
-            .unwrap(),
+    let _opened = open_and_assert_success(
+        {
+            let mut cmd = rub_cmd(&home);
+            cmd.args(["--user-data-dir", &profile_root]);
+            cmd
+        },
+        server.url().as_str(),
     );
-    assert_eq!(opened["success"], true, "{opened}");
 
     let bound = parse_json(
         &rub_cmd(&home)
@@ -946,23 +854,7 @@ fn t389i_use_alias_launches_bound_runtime_when_no_live_match() {
     let closed = parse_json(&rub_cmd(&home).args(["close", "--all"]).output().unwrap());
     assert_eq!(closed["success"], true, "{closed}");
 
-    let no_live_match = (0..50).find_map(|_| {
-        let sessions = parse_json(&rub_cmd(&home).arg("sessions").output().unwrap());
-        if sessions["success"] == true
-            && sessions["data"]["result"]["items"]
-                .as_array()
-                .is_some_and(|items| items.is_empty())
-        {
-            Some(sessions)
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            None
-        }
-    });
-    assert!(
-        no_live_match.is_some(),
-        "expected close --all to leave no live sessions before --use fallback"
-    );
+    let _no_live_match = wait_for_no_live_sessions(&home);
 
     let doctor = parse_json(
         &rub_cmd(&home)
@@ -1001,6 +893,93 @@ fn t389i_use_alias_launches_bound_runtime_when_no_live_match() {
     );
 
     let _ = rub_cmd(&home).arg("close").output();
+}
+
+/// T389j: `--use` should launch a bound profile through the top-level route when no live match exists.
+#[test]
+#[ignore]
+#[serial]
+fn t389j_use_alias_launches_bound_profile_when_no_live_match() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home().to_string();
+    let (fake_home, resolved_profile, envs_owned) = prepare_fake_profile_env();
+    let (_rt, server) = start_standard_site_fixture();
+    let envs = envs_owned
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+
+    let opened = parse_json(
+        &rub_cmd_env(&home, &envs)
+            .args(["--profile", "Default", "open", &server.url()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+
+    bind_current_and_remember_alias(
+        rub_cmd_env(&home, &envs),
+        rub_cmd_env(&home, &envs),
+        "old-admin",
+        "finance",
+        "workspace",
+    );
+
+    let closed = parse_json(
+        &rub_cmd_env(&home, &envs)
+            .args(["close", "--all"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(closed["success"], true, "{closed}");
+
+    let _no_live_match = wait_for_no_live_sessions(&home);
+
+    let doctor = parse_json(
+        &rub_cmd_env(&home, &envs)
+            .args(["--use", "finance", "doctor"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(doctor["success"], true, "{doctor}");
+    assert_eq!(
+        doctor["data"]["binding_resolution"]["requested_alias"], "finance",
+        "{doctor}"
+    );
+    assert_eq!(
+        doctor["data"]["binding_resolution"]["binding_alias"], "old-admin",
+        "{doctor}"
+    );
+    assert_eq!(
+        doctor["data"]["binding_resolution"]["mode"], "launch_bound_profile",
+        "{doctor}"
+    );
+    assert_eq!(
+        doctor["data"]["binding_resolution"]["effective_profile_dir_name"], "Default",
+        "{doctor}"
+    );
+    assert!(
+        doctor["data"]["binding_resolution"]["effective_user_data_dir"].is_null(),
+        "{doctor}"
+    );
+
+    let report = doctor_result(&doctor);
+    assert_eq!(
+        report["launch_policy"]["connection_target"]["source"], "profile",
+        "{doctor}"
+    );
+    assert_eq!(
+        report["launch_policy"]["connection_target"]["name"], "Default",
+        "{doctor}"
+    );
+    assert_eq!(
+        report["launch_policy"]["connection_target"]["resolved_path"],
+        resolved_profile.display().to_string(),
+        "{doctor}"
+    );
+
+    let _ = rub_cmd_env(&home, &envs).arg("close").output();
+    let _ = std::fs::remove_dir_all(fake_home);
 }
 
 /// T390/T391/T392/T392b: intercept rewrite/block/header-override network flows

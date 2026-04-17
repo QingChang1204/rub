@@ -13,11 +13,13 @@ use rub_core::model::{
 use rub_core::port::BrowserPort;
 
 use crate::interference::InterferenceRecoveryContext;
-use crate::runtime_refresh::refresh_live_runtime_and_interference;
+use crate::runtime_refresh::{InterferenceRefreshIntent, refresh_live_runtime_and_interference};
 use crate::session::SessionState;
 
-const RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(4);
+const RECOVERY_POLL_FLOOR_MS: u64 = 100;
+const RECOVERY_POLL_STEP_MS: u64 = 100;
+const RECOVERY_POLL_CEILING_MS: u64 = 300;
 const DISMISS_OVERLAY_PROBE_JS: &str = r#"
 (() => {
     const nodes = Array.from(document.querySelectorAll('*'));
@@ -134,7 +136,13 @@ pub(crate) async fn recover(
     browser: &Arc<dyn BrowserPort>,
     state: &Arc<SessionState>,
 ) -> InterferenceRecoveryReport {
-    let tabs = match refresh_live_runtime_and_interference(browser, state).await {
+    let tabs = match refresh_live_runtime_and_interference(
+        browser,
+        state,
+        InterferenceRefreshIntent::ReadOnly,
+    )
+    .await
+    {
         Ok(tabs) => tabs,
         Err(error) => {
             return InterferenceRecoveryReport {
@@ -185,7 +193,12 @@ pub(crate) async fn recover(
         }
 
         state.activate_handoff().await;
-        let _ = refresh_live_runtime_and_interference(browser, state).await;
+        let _ = refresh_live_runtime_and_interference(
+            browser,
+            state,
+            InterferenceRefreshIntent::ReadOnly,
+        )
+        .await;
         state
             .finish_interference_recovery(InterferenceRecoveryResult::Escalated)
             .await;
@@ -200,7 +213,12 @@ pub(crate) async fn recover(
     }
 
     if let Err(reason) = apply_recovery_action(browser, action, &context, &tabs).await {
-        let _ = refresh_live_runtime_and_interference(browser, state).await;
+        let _ = refresh_live_runtime_and_interference(
+            browser,
+            state,
+            InterferenceRefreshIntent::ReadOnly,
+        )
+        .await;
         state
             .finish_interference_recovery(InterferenceRecoveryResult::Failed)
             .await;
@@ -298,9 +316,16 @@ async fn wait_for_recovery_fence(
     context: &InterferenceRecoveryContext,
 ) -> (bool, Option<String>) {
     let deadline = Instant::now() + RECOVERY_TIMEOUT;
+    let mut poll_count = 0u32;
 
     loop {
-        let tabs = match refresh_live_runtime_and_interference(browser, state).await {
+        let tabs = match refresh_live_runtime_and_interference(
+            browser,
+            state,
+            InterferenceRefreshIntent::ReadOnly,
+        )
+        .await
+        {
             Ok(tabs) => tabs,
             Err(error) => return (false, Some(format!("live_refresh_failed:{error}"))),
         };
@@ -315,8 +340,15 @@ async fn wait_for_recovery_fence(
             return (false, Some("recovery_fence_timed_out".to_string()));
         }
 
-        sleep(RECOVERY_POLL_INTERVAL).await;
+        sleep(recovery_poll_delay(poll_count)).await;
+        poll_count = poll_count.saturating_add(1);
     }
+}
+
+fn recovery_poll_delay(poll_count: u32) -> Duration {
+    let delay_ms = RECOVERY_POLL_FLOOR_MS
+        .saturating_add(RECOVERY_POLL_STEP_MS.saturating_mul(u64::from(poll_count)));
+    Duration::from_millis(delay_ms.min(RECOVERY_POLL_CEILING_MS))
 }
 
 fn recovery_fence_satisfied(
@@ -466,7 +498,7 @@ async fn dismiss_overlay(browser: &Arc<dyn BrowserPort>) -> Result<(), String> {
 mod tests {
     use super::{
         find_primary_tab, overlay_dismiss_fence_satisfied, primary_context_restored,
-        readiness_allows_resume, select_recovery_action,
+        readiness_allows_resume, recovery_poll_delay, select_recovery_action,
     };
     use crate::interference::InterferenceRecoveryContext;
     use crate::interference_classifier::InterferenceBaseline;
@@ -475,6 +507,7 @@ mod tests {
         InterferenceRuntimeInfo, OverlayState, ReadinessInfo, ReadinessStatus, RouteStability,
         TabInfo,
     };
+    use std::time::Duration;
 
     fn active_tab(index: u32, target_id: &str, url: &str) -> TabInfo {
         TabInfo {
@@ -569,5 +602,13 @@ mod tests {
             overlay_state: OverlayState::UserBlocking,
             ..ReadinessInfo::default()
         }));
+    }
+
+    #[test]
+    fn recovery_poll_delay_uses_bounded_backoff() {
+        assert_eq!(recovery_poll_delay(0), Duration::from_millis(100));
+        assert_eq!(recovery_poll_delay(1), Duration::from_millis(200));
+        assert_eq!(recovery_poll_delay(2), Duration::from_millis(300));
+        assert_eq!(recovery_poll_delay(8), Duration::from_millis(300));
     }
 }

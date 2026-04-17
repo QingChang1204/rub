@@ -7,9 +7,9 @@ pub(crate) use confirmation::{
     confirm_select, confirm_typed_text, confirm_typed_text_in_context, confirm_upload,
 };
 pub(crate) use observation::{
-    capture_active_interaction_baseline, capture_active_interaction_baseline_in_context,
-    capture_interaction_baseline, capture_page_baseline, capture_related_page_baseline,
-    observe_element,
+    EditableProjectionKind, capture_active_interaction_baseline,
+    capture_active_interaction_baseline_in_context, capture_interaction_baseline,
+    capture_page_baseline, capture_related_page_baseline, observe_element,
 };
 pub(crate) use preflight::{
     clear_text_input, ensure_activation_target_enabled, ensure_active_text_target_editable,
@@ -19,10 +19,12 @@ pub(crate) use preflight::{
 #[cfg(test)]
 mod tests {
     use super::observation::{
-        ElementObservation, PageObservation, confirmation_observation_degraded,
-        element_state_changed, is_context_replaced_error, page_changed, page_mutated,
-        typed_effect_contradicted, typed_effect_observed,
+        EditableProjectionKind, ElementObservation, PageObservation, build_page_observation_params,
+        confirmation_observation_degraded, editable_effect_contradicted,
+        editable_effect_matches_expected, element_state_changed, is_context_replaced_error,
+        page_changed, page_mutated, typed_effect_contradicted, typed_effect_observed,
     };
+    use chromiumoxide::cdp::js_protocol::runtime::ExecutionContextId;
 
     #[test]
     fn page_mutated_detects_dom_fingerprint_changes() {
@@ -118,6 +120,26 @@ mod tests {
     }
 
     #[test]
+    fn page_observation_params_include_context_for_frame_scoped_probe() {
+        let params = build_page_observation_params(Some(
+            serde_json::from_value::<ExecutionContextId>(serde_json::json!(13))
+                .expect("execution context id"),
+        ));
+        let value = serde_json::to_value(&params).expect("params should serialize");
+        assert_eq!(value["contextId"], serde_json::json!(13));
+    }
+
+    #[test]
+    fn page_observation_params_omit_context_for_top_page_probe() {
+        let params = build_page_observation_params(None);
+        let value = serde_json::to_value(&params).expect("params should serialize");
+        assert!(
+            value.get("contextId").is_none(),
+            "top-page probe should not force an execution context"
+        );
+    }
+
+    #[test]
     fn typed_effect_observed_detects_value_growth() {
         let before = ElementObservation {
             value: Some("hel".to_string()),
@@ -155,5 +177,38 @@ mod tests {
         };
         assert!(!typed_effect_observed(&before, &after, "Test User"));
         assert!(typed_effect_contradicted(&before, &after, "Test User"));
+    }
+
+    #[test]
+    fn editable_effect_matches_expected_uses_value_projection() {
+        let observed = ElementObservation {
+            value: Some("hello".to_string()),
+            editable_projection: Some(EditableProjectionKind::Value),
+            ..ElementObservation::default()
+        };
+        assert!(editable_effect_matches_expected(&observed, "hello"));
+        assert!(!editable_effect_contradicted(&observed, "hello"));
+    }
+
+    #[test]
+    fn editable_effect_matches_expected_uses_contenteditable_text_projection() {
+        let observed = ElementObservation {
+            text: Some("hello world".to_string()),
+            editable_projection: Some(EditableProjectionKind::Text),
+            ..ElementObservation::default()
+        };
+        assert!(editable_effect_matches_expected(&observed, "hello world"));
+        assert!(editable_effect_contradicted(&observed, "goodbye"));
+    }
+
+    #[test]
+    fn editable_effect_treats_empty_contenteditable_text_as_empty_string() {
+        let observed = ElementObservation {
+            text: None,
+            editable_projection: Some(EditableProjectionKind::Text),
+            ..ElementObservation::default()
+        };
+        assert!(editable_effect_matches_expected(&observed, ""));
+        assert!(!editable_effect_contradicted(&observed, ""));
     }
 }

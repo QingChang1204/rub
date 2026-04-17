@@ -11,9 +11,8 @@ use std::sync::{Mutex, Once, OnceLock};
 
 pub use self::cleanup::{
     browser_processes_for_daemon_pid, cleanup, daemon_pid_matches_home_in_snapshot,
-    daemon_processes_for_home, default_session_pid_path, e2e_home_owner_pid,
-    managed_browser_profile_dir_for_daemon, observe_home_cleanup, prepare_home, session_pid_path,
-    verify_home_cleanup_complete, wait_for_home_processes_to_exit,
+    daemon_processes_for_home, default_session_pid_path, e2e_home_owner_pid, observe_home_cleanup,
+    prepare_home, session_pid_path, verify_home_cleanup_complete, wait_for_home_processes_to_exit,
 };
 pub use self::external_chrome::{
     browser_binary_for_external_tests, external_chrome_pid_matches_profile_in_snapshot,
@@ -30,12 +29,24 @@ static REGISTERED_EXTERNAL_CHROMES: OnceLock<Mutex<Vec<(u32, PathBuf)>>> = OnceL
 #[derive(Clone, Debug)]
 pub struct HomeCleanupObservation {
     pub daemon_root_pids: Vec<u32>,
+    pub managed_profile_dirs: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CleanupVerification {
     Verified,
+    VerifiedWithHarnessFallback,
     SkippedDuringPanic,
+}
+
+impl CleanupVerification {
+    pub fn product_teardown_verified(self) -> bool {
+        matches!(self, Self::Verified)
+    }
+
+    pub fn used_harness_fallback(self) -> bool {
+        matches!(self, Self::VerifiedWithHarnessFallback)
+    }
 }
 
 pub fn registered_homes() -> &'static Mutex<Vec<String>> {
@@ -92,8 +103,10 @@ pub fn cleanup_registered_artifacts() {
     let homes = registered_homes().lock().unwrap().clone();
     let mut failed_homes = Vec::new();
     for home in homes {
-        match cleanup::try_cleanup_home(&home) {
-            Ok(CleanupVerification::Verified) => {}
+        match cleanup::try_cleanup_home_allow_harness_fallback(&home) {
+            Ok(
+                CleanupVerification::Verified | CleanupVerification::VerifiedWithHarnessFallback,
+            ) => {}
             Ok(CleanupVerification::SkippedDuringPanic) | Err(_) => {
                 failed_homes.push(home);
             }
@@ -104,7 +117,9 @@ pub fn cleanup_registered_artifacts() {
     let mut failed_external = Vec::new();
     for (pid, profile_dir) in external {
         match external_chrome::try_cleanup_external_chrome(pid, &profile_dir) {
-            Ok(CleanupVerification::Verified) => {}
+            Ok(
+                CleanupVerification::Verified | CleanupVerification::VerifiedWithHarnessFallback,
+            ) => {}
             Ok(CleanupVerification::SkippedDuringPanic) | Err(_) => {
                 failed_external.push((pid, profile_dir));
             }
@@ -143,17 +158,35 @@ pub fn write_secure_secrets_env(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
-pub(super) fn rub_binary() -> String {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_rub") {
-        return path;
+pub fn resolve_test_rub_binary_path(
+    explicit_test_binary: Option<&str>,
+    cargo_bin_exe: Option<&str>,
+    manifest_dir: Option<&str>,
+) -> String {
+    if let Some(path) = explicit_test_binary
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        return path.to_string();
     }
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    if let Some(path) = cargo_bin_exe.map(str::trim).filter(|path| !path.is_empty()) {
+        return path.to_string();
+    }
+    let manifest = manifest_dir.unwrap_or_default();
     let workspace = std::path::Path::new(&manifest)
         .parent()
         .and_then(|p| p.parent())
         .unwrap_or(std::path::Path::new("."));
     let path = workspace.join("target/debug/rub");
     path.to_string_lossy().to_string()
+}
+
+pub(super) fn rub_binary() -> String {
+    resolve_test_rub_binary_path(
+        std::env::var("RUB_TEST_BINARY").ok().as_deref(),
+        std::env::var("CARGO_BIN_EXE_rub").ok().as_deref(),
+        std::env::var("CARGO_MANIFEST_DIR").ok().as_deref(),
+    )
 }
 
 pub(super) fn rub_cmd(rub_home: &str) -> Command {
@@ -233,5 +266,30 @@ impl ManagedBrowserSession {
 impl Drop for ManagedBrowserSession {
     fn drop(&mut self) {
         cleanup(&self.home);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_test_rub_binary_path;
+
+    #[test]
+    fn resolve_test_rub_binary_path_prefers_explicit_test_binary() {
+        let resolved = resolve_test_rub_binary_path(
+            Some("/tmp/target/release/rub"),
+            Some("/tmp/target/debug/rub"),
+            Some("/workspace/crates/rub-test-harness"),
+        );
+        assert_eq!(resolved, "/tmp/target/release/rub");
+    }
+
+    #[test]
+    fn resolve_test_rub_binary_path_falls_back_to_cargo_bin_exe() {
+        let resolved = resolve_test_rub_binary_path(
+            None,
+            Some("/tmp/target/debug/rub"),
+            Some("/workspace/crates/rub-test-harness"),
+        );
+        assert_eq!(resolved, "/tmp/target/debug/rub");
     }
 }

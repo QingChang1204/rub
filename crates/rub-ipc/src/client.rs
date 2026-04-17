@@ -1,13 +1,14 @@
 use std::path::Path;
 use std::path::PathBuf;
 use std::{error::Error, fmt};
-use tokio::io::BufReader;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::{Duration, timeout};
 
 use crate::codec::{NdJsonCodec, is_oversized_frame_io_error};
 use crate::protocol::{IPC_PROTOCOL_VERSION, IpcProtocolDecodeError, IpcRequest, IpcResponse};
 use rub_core::error::{ErrorCode, ErrorEnvelope};
+use std::time::Instant;
 
 /// CLI-side IPC client. Connects to a daemon's Unix socket.
 pub struct IpcClient {
@@ -18,13 +19,6 @@ pub struct IpcClient {
 }
 
 const IPC_CLIENT_TIMEOUT_BUFFER_MS: u64 = 1_000;
-
-fn preserve_io_error(error: Box<dyn std::error::Error + Send + Sync>) -> std::io::Error {
-    match error.downcast::<std::io::Error>() {
-        Ok(io_error) => *io_error,
-        Err(error) => std::io::Error::other(error.to_string()),
-    }
-}
 
 #[derive(Debug)]
 pub enum IpcClientError {
@@ -39,6 +33,59 @@ impl IpcClientError {
 
     fn protocol(envelope: ErrorEnvelope) -> Self {
         Self::Protocol(envelope)
+    }
+
+    fn request_encode_error(error: serde_json::Error) -> Self {
+        let (message, reason) = match error.io_error_kind() {
+            Some(std::io::ErrorKind::InvalidData) => (
+                format!("Invalid IPC request frame: {error}"),
+                "oversized_ndjson_request",
+            ),
+            _ => (
+                format!("Failed to encode IPC request: {error}"),
+                "invalid_json_request",
+            ),
+        };
+        Self::Protocol(
+            ErrorEnvelope::new(ErrorCode::IpcProtocolError, message).with_context(
+                serde_json::json!({
+                    "phase": "ipc_request_write",
+                    "reason": reason,
+                }),
+            ),
+        )
+    }
+
+    fn committed_request_timeout(request: &IpcRequest, timeout_budget: Duration) -> Self {
+        let mut context = serde_json::json!({
+            "phase": "ipc_response_read",
+            "reason": "ipc_response_timeout_after_request_commit",
+            "command": request.command,
+            "timeout_ms": timeout_budget.as_millis() as u64,
+            "request_committed": true,
+            "command_id_present": request.command_id.is_some(),
+        });
+        if let Some(context_object) = context.as_object_mut()
+            && let Some(command_id) = request.command_id.as_ref()
+        {
+            context_object.insert("command_id".to_string(), serde_json::json!(command_id));
+        }
+        let suggestion = if request.command_id.is_some() {
+            "Retry only through the same command_id or replay-recovery lane; do not send a fresh command."
+        } else {
+            "Treat this request as possibly executed. Do not blindly retry without a command_id."
+        };
+        Self::Protocol(
+            ErrorEnvelope::new(
+                ErrorCode::IpcTimeout,
+                format!(
+                    "IPC request '{}' exceeded local response timeout after the request frame was already committed",
+                    request.command
+                ),
+            )
+            .with_context(context)
+            .with_suggestion(suggestion),
+        )
     }
 
     pub fn protocol_envelope(&self) -> Option<&ErrorEnvelope> {
@@ -202,6 +249,8 @@ impl IpcClient {
                 .map_err(|error| IpcClientError::transport(std::io::Error::other(error)))?,
             _ => request.clone(),
         };
+        let encoded_request =
+            NdJsonCodec::encode(&request).map_err(IpcClientError::request_encode_error)?;
 
         let stream = if let Some(stream) = self.stream.take() {
             stream
@@ -224,34 +273,65 @@ impl IpcClient {
                 .timeout_ms
                 .saturating_add(IPC_CLIENT_TIMEOUT_BUFFER_MS),
         );
+        let deadline = Instant::now() + timeout_budget;
 
-        let response_value: serde_json::Value = timeout(timeout_budget, async {
-            NdJsonCodec::write(&mut writer, &request)
+        timeout(timeout_budget, async {
+            writer
+                .write_all(&encoded_request)
                 .await
-                .map_err(preserve_io_error)
                 .map_err(IpcClientError::transport)?;
-            let mut buf_reader = BufReader::new(reader);
-            NdJsonCodec::read(&mut buf_reader)
-                .await
-                .map_err(IpcClientError::response_read_error)?
-                .ok_or_else(|| {
-                    IpcClientError::transport(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "Daemon closed connection",
-                    ))
-                })
+            writer.flush().await.map_err(IpcClientError::transport)
         })
         .await
         .map_err(|_| {
             IpcClientError::transport(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
-                    "IPC request '{}' exceeded local round-trip timeout after {}ms",
+                    "IPC request '{}' exceeded local write timeout after {}ms",
                     request.command,
                     timeout_budget.as_millis()
                 ),
             ))
         })??;
+
+        let remaining_budget = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO);
+        if remaining_budget.is_zero() {
+            return Err(IpcClientError::committed_request_timeout(
+                &request,
+                timeout_budget,
+            ));
+        }
+
+        let mut buf_reader = BufReader::new(reader);
+        let response_value =
+            match timeout(remaining_budget, NdJsonCodec::read(&mut buf_reader)).await {
+                Ok(Ok(Some(value))) => value,
+                Ok(Ok(None)) => {
+                    return Err(IpcClientError::transport(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "Daemon closed connection",
+                    )));
+                }
+                Ok(Err(error)) => match IpcClientError::response_read_error(error) {
+                    IpcClientError::Transport(io_error)
+                        if io_error.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        return Err(IpcClientError::committed_request_timeout(
+                            &request,
+                            timeout_budget,
+                        ));
+                    }
+                    other => return Err(other),
+                },
+                Err(_) => {
+                    return Err(IpcClientError::committed_request_timeout(
+                        &request,
+                        timeout_budget,
+                    ));
+                }
+            };
 
         let response =
             IpcResponse::from_value_strict(response_value).map_err(IpcClientError::protocol)?;
@@ -294,399 +374,4 @@ impl IpcClient {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::IpcClient;
-    use crate::codec::{MAX_FRAME_BYTES, NdJsonCodec};
-    use crate::protocol::{IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse, ResponseStatus};
-    use rub_core::error::{ErrorCode, ErrorEnvelope};
-    use tokio::io::AsyncWriteExt;
-    use tokio::io::BufReader;
-    use tokio::net::UnixListener;
-
-    #[tokio::test]
-    async fn client_is_single_use() {
-        let socket_dir = std::env::temp_dir().join(format!("rubipc-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&socket_dir).expect("create socket dir");
-        let socket_path = socket_dir.join("ipc.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind listener");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = BufReader::new(reader);
-            let request: IpcRequest = NdJsonCodec::read(&mut reader)
-                .await
-                .expect("read request")
-                .expect("request");
-            assert_eq!(request.command, "doctor");
-            let response = IpcResponse::success("req-1", serde_json::json!({"ok": true}));
-            NdJsonCodec::write(&mut writer, &response)
-                .await
-                .expect("write response");
-        });
-
-        let mut client = IpcClient::connect(&socket_path).await.expect("connect");
-        let request = IpcRequest::new("doctor", serde_json::json!({}), 1_000);
-        let first = client.send(&request).await.expect("first send");
-        assert_eq!(first.status, ResponseStatus::Success);
-
-        let error = client
-            .send(&request)
-            .await
-            .expect_err("second send should fail");
-        assert!(
-            error.to_string().contains("IpcClient is single-use"),
-            "{error}"
-        );
-
-        server.await.expect("server join");
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_dir_all(&socket_dir);
-    }
-
-    #[tokio::test]
-    async fn client_rejects_mismatched_response_protocol_version() {
-        let socket_dir = std::env::temp_dir().join(format!("rubipc-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&socket_dir).expect("create socket dir");
-        let socket_path = socket_dir.join("ipc.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind listener");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = BufReader::new(reader);
-            let _: IpcRequest = NdJsonCodec::read(&mut reader)
-                .await
-                .expect("read request")
-                .expect("request");
-            let mut response = IpcResponse::success("req-1", serde_json::json!({"ok": true}));
-            response.ipc_protocol_version = "0.9".to_string();
-            NdJsonCodec::write(&mut writer, &response)
-                .await
-                .expect("write response");
-        });
-
-        let mut client = IpcClient::connect(&socket_path).await.expect("connect");
-        let request = IpcRequest::new("doctor", serde_json::json!({}), 1_000);
-        let error = client
-            .send(&request)
-            .await
-            .expect_err("mismatched protocol response should fail");
-        assert!(error.to_string().contains("protocol version mismatch"));
-        assert_eq!(
-            error
-                .protocol_envelope()
-                .and_then(|envelope| envelope.context.as_ref())
-                .and_then(|ctx| ctx.get("reason"))
-                .and_then(|value| value.as_str()),
-            Some("ipc_response_protocol_version_mismatch")
-        );
-
-        server.await.expect("server join");
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_dir_all(&socket_dir);
-    }
-
-    #[tokio::test]
-    async fn client_rejects_mismatched_response_command_id() {
-        let socket_dir = std::env::temp_dir().join(format!("rubipc-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&socket_dir).expect("create socket dir");
-        let socket_path = socket_dir.join("ipc.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind listener");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = BufReader::new(reader);
-            let _: IpcRequest = NdJsonCodec::read(&mut reader)
-                .await
-                .expect("read request")
-                .expect("request");
-            let response = IpcResponse::success("req-1", serde_json::json!({"ok": true}))
-                .with_command_id("other-command")
-                .expect("static command_id must be valid");
-            NdJsonCodec::write(&mut writer, &response)
-                .await
-                .expect("write response");
-        });
-
-        let mut client = IpcClient::connect(&socket_path).await.expect("connect");
-        let request = IpcRequest::new("doctor", serde_json::json!({}), 1_000)
-            .with_command_id("cmd-1")
-            .expect("static command_id must be valid");
-        let error = client
-            .send(&request)
-            .await
-            .expect_err("mismatched command_id response should fail");
-        assert!(error.to_string().contains("command_id mismatch"));
-
-        server.await.expect("server join");
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_dir_all(&socket_dir);
-    }
-
-    #[tokio::test]
-    async fn client_rejects_unsolicited_response_command_id() {
-        let socket_dir = std::env::temp_dir().join(format!("rubipc-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&socket_dir).expect("create socket dir");
-        let socket_path = socket_dir.join("ipc.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind listener");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = BufReader::new(reader);
-            let _: IpcRequest = NdJsonCodec::read(&mut reader)
-                .await
-                .expect("read request")
-                .expect("request");
-            let response = IpcResponse::success("req-1", serde_json::json!({"ok": true}))
-                .with_command_id("unsolicited-command")
-                .expect("static command_id must be valid");
-            NdJsonCodec::write(&mut writer, &response)
-                .await
-                .expect("write response");
-        });
-
-        let mut client = IpcClient::connect(&socket_path).await.expect("connect");
-        let request = IpcRequest::new("doctor", serde_json::json!({}), 1_000);
-        let error = client
-            .send(&request)
-            .await
-            .expect_err("unexpected command_id response should fail");
-        assert!(error.to_string().contains("command_id mismatch"));
-
-        server.await.expect("server join");
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_dir_all(&socket_dir);
-    }
-
-    #[tokio::test]
-    async fn deferred_bound_client_projects_verified_daemon_session_id() {
-        let socket_dir = std::env::temp_dir().join(format!("rubipc-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&socket_dir).expect("create socket dir");
-        let socket_path = socket_dir.join("ipc.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind listener");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = BufReader::new(reader);
-            let request: IpcRequest = NdJsonCodec::read(&mut reader)
-                .await
-                .expect("read request")
-                .expect("request");
-            assert_eq!(request.daemon_session_id.as_deref(), Some("sess-bound"));
-            let response = IpcResponse::success("req-1", serde_json::json!({"ok": true}));
-            NdJsonCodec::write(&mut writer, &response)
-                .await
-                .expect("write response");
-        });
-
-        let mut client = IpcClient::deferred(&socket_path)
-            .bind_daemon_session_id("sess-bound")
-            .expect("daemon authority must be valid");
-        let request = IpcRequest::new("doctor", serde_json::json!({}), 1_000);
-        let response = client.send(&request).await.expect("send succeeds");
-        assert_eq!(response.status, ResponseStatus::Success);
-
-        server.await.expect("server join");
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_dir_all(&socket_dir);
-    }
-
-    #[tokio::test]
-    async fn bound_client_rejects_conflicting_explicit_daemon_authority() {
-        let socket_dir = std::env::temp_dir().join(format!("rubipc-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&socket_dir).expect("create socket dir");
-        let socket_path = socket_dir.join("ipc.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind listener");
-
-        let server = tokio::spawn(async move {
-            let accepted =
-                tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
-                    .await;
-            assert!(
-                accepted.is_err(),
-                "client-side authority mismatch must fail closed before opening a socket"
-            );
-        });
-
-        let mut client = IpcClient::deferred(&socket_path)
-            .bind_daemon_session_id("sess-bound")
-            .expect("daemon authority must be valid");
-        let request = IpcRequest::new("doctor", serde_json::json!({}), 1_000)
-            .with_daemon_session_id("sess-other")
-            .expect("explicit authority must be valid");
-        let error = client
-            .send(&request)
-            .await
-            .expect_err("conflicting daemon authority must fail locally");
-        assert!(error.to_string().contains("daemon_session_id mismatch"));
-
-        server.await.expect("server join");
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_dir_all(&socket_dir);
-    }
-
-    #[tokio::test]
-    async fn deferred_client_connect_failure_does_not_consume_single_use_authority() {
-        let socket_dir = std::env::temp_dir().join(format!("rubipc-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&socket_dir).expect("create socket dir");
-        let socket_path = socket_dir.join("ipc.sock");
-        let mut client = IpcClient::deferred(&socket_path);
-        let request = IpcRequest::new("doctor", serde_json::json!({}), 250);
-
-        let error = client
-            .send(&request)
-            .await
-            .expect_err("missing socket should fail to connect");
-        let error_text = error.to_string();
-        assert!(
-            error_text.contains("No such file")
-                || error_text.contains("not found")
-                || error_text.contains("No such")
-        );
-
-        let listener = UnixListener::bind(&socket_path).expect("bind listener");
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = BufReader::new(reader);
-            let request: IpcRequest = NdJsonCodec::read(&mut reader)
-                .await
-                .expect("read request")
-                .expect("request");
-            assert_eq!(request.command, "doctor");
-            let response = IpcResponse::success("req-1", serde_json::json!({"ok": true}));
-            NdJsonCodec::write(&mut writer, &response)
-                .await
-                .expect("write response");
-        });
-
-        let response = client
-            .send(&request)
-            .await
-            .expect("client should remain reusable after connect failure");
-        assert_eq!(response.status, ResponseStatus::Success);
-
-        server.await.expect("server join");
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_dir_all(&socket_dir);
-    }
-
-    #[tokio::test]
-    async fn client_surfaces_structured_response_contract_errors() {
-        let socket_dir = std::env::temp_dir().join(format!("rubipc-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&socket_dir).expect("create socket dir");
-        let socket_path = socket_dir.join("ipc.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind listener");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = BufReader::new(reader);
-            let _: IpcRequest = NdJsonCodec::read(&mut reader)
-                .await
-                .expect("read request")
-                .expect("request");
-            let invalid = serde_json::json!({
-                "ipc_protocol_version": IPC_PROTOCOL_VERSION,
-                "request_id": "req-1",
-                "status": "success",
-                "data": { "ok": true },
-                "error": serde_json::to_value(
-                    ErrorEnvelope::new(ErrorCode::IpcProtocolError, "bad"),
-                )
-                .expect("serialize envelope"),
-                "timing": { "queue_ms": 0, "exec_ms": 0, "total_ms": 0 }
-            });
-            NdJsonCodec::write(&mut writer, &invalid)
-                .await
-                .expect("write response");
-        });
-
-        let mut client = IpcClient::connect(&socket_path).await.expect("connect");
-        let request = IpcRequest::new("doctor", serde_json::json!({}), 1_000);
-        let error = client
-            .send(&request)
-            .await
-            .expect_err("invalid response contract should fail");
-        assert_eq!(
-            error
-                .protocol_envelope()
-                .and_then(|envelope| envelope.context.as_ref())
-                .and_then(|ctx| ctx.get("reason"))
-                .and_then(|value| value.as_str()),
-            Some("invalid_ipc_response_contract")
-        );
-
-        server.await.expect("server join");
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_dir_all(&socket_dir);
-    }
-
-    #[tokio::test]
-    async fn client_treats_partial_response_frame_as_transport_error() {
-        let socket_dir = std::env::temp_dir().join(format!("rubipc-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&socket_dir).expect("create socket dir");
-        let socket_path = socket_dir.join("ipc.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind listener");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = BufReader::new(reader);
-            let _: IpcRequest = NdJsonCodec::read(&mut reader)
-                .await
-                .expect("read request")
-                .expect("request");
-            writer
-                .write_all(br#"{"ipc_protocol_version":"1.0","request_id":"req-1""#)
-                .await
-                .expect("write partial response");
-            writer.shutdown().await.expect("shutdown writer");
-        });
-
-        let mut client = IpcClient::connect(&socket_path).await.expect("connect");
-        let request = IpcRequest::new("doctor", serde_json::json!({}), 1_000);
-        let error = client
-            .send(&request)
-            .await
-            .expect_err("partial response frame should fail");
-        match error {
-            super::IpcClientError::Transport(io_error) => {
-                assert_eq!(io_error.kind(), std::io::ErrorKind::UnexpectedEof);
-            }
-            super::IpcClientError::Protocol(envelope) => {
-                panic!("partial response must remain transport-scoped, got {envelope:?}");
-            }
-        }
-
-        server.await.expect("server join");
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_dir_all(&socket_dir);
-    }
-
-    #[tokio::test]
-    async fn client_classifies_oversized_response_frame_without_string_matching() {
-        let oversized = format!("{{\"payload\":\"{}\"}}\n", "a".repeat(MAX_FRAME_BYTES));
-        let mut reader = BufReader::new(oversized.as_bytes());
-        let decode_error = NdJsonCodec::read::<serde_json::Value, _>(&mut reader)
-            .await
-            .expect_err("oversized response frame should fail");
-        let error = super::IpcClientError::response_read_error(decode_error);
-        let envelope = error
-            .protocol_envelope()
-            .expect("oversized response should be protocol-scoped");
-        assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
-        assert_eq!(
-            envelope
-                .context
-                .as_ref()
-                .and_then(|ctx| ctx.get("reason"))
-                .and_then(|value| value.as_str()),
-            Some("oversized_ndjson_frame")
-        );
-    }
-}
+mod tests;

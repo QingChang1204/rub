@@ -1,7 +1,8 @@
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{
     BindingAuthInputMode, BindingLiveStatus, BindingPersistencePolicy, BindingRecord,
-    BindingResolution, BindingResolutionMatch, BindingStatus, RememberedBindingAliasTarget,
+    BindingRegistryData, BindingResolution, BindingResolutionMatch, BindingStatus,
+    RememberedBindingAliasTarget,
 };
 use rub_daemon::rub_paths::RubPaths;
 use rub_daemon::session::{RegistryAuthoritySnapshot, RegistryEntry, registry_authority_snapshot};
@@ -14,13 +15,13 @@ use super::{
 };
 
 pub(crate) fn project_binding_list(rub_home: &Path) -> Result<Value, RubError> {
-    let registry = read_binding_registry(rub_home)?;
-    let live_snapshot = load_live_registry_snapshot(rub_home);
-    let items = registry
+    let state = load_binding_resolution_state(rub_home)?;
+    let items = state
+        .registry
         .bindings
         .iter()
         .map(|binding| {
-            let (live_status, resolution) = project_live_status(binding, live_snapshot.as_ref());
+            let (live_status, resolution) = project_live_status(binding, state.live_snapshot());
             json!({
                 "binding": binding,
                 "live_status": live_status,
@@ -32,7 +33,7 @@ pub(crate) fn project_binding_list(rub_home: &Path) -> Result<Value, RubError> {
     Ok(json!({
         "subject": binding_registry_subject(rub_home),
         "result": {
-            "schema_version": registry.schema_version,
+            "schema_version": state.registry.schema_version,
             "items": items,
         }
     }))
@@ -40,15 +41,15 @@ pub(crate) fn project_binding_list(rub_home: &Path) -> Result<Value, RubError> {
 
 pub(crate) fn project_binding_inspect(rub_home: &Path, alias: &str) -> Result<Value, RubError> {
     let normalized = normalize_binding_alias(alias)?;
-    let registry = read_binding_registry(rub_home)?;
-    let binding = registry
+    let state = load_binding_resolution_state(rub_home)?;
+    let binding = state
+        .registry
         .bindings
         .iter()
         .find(|binding| binding.alias == normalized)
         .cloned()
         .ok_or_else(|| binding_alias_not_found_error(rub_home, &normalized))?;
-    let live_snapshot = load_live_registry_snapshot(rub_home);
-    let (live_status, resolution) = project_live_status(&binding, live_snapshot.as_ref());
+    let (live_status, resolution) = project_live_status(&binding, state.live_snapshot());
 
     Ok(json!({
         "subject": binding_alias_subject(rub_home, &normalized),
@@ -64,9 +65,26 @@ pub(crate) fn resolve_binding_target(
     rub_home: &Path,
     binding_alias: &str,
 ) -> Result<RememberedBindingAliasTarget, RubError> {
+    let state = load_binding_resolution_state(rub_home)?;
+    resolve_binding_target_from_state(binding_alias, &state)
+}
+
+pub(crate) fn load_binding_resolution_state(
+    rub_home: &Path,
+) -> Result<BindingResolutionState, RubError> {
+    Ok(BindingResolutionState {
+        registry: read_binding_registry(rub_home)?,
+        live_snapshot: load_live_registry_snapshot(rub_home),
+    })
+}
+
+pub(crate) fn resolve_binding_target_from_state(
+    binding_alias: &str,
+    state: &BindingResolutionState,
+) -> Result<RememberedBindingAliasTarget, RubError> {
     let normalized = normalize_binding_alias(binding_alias)?;
-    let registry = read_binding_registry(rub_home)?;
-    let Some(binding) = registry
+    let Some(binding) = state
+        .registry
         .bindings
         .iter()
         .find(|binding| binding.alias == normalized)
@@ -76,8 +94,7 @@ pub(crate) fn resolve_binding_target(
             binding_alias: normalized,
         });
     };
-    let live_snapshot = load_live_registry_snapshot(rub_home);
-    let (live_status, resolution) = project_live_status(&binding, live_snapshot.as_ref());
+    let (live_status, resolution) = project_live_status(&binding, state.live_snapshot());
     Ok(RememberedBindingAliasTarget::Resolved {
         binding_alias: normalized,
         binding: Box::new(binding),
@@ -106,6 +123,17 @@ pub(crate) fn binding_alias_not_found_error(rub_home: &Path, alias: &str) -> Rub
 
 pub(crate) fn load_live_registry_snapshot(rub_home: &Path) -> Option<RegistryAuthoritySnapshot> {
     registry_authority_snapshot(rub_home).ok()
+}
+
+pub(crate) struct BindingResolutionState {
+    registry: BindingRegistryData,
+    live_snapshot: Option<RegistryAuthoritySnapshot>,
+}
+
+impl BindingResolutionState {
+    pub(crate) fn live_snapshot(&self) -> Option<&RegistryAuthoritySnapshot> {
+        self.live_snapshot.as_ref()
+    }
 }
 
 pub(crate) fn project_live_status(

@@ -1,5 +1,7 @@
 use crate::commands::EffectiveCli;
+use crate::timeout_budget::{ensure_remaining_budget, run_with_remaining_budget};
 use rub_core::error::ErrorCode;
+use std::time::Instant;
 
 use super::ConnectionRequest;
 use super::identity::{normalize_cdp_identity, normalize_identity_path};
@@ -101,25 +103,129 @@ pub(crate) fn materialized_auto_discover_request(
 pub(crate) async fn materialize_connection_request(
     request: &ConnectionRequest,
 ) -> Result<ConnectionRequest, rub_core::error::RubError> {
+    materialize_connection_request_with_deadline(request, None, None).await
+}
+
+pub(crate) async fn materialize_connection_request_with_deadline(
+    request: &ConnectionRequest,
+    deadline: Option<Instant>,
+    timeout_ms: Option<u64>,
+) -> Result<ConnectionRequest, rub_core::error::RubError> {
     match request {
         ConnectionRequest::AutoDiscover => {
-            let candidate = rub_cdp::attachment::resolve_unique_local_cdp_candidate().await?;
+            let candidate = match (deadline, timeout_ms) {
+                (Some(deadline), Some(timeout_ms)) => {
+                    run_with_remaining_budget(
+                        deadline,
+                        timeout_ms,
+                        "connection_request_materialization",
+                        async { rub_cdp::attachment::resolve_unique_local_cdp_candidate().await },
+                    )
+                    .await?
+                }
+                _ => rub_cdp::attachment::resolve_unique_local_cdp_candidate().await?,
+            };
             Ok(materialized_auto_discover_request(&candidate))
         }
-        ConnectionRequest::UserDataDir { path } => Ok(ConnectionRequest::UserDataDir {
-            path: normalize_identity_path(path),
-        }),
+        ConnectionRequest::UserDataDir { path } => {
+            if let (Some(deadline), Some(timeout_ms)) = (deadline, timeout_ms) {
+                ensure_remaining_budget(
+                    deadline,
+                    timeout_ms,
+                    "connection_request_materialization",
+                )?;
+            }
+            let normalized = normalize_identity_path(path);
+            if let (Some(deadline), Some(timeout_ms)) = (deadline, timeout_ms) {
+                ensure_remaining_budget(
+                    deadline,
+                    timeout_ms,
+                    "connection_request_materialization",
+                )?;
+            }
+            Ok(ConnectionRequest::UserDataDir { path: normalized })
+        }
         ConnectionRequest::Profile {
             name,
             dir_name,
             resolved_path,
             user_data_root,
-        } => Ok(ConnectionRequest::Profile {
-            name: name.clone(),
-            dir_name: dir_name.clone(),
-            resolved_path: resolved_path.clone(),
-            user_data_root: normalize_identity_path(user_data_root),
-        }),
+        } => {
+            if let (Some(deadline), Some(timeout_ms)) = (deadline, timeout_ms) {
+                ensure_remaining_budget(
+                    deadline,
+                    timeout_ms,
+                    "connection_request_materialization",
+                )?;
+            }
+            let normalized_user_data_root = normalize_identity_path(user_data_root);
+            if let (Some(deadline), Some(timeout_ms)) = (deadline, timeout_ms) {
+                ensure_remaining_budget(
+                    deadline,
+                    timeout_ms,
+                    "connection_request_materialization",
+                )?;
+            }
+            Ok(ConnectionRequest::Profile {
+                name: name.clone(),
+                dir_name: dir_name.clone(),
+                resolved_path: resolved_path.clone(),
+                user_data_root: normalized_user_data_root,
+            })
+        }
         _ => Ok(request.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rub_core::error::ErrorCode;
+    use std::path::Path;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn materialize_connection_request_times_out_when_deadline_is_exhausted() {
+        let request = ConnectionRequest::UserDataDir {
+            path: "./profile".to_string(),
+        };
+        let error = materialize_connection_request_with_deadline(
+            &request,
+            Some(Instant::now() - Duration::from_millis(1)),
+            Some(1_500),
+        )
+        .await
+        .expect_err("expired deadline should fail closed");
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::IpcTimeout);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|value| value.get("phase"))
+                .and_then(|value| value.as_str()),
+            Some("connection_request_materialization")
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_connection_request_normalizes_path_within_deadline() {
+        let request = ConnectionRequest::UserDataDir {
+            path: "./profile".to_string(),
+        };
+        let materialized = materialize_connection_request_with_deadline(
+            &request,
+            Some(Instant::now() + Duration::from_secs(1)),
+            Some(1_500),
+        )
+        .await
+        .expect("live deadline should allow normalization");
+        match materialized {
+            ConnectionRequest::UserDataDir { path } => {
+                assert!(path.ends_with("profile"));
+                assert!(Path::new(&path).is_absolute());
+            }
+            other => panic!("unexpected materialized request: {other:?}"),
+        }
     }
 }

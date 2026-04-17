@@ -5,6 +5,13 @@ use std::time::{Duration, Instant};
 const CORRELATION_LIMIT: usize = 2_048;
 const CORRELATION_TTL: Duration = Duration::from_secs(900);
 
+pub(crate) const CORRELATION_REGISTRY_EVICTED_REASON: &str = "request_correlation_registry_evicted";
+pub(crate) const CORRELATION_REGISTRY_TTL_EXPIRED_REASON: &str =
+    "request_correlation_registry_ttl_expired";
+pub(crate) const CORRELATION_STRICT_FALLBACK_REASON: &str =
+    "request_correlation_unresolved_fallback";
+pub(crate) const CORRELATION_RELAXED_FALLBACK_REASON: &str = "request_correlation_relaxed_fallback";
+
 /// Correlated request metadata produced by network rule execution and consumed
 /// by the runtime observatory when the request later resolves or fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,13 +24,24 @@ pub struct RequestCorrelation {
 }
 
 /// Bounded bridge between Fetch interception and Network observability.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RequestCorrelationRegistry {
     next_id: u64,
     by_id: HashMap<u64, TimedCorrelation>,
-    by_key: HashMap<String, u64>,
+    by_fetch_request_id: HashMap<String, u64>,
+    by_network_request_id: HashMap<String, u64>,
     order: VecDeque<u64>,
-    unresolved: VecDeque<u64>,
+    unresolved_by_lookup_key: HashMap<UnresolvedLookupKey, Vec<u64>>,
+    fallback_metrics: CorrelationFallbackMetrics,
+    degraded_reasons: VecDeque<&'static str>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CorrelationFallbackMetrics {
+    pub unresolved_fallback_attempts: u64,
+    pub unresolved_entries_scanned: u64,
+    pub relaxed_match_candidates: u64,
+    pub strict_match_candidates: u64,
 }
 
 pub(crate) fn normalize_header_name(name: &str) -> String {
@@ -93,10 +111,15 @@ impl RequestCorrelationRegistry {
     ) {
         self.prune(now);
         self.insert_timed(fetch_request_id, network_id, method, correlation, now);
+        let mut bounded_evicted = false;
         while self.order.len() > CORRELATION_LIMIT {
             if let Some(oldest) = self.order.pop_front() {
                 self.remove_entry(oldest);
+                bounded_evicted = true;
             }
+        }
+        if bounded_evicted {
+            self.emit_degraded(CORRELATION_REGISTRY_EVICTED_REASON);
         }
     }
 
@@ -110,7 +133,7 @@ impl RequestCorrelationRegistry {
         now: Instant,
     ) -> Option<RequestCorrelation> {
         self.prune(now);
-        let entry_id = if let Some(entry_id) = self.by_key.get(request_id).copied() {
+        let entry_id = if let Some(entry_id) = self.direct_entry_id(request_id) {
             Some(entry_id)
         } else {
             self.find_unique_unresolved(url, method, request_headers, tab_target_id)
@@ -128,7 +151,7 @@ impl RequestCorrelationRegistry {
         now: Instant,
     ) -> Option<RequestCorrelation> {
         self.prune(now);
-        if let Some(entry_id) = self.by_key.get(request_id).copied() {
+        if let Some(entry_id) = self.direct_entry_id(request_id) {
             self.retire_unresolved(entry_id);
             return self
                 .by_id
@@ -142,6 +165,8 @@ impl RequestCorrelationRegistry {
     }
 
     fn prune(&mut self, now: Instant) {
+        let mut expired_pruned = false;
+        let mut bounded_evicted = false;
         while let Some(oldest) = self.order.front().copied() {
             let expired = self
                 .by_id
@@ -152,21 +177,39 @@ impl RequestCorrelationRegistry {
             }
             self.order.pop_front();
             self.remove_entry(oldest);
+            if expired {
+                expired_pruned = true;
+            } else {
+                bounded_evicted = true;
+            }
         }
-        self.unresolved
-            .retain(|entry_id| self.by_id.contains_key(entry_id));
+        if expired_pruned {
+            self.emit_degraded(CORRELATION_REGISTRY_TTL_EXPIRED_REASON);
+        }
+        if bounded_evicted {
+            self.emit_degraded(CORRELATION_REGISTRY_EVICTED_REASON);
+        }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TimedCorrelation {
     recorded_at: Instant,
-    keys: Vec<String>,
+    fetch_request_id: String,
+    network_id: Option<String>,
     unresolved_match: Option<UnresolvedCorrelationMatch>,
+    unresolved_lookup_key: Option<UnresolvedLookupKey>,
     correlation: RequestCorrelation,
 }
 
 impl RequestCorrelationRegistry {
+    fn direct_entry_id(&self, request_id: &str) -> Option<u64> {
+        self.by_network_request_id
+            .get(request_id)
+            .copied()
+            .or_else(|| self.by_fetch_request_id.get(request_id).copied())
+    }
+
     fn insert_timed(
         &mut self,
         fetch_request_id: String,
@@ -178,15 +221,11 @@ impl RequestCorrelationRegistry {
         let entry_id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
 
-        let mut keys = vec![fetch_request_id];
-        if let Some(network_id) = network_id
-            && keys.iter().all(|existing| existing != &network_id)
-        {
-            keys.push(network_id);
-        }
-
-        for key in &keys {
-            self.by_key.insert(key.clone(), entry_id);
+        self.by_fetch_request_id
+            .insert(fetch_request_id.clone(), entry_id);
+        if let Some(network_id) = network_id.as_ref() {
+            self.by_network_request_id
+                .insert(network_id.clone(), entry_id);
         }
 
         let unresolved_match = Some(UnresolvedCorrelationMatch {
@@ -198,14 +237,24 @@ impl RequestCorrelationRegistry {
             effective_request_headers: correlation.effective_request_headers.clone(),
             expected_tab_target_id: correlation.tab_target_id.clone(),
         });
-        self.unresolved.push_back(entry_id);
+        let unresolved_lookup_key = unresolved_match
+            .as_ref()
+            .map(UnresolvedLookupKey::from_match);
+        if let Some(lookup_key) = unresolved_lookup_key.as_ref() {
+            self.unresolved_by_lookup_key
+                .entry(lookup_key.clone())
+                .or_default()
+                .push(entry_id);
+        }
 
         self.by_id.insert(
             entry_id,
             TimedCorrelation {
                 recorded_at: now,
-                keys,
+                fetch_request_id,
+                network_id,
                 unresolved_match,
+                unresolved_lookup_key,
                 correlation,
             },
         );
@@ -213,38 +262,50 @@ impl RequestCorrelationRegistry {
     }
 
     fn find_unique_unresolved(
-        &self,
+        &mut self,
         url: &str,
         method: &str,
         request_headers: Option<&BTreeMap<String, String>>,
         tab_target_id: Option<&str>,
     ) -> Option<u64> {
+        self.fallback_metrics.unresolved_fallback_attempts = self
+            .fallback_metrics
+            .unresolved_fallback_attempts
+            .saturating_add(1);
+        let lookup_key = UnresolvedLookupKey::for_request(url, method, tab_target_id);
         let mut strict_match = None;
         let mut strict_ambiguous = false;
         let mut relaxed_match = None;
         let mut relaxed_ambiguous = false;
-        for entry_id in &self.unresolved {
-            let Some(entry) = self.by_id.get(entry_id) else {
+        let candidate_entry_ids = self
+            .unresolved_by_lookup_key
+            .get(&lookup_key)
+            .cloned()
+            .unwrap_or_default();
+        for entry_id in candidate_entry_ids {
+            let Some(entry) = self.by_id.get(&entry_id) else {
                 continue;
             };
             let Some(unresolved_match) = entry.unresolved_match.as_ref() else {
                 continue;
             };
-            if unresolved_match.expected_url != url {
-                continue;
-            }
-            if unresolved_match.expected_method != method {
-                continue;
-            }
-            if unresolved_match.expected_tab_target_id.as_deref() != tab_target_id {
+            self.fallback_metrics.unresolved_entries_scanned = self
+                .fallback_metrics
+                .unresolved_entries_scanned
+                .saturating_add(1);
+            if entry.unresolved_lookup_key.as_ref() != Some(&lookup_key) {
                 continue;
             }
 
             if relaxed_match.is_some() {
                 relaxed_ambiguous = true;
             } else {
-                relaxed_match = Some(*entry_id);
+                relaxed_match = Some(entry_id);
             }
+            self.fallback_metrics.relaxed_match_candidates = self
+                .fallback_metrics
+                .relaxed_match_candidates
+                .saturating_add(1);
 
             let strict_headers_match = match unresolved_match.effective_request_headers.as_ref() {
                 Some(expected_headers) => request_headers.is_some_and(|actual_headers| {
@@ -253,10 +314,14 @@ impl RequestCorrelationRegistry {
                 None => true,
             };
             if strict_headers_match {
+                self.fallback_metrics.strict_match_candidates = self
+                    .fallback_metrics
+                    .strict_match_candidates
+                    .saturating_add(1);
                 if strict_match.is_some() {
                     strict_ambiguous = true;
                 } else {
-                    strict_match = Some(*entry_id);
+                    strict_match = Some(entry_id);
                 }
             }
         }
@@ -265,10 +330,14 @@ impl RequestCorrelationRegistry {
             return None;
         }
         if let Some(entry_id) = strict_match {
+            self.emit_degraded(CORRELATION_STRICT_FALLBACK_REASON);
             return Some(entry_id);
         }
         if relaxed_ambiguous {
             return None;
+        }
+        if relaxed_match.is_some() {
+            self.emit_degraded(CORRELATION_RELAXED_FALLBACK_REASON);
         }
         relaxed_match
     }
@@ -276,29 +345,99 @@ impl RequestCorrelationRegistry {
     fn remove_entry(&mut self, entry_id: u64) -> Option<RequestCorrelation> {
         let entry = self.by_id.remove(&entry_id)?;
         self.order.retain(|existing| *existing != entry_id);
-        self.unresolved.retain(|existing| *existing != entry_id);
-        for key in &entry.keys {
-            if self.by_key.get(key).copied() == Some(entry_id) {
-                self.by_key.remove(key);
-            }
+        if let Some(lookup_key) = entry.unresolved_lookup_key.as_ref() {
+            self.remove_from_unresolved_index(lookup_key, entry_id);
+        }
+        if self
+            .by_fetch_request_id
+            .get(&entry.fetch_request_id)
+            .copied()
+            == Some(entry_id)
+        {
+            self.by_fetch_request_id.remove(&entry.fetch_request_id);
+        }
+        if let Some(network_id) = entry.network_id.as_ref()
+            && self.by_network_request_id.get(network_id).copied() == Some(entry_id)
+        {
+            self.by_network_request_id.remove(network_id);
         }
         Some(entry.correlation)
     }
 
     fn retire_unresolved(&mut self, entry_id: u64) {
+        let lookup_key = self
+            .by_id
+            .get(&entry_id)
+            .and_then(|entry| entry.unresolved_lookup_key.clone());
+        if let Some(lookup_key) = lookup_key.as_ref() {
+            self.remove_from_unresolved_index(lookup_key, entry_id);
+        }
         if let Some(entry) = self.by_id.get_mut(&entry_id) {
             entry.unresolved_match = None;
+            entry.unresolved_lookup_key = None;
         }
-        self.unresolved.retain(|existing| *existing != entry_id);
+    }
+
+    #[cfg(test)]
+    fn fallback_metrics(&self) -> CorrelationFallbackMetrics {
+        self.fallback_metrics
+    }
+
+    pub(crate) fn take_degraded_reasons(&mut self) -> Vec<&'static str> {
+        self.degraded_reasons.drain(..).collect()
+    }
+
+    fn emit_degraded(&mut self, reason: &'static str) {
+        if self.degraded_reasons.back().copied() != Some(reason) {
+            self.degraded_reasons.push_back(reason);
+        }
+    }
+
+    fn remove_from_unresolved_index(&mut self, lookup_key: &UnresolvedLookupKey, entry_id: u64) {
+        let remove_bucket = if let Some(entries) = self.unresolved_by_lookup_key.get_mut(lookup_key)
+        {
+            entries.retain(|existing| *existing != entry_id);
+            entries.is_empty()
+        } else {
+            false
+        };
+        if remove_bucket {
+            self.unresolved_by_lookup_key.remove(lookup_key);
+        }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct UnresolvedCorrelationMatch {
     expected_url: String,
     expected_method: String,
     effective_request_headers: Option<BTreeMap<String, String>>,
     expected_tab_target_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UnresolvedLookupKey {
+    expected_tab_target_id: Option<String>,
+    expected_url: String,
+    expected_method: String,
+}
+
+impl UnresolvedLookupKey {
+    fn from_match(unresolved_match: &UnresolvedCorrelationMatch) -> Self {
+        Self {
+            expected_tab_target_id: unresolved_match.expected_tab_target_id.clone(),
+            expected_url: unresolved_match.expected_url.clone(),
+            expected_method: unresolved_match.expected_method.clone(),
+        }
+    }
+
+    fn for_request(url: &str, method: &str, tab_target_id: Option<&str>) -> Self {
+        Self {
+            expected_tab_target_id: tab_target_id.map(str::to_string),
+            expected_url: url.to_string(),
+            expected_method: method.to_string(),
+        }
+    }
 }
 
 fn headers_include(actual: &BTreeMap<String, String>, expected: &BTreeMap<String, String>) -> bool {
@@ -311,448 +450,4 @@ fn headers_include(actual: &BTreeMap<String, String>, expected: &BTreeMap<String
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        CORRELATION_LIMIT, CORRELATION_TTL, RequestCorrelation, RequestCorrelationRegistry,
-        headers_include, normalize_header_name,
-    };
-    use rub_core::model::{NetworkRuleEffect, NetworkRuleEffectKind};
-    use std::collections::BTreeMap;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn correlation_registry_is_bounded_and_consuming() {
-        let mut registry = RequestCorrelationRegistry::default();
-        for index in 0..(CORRELATION_LIMIT + 4) {
-            registry.record(
-                format!("req-{index}"),
-                None,
-                "GET",
-                RequestCorrelation {
-                    tab_target_id: Some("tab-1".to_string()),
-                    original_url: format!("https://example.com/{index}"),
-                    rewritten_url: None,
-                    effective_request_headers: None,
-                    applied_rule_effects: vec![NetworkRuleEffect {
-                        rule_id: index as u32,
-                        kind: NetworkRuleEffectKind::Allow,
-                    }],
-                },
-            );
-        }
-
-        assert!(
-            registry
-                .take_for_request("req-0", "https://example.com/0", "GET", None, Some("tab-1"))
-                .is_none()
-        );
-        let last = registry.take_for_request(
-            &format!("req-{}", CORRELATION_LIMIT + 3),
-            &format!("https://example.com/{}", CORRELATION_LIMIT + 3),
-            "GET",
-            None,
-            Some("tab-1"),
-        );
-        assert!(last.is_some());
-        assert!(
-            registry
-                .take_for_request(
-                    &format!("req-{}", CORRELATION_LIMIT + 3),
-                    &format!("https://example.com/{}", CORRELATION_LIMIT + 3),
-                    "GET",
-                    None,
-                    Some("tab-1")
-                )
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn correlation_registry_peek_does_not_consume_entry() {
-        let mut registry = RequestCorrelationRegistry::default();
-        registry.record(
-            "req-1".to_string(),
-            Some("net-1".to_string()),
-            "GET",
-            RequestCorrelation {
-                tab_target_id: Some("tab-1".to_string()),
-                original_url: "https://example.com/1".to_string(),
-                rewritten_url: Some("https://cdn.example.com/1".to_string()),
-                effective_request_headers: None,
-                applied_rule_effects: vec![NetworkRuleEffect {
-                    rule_id: 1,
-                    kind: NetworkRuleEffectKind::Rewrite,
-                }],
-            },
-        );
-
-        let peeked = registry
-            .peek_for_request(
-                "net-1",
-                "https://cdn.example.com/1",
-                "GET",
-                None,
-                Some("tab-1"),
-            )
-            .expect("peek should clone entry");
-        assert_eq!(peeked.original_url, "https://example.com/1");
-        assert!(
-            registry
-                .take_for_request(
-                    "req-1",
-                    "https://cdn.example.com/1",
-                    "GET",
-                    None,
-                    Some("tab-1")
-                )
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn correlation_registry_expires_stale_entries() {
-        let mut registry = RequestCorrelationRegistry::default();
-        let now = Instant::now();
-        registry.record_at(
-            "req-1".to_string(),
-            None,
-            "GET".to_string(),
-            RequestCorrelation {
-                tab_target_id: Some("tab-1".to_string()),
-                original_url: "https://example.com/1".to_string(),
-                rewritten_url: None,
-                effective_request_headers: None,
-                applied_rule_effects: vec![NetworkRuleEffect {
-                    rule_id: 1,
-                    kind: NetworkRuleEffectKind::Block,
-                }],
-            },
-            now,
-        );
-
-        assert!(
-            registry
-                .take_at(
-                    "req-1",
-                    "https://example.com/1",
-                    "GET",
-                    None,
-                    Some("tab-1"),
-                    now + CORRELATION_TTL + Duration::from_secs(1)
-                )
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn correlation_registry_falls_back_to_unique_url_and_header_match_without_network_id() {
-        let mut registry = RequestCorrelationRegistry::default();
-        let mut expected_headers = BTreeMap::new();
-        expected_headers.insert("x-rub-test".to_string(), "1".to_string());
-        registry.record(
-            "fetch-1".to_string(),
-            None,
-            "GET",
-            RequestCorrelation {
-                tab_target_id: Some("tab-1".to_string()),
-                original_url: "https://example.com/api".to_string(),
-                rewritten_url: Some("https://cdn.example.com/api".to_string()),
-                effective_request_headers: Some(expected_headers.clone()),
-                applied_rule_effects: vec![NetworkRuleEffect {
-                    rule_id: 1,
-                    kind: NetworkRuleEffectKind::Rewrite,
-                }],
-            },
-        );
-
-        let peeked = registry
-            .peek_for_request(
-                "network-1",
-                "https://cdn.example.com/api",
-                "GET",
-                Some(&expected_headers),
-                Some("tab-1"),
-            )
-            .expect("fallback should bridge correlation");
-        assert_eq!(peeked.original_url, "https://example.com/api");
-        assert!(
-            registry
-                .take_for_request(
-                    "network-1",
-                    "https://cdn.example.com/api",
-                    "GET",
-                    Some(&expected_headers),
-                    Some("tab-1"),
-                )
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn correlation_registry_falls_back_when_network_key_space_does_not_match_request_id() {
-        let mut registry = RequestCorrelationRegistry::default();
-        let mut expected_headers = BTreeMap::new();
-        expected_headers.insert("x-rub-test".to_string(), "1".to_string());
-        registry.record(
-            "fetch-1".to_string(),
-            Some("network-side-key".to_string()),
-            "GET",
-            RequestCorrelation {
-                tab_target_id: Some("tab-1".to_string()),
-                original_url: "https://example.com/api".to_string(),
-                rewritten_url: Some("https://cdn.example.com/api".to_string()),
-                effective_request_headers: Some(expected_headers.clone()),
-                applied_rule_effects: vec![NetworkRuleEffect {
-                    rule_id: 2,
-                    kind: NetworkRuleEffectKind::Rewrite,
-                }],
-            },
-        );
-
-        let peeked = registry
-            .peek_for_request(
-                "request-side-key",
-                "https://cdn.example.com/api",
-                "GET",
-                Some(&expected_headers),
-                Some("tab-1"),
-            )
-            .expect("fallback should bridge mismatched key spaces");
-        assert_eq!(peeked.original_url, "https://example.com/api");
-        assert!(
-            registry
-                .take_for_request(
-                    "request-side-key",
-                    "https://cdn.example.com/api",
-                    "GET",
-                    Some(&expected_headers),
-                    Some("tab-1"),
-                )
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn header_match_is_case_insensitive() {
-        let mut actual = BTreeMap::new();
-        actual.insert(
-            normalize_header_name("Authorization"),
-            "Bearer live".to_string(),
-        );
-        let mut expected = BTreeMap::new();
-        expected.insert("authorization".to_string(), "Bearer live".to_string());
-        assert!(headers_include(&actual, &expected));
-    }
-
-    #[test]
-    fn exact_binding_retires_unresolved_fallback_pool() {
-        let mut registry = RequestCorrelationRegistry::default();
-        let mut headers = BTreeMap::new();
-        headers.insert("x-rub-test".to_string(), "1".to_string());
-        registry.record(
-            "fetch-1".to_string(),
-            Some("net-1".to_string()),
-            "GET",
-            RequestCorrelation {
-                tab_target_id: Some("tab-1".to_string()),
-                original_url: "https://example.com/api".to_string(),
-                rewritten_url: Some("https://cdn.example.com/api".to_string()),
-                effective_request_headers: Some(headers.clone()),
-                applied_rule_effects: vec![NetworkRuleEffect {
-                    rule_id: 9,
-                    kind: NetworkRuleEffectKind::Rewrite,
-                }],
-            },
-        );
-
-        let exact = registry
-            .peek_for_request(
-                "net-1",
-                "https://cdn.example.com/api",
-                "GET",
-                Some(&headers),
-                Some("tab-1"),
-            )
-            .expect("exact binding should still succeed");
-        assert_eq!(exact.original_url, "https://example.com/api");
-        assert!(
-            registry
-                .peek_for_request(
-                    "unrelated-request",
-                    "https://cdn.example.com/api",
-                    "GET",
-                    Some(&headers),
-                    Some("tab-1"),
-                )
-                .is_none(),
-            "exactly bound correlations must leave the unresolved fallback pool"
-        );
-    }
-
-    #[test]
-    fn unresolved_fallback_requires_matching_http_method() {
-        let mut registry = RequestCorrelationRegistry::default();
-        registry.record(
-            "fetch-1".to_string(),
-            None,
-            "POST",
-            RequestCorrelation {
-                tab_target_id: Some("tab-1".to_string()),
-                original_url: "https://example.com/api".to_string(),
-                rewritten_url: Some("https://cdn.example.com/api".to_string()),
-                effective_request_headers: None,
-                applied_rule_effects: vec![NetworkRuleEffect {
-                    rule_id: 10,
-                    kind: NetworkRuleEffectKind::Rewrite,
-                }],
-            },
-        );
-
-        assert!(
-            registry
-                .peek_for_request(
-                    "req-1",
-                    "https://cdn.example.com/api",
-                    "GET",
-                    None,
-                    Some("tab-1")
-                )
-                .is_none()
-        );
-        assert!(
-            registry
-                .take_for_request(
-                    "req-1",
-                    "https://cdn.example.com/api",
-                    "POST",
-                    None,
-                    Some("tab-1")
-                )
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn correlation_registry_falls_back_to_unique_url_method_when_effective_headers_are_not_visible()
-    {
-        let mut registry = RequestCorrelationRegistry::default();
-        let mut expected_headers = BTreeMap::new();
-        expected_headers.insert("x-rub-test".to_string(), "1".to_string());
-        registry.record(
-            "fetch-1".to_string(),
-            None,
-            "GET",
-            RequestCorrelation {
-                tab_target_id: Some("tab-1".to_string()),
-                original_url: "https://example.com/api".to_string(),
-                rewritten_url: Some("https://example.com/api".to_string()),
-                effective_request_headers: Some(expected_headers),
-                applied_rule_effects: vec![NetworkRuleEffect {
-                    rule_id: 11,
-                    kind: NetworkRuleEffectKind::HeaderOverride,
-                }],
-            },
-        );
-
-        let peeked = registry
-            .peek_for_request(
-                "network-1",
-                "https://example.com/api",
-                "GET",
-                Some(&BTreeMap::new()),
-                Some("tab-1"),
-            )
-            .expect("unique URL+method fallback should bridge correlation");
-        assert_eq!(peeked.applied_rule_effects.len(), 1);
-        assert_eq!(
-            peeked.applied_rule_effects[0].kind,
-            NetworkRuleEffectKind::HeaderOverride
-        );
-    }
-
-    #[test]
-    fn correlation_registry_relaxed_fallback_requires_same_tab_target() {
-        let mut registry = RequestCorrelationRegistry::default();
-        registry.record(
-            "fetch-1".to_string(),
-            None,
-            "GET",
-            RequestCorrelation {
-                tab_target_id: Some("tab-1".to_string()),
-                original_url: "https://example.com/api".to_string(),
-                rewritten_url: Some("https://example.com/api".to_string()),
-                effective_request_headers: Some(BTreeMap::from([(
-                    "x-rub-test".to_string(),
-                    "1".to_string(),
-                )])),
-                applied_rule_effects: vec![NetworkRuleEffect {
-                    rule_id: 12,
-                    kind: NetworkRuleEffectKind::HeaderOverride,
-                }],
-            },
-        );
-
-        assert!(
-            registry
-                .peek_for_request(
-                    "network-1",
-                    "https://example.com/api",
-                    "GET",
-                    Some(&BTreeMap::new()),
-                    Some("tab-2"),
-                )
-                .is_none(),
-            "relaxed fallback must stay within the same tab target"
-        );
-        assert!(
-            registry
-                .peek_for_request(
-                    "network-1",
-                    "https://example.com/api",
-                    "GET",
-                    Some(&BTreeMap::new()),
-                    Some("tab-1"),
-                )
-                .is_some(),
-            "same-tab relaxed fallback should still bridge when the match is unique"
-        );
-    }
-
-    #[test]
-    fn correlation_registry_fails_closed_when_relaxed_url_method_match_is_ambiguous() {
-        let mut registry = RequestCorrelationRegistry::default();
-
-        for (index, header_value) in ["1", "2"].into_iter().enumerate() {
-            let mut expected_headers = BTreeMap::new();
-            expected_headers.insert("x-rub-test".to_string(), header_value.to_string());
-            registry.record(
-                format!("fetch-{index}"),
-                None,
-                "GET",
-                RequestCorrelation {
-                    tab_target_id: Some("tab-1".to_string()),
-                    original_url: "https://example.com/api".to_string(),
-                    rewritten_url: Some("https://example.com/api".to_string()),
-                    effective_request_headers: Some(expected_headers),
-                    applied_rule_effects: vec![NetworkRuleEffect {
-                        rule_id: index as u32,
-                        kind: NetworkRuleEffectKind::HeaderOverride,
-                    }],
-                },
-            );
-        }
-
-        assert!(
-            registry
-                .peek_for_request(
-                    "network-1",
-                    "https://example.com/api",
-                    "GET",
-                    Some(&BTreeMap::new()),
-                    Some("tab-1"),
-                )
-                .is_none(),
-            "relaxed fallback must fail closed when multiple unresolved correlations share URL+method",
-        );
-    }
-}
+mod tests;

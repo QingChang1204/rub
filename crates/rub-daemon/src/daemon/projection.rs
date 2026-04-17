@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-use crate::session::{RegistryEntry, SessionState, register_session_with_displaced};
+use crate::session::{
+    RegistryEntry, SessionState, cleanup_projections, deregister_session,
+    register_session_with_displaced, registry_entry_is_live_for_home,
+};
 use rub_core::fs::{FileCommitOutcome, atomic_write_bytes, sync_parent_dir};
 
 pub(super) fn signal_ready() -> std::io::Result<()> {
@@ -12,15 +15,26 @@ pub(super) fn signal_ready() -> std::io::Result<()> {
     Ok(())
 }
 
-pub(super) fn restore_previous_authority(
+pub(super) enum RestorePreviousAuthorityOutcome {
+    Restored,
+    SkippedNotLive,
+}
+
+pub(super) fn restore_previous_authority_if_live(
     home: &Path,
     entry: &RegistryEntry,
-) -> std::io::Result<()> {
+) -> std::io::Result<RestorePreviousAuthorityOutcome> {
+    if !registry_entry_is_live_for_home(home, entry) {
+        let _ = deregister_session(home, &entry.session_id);
+        cleanup_projections(home, entry);
+        return Ok(RestorePreviousAuthorityOutcome::SkippedNotLive);
+    }
+
     let _ = register_session_with_displaced(home, entry.clone())?;
     restore_socket_projection(home, entry)?;
     restore_pid_projection(home, entry)?;
     restore_startup_commit_marker(home, entry)?;
-    Ok(())
+    Ok(RestorePreviousAuthorityOutcome::Restored)
 }
 
 pub(super) fn startup_ready_marker_path() -> Option<PathBuf> {

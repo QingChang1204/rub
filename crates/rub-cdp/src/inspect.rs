@@ -259,17 +259,11 @@ async fn resolve_selector_matches(
         ));
     }
 
-    let mut snapshot_by_index = HashMap::new();
-    for element in &snapshot.elements {
-        snapshot_by_index.insert(element.index, element);
-    }
-
-    let mut resolved = Vec::new();
-    for matched_index in payload.match_indices {
-        if let Some(element) = snapshot_by_index.get(&matched_index) {
-            resolved.push((element.index, (*element).clone()));
-        }
-    }
+    let snapshot_by_index = crate::snapshot_lookup::build_snapshot_index_lookup(snapshot);
+    let mut resolved = crate::snapshot_lookup::clone_snapshot_elements_by_index(
+        &snapshot_by_index,
+        payload.match_indices,
+    );
 
     if resolved.is_empty() {
         return Err(RubError::domain_with_context_and_suggestion(

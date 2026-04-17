@@ -239,9 +239,12 @@ impl OrchestrationRuntimeState {
             return self.projection();
         }
         self.last_refresh_sequence = sequence;
+        self.projection.known_sessions.clear();
+        self.projection.session_count = 0;
         self.projection.addressing_supported = false;
         self.projection.execution_supported = false;
         self.projection.degraded_reason = Some(reason.into());
+        self.reconcile_sessions();
         self.refresh_counts();
         self.refresh_status();
         self.projection()

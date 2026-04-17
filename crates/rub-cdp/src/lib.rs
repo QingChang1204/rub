@@ -35,6 +35,7 @@ pub mod request_correlation;
 pub mod runtime;
 pub mod runtime_observatory;
 pub mod runtime_state;
+pub(crate) mod snapshot_lookup;
 pub mod stealth;
 pub mod storage;
 pub mod tab_projection;
@@ -42,5 +43,7 @@ pub mod targeting;
 pub mod trigger_probe;
 pub mod waiting;
 
+pub use managed_browser::cleanup_managed_profile_authority;
 pub use managed_browser::is_profile_in_use as managed_profile_in_use;
 pub use managed_browser::projected_managed_profile_path;
+pub use managed_browser::projected_managed_profile_path_for_session;

@@ -12,6 +12,21 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+fn workflow_capture_delivery_delivered() -> WorkflowCaptureDeliveryState {
+    WorkflowCaptureDeliveryState::Delivered
+}
+
+fn workflow_capture_delivery_is_delivered(value: &WorkflowCaptureDeliveryState) -> bool {
+    matches!(value, WorkflowCaptureDeliveryState::Delivered)
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowCaptureDeliveryState {
+    Delivered,
+    DeliveryFailedAfterCommit,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowCaptureEntry {
     pub sequence: u64,
@@ -23,6 +38,11 @@ pub struct WorkflowCaptureEntry {
     pub capture_class: WorkflowCaptureClass,
     #[serde(default)]
     pub workflow_allowed: bool,
+    #[serde(
+        default = "workflow_capture_delivery_delivered",
+        skip_serializing_if = "workflow_capture_delivery_is_delivered"
+    )]
+    pub delivery_state: WorkflowCaptureDeliveryState,
     pub timing: rub_core::model::Timing,
 }
 
@@ -73,7 +93,12 @@ fn trim_workflow_capture_with_limits(
 }
 
 impl WorkflowCaptureState {
-    pub fn record(&mut self, request: &IpcRequest, response: &IpcResponse) {
+    pub fn record(
+        &mut self,
+        request: &IpcRequest,
+        response: &IpcResponse,
+        delivery_state: WorkflowCaptureDeliveryState,
+    ) {
         if !matches!(response.status, ResponseStatus::Success) {
             return;
         }
@@ -89,6 +114,7 @@ impl WorkflowCaptureState {
             args: request.args.clone(),
             capture_class: workflow_request_capture_class(&request.command, &request.args),
             workflow_allowed: workflow_request_allowed(&request.command, &request.args),
+            delivery_state,
             timing: response.timing,
         };
         let approx_bytes = workflow_capture_entry_bytes(&entry);
@@ -139,8 +165,9 @@ impl WorkflowCaptureState {
 #[cfg(test)]
 mod tests {
     use super::{
-        WORKFLOW_CAPTURE_LIMIT_BYTES, WorkflowCaptureClass, WorkflowCaptureEntry,
-        WorkflowCaptureState, WorkflowCaptureStoredEntry, trim_workflow_capture_with_limits,
+        WORKFLOW_CAPTURE_LIMIT_BYTES, WorkflowCaptureClass, WorkflowCaptureDeliveryState,
+        WorkflowCaptureEntry, WorkflowCaptureState, WorkflowCaptureStoredEntry,
+        trim_workflow_capture_with_limits,
     };
     use rub_core::error::{ErrorCode, ErrorEnvelope};
     use rub_core::model::Timing;
@@ -174,19 +201,31 @@ mod tests {
         let pipe_response = rub_ipc::protocol::IpcResponse::success("req-1", serde_json::json!({}))
             .with_command_id("cmd-1")
             .expect("static command_id must be valid");
-        capture.record(&pipe, &pipe_response);
+        capture.record(
+            &pipe,
+            &pipe_response,
+            WorkflowCaptureDeliveryState::Delivered,
+        );
 
         let observe = IpcRequest::new("observe", serde_json::json!({ "limit": 5 }), 30_000);
         let observe_response =
             rub_ipc::protocol::IpcResponse::success("req-2", serde_json::json!({}));
-        capture.record(&observe, &observe_response);
+        capture.record(
+            &observe,
+            &observe_response,
+            WorkflowCaptureDeliveryState::Delivered,
+        );
 
         let failed = IpcRequest::new("click", serde_json::json!({ "selector": "#go" }), 30_000);
         let failed_response = rub_ipc::protocol::IpcResponse::error(
             "req-3",
             ErrorEnvelope::new(ErrorCode::ElementNotFound, "missing"),
         );
-        capture.record(&failed, &failed_response);
+        capture.record(
+            &failed,
+            &failed_response,
+            WorkflowCaptureDeliveryState::Delivered,
+        );
 
         let orchestration = IpcRequest::new(
             "orchestration",
@@ -197,7 +236,11 @@ mod tests {
             "req-4",
             serde_json::json!({ "rule": { "id": 1 } }),
         );
-        capture.record(&orchestration, &orchestration_response);
+        capture.record(
+            &orchestration,
+            &orchestration_response,
+            WorkflowCaptureDeliveryState::Delivered,
+        );
 
         let orchestration_trace = IpcRequest::new(
             "orchestration",
@@ -208,7 +251,11 @@ mod tests {
             "req-5",
             serde_json::json!({ "trace": { "events": [] } }),
         );
-        capture.record(&orchestration_trace, &orchestration_trace_response);
+        capture.record(
+            &orchestration_trace,
+            &orchestration_trace_response,
+            WorkflowCaptureDeliveryState::Delivered,
+        );
 
         let projection = capture.projection(10, 0);
         assert_eq!(projection.entries.len(), 4);
@@ -216,6 +263,10 @@ mod tests {
         assert_eq!(
             projection.entries[0].capture_class,
             WorkflowCaptureClass::Administrative
+        );
+        assert_eq!(
+            projection.entries[0].delivery_state,
+            WorkflowCaptureDeliveryState::Delivered
         );
         assert_eq!(
             projection.entries[0].args["spec_source"]["kind"],
@@ -256,7 +307,7 @@ mod tests {
                 format!("req-{index}"),
                 serde_json::json!({}),
             );
-            capture.record(&request, &response);
+            capture.record(&request, &response, WorkflowCaptureDeliveryState::Delivered);
         }
 
         let projection = capture.projection(usize::MAX, 0);
@@ -280,6 +331,7 @@ mod tests {
                 args: serde_json::json!({}),
                 capture_class: WorkflowCaptureClass::Workflow,
                 workflow_allowed: true,
+                delivery_state: WorkflowCaptureDeliveryState::Delivered,
                 timing: Timing::default(),
             },
             approx_bytes: (WORKFLOW_CAPTURE_LIMIT_BYTES / 2).max(1),
@@ -294,6 +346,7 @@ mod tests {
                 args: serde_json::json!({}),
                 capture_class: WorkflowCaptureClass::Workflow,
                 workflow_allowed: true,
+                delivery_state: WorkflowCaptureDeliveryState::Delivered,
                 timing: Timing::default(),
             },
             approx_bytes: (WORKFLOW_CAPTURE_LIMIT_BYTES / 2).max(1),
@@ -304,5 +357,35 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].entry.request_id, "req-b");
+    }
+
+    #[test]
+    fn workflow_capture_records_daemon_committed_delivery_failure_with_honest_metadata() {
+        let mut capture = WorkflowCaptureState::default();
+        let request = IpcRequest::new(
+            "open",
+            serde_json::json!({ "url": "https://example.com" }),
+            1_000,
+        )
+        .with_command_id("cmd-1")
+        .expect("static command_id must be valid");
+        let response =
+            rub_ipc::protocol::IpcResponse::success("req-1", serde_json::json!({ "ok": true }))
+                .with_command_id("cmd-1")
+                .expect("static command_id must be valid");
+
+        capture.record(
+            &request,
+            &response,
+            WorkflowCaptureDeliveryState::DeliveryFailedAfterCommit,
+        );
+
+        let projection = capture.projection(10, 0);
+        assert_eq!(projection.entries.len(), 1);
+        assert_eq!(
+            projection.entries[0].delivery_state,
+            WorkflowCaptureDeliveryState::DeliveryFailedAfterCommit
+        );
+        assert_eq!(projection.entries[0].command, "open");
     }
 }

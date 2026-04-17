@@ -164,16 +164,27 @@ impl RubPaths {
 }
 
 pub fn temp_roots() -> Vec<PathBuf> {
-    let mut roots = vec![std::env::temp_dir()];
-    let explicit_tmp = PathBuf::from("/tmp");
-    if !roots.iter().any(|root| root == &explicit_tmp) {
-        roots.push(explicit_tmp);
+    let mut roots = Vec::new();
+    for root in [std::env::temp_dir(), PathBuf::from("/tmp")] {
+        push_temp_root_variant(&mut roots, root.clone());
+        if let Ok(canonical) = root.canonicalize() {
+            push_temp_root_variant(&mut roots, canonical);
+        }
     }
     roots
 }
 
 pub fn is_temp_root_path(path: &Path) -> bool {
-    temp_roots().into_iter().any(|root| path.starts_with(root))
+    let mut candidates = vec![path.to_path_buf()];
+    if let Some(alias) = strip_private_prefix(path) {
+        candidates.push(alias);
+    }
+
+    temp_roots().into_iter().any(|root| {
+        candidates
+            .iter()
+            .any(|candidate| candidate.starts_with(&root))
+    })
 }
 
 pub fn is_temp_owned_home(path: &Path) -> bool {
@@ -183,6 +194,33 @@ pub fn is_temp_owned_home(path: &Path) -> bool {
 pub fn read_temp_home_owner_pid(path: &Path) -> Option<u32> {
     let raw = fs::read_to_string(RubPaths::new(path).temp_home_owner_marker_path()).ok()?;
     raw.trim().parse::<u32>().ok()
+}
+
+fn push_temp_root_variant(roots: &mut Vec<PathBuf>, root: PathBuf) {
+    if !roots.iter().any(|existing| existing == &root) {
+        roots.push(root.clone());
+    }
+    if let Some(alias) = strip_private_prefix(&root)
+        && !roots.iter().any(|existing| existing == &alias)
+    {
+        roots.push(alias);
+    }
+}
+
+fn strip_private_prefix(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::RootDir), Some(Component::Normal(component)))
+            if component == "private" =>
+        {
+            let mut stripped = PathBuf::from("/");
+            for component in components {
+                stripped.push(component.as_os_str());
+            }
+            Some(stripped)
+        }
+        _ => None,
+    }
 }
 
 impl SessionPaths {
@@ -274,6 +312,16 @@ impl SessionPaths {
     pub fn startup_error_path(&self, startup_id: &str) -> PathBuf {
         self.session_dir()
             .join(format!("startup.{startup_id}.error"))
+    }
+
+    pub fn startup_stderr_path(&self, startup_id: &str) -> PathBuf {
+        self.session_dir()
+            .join(format!("startup.{startup_id}.stderr"))
+    }
+
+    pub fn startup_cleanup_path(&self, startup_id: &str) -> PathBuf {
+        self.session_dir()
+            .join(format!("startup.{startup_id}.cleanup"))
     }
 
     pub fn startup_committed_path(&self) -> PathBuf {
@@ -402,287 +450,4 @@ pub fn default_rub_home() -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        RubPaths, default_rub_home, is_temp_owned_home, is_temp_root_path,
-        read_temp_home_owner_pid, validate_session_id_component, validate_session_name,
-    };
-    use std::path::PathBuf;
-
-    #[test]
-    fn rub_paths_projects_canonical_home_artifacts() {
-        let paths = RubPaths::new("/tmp/rub-home");
-        assert_eq!(paths.logs_dir(), PathBuf::from("/tmp/rub-home/logs"));
-        assert_eq!(
-            paths.sessions_dir(),
-            PathBuf::from("/tmp/rub-home/sessions")
-        );
-        // Socket runtime dir is now user-scoped; verify it contains the
-        // current username (or UID fallback) rather than a hardcoded string.
-        let tag = std::env::var("USER")
-            .or_else(|_| std::env::var("UID"))
-            .unwrap_or_else(|_| "unknown".to_string());
-        assert_eq!(
-            paths.socket_runtime_dir(),
-            PathBuf::from(format!("/tmp/rub-sock-{tag}"))
-        );
-        assert_eq!(
-            paths.workflows_dir(),
-            PathBuf::from("/tmp/rub-home/workflows")
-        );
-        assert_eq!(
-            paths.orchestrations_dir(),
-            PathBuf::from("/tmp/rub-home/orchestrations")
-        );
-        assert_eq!(paths.cache_dir(), PathBuf::from("/tmp/rub-home/cache"));
-        assert_eq!(paths.history_dir(), PathBuf::from("/tmp/rub-home/history"));
-        assert_eq!(
-            paths.registry_path(),
-            PathBuf::from("/tmp/rub-home/registry.json")
-        );
-        assert_eq!(
-            paths.bindings_path(),
-            PathBuf::from("/tmp/rub-home/bindings.json")
-        );
-        assert_eq!(
-            paths.bindings_lock_path(),
-            PathBuf::from("/tmp/rub-home/bindings.lock")
-        );
-        assert_eq!(
-            paths.remembered_bindings_path(),
-            PathBuf::from("/tmp/rub-home/remembered-bindings.json")
-        );
-        assert_eq!(
-            paths.remembered_bindings_lock_path(),
-            PathBuf::from("/tmp/rub-home/remembered-bindings.lock")
-        );
-        assert_eq!(
-            paths.daemon_log_path(),
-            PathBuf::from("/tmp/rub-home/logs/daemon.log")
-        );
-        assert_eq!(
-            paths.config_path(),
-            PathBuf::from("/tmp/rub-home/config.toml")
-        );
-        assert_eq!(
-            paths.secrets_env_path(),
-            PathBuf::from("/tmp/rub-home/secrets.env")
-        );
-        assert_eq!(
-            paths.secrets_env_lock_path(),
-            PathBuf::from("/tmp/rub-home/secrets.lock")
-        );
-    }
-
-    #[test]
-    fn session_paths_project_socket_pid_lock_and_ready_files() {
-        let session = RubPaths::new("/tmp/rub-home").session("default");
-        assert_eq!(
-            session.session_dir(),
-            PathBuf::from("/tmp/rub-home/sessions/default")
-        );
-        assert_eq!(
-            session.canonical_socket_path(),
-            PathBuf::from("/tmp/rub-home/sessions/default/daemon.sock")
-        );
-        assert_eq!(
-            session.socket_path(),
-            PathBuf::from("/tmp/rub-home/sessions/default/daemon.sock")
-        );
-        assert_eq!(
-            session.pid_path(),
-            PathBuf::from("/tmp/rub-home/sessions/default/daemon.pid")
-        );
-        assert_eq!(
-            session.canonical_pid_path(),
-            PathBuf::from("/tmp/rub-home/sessions/default/daemon.pid")
-        );
-        assert_eq!(
-            session.lock_path(),
-            PathBuf::from("/tmp/rub-home/sessions/default/startup.lock")
-        );
-        assert_eq!(
-            session.startup_ready_path("abc"),
-            PathBuf::from("/tmp/rub-home/sessions/default/startup.abc.ready")
-        );
-        assert_eq!(
-            session.startup_error_path("abc"),
-            PathBuf::from("/tmp/rub-home/sessions/default/startup.abc.error")
-        );
-        assert_eq!(
-            session.startup_committed_path(),
-            PathBuf::from("/tmp/rub-home/sessions/default/startup.committed")
-        );
-        assert_eq!(
-            session.post_commit_journal_path(),
-            PathBuf::from("/tmp/rub-home/sessions/default/post-commit.journal.ndjson")
-        );
-        assert_eq!(
-            session.download_dir(),
-            PathBuf::from("/tmp/rub-home/downloads/default")
-        );
-        assert_eq!(
-            session.socket_paths(),
-            vec![PathBuf::from("/tmp/rub-home/sessions/default/daemon.sock")]
-        );
-        assert_eq!(
-            session.actual_socket_paths(),
-            vec![PathBuf::from("/tmp/rub-home/sessions/default/daemon.sock")]
-        );
-        assert_eq!(
-            session.pid_paths(),
-            vec![PathBuf::from("/tmp/rub-home/sessions/default/daemon.pid")]
-        );
-        assert_eq!(
-            session.lock_paths(),
-            vec![PathBuf::from("/tmp/rub-home/sessions/default/startup.lock")]
-        );
-    }
-
-    #[test]
-    fn runtime_session_paths_key_actual_artifacts_by_session_id_while_preserving_name_projections()
-    {
-        let session = RubPaths::new("/tmp/rub-home").session_runtime("default", "sess-123");
-        assert_eq!(
-            session.session_dir(),
-            PathBuf::from("/tmp/rub-home/sessions/by-id/sess-123")
-        );
-        assert_eq!(
-            session.projection_dir(),
-            PathBuf::from("/tmp/rub-home/sessions/default")
-        );
-        assert_eq!(
-            session.canonical_socket_path(),
-            PathBuf::from("/tmp/rub-home/sessions/default/daemon.sock")
-        );
-        let tag = std::env::var("USER")
-            .or_else(|_| std::env::var("UID"))
-            .unwrap_or_else(|_| "unknown".to_string());
-        assert!(
-            session
-                .socket_path()
-                .starts_with(format!("/tmp/rub-sock-{tag}"))
-        );
-        assert_eq!(
-            session.pid_path(),
-            PathBuf::from("/tmp/rub-home/sessions/by-id/sess-123/daemon.pid")
-        );
-        assert_eq!(
-            session.lock_path(),
-            PathBuf::from("/tmp/rub-home/sessions/by-id/sess-123/startup.lock")
-        );
-        assert_eq!(
-            session.startup_ready_path("abc"),
-            PathBuf::from("/tmp/rub-home/sessions/by-id/sess-123/startup.abc.ready")
-        );
-        assert_eq!(
-            session.startup_committed_path(),
-            PathBuf::from("/tmp/rub-home/sessions/default/startup.committed")
-        );
-        assert_eq!(
-            session.post_commit_journal_path(),
-            PathBuf::from("/tmp/rub-home/sessions/by-id/sess-123/post-commit.journal.ndjson")
-        );
-        assert_eq!(
-            session.download_dir(),
-            PathBuf::from("/tmp/rub-home/downloads/by-id/sess-123")
-        );
-        assert_eq!(session.actual_socket_paths(), vec![session.socket_path()]);
-    }
-
-    #[test]
-    fn session_socket_authority_stays_short_under_deep_rub_home() {
-        let deep_home = PathBuf::from("/tmp")
-            .join("rub-very-deep-home")
-            .join("nested")
-            .join("structure")
-            .join("that")
-            .join("would")
-            .join("otherwise")
-            .join("overflow");
-        let session = RubPaths::new(&deep_home).session_runtime("default", "sess-123");
-        let socket = session.socket_path();
-        let tag = std::env::var("USER")
-            .or_else(|_| std::env::var("UID"))
-            .unwrap_or_else(|_| "unknown".to_string());
-        assert!(socket.starts_with(format!("/tmp/rub-sock-{tag}")));
-        assert!(
-            socket.as_os_str().len() < 100,
-            "actual socket authority should stay below Unix socket path limits: {}",
-            socket.display()
-        );
-    }
-
-    #[test]
-    fn default_rub_home_prefers_env_and_falls_back_to_home() {
-        let previous = std::env::var_os("RUB_HOME");
-        unsafe {
-            std::env::set_var("RUB_HOME", "/tmp/rub-env-home");
-        }
-        assert_eq!(default_rub_home(), PathBuf::from("/tmp/rub-env-home"));
-        match previous {
-            Some(value) => unsafe { std::env::set_var("RUB_HOME", value) },
-            None => unsafe { std::env::remove_var("RUB_HOME") },
-        }
-    }
-
-    #[test]
-    fn temp_owned_home_marker_tracks_owner_pid_inside_temp_root() {
-        let home = std::env::temp_dir().join(format!("rub-temp-owned-{}", uuid::Uuid::now_v7()));
-        let _ = std::fs::remove_dir_all(&home);
-        let paths = RubPaths::new(&home);
-        assert!(is_temp_root_path(&home));
-        assert!(!is_temp_owned_home(&home));
-        assert!(paths.mark_temp_home_owner_if_applicable().unwrap());
-        assert!(is_temp_owned_home(&home));
-        assert_eq!(read_temp_home_owner_pid(&home), Some(std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn invalid_session_names_are_rejected_by_validator() {
-        for value in ["../x", "a/b", "/tmp/x", ".", "..", "a\\b"] {
-            assert!(validate_session_name(value).is_err(), "{value}");
-        }
-        assert!(validate_session_name("default").is_ok());
-    }
-
-    #[test]
-    fn invalid_session_ids_are_rejected_by_validator() {
-        for value in ["../x", "a/b", "/tmp/x", ".", "..", "a\\b"] {
-            assert!(validate_session_id_component(value).is_err(), "{value}");
-        }
-        assert!(validate_session_id_component("sess-123").is_ok());
-    }
-
-    #[test]
-    fn invalid_session_names_do_not_escape_path_namespace() {
-        let session = RubPaths::new("/tmp/rub-home").session("../x");
-        assert!(
-            session
-                .projection_dir()
-                .starts_with(PathBuf::from("/tmp/rub-home/sessions")),
-            "{}",
-            session.projection_dir().display()
-        );
-    }
-
-    #[test]
-    fn invalid_runtime_session_ids_do_not_escape_by_id_namespace() {
-        let session = RubPaths::new("/tmp/rub-home").session_runtime("default", "../x");
-        assert!(
-            session
-                .session_dir()
-                .starts_with(PathBuf::from("/tmp/rub-home/sessions/by-id")),
-            "{}",
-            session.session_dir().display()
-        );
-        assert!(
-            session
-                .download_dir()
-                .starts_with(PathBuf::from("/tmp/rub-home/downloads/by-id")),
-            "{}",
-            session.download_dir().display()
-        );
-    }
-}
+mod tests;

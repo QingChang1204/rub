@@ -1,11 +1,13 @@
 use std::fs::{File, OpenOptions, create_dir_all, rename};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(target_vendor = "apple")]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -46,63 +48,31 @@ pub fn atomic_write_bytes(
     let (temp_path, mut temp) = create_unique_temporary_file(path, mode)?;
     temp.write_all(contents)?;
     temp.sync_all()?;
-    let outcome = {
-        #[cfg(unix)]
-        {
-            commit_temporary_file_from_synced_handle(&temp, &temp_path, path)
-        }
-        #[cfg(not(unix))]
-        {
-            drop(temp);
-            commit_temporary_file(&temp_path, path)
-        }
-    }?;
+    let outcome = commit_temporary_file(&temp, &temp_path, path)?;
     confirm_created_directory_chain(path, &created_directories, outcome)
 }
 
-pub fn commit_temporary_file(temp_path: &Path, final_path: &Path) -> io::Result<FileCommitOutcome> {
-    let temp = File::open(temp_path)?;
-    temp.sync_all()?;
-    #[cfg(unix)]
-    {
-        commit_temporary_file_from_synced_handle(&temp, temp_path, final_path)
-    }
-    #[cfg(not(unix))]
-    {
-        if final_path.exists() {
-            return Err(io::Error::new(
-                ErrorKind::Unsupported,
-                format!(
-                    "atomic replacement is not supported for existing file {} on this platform",
-                    final_path.display()
-                ),
-            ));
-        }
-
-        rename(temp_path, final_path)?;
-        finalize_published_file(final_path)
-    }
-}
-
-pub fn commit_temporary_file_no_clobber(
+pub fn commit_temporary_file(
+    temp: &File,
     temp_path: &Path,
     final_path: &Path,
 ) -> io::Result<FileCommitOutcome> {
-    let temp = File::open(temp_path)?;
     temp.sync_all()?;
-    #[cfg(unix)]
-    ensure_temp_path_matches_file_authority(&temp, temp_path)?;
-    match std::fs::hard_link(temp_path, final_path) {
-        Ok(()) => {
-            let remove_error = std::fs::remove_file(temp_path).err();
-            let parent_sync = sync_parent_dir(final_path);
-            if remove_error.is_some() || parent_sync.is_err() {
-                return Ok(FileCommitOutcome::Published);
-            }
-            Ok(FileCommitOutcome::Durable)
-        }
-        Err(error) => Err(error),
-    }
+    commit_temporary_file_from_synced_handle(temp, temp_path, final_path)
+}
+
+pub fn commit_temporary_file_no_clobber(
+    temp: &File,
+    temp_path: &Path,
+    final_path: &Path,
+) -> io::Result<FileCommitOutcome> {
+    temp.sync_all()?;
+    commit_temporary_file_from_synced_handle_no_clobber(temp, temp_path, final_path)
+}
+
+pub fn remove_file_with_sync(path: &Path) -> io::Result<FileCommitOutcome> {
+    std::fs::remove_file(path)?;
+    finalize_published_file(path)
 }
 
 pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
@@ -117,15 +87,171 @@ pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn commit_temporary_file_from_synced_handle(
     temp: &File,
     temp_path: &Path,
     final_path: &Path,
 ) -> io::Result<FileCommitOutcome> {
-    ensure_temp_path_matches_file_authority(temp, temp_path)?;
-    rename(temp_path, final_path)?;
+    let (publish_path, publish_file) =
+        promote_synced_handle_to_publish_authority(temp, final_path)?;
+    let outcome = commit_publish_path(&publish_file, &publish_path, final_path)?;
+    cleanup_source_temp_path_if_still_authoritative(temp, temp_path);
+    Ok(outcome)
+}
+
+fn commit_temporary_file_from_synced_handle_no_clobber(
+    temp: &File,
+    temp_path: &Path,
+    final_path: &Path,
+) -> io::Result<FileCommitOutcome> {
+    let (publish_path, publish_file) =
+        promote_synced_handle_to_publish_authority(temp, final_path)?;
+    let outcome = commit_publish_path_no_clobber(&publish_file, &publish_path, final_path)?;
+    cleanup_source_temp_path_if_still_authoritative(temp, temp_path);
+    Ok(outcome)
+}
+
+fn promote_synced_handle_to_publish_authority(
+    temp: &File,
+    final_path: &Path,
+) -> io::Result<(PathBuf, File)> {
+    let mode = source_file_mode(temp)?;
+    let (publish_path, mut publish_file) = create_unique_temporary_file(final_path, mode)?;
+    copy_file_data_from_synced_handle(temp, &mut publish_file)?;
+    publish_file.sync_all()?;
+    Ok((publish_path, publish_file))
+}
+
+fn source_file_mode(temp: &File) -> io::Result<u32> {
+    #[cfg(unix)]
+    {
+        Ok(temp.metadata()?.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = temp;
+        Ok(0o600)
+    }
+}
+
+fn copy_file_data_from_synced_handle(source: &File, destination: &mut File) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut src = source.try_clone()?;
+        src.seek(SeekFrom::Start(0))?;
+        let rc = unsafe {
+            libc::fcopyfile(
+                src.as_raw_fd(),
+                destination.as_raw_fd(),
+                std::ptr::null_mut(),
+                libc::COPYFILE_DATA,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        destination.set_len(0)?;
+        destination.seek(SeekFrom::Start(0))?;
+        src.seek(SeekFrom::Start(0))?;
+        std::io::copy(&mut src, destination)?;
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    {
+        let mut src = source.try_clone()?;
+        src.seek(SeekFrom::Start(0))?;
+        std::io::copy(&mut src, destination)?;
+        Ok(())
+    }
+}
+
+fn commit_publish_path(
+    publish_file: &File,
+    publish_path: &Path,
+    final_path: &Path,
+) -> io::Result<FileCommitOutcome> {
+    #[cfg(unix)]
+    ensure_temp_path_matches_file_authority(publish_file, publish_path)?;
+    rename(publish_path, final_path)?;
     finalize_published_file(final_path)
+}
+
+fn commit_publish_path_no_clobber(
+    publish_file: &File,
+    publish_path: &Path,
+    final_path: &Path,
+) -> io::Result<FileCommitOutcome> {
+    #[cfg(unix)]
+    ensure_temp_path_matches_file_authority(publish_file, publish_path)?;
+    #[cfg(target_vendor = "apple")]
+    {
+        rename_publish_path_exclusive(publish_path, final_path)?;
+        finalize_published_file(final_path)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        match std::fs::hard_link(publish_path, final_path) {
+            Ok(()) => {
+                let remove_error = std::fs::remove_file(publish_path).err();
+                let parent_sync = sync_parent_dir(final_path);
+                if remove_error.is_some() || parent_sync.is_err() {
+                    return Ok(FileCommitOutcome::Published);
+                }
+                Ok(FileCommitOutcome::Durable)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn rename_publish_path_exclusive(publish_path: &Path, final_path: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let publish = CString::new(publish_path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "publish path {} contains interior NUL byte",
+                publish_path.display()
+            ),
+        )
+    })?;
+    let final_path = CString::new(final_path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "final path {} contains interior NUL byte",
+                final_path.display()
+            ),
+        )
+    })?;
+    let rc = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            publish.as_ptr(),
+            libc::AT_FDCWD,
+            final_path.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn cleanup_source_temp_path_if_still_authoritative(temp: &File, temp_path: &Path) {
+    #[cfg(unix)]
+    {
+        if ensure_temp_path_matches_file_authority(temp, temp_path).is_err() {
+            return;
+        }
+    }
+    let _ = std::fs::remove_file(temp_path);
 }
 
 #[cfg(unix)]
@@ -238,7 +364,7 @@ fn create_unique_temporary_file(path: &Path, mode: u32) -> io::Result<(PathBuf, 
     for _attempt in 0..TEMP_PATH_COLLISION_RETRIES {
         let temp_path = temporary_path(path);
         let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
+        options.create_new(true).read(true).write(true);
         #[cfg(unix)]
         {
             options.mode(mode);
@@ -303,7 +429,9 @@ mod tests {
         FileCommitOutcome, atomic_write_bytes, commit_temporary_file,
         commit_temporary_file_no_clobber, create_unique_temporary_file,
         force_sync_parent_dir_failure_once_for, force_temp_path_collision_once_for,
+        remove_file_with_sync,
     };
+    use std::fs::File;
     use std::io::ErrorKind;
     use std::io::Write;
 
@@ -365,7 +493,8 @@ mod tests {
         std::fs::write(&final_path, b"live").expect("seed final");
         std::fs::write(&temp_path, b"new").expect("seed temp");
 
-        let error = commit_temporary_file_no_clobber(&temp_path, &final_path)
+        let temp = File::open(&temp_path).expect("open temp");
+        let error = commit_temporary_file_no_clobber(&temp, &temp_path, &final_path)
             .expect_err("must not clobber");
         assert_eq!(error.kind(), ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&final_path).expect("read final"), b"live");
@@ -407,7 +536,9 @@ mod tests {
         std::fs::write(&temp_path, b"new").expect("seed temp");
         force_sync_parent_dir_failure_once_for(&final_path);
 
-        let outcome = commit_temporary_file(&temp_path, &final_path).expect("commit outcome");
+        let temp = File::open(&temp_path).expect("open temp");
+        let outcome =
+            commit_temporary_file(&temp, &temp_path, &final_path).expect("commit outcome");
         assert_eq!(outcome, FileCommitOutcome::Published);
         assert_eq!(std::fs::read(&final_path).expect("read final"), b"new");
 
@@ -415,8 +546,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn commit_rejects_temp_path_authority_replacement_after_write_fence() {
+    fn commit_publishes_synced_handle_even_if_source_temp_path_is_replaced() {
         let root = std::env::temp_dir().join(format!(
             "rub-core-atomic-write-authority-{}",
             std::process::id()
@@ -432,9 +562,45 @@ mod tests {
         std::fs::remove_file(&temp_path).expect("unlink original temp path");
         std::fs::write(&temp_path, b"replacement").expect("replace temp path");
 
-        let error = super::commit_temporary_file_from_synced_handle(&temp, &temp_path, &final_path)
-            .expect_err("replaced temp path must be rejected");
-        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        let outcome =
+            super::commit_temporary_file_from_synced_handle(&temp, &temp_path, &final_path).expect(
+                "publish should derive from the synced handle, not the replaced source path",
+            );
+        assert_eq!(outcome, FileCommitOutcome::Durable);
+        assert_eq!(std::fs::read(&final_path).expect("read final"), b"original");
+        assert_eq!(
+            std::fs::read(&temp_path).expect("read replacement"),
+            b"replacement"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_clobber_commit_publishes_synced_handle_even_if_source_temp_path_is_replaced() {
+        let root = std::env::temp_dir().join(format!(
+            "rub-core-no-clobber-authority-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let final_path = root.join("asset.json");
+        let (temp_path, mut temp) =
+            create_unique_temporary_file(&final_path, 0o600).expect("create temp");
+        temp.write_all(b"original").expect("write temp");
+        temp.sync_all().expect("sync temp");
+
+        std::fs::remove_file(&temp_path).expect("unlink original temp path");
+        std::fs::write(&temp_path, b"replacement").expect("replace temp path");
+
+        let outcome = commit_temporary_file_no_clobber(&temp, &temp_path, &final_path)
+            .expect("no-clobber publish should use the authoritative temp handle");
+        assert_eq!(outcome, FileCommitOutcome::Durable);
+        assert_eq!(std::fs::read(&final_path).expect("read final"), b"original");
+        assert_eq!(
+            std::fs::read(&temp_path).expect("read replacement"),
+            b"replacement"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -469,12 +635,32 @@ mod tests {
         std::fs::write(&durable_temp, b"durable").expect("seed durable temp");
         force_sync_parent_dir_failure_once_for(&published_path);
 
-        let durable_outcome =
-            commit_temporary_file(&durable_temp, &durable_path).expect("durable commit");
+        let durable_file = File::open(&durable_temp).expect("open durable temp");
+        let published_file = File::open(&published_temp).expect("open published temp");
+        let durable_outcome = commit_temporary_file(&durable_file, &durable_temp, &durable_path)
+            .expect("durable commit");
         let published_outcome =
-            commit_temporary_file(&published_temp, &published_path).expect("published commit");
+            commit_temporary_file(&published_file, &published_temp, &published_path)
+                .expect("published commit");
         assert_eq!(durable_outcome, FileCommitOutcome::Durable);
         assert_eq!(published_outcome, FileCommitOutcome::Published);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remove_file_with_sync_reports_published_when_parent_sync_fails_after_unlink() {
+        let root =
+            std::env::temp_dir().join(format!("rub-core-remove-with-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let path = root.join("asset.json");
+        std::fs::write(&path, b"published").expect("seed file");
+        force_sync_parent_dir_failure_once_for(&path);
+
+        let outcome = remove_file_with_sync(&path).expect("remove should succeed");
+        assert_eq!(outcome, FileCommitOutcome::Published);
+        assert!(!path.exists(), "file should still be removed");
 
         let _ = std::fs::remove_dir_all(root);
     }

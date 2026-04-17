@@ -2,7 +2,10 @@ use super::*;
 use crate::binding_ctl::write_binding_registry;
 use crate::binding_execution_ctl::resolve_command_execution_binding;
 use crate::binding_memory_ctl::remember_binding_alias;
+use crate::commands::EffectiveCli;
 use crate::commands::RememberedBindingAliasKindArg;
+use crate::main_support::project_sessions_result;
+use crate::session_policy::ConnectionRequest;
 use rub_core::error::ErrorCode;
 use rub_core::model::{
     BindingAuthInputMode, BindingAuthProvenance, BindingCreatedVia, BindingPersistencePolicy,
@@ -10,6 +13,9 @@ use rub_core::model::{
     BindingSessionReferenceKind,
 };
 use rub_daemon::session::RegistryEntry;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use uuid::Uuid;
 
 fn temp_home() -> std::path::PathBuf {
@@ -34,6 +40,32 @@ fn use_alias_doctor_cli(home: &std::path::Path) -> EffectiveCli {
         connect: false,
         profile: None,
         use_alias: Some("ops-admin".to_string()),
+        no_stealth: false,
+        humanize: false,
+        humanize_speed: "normal".to_string(),
+        requested_launch_policy: commands::RequestedLaunchPolicy::default(),
+        effective_launch_policy: commands::RequestedLaunchPolicy::default(),
+    }
+}
+
+fn close_cli(home: &std::path::Path) -> EffectiveCli {
+    EffectiveCli {
+        session: "default".to_string(),
+        session_id: None,
+        rub_home: home.to_path_buf(),
+        timeout: 30_000,
+        headed: false,
+        ignore_cert_errors: false,
+        user_data_dir: None,
+        hide_infobars: true,
+        json_pretty: false,
+        verbose: false,
+        trace: false,
+        command: Commands::Close { all: false },
+        cdp_url: None,
+        connect: false,
+        profile: None,
+        use_alias: None,
         no_stealth: false,
         humanize: false,
         humanize_speed: "normal".to_string(),
@@ -242,6 +274,74 @@ fn daemon_args_forward_explicit_user_data_dir_request() {
 }
 
 #[test]
+fn close_command_selector_detection_covers_use_alias_and_profile_root() {
+    let home = temp_home();
+    let mut cli = close_cli(&home);
+    assert!(!close_command_uses_attachment_selector(&cli));
+
+    cli.use_alias = Some("ops-admin".to_string());
+    assert!(close_command_uses_attachment_selector(&cli));
+
+    cli.use_alias = None;
+    cli.profile = Some("Work".to_string());
+    assert!(close_command_uses_attachment_selector(&cli));
+}
+
+#[test]
+fn close_all_selector_error_is_invalid_input() {
+    let envelope = close_all_selector_error().into_envelope();
+    assert_eq!(envelope.code, ErrorCode::InvalidInput);
+    assert_eq!(
+        envelope.context.expect("context")["reason"],
+        serde_json::json!("close_all_selector_not_supported")
+    );
+}
+
+#[tokio::test]
+async fn close_selector_attachment_identity_resolves_to_canonical_cdp_authority() {
+    let home = temp_home();
+    let mut cli = close_cli(&home);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("local addr");
+    let ws_url = format!("ws://{address}/devtools/browser/test");
+    cli.cdp_url = Some(format!("http://{address}"));
+
+    let server = tokio::spawn({
+        let ws_url = ws_url.clone();
+        async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.expect("read request");
+            let body = format!(r#"{{"webSocketDebuggerUrl":"{ws_url}"}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        }
+    });
+
+    let request = ConnectionRequest::CdpUrl {
+        url: format!("http://{address}/json/version"),
+    };
+    let resolved = crate::main_dispatch::resolve_close_selector_attachment_identity_until(
+        &cli,
+        &request,
+        Instant::now() + Duration::from_secs(1),
+        1_000,
+    )
+    .await
+    .expect("close selector identity should canonicalize");
+    assert_eq!(resolved.as_deref(), Some(format!("cdp:{ws_url}").as_str()));
+
+    server.await.expect("server join");
+}
+
+#[test]
 fn handle_sessions_reports_registry_read_failure_instead_of_empty_success() {
     let temp = std::env::temp_dir().join(format!("rub-sessions-test-{}", std::process::id()));
     let _ = std::fs::remove_file(&temp);
@@ -250,7 +350,7 @@ fn handle_sessions_reports_registry_read_failure_instead_of_empty_success() {
     let error = handle_sessions(&temp, "default", false)
         .expect_err("registry read failure should propagate")
         .into_envelope();
-    assert_eq!(error.code, ErrorCode::DaemonNotRunning);
+    assert_eq!(error.code, ErrorCode::IoError);
     let context = error
         .context
         .expect("sessions failure should publish context");
@@ -383,6 +483,50 @@ fn use_alias_local_surface_error_rejects_local_only_surfaces() {
         teardown_error.context.expect("context")["surface"],
         serde_json::json!("teardown")
     );
+
+    let pipe_list_cli = local_surface_use_alias_cli(Commands::Pipe {
+        spec: None,
+        file: None,
+        workflow: None,
+        list_workflows: true,
+        vars: Vec::new(),
+        wait_after: commands::WaitAfterArgs::default(),
+    });
+    let pipe_list_error =
+        use_alias_local_surface_error(&pipe_list_cli).expect("pipe list-workflows must fail");
+    assert_eq!(
+        pipe_list_error.context.expect("context")["surface"],
+        serde_json::json!("pipe list-workflows")
+    );
+
+    let orchestration_assets_cli = local_surface_use_alias_cli(Commands::Orchestration {
+        subcommand: commands::OrchestrationSubcommand::ListAssets,
+    });
+    let orchestration_assets_error = use_alias_local_surface_error(&orchestration_assets_cli)
+        .expect("orchestration list-assets must fail");
+    assert_eq!(
+        orchestration_assets_error.context.expect("context")["surface"],
+        serde_json::json!("orchestration list-assets")
+    );
+
+    let inspect_harvest_cli =
+        local_surface_use_alias_cli(Commands::Inspect(commands::InspectSubcommand::Harvest {
+            file: "/tmp/rows.json".to_string(),
+            input_field: None,
+            url_field: None,
+            name_field: None,
+            base_url: None,
+            extract: None,
+            extract_file: None,
+            field: Vec::new(),
+            limit: None,
+        }));
+    let inspect_harvest_error =
+        use_alias_local_surface_error(&inspect_harvest_cli).expect("inspect harvest must fail");
+    assert_eq!(
+        inspect_harvest_error.context.expect("context")["surface"],
+        serde_json::json!("inspect harvest")
+    );
 }
 
 #[test]
@@ -395,15 +539,22 @@ fn use_alias_profile_binding_routes_to_daemon_profile_flag() {
     assert_eq!(resolved.cli.profile.as_deref(), Some("Profile 3"));
     assert!(resolved.cli.user_data_dir.is_none());
     assert!(resolved.cli.use_alias.is_none());
-
-    let args = daemon_args(
-        &resolved.cli,
-        &ConnectionRequest::Profile {
+    assert_eq!(
+        resolved.connection_request_override,
+        Some(ConnectionRequest::Profile {
             name: "Profile 3".to_string(),
             dir_name: "Profile 3".to_string(),
             resolved_path: "/tmp/work/Profile 3".to_string(),
             user_data_root: "/tmp/work".to_string(),
-        },
+        })
+    );
+
+    let args = daemon_args(
+        &resolved.cli,
+        resolved
+            .connection_request_override
+            .as_ref()
+            .expect("profile alias should preserve connection request authority"),
     );
     assert!(args.contains(&"--profile".to_string()));
     assert!(args.contains(&"Profile 3".to_string()));

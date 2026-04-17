@@ -64,7 +64,7 @@ pub(super) async fn fetch_upgrade_status_for_session(
             .await
             .map_err(|error| cleanup_upgrade_probe_send_error(&socket_path, error))?;
         if response.status == ResponseStatus::Error {
-            continue;
+            return Err(cleanup_upgrade_probe_response_error(&socket_path, response));
         }
         let data = response.data.unwrap_or_default();
         return Ok(Some((
@@ -75,6 +75,28 @@ pub(super) async fn fetch_upgrade_status_for_session(
         )));
     }
     Ok(None)
+}
+
+fn cleanup_upgrade_probe_response_error(
+    socket_path: &Path,
+    response: rub_ipc::protocol::IpcResponse,
+) -> RubError {
+    if let Some(envelope) = response.error {
+        return cleanup_upgrade_status_error(
+            envelope.code,
+            format!("Failed to fetch upgrade status: {}", envelope.message),
+            socket_path,
+            envelope.context,
+            "cleanup_upgrade_check_response_error",
+        );
+    }
+    cleanup_upgrade_status_error(
+        ErrorCode::IpcProtocolError,
+        "Failed to fetch upgrade status: daemon returned error status without envelope".to_string(),
+        socket_path,
+        None,
+        "cleanup_upgrade_check_response_missing_error_envelope",
+    )
 }
 
 fn cleanup_upgrade_probe_send_error(socket_path: &Path, error: IpcClientError) -> RubError {
@@ -113,5 +135,59 @@ pub(super) async fn wait_for_shutdown_paths(socket_paths: &[PathBuf]) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cleanup_upgrade_probe_response_error;
+    use std::path::Path;
+
+    use rub_core::error::{ErrorCode, ErrorEnvelope};
+    use rub_core::model::Timing;
+
+    #[test]
+    fn upgrade_probe_error_response_preserves_socket_path_context() {
+        let error = cleanup_upgrade_probe_response_error(
+            Path::new("/tmp/rub.sock"),
+            rub_ipc::protocol::IpcResponse::error(
+                "req-1",
+                ErrorEnvelope::new(ErrorCode::DaemonNotRunning, "daemon unavailable").with_context(
+                    serde_json::json!({
+                        "upstream": "context"
+                    }),
+                ),
+            ),
+        )
+        .into_envelope();
+        let context = error.context.expect("context");
+        assert_eq!(context["upstream"], serde_json::json!("context"));
+        assert_eq!(
+            context["reason"],
+            serde_json::json!("cleanup_upgrade_check_response_error")
+        );
+        assert_eq!(context["socket_path"], serde_json::json!("/tmp/rub.sock"));
+    }
+
+    #[test]
+    fn upgrade_probe_missing_error_envelope_is_protocol_error() {
+        let error = cleanup_upgrade_probe_response_error(
+            Path::new("/tmp/rub.sock"),
+            rub_ipc::protocol::IpcResponse {
+                ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+                command_id: None,
+                request_id: "req-2".to_string(),
+                status: rub_ipc::protocol::ResponseStatus::Error,
+                data: None,
+                error: None,
+                timing: Timing::default(),
+            },
+        )
+        .into_envelope();
+        assert_eq!(error.code, ErrorCode::IpcProtocolError);
+        assert_eq!(
+            error.context.expect("context")["reason"],
+            serde_json::json!("cleanup_upgrade_check_response_missing_error_envelope")
+        );
     }
 }

@@ -26,8 +26,47 @@ use self::args::{
 pub(super) use self::screenshot::{
     cmd_screenshot, inline_screenshot_payload_exceeds_limit, write_screenshot_artifact,
 };
-use self::settle::{active_tab_entity, is_page_load_timeout, settle_navigation_projection};
+use self::settle::{active_tab_projection, is_page_load_timeout, settle_navigation_projection};
 pub(super) use self::tabs::{cmd_close_tab, cmd_switch, cmd_tabs};
+
+fn snapshot_diff_metadata(
+    base_snapshot_id: &str,
+    current_snapshot_id: &str,
+    frame_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "snapshot_comparison",
+        "base_snapshot": {
+            "snapshot_id": base_snapshot_id,
+            "frame_id": frame_id,
+        },
+        "current_snapshot": {
+            "snapshot_id": current_snapshot_id,
+            "frame_id": frame_id,
+        },
+    })
+}
+
+fn snapshot_diff_mismatch_context(
+    base_snapshot_id: &str,
+    current_snapshot_id: &str,
+    base_frame_id: &str,
+    current_frame_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "comparison": {
+            "kind": "snapshot_comparison",
+            "base_snapshot": {
+                "snapshot_id": base_snapshot_id,
+                "frame_id": base_frame_id,
+            },
+            "current_snapshot": {
+                "snapshot_id": current_snapshot_id,
+                "frame_id": current_frame_id,
+            },
+        },
+    })
+}
 
 pub(super) async fn cmd_open(
     router: &DaemonRouter,
@@ -56,7 +95,7 @@ pub(super) async fn cmd_open(
     };
     let pending_external_dom_commit =
         settle_navigation_projection(router, state, "open", deadline).await;
-    let active_tab = active_tab_entity(router).await?;
+    let active_tab = active_tab_projection(router).await;
     let mut data = serde_json::json!({});
     attach_subject(
         &mut data,
@@ -71,7 +110,8 @@ pub(super) async fn cmd_open(
         &mut data,
         serde_json::json!({
             "page": page_entity(&page),
-            "active_tab": active_tab,
+            "active_tab": active_tab.tab,
+            "active_tab_degraded_reason": active_tab.degraded_reason,
         }),
     );
     Ok(CommandDispatchOutcome::new(data)
@@ -183,11 +223,12 @@ pub(super) async fn cmd_state(
             return Err(RubError::domain_with_context(
                 rub_core::error::ErrorCode::InvalidInput,
                 "state --diff cannot compare snapshots captured from different frame contexts",
-                serde_json::json!({
-                    "base_snapshot_id": base_id,
-                    "base_frame_id": old_snapshot.frame_context.frame_id.clone(),
-                    "current_frame_id": snapshot.frame_context.frame_id.clone(),
-                }),
+                snapshot_diff_mismatch_context(
+                    base_id,
+                    &snapshot.snapshot_id,
+                    &old_snapshot.frame_context.frame_id,
+                    &snapshot.frame_context.frame_id,
+                ),
             ));
         }
         let diff = rub_cdp::dom::diff_snapshots(&old_snapshot, &snapshot);
@@ -196,9 +237,12 @@ pub(super) async fn cmd_state(
             &mut data,
             serde_json::json!({
                 "kind": "page_observation_diff",
-                "base_snapshot_id": base_id,
-                "current_snapshot_id": snapshot.snapshot_id.clone(),
                 "frame_id": snapshot.frame_context.frame_id.clone(),
+                "comparison": snapshot_diff_metadata(
+                    base_id,
+                    &snapshot.snapshot_id,
+                    &snapshot.frame_context.frame_id,
+                ),
             }),
         );
         attach_result(
@@ -243,8 +287,11 @@ pub(super) async fn cmd_scroll(
     let parsed: ScrollArgs = parse_json_args(args, "scroll")?;
     let direction = parse_optional_scroll_direction(parsed.direction.as_deref(), "direction")?;
     let amount = parsed.amount;
-    let position = router.browser.scroll(direction, amount).await?;
     let selected_frame_id = state.selected_frame_id().await;
+    let position = router
+        .browser
+        .scroll(selected_frame_id.as_deref(), direction, amount)
+        .await?;
     let mut data = serde_json::json!({});
     attach_subject(&mut data, viewport_subject(selected_frame_id.as_deref()));
     attach_result(
@@ -258,12 +305,38 @@ pub(super) async fn cmd_scroll(
     Ok(data)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistoryBoundaryProjection {
+    value: Option<bool>,
+    degraded_reason: Option<&'static str>,
+}
+
+fn history_boundary_projection(
+    value: Option<bool>,
+    unavailable_reason: &'static str,
+) -> HistoryBoundaryProjection {
+    match value {
+        Some(flag) => HistoryBoundaryProjection {
+            value: Some(flag),
+            degraded_reason: None,
+        },
+        None => HistoryBoundaryProjection {
+            value: None,
+            degraded_reason: Some(unavailable_reason),
+        },
+    }
+}
+
 pub(super) async fn cmd_back(
     router: &DaemonRouter,
     deadline: TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<CommandDispatchOutcome, RubError> {
-    let page = match router.browser.back(deadline.remaining_ms()).await {
+    let navigation = match router
+        .browser
+        .back_with_boundary(deadline.remaining_ms())
+        .await
+    {
         Ok(page) => page,
         Err(error) => {
             if is_page_load_timeout(&error) {
@@ -275,24 +348,19 @@ pub(super) async fn cmd_back(
     };
     let pending_external_dom_commit =
         settle_navigation_projection(router, state, "back", deadline).await;
-    let at_start = router
-        .browser
-        .execute_js(
-            "(() => { const nav = globalThis.navigation; if (nav && typeof nav.canGoBack === 'boolean') return !nav.canGoBack; return history.length <= 1; })()",
-        )
-        .await
-        .ok()
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    let active_tab = active_tab_entity(router).await?;
+    let at_start =
+        history_boundary_projection(navigation.at_boundary, "history_boundary_probe_failed");
+    let active_tab = active_tab_projection(router).await;
     let mut data = serde_json::json!({});
     attach_subject(&mut data, navigation_subject("back"));
     attach_result(
         &mut data,
         serde_json::json!({
-            "page": page_entity(&page),
-            "active_tab": active_tab,
-            "at_start": at_start,
+            "page": page_entity(&navigation.page),
+            "active_tab": active_tab.tab,
+            "active_tab_degraded_reason": active_tab.degraded_reason,
+            "at_start": at_start.value,
+            "at_start_degraded_reason": at_start.degraded_reason,
         }),
     );
     Ok(CommandDispatchOutcome::new(data)
@@ -304,7 +372,11 @@ pub(super) async fn cmd_forward(
     deadline: TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<CommandDispatchOutcome, RubError> {
-    let page = match router.browser.forward(deadline.remaining_ms()).await {
+    let navigation = match router
+        .browser
+        .forward_with_boundary(deadline.remaining_ms())
+        .await
+    {
         Ok(page) => page,
         Err(error) => {
             if is_page_load_timeout(&error) {
@@ -316,24 +388,19 @@ pub(super) async fn cmd_forward(
     };
     let pending_external_dom_commit =
         settle_navigation_projection(router, state, "forward", deadline).await;
-    let at_end = router
-        .browser
-        .execute_js(
-            "(() => { const nav = globalThis.navigation; if (nav && typeof nav.canGoForward === 'boolean') return !nav.canGoForward; return false; })()",
-        )
-        .await
-        .ok()
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    let active_tab = active_tab_entity(router).await?;
+    let at_end =
+        history_boundary_projection(navigation.at_boundary, "history_boundary_probe_failed");
+    let active_tab = active_tab_projection(router).await;
     let mut data = serde_json::json!({});
     attach_subject(&mut data, navigation_subject("forward"));
     attach_result(
         &mut data,
         serde_json::json!({
-            "page": page_entity(&page),
-            "active_tab": active_tab,
-            "at_end": at_end,
+            "page": page_entity(&navigation.page),
+            "active_tab": active_tab.tab,
+            "active_tab_degraded_reason": active_tab.degraded_reason,
+            "at_end": at_end.value,
+            "at_end_degraded_reason": at_end.degraded_reason,
         }),
     );
     Ok(CommandDispatchOutcome::new(data)
@@ -365,14 +432,15 @@ pub(super) async fn cmd_reload(
     };
     let pending_external_dom_commit =
         settle_navigation_projection(router, state, "reload", deadline).await;
-    let active_tab = active_tab_entity(router).await?;
+    let active_tab = active_tab_projection(router).await;
     let mut data = serde_json::json!({});
     attach_subject(&mut data, navigation_subject("reload"));
     attach_result(
         &mut data,
         serde_json::json!({
             "page": page_entity(&page),
-            "active_tab": active_tab,
+            "active_tab": active_tab.tab,
+            "active_tab_degraded_reason": active_tab.degraded_reason,
             "load_strategy": strategy,
         }),
     );
@@ -381,218 +449,4 @@ pub(super) async fn cmd_reload(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::args::{
-        OpenArgs, ReloadArgs, ScreenshotArgs, ScrollArgs, StateArgs, SwitchArgs,
-        parse_optional_load_strategy, parse_optional_scroll_direction,
-    };
-    use super::{inline_screenshot_payload_exceeds_limit, write_screenshot_artifact};
-    use crate::router::request_args::parse_json_args;
-    use rub_core::error::ErrorCode;
-    use rub_core::model::{LoadStrategy, ScrollDirection};
-
-    #[test]
-    fn invalid_load_strategy_is_rejected() {
-        let error = parse_optional_load_strategy(Some("slow"), "load_strategy")
-            .expect_err("invalid load strategy should fail");
-        assert_eq!(error.into_envelope().code, ErrorCode::InvalidInput);
-    }
-
-    #[test]
-    fn valid_load_strategy_parses() {
-        let strategy = parse_optional_load_strategy(Some("domcontentloaded"), "load_strategy")
-            .expect("valid load strategy");
-        assert_eq!(strategy, LoadStrategy::DomContentLoaded);
-    }
-
-    #[test]
-    fn invalid_scroll_direction_is_rejected() {
-        let error = parse_optional_scroll_direction(Some("sideways"), "direction")
-            .expect_err("invalid direction should fail");
-        assert_eq!(error.into_envelope().code, ErrorCode::InvalidInput);
-    }
-
-    #[test]
-    fn valid_scroll_direction_parses() {
-        let direction =
-            parse_optional_scroll_direction(Some("up"), "direction").expect("valid direction");
-        assert_eq!(direction, ScrollDirection::Up);
-    }
-
-    #[test]
-    fn typed_open_payload_accepts_navigation_fields() {
-        let parsed: OpenArgs = parse_json_args(
-            &serde_json::json!({
-                "url": "example.com",
-                "load_strategy": "load",
-            }),
-            "open",
-        )
-        .expect("open payload should parse");
-        assert_eq!(parsed.url, "example.com");
-        assert_eq!(parsed.load_strategy.as_deref(), Some("load"));
-    }
-
-    #[test]
-    fn typed_open_payload_accepts_wait_after_compat_field() {
-        let parsed: OpenArgs = parse_json_args(
-            &serde_json::json!({
-                "url": "https://example.com",
-                "wait_after": {"text":"Ready"},
-                "_trigger": {"kind": "trigger_action"},
-            }),
-            "open",
-        )
-        .expect("open payload should accept post-wait compatibility field");
-        assert!(parsed._wait_after.is_some());
-        assert!(parsed._trigger.is_some());
-    }
-
-    #[test]
-    fn typed_reload_payload_accepts_trigger_metadata() {
-        let parsed: ReloadArgs = parse_json_args(
-            &serde_json::json!({
-                "load_strategy": "load",
-                "_trigger": {"kind": "trigger_action"},
-            }),
-            "reload",
-        )
-        .expect("reload payload should accept trigger metadata");
-        assert_eq!(parsed.load_strategy.as_deref(), Some("load"));
-        assert!(parsed._trigger.is_some());
-    }
-
-    #[test]
-    fn typed_state_payload_rejects_unknown_fields() {
-        let error = parse_json_args::<StateArgs>(
-            &serde_json::json!({
-                "limit": 10,
-                "mystery": true,
-            }),
-            "state",
-        )
-        .expect_err("unknown state fields should be rejected")
-        .into_envelope();
-        assert_eq!(error.code, ErrorCode::InvalidInput);
-    }
-
-    #[test]
-    fn typed_scroll_payload_rejects_unknown_fields() {
-        let error = parse_json_args::<ScrollArgs>(
-            &serde_json::json!({
-                "direction": "down",
-                "other": 1,
-            }),
-            "scroll",
-        )
-        .expect_err("unknown scroll fields should fail")
-        .into_envelope();
-        assert_eq!(error.code, ErrorCode::InvalidInput);
-    }
-
-    #[test]
-    fn typed_switch_payload_accepts_trigger_metadata_but_stays_strict_otherwise() {
-        let parsed = parse_json_args::<SwitchArgs>(
-            &serde_json::json!({
-                "index": 2,
-                "_trigger": {
-                    "kind": "trigger_action",
-                }
-            }),
-            "switch",
-        )
-        .expect("switch payload should accept trigger metadata");
-        assert_eq!(parsed.index, 2);
-
-        let error = parse_json_args::<SwitchArgs>(
-            &serde_json::json!({
-                "index": 2,
-                "mystery": true,
-            }),
-            "switch",
-        )
-        .expect_err("unknown switch fields should still fail")
-        .into_envelope();
-        assert_eq!(error.code, ErrorCode::InvalidInput);
-    }
-
-    #[test]
-    fn inline_screenshot_limit_helper_flags_oversized_payloads() {
-        assert!(!inline_screenshot_payload_exceeds_limit(1024));
-        assert!(inline_screenshot_payload_exceeds_limit(7 * 1024 * 1024));
-    }
-
-    #[test]
-    fn screenshot_artifact_marks_file_truth_boundary() {
-        let root =
-            std::env::temp_dir().join(format!("rub-screenshot-artifact-{}", uuid::Uuid::now_v7()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create temp root");
-        let output = root.join("page.png");
-
-        let artifact = write_screenshot_artifact(
-            output.to_str().expect("utf-8 path"),
-            b"png",
-            "router.screenshot_artifact",
-            "page_screenshot_result",
-        )
-        .expect("write screenshot artifact");
-
-        assert_eq!(artifact["output_path"], output.display().to_string());
-        assert_eq!(
-            artifact["artifact_state"]["truth_level"],
-            "command_artifact"
-        );
-        assert_eq!(
-            artifact["artifact_state"]["artifact_authority"],
-            "router.screenshot_artifact"
-        );
-        assert_eq!(
-            artifact["artifact_state"]["upstream_truth"],
-            "page_screenshot_result"
-        );
-        assert_eq!(artifact["artifact_state"]["durability"], "durable");
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn inspect_page_routing_sub_field_is_stripped_by_cmd_inspect_before_reaching_state_args() {
-        // Documentation test: confirm that StateArgs correctly rejects "sub" when it
-        // appears directly. This verifies that cmd_inspect's strip_inspect_routing_key
-        // is required — if it were removed, inspect page would fail with INVALID_INPUT.
-        let error = parse_json_args::<StateArgs>(
-            &serde_json::json!({ "sub": "page", "format": "compact" }),
-            "state",
-        )
-        .expect_err("StateArgs must reject 'sub' — stripping is cmd_inspect's responsibility");
-        assert_eq!(error.into_envelope().code, ErrorCode::InvalidInput);
-    }
-
-    #[test]
-    fn state_args_still_rejects_genuinely_unknown_fields() {
-        // Guard: ensure the schema stays strict for all unknown fields.
-        let error = parse_json_args::<StateArgs>(
-            &serde_json::json!({ "limit": 10, "mystery": true }),
-            "state",
-        )
-        .expect_err("unknown state fields must still be rejected")
-        .into_envelope();
-        assert_eq!(error.code, ErrorCode::InvalidInput);
-    }
-
-    #[test]
-    fn typed_screenshot_payload_accepts_path_state_metadata() {
-        let parsed = parse_json_args::<ScreenshotArgs>(
-            &serde_json::json!({
-                "path": "/tmp/capture.png",
-                "path_state": {
-                    "path_authority": "cli.screenshot.path"
-                }
-            }),
-            "screenshot",
-        )
-        .expect("screenshot payload should accept display-only path metadata");
-        assert_eq!(parsed.path.as_deref(), Some("/tmp/capture.png"));
-    }
-}
+mod tests;

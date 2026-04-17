@@ -99,17 +99,26 @@ pub(crate) async fn close_all_sessions(
             );
         }
 
-        let termination_requested = terminate_registry_entry_process(rub_home, entry).is_ok();
-        let shutdown = wait_for_shutdown_until(rub_home, entry, command_deadline).await;
-
-        let still_running = rub_core::process::is_process_alive(entry.pid)
+        let initial_shutdown = wait_for_shutdown_until(rub_home, entry, command_deadline).await;
+        let mut shutdown = initial_shutdown;
+        let mut kill_fallback_used = false;
+        let mut still_running = rub_core::process::is_process_alive(entry.pid)
             || !session_paths.existing_socket_paths().is_empty();
-        match classify_close_all_result(
-            graceful_close,
-            termination_requested,
+
+        if should_escalate_close_all_to_kill_fallback(
             shutdown,
             still_running,
-        ) {
+            remaining_budget_ms(command_deadline),
+        ) && terminate_registry_entry_process(rub_home, entry).is_ok()
+        {
+            kill_fallback_used = true;
+            shutdown = wait_for_shutdown_until(rub_home, entry, command_deadline).await;
+            still_running = rub_core::process::is_process_alive(entry.pid)
+                || !session_paths.existing_socket_paths().is_empty();
+        }
+
+        match classify_close_all_result(graceful_close, kill_fallback_used, shutdown, still_running)
+        {
             CloseAllDisposition::Closed => {
                 cleanup_stale(rub_home, entry);
                 let _ = rub_daemon::session::deregister_session(rub_home, &entry.session_id);
@@ -133,6 +142,14 @@ pub(crate) async fn close_all_sessions(
     })
 }
 
+pub(crate) fn should_escalate_close_all_to_kill_fallback(
+    shutdown: ShutdownFenceStatus,
+    still_running: bool,
+    remaining_budget_ms: u64,
+) -> bool {
+    !shutdown.fully_released() && still_running && remaining_budget_ms > 0
+}
+
 pub(crate) fn close_all_session_targets(
     snapshot: &rub_daemon::session::RegistryAuthoritySnapshot,
 ) -> Vec<CloseAllSessionTarget> {
@@ -152,18 +169,18 @@ pub(crate) fn close_all_session_targets(
 
 pub(crate) fn classify_close_all_result(
     graceful_close: bool,
-    termination_requested: bool,
+    kill_fallback_used: bool,
     shutdown: ShutdownFenceStatus,
     still_running: bool,
 ) -> CloseAllDisposition {
     if shutdown.fully_released() {
-        if graceful_close {
+        if graceful_close && !kill_fallback_used {
             CloseAllDisposition::Closed
         } else {
             CloseAllDisposition::CleanedStale
         }
     } else if graceful_close
-        || termination_requested
+        || kill_fallback_used
         || still_running
         || shutdown.lifecycle_committed()
     {

@@ -44,23 +44,32 @@ mod registry;
 mod replay;
 mod startup;
 
+#[cfg(test)]
+pub(crate) use self::bootstrap::cleanup_precommit_browser_authority_for_test;
 pub use self::bootstrap::{BootstrapClient, bootstrap_client};
 pub(crate) use self::close_all::close_all_sessions;
 #[cfg(test)]
 pub(crate) use self::close_all::{
     CloseAllDisposition, classify_close_all_result, close_all_session_targets,
+    should_escalate_close_all_to_kill_fallback,
 };
 pub use self::close_existing::close_existing_session;
+pub(crate) use self::close_existing::{
+    close_existing_session_targeted, resolve_existing_close_target_by_attachment_identity,
+};
 pub(crate) use self::connect::{
     ShutdownFenceStatus, TransientSocketPolicy, authority_bound_deferred_client, connect_ipc_once,
-    connect_ipc_with_retry, detect_or_connect_hardened, preferred_socket_path_for_session,
+    connect_ipc_with_retry, detect_or_connect_hardened, detect_or_connect_hardened_until,
     remaining_budget_duration, remaining_budget_ms, wait_for_shutdown_until,
 };
 #[cfg(test)]
-pub(crate) use self::connect::{maybe_upgrade_if_needed, socket_candidates_for_session};
-pub(crate) use self::handshake::{HandshakePayload, fetch_launch_policy_for_session};
-use self::handshake::{
-    fetch_handshake_info, fetch_handshake_info_with_timeout, handshake_attempt_error,
+pub(crate) use self::connect::{
+    apply_hard_cut_shutdown_outcome, maybe_upgrade_if_needed, socket_candidates_for_session,
+};
+use self::handshake::handshake_attempt_error;
+pub(crate) use self::handshake::{
+    HandshakePayload, fetch_handshake_info, fetch_handshake_info_until,
+    fetch_handshake_info_with_timeout,
 };
 use self::ipc::{
     ipc_budget_exhausted_error, ipc_transport_error, replay_recoverable_transport_reason,
@@ -86,10 +95,15 @@ pub(crate) use self::replay::{
 #[cfg(all(test, unix))]
 use self::startup::detach_daemon_session;
 pub use self::startup::startup_signal_paths;
+pub(crate) use self::startup::{
+    StartupCleanupAuthorityKind, StartupCleanupProof, clear_startup_cleanup_proof,
+    startup_cleanup_signal_path, write_startup_cleanup_proof_at,
+};
 #[cfg(test)]
 use self::startup::{
-    StartupSignalFiles, acquire_startup_lock, read_startup_error, startup_lock_scope_keys,
-    startup_ready_retry_timeout_failure, try_lock_exclusive, unlock, wait_for_ready,
+    StartupSignalFiles, acquire_startup_lock, read_startup_cleanup_proof, read_startup_error,
+    startup_lock_scope_keys, startup_ready_retry_timeout_failure, try_lock_exclusive, unlock,
+    upgrade_startup_lock_to_canonical_attachment_until, wait_for_ready,
 };
 
 #[cfg(test)]

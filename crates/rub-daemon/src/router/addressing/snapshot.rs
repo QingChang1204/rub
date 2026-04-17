@@ -73,6 +73,21 @@ async fn ensure_cached_snapshot_authority(
         ));
     }
 
+    if state.pending_external_dom_change_affects_target(snapshot.frame_context.target_id.as_deref())
+    {
+        return Err(RubError::domain_with_context(
+            ErrorCode::StaleSnapshot,
+            format!(
+                "Snapshot {snapshot_id} cannot be reused because external DOM drift is pending for its authority target",
+            ),
+            serde_json::json!({
+                "snapshot_id": snapshot_id,
+                "authority_state": "pending_external_dom_change",
+                "target_id": snapshot.frame_context.target_id.clone(),
+            }),
+        ));
+    }
+
     if let Some(requested_frame_id) = requested_frame_id {
         if snapshot.frame_context.frame_id == requested_frame_id {
             return Ok(());
@@ -265,6 +280,52 @@ mod tests {
                 .and_then(|context| context.get("frame_runtime"))
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn cached_snapshot_authority_rejects_pending_dom_drift_for_same_target() {
+        let state = test_state("pending-dom-drift");
+        let snapshot = cached_snapshot("snap-1", state.current_epoch(), "frame-main");
+        state.cache_snapshot(snapshot.clone()).await;
+        set_current_frame(&state, "frame-main").await;
+        state
+            .observe_external_dom_change(Some("target-1"))
+            .expect("idle same-target drift should advance epoch");
+        let snapshot = cached_snapshot("snap-2", state.current_epoch(), "frame-main");
+        state.cache_snapshot(snapshot.clone()).await;
+        state
+            .in_flight_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        state.observe_external_dom_change(Some("target-1"));
+
+        let error = ensure_cached_snapshot_authority(&state, "snap-2", &snapshot, None)
+            .await
+            .expect_err("pending same-target drift must fail closed");
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::StaleSnapshot);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|context| context.get("authority_state")),
+            Some(&serde_json::json!("pending_external_dom_change"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_snapshot_authority_allows_unrelated_target_pending_dom_drift() {
+        let state = test_state("pending-dom-drift-unrelated");
+        let snapshot = cached_snapshot("snap-1", state.current_epoch(), "frame-main");
+        state.cache_snapshot(snapshot.clone()).await;
+        set_current_frame(&state, "frame-main").await;
+        state
+            .in_flight_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        state.observe_external_dom_change(Some("target-2"));
+
+        ensure_cached_snapshot_authority(&state, "snap-1", &snapshot, None)
+            .await
+            .expect("unrelated target drift must not globally invalidate snapshot authority");
     }
 
     #[tokio::test]

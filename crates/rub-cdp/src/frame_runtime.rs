@@ -1,6 +1,7 @@
 use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::page::FrameId;
 use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -23,6 +24,25 @@ const SAME_ORIGIN_ACCESS_JS: &str = r#"
     }
 })()
 "#;
+
+thread_local! {
+    static FRAME_INVENTORY_COLLECTIONS: Cell<u64> = const { Cell::new(0) };
+    static FRAME_INVENTORY_ENTRY_STEPS: Cell<u64> = const { Cell::new(0) };
+    static FRAME_SAME_ORIGIN_PROBE_REQUESTS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrameRuntimeMetrics {
+    pub(crate) primary_fast_path_hits: u64,
+    pub(crate) inventory_collections: u64,
+    pub(crate) inventory_entry_steps: u64,
+    pub(crate) same_origin_probe_requests: u64,
+}
+
+thread_local! {
+    static FRAME_PRIMARY_FAST_PATH_HITS: Cell<u64> = const { Cell::new(0) };
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedFrameContext {
@@ -56,78 +76,96 @@ pub(crate) async fn resolve_frame_context(
     page: &Arc<Page>,
     frame_id: Option<&str>,
 ) -> Result<ResolvedFrameContext, RubError> {
-    let inventory = collect_frame_inventory(page).await?;
-    let primary = inventory
-        .iter()
-        .find(|entry| entry.is_primary)
-        .or_else(|| inventory.first())
-        .ok_or_else(|| RubError::Internal("Frame inventory is empty".to_string()))?;
-
-    if let Some(frame_id) = frame_id {
-        let selected = inventory
-            .iter()
-            .find(|entry| entry.frame.frame_id == frame_id)
-            .ok_or_else(|| {
-                RubError::domain_with_context(
-                    ErrorCode::InvalidInput,
-                    format!("Frame '{frame_id}' is not present in the current frame inventory"),
-                    serde_json::json!({
-                        "frame_id": frame_id,
-                    }),
-                )
-            })?;
-
-        if !selected.is_primary && !matches!(selected.frame.same_origin_accessible, Some(true)) {
-            return Err(RubError::domain_with_context(
-                ErrorCode::InvalidInput,
-                format!(
-                    "Frame '{frame_id}' is not same-origin accessible for frame-scoped snapshot"
-                ),
-                serde_json::json!({
-                    "frame_id": frame_id,
-                    "same_origin_accessible": selected.frame.same_origin_accessible,
-                }),
-            ));
-        }
-
-        let execution_context_id = if selected.is_primary {
-            None
-        } else {
-            Some(
-                page.frame_execution_context(FrameId::new(frame_id.to_string()))
-                    .await
-                    .map_err(|error| {
-                        RubError::Internal(format!(
-                            "Resolve frame execution context failed: {error}"
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        RubError::domain_with_context(
-                            ErrorCode::InvalidInput,
-                            format!("Frame '{frame_id}' has no live execution context"),
-                            serde_json::json!({
-                                "frame_id": frame_id,
-                            }),
-                        )
-                    })?,
-            )
-        };
-
-        return Ok(ResolvedFrameContext {
-            frame: selected.frame.clone(),
-            lineage: build_lineage(frame_id, &inventory),
-            execution_context_id,
-        });
+    if frame_id.is_none() {
+        FRAME_PRIMARY_FAST_PATH_HITS.with(|count| count.set(count.get().saturating_add(1)));
+        return resolve_primary_frame_context(page).await;
     }
 
+    let inventory = collect_frame_inventory(page).await?;
+    let frame_id = frame_id.expect("non-primary path always has explicit frame_id");
+    let selected = inventory
+        .iter()
+        .find(|entry| entry.frame.frame_id == frame_id)
+        .ok_or_else(|| {
+            RubError::domain_with_context(
+                ErrorCode::InvalidInput,
+                format!("Frame '{frame_id}' is not present in the current frame inventory"),
+                serde_json::json!({
+                    "frame_id": frame_id,
+                }),
+            )
+        })?;
+
+    if !selected.is_primary && !matches!(selected.frame.same_origin_accessible, Some(true)) {
+        return Err(RubError::domain_with_context(
+            ErrorCode::InvalidInput,
+            format!("Frame '{frame_id}' is not same-origin accessible for frame-scoped snapshot"),
+            serde_json::json!({
+                "frame_id": frame_id,
+                "same_origin_accessible": selected.frame.same_origin_accessible,
+            }),
+        ));
+    }
+
+    let execution_context_id = if selected.is_primary {
+        None
+    } else {
+        Some(
+            page.frame_execution_context(FrameId::new(frame_id.to_string()))
+                .await
+                .map_err(|error| {
+                    RubError::Internal(format!("Resolve frame execution context failed: {error}"))
+                })?
+                .ok_or_else(|| {
+                    RubError::domain_with_context(
+                        ErrorCode::InvalidInput,
+                        format!("Frame '{frame_id}' has no live execution context"),
+                        serde_json::json!({
+                            "frame_id": frame_id,
+                        }),
+                    )
+                })?,
+        )
+    };
+
     Ok(ResolvedFrameContext {
-        frame: primary.frame.clone(),
-        lineage: build_lineage(primary.frame.frame_id.as_str(), &inventory),
+        frame: selected.frame.clone(),
+        lineage: build_lineage(frame_id, &inventory),
+        execution_context_id,
+    })
+}
+
+async fn resolve_primary_frame_context(page: &Arc<Page>) -> Result<ResolvedFrameContext, RubError> {
+    let main_frame = page
+        .mainframe()
+        .await
+        .map_err(|error| RubError::Internal(format!("Read main frame failed: {error}")))?
+        .ok_or_else(|| RubError::Internal("Main frame is unavailable".to_string()))?;
+    let main_frame_key = main_frame.as_ref().to_string();
+
+    Ok(ResolvedFrameContext {
+        frame: FrameContextInfo {
+            frame_id: main_frame_key.clone(),
+            name: page
+                .frame_name(main_frame.clone())
+                .await
+                .map_err(|error| RubError::Internal(format!("Read frame name failed: {error}")))?,
+            parent_frame_id: None,
+            target_id: Some(page.target_id().as_ref().to_string()),
+            url: page
+                .frame_url(main_frame)
+                .await
+                .map_err(|error| RubError::Internal(format!("Read frame URL failed: {error}")))?,
+            depth: 0,
+            same_origin_accessible: Some(true),
+        },
+        lineage: vec![main_frame_key],
         execution_context_id: None,
     })
 }
 
 async fn collect_frame_inventory(page: &Arc<Page>) -> Result<Vec<FrameInventoryEntry>, RubError> {
+    FRAME_INVENTORY_COLLECTIONS.with(|count| count.set(count.get().saturating_add(1)));
     let main_frame = page
         .mainframe()
         .await
@@ -138,17 +176,18 @@ async fn collect_frame_inventory(page: &Arc<Page>) -> Result<Vec<FrameInventoryE
         .await
         .map_err(|error| RubError::Internal(format!("Read frame inventory failed: {error}")))?;
 
-    let mut raw_entries = Vec::with_capacity(frames.len().saturating_add(1));
-    let mut seen_frame_ids = HashSet::new();
-    let mut ordered_frames = Vec::with_capacity(frames.len().saturating_add(1));
-    ordered_frames.push(main_frame.clone());
-    for frame_id in frames {
-        if frame_id != main_frame {
-            ordered_frames.push(frame_id);
-        }
-    }
-
     let main_frame_key = main_frame.as_ref().to_string();
+    let ordered_frames = build_ordered_frame_inventory(main_frame.clone(), frames);
+    FRAME_INVENTORY_ENTRY_STEPS.with(|count| {
+        count.set(
+            count
+                .get()
+                .saturating_add(ordered_frames.len().try_into().unwrap_or(u64::MAX)),
+        )
+    });
+
+    let mut raw_entries = Vec::with_capacity(ordered_frames.len());
+    let mut seen_frame_ids = HashSet::new();
     for frame_id in ordered_frames {
         let frame_key = frame_id.as_ref().to_string();
         if !seen_frame_ids.insert(frame_key.clone()) {
@@ -160,6 +199,7 @@ async fn collect_frame_inventory(page: &Arc<Page>) -> Result<Vec<FrameInventoryE
             .await
             .map_err(|error| RubError::Internal(format!("Read frame parent failed: {error}")))?
             .map(|parent| parent.as_ref().to_string());
+        let needs_same_origin_probe = same_origin_probe_required(&frame_key, &main_frame_key);
 
         raw_entries.push(FrameContextInfo {
             frame_id: frame_key,
@@ -174,10 +214,12 @@ async fn collect_frame_inventory(page: &Arc<Page>) -> Result<Vec<FrameInventoryE
                 .await
                 .map_err(|error| RubError::Internal(format!("Read frame URL failed: {error}")))?,
             depth: 0,
-            same_origin_accessible: if frame_id == main_frame {
-                Some(true)
-            } else {
+            same_origin_accessible: if needs_same_origin_probe {
+                FRAME_SAME_ORIGIN_PROBE_REQUESTS
+                    .with(|count| count.set(count.get().saturating_add(1)));
                 probe_same_origin_accessibility(page, &frame_id).await?
+            } else {
+                Some(true)
             },
         });
     }
@@ -259,6 +301,39 @@ async fn probe_same_origin_accessibility(
         .and_then(|value| value.as_bool()))
 }
 
+fn build_ordered_frame_inventory(main_frame: FrameId, frames: Vec<FrameId>) -> Vec<FrameId> {
+    let mut ordered_frames = Vec::with_capacity(frames.len().saturating_add(1));
+    ordered_frames.push(main_frame.clone());
+    for frame_id in frames {
+        if frame_id != main_frame {
+            ordered_frames.push(frame_id);
+        }
+    }
+    ordered_frames
+}
+
+fn same_origin_probe_required(frame_id: &str, main_frame_id: &str) -> bool {
+    frame_id != main_frame_id
+}
+
+#[cfg(test)]
+fn frame_runtime_metrics_snapshot() -> FrameRuntimeMetrics {
+    FrameRuntimeMetrics {
+        primary_fast_path_hits: FRAME_PRIMARY_FAST_PATH_HITS.with(Cell::get),
+        inventory_collections: FRAME_INVENTORY_COLLECTIONS.with(Cell::get),
+        inventory_entry_steps: FRAME_INVENTORY_ENTRY_STEPS.with(Cell::get),
+        same_origin_probe_requests: FRAME_SAME_ORIGIN_PROBE_REQUESTS.with(Cell::get),
+    }
+}
+
+#[cfg(test)]
+fn reset_frame_runtime_metrics() {
+    FRAME_PRIMARY_FAST_PATH_HITS.with(|count| count.set(0));
+    FRAME_INVENTORY_COLLECTIONS.with(|count| count.set(0));
+    FRAME_INVENTORY_ENTRY_STEPS.with(|count| count.set(0));
+    FRAME_SAME_ORIGIN_PROBE_REQUESTS.with(|count| count.set(0));
+}
+
 fn build_lineage(current_frame_id: &str, inventory: &[FrameInventoryEntry]) -> Vec<String> {
     let parent_by_frame = inventory
         .iter()
@@ -318,7 +393,11 @@ fn frame_depth(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_lineage, frame_depth};
+    use super::{
+        FrameRuntimeMetrics, build_lineage, build_ordered_frame_inventory, frame_depth,
+        frame_runtime_metrics_snapshot, reset_frame_runtime_metrics, same_origin_probe_required,
+    };
+    use chromiumoxide::cdp::browser_protocol::page::FrameId;
     use rub_core::model::{FrameContextInfo, FrameInventoryEntry};
     use std::collections::HashMap;
 
@@ -385,6 +464,71 @@ mod tests {
         assert_eq!(
             build_lineage("child", &inventory),
             vec!["child".to_string(), "main".to_string()]
+        );
+    }
+
+    #[test]
+    fn ordered_frame_inventory_keeps_primary_first_and_skips_duplicate_main() {
+        let ordered = build_ordered_frame_inventory(
+            FrameId::new("main".to_string()),
+            vec![
+                FrameId::new("main".to_string()),
+                FrameId::new("child".to_string()),
+                FrameId::new("grandchild".to_string()),
+            ],
+        );
+
+        let ids = ordered
+            .into_iter()
+            .map(|frame_id| frame_id.as_ref().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["main", "child", "grandchild"]);
+    }
+
+    #[test]
+    fn frame_runtime_metrics_capture_probe_plan_baseline() {
+        reset_frame_runtime_metrics();
+        let main_frame_id = "main".to_string();
+        let ordered = build_ordered_frame_inventory(
+            FrameId::new(main_frame_id.clone()),
+            vec![
+                FrameId::new("child".to_string()),
+                FrameId::new("grandchild".to_string()),
+            ],
+        );
+        super::FRAME_INVENTORY_COLLECTIONS.with(|count| count.set(1));
+        super::FRAME_INVENTORY_ENTRY_STEPS
+            .with(|count| count.set(ordered.len().try_into().unwrap_or(u64::MAX)));
+        let probe_requests = ordered
+            .iter()
+            .filter(|frame_id| same_origin_probe_required(frame_id.as_ref(), &main_frame_id))
+            .count() as u64;
+        super::FRAME_SAME_ORIGIN_PROBE_REQUESTS.with(|count| count.set(probe_requests));
+
+        assert_eq!(
+            frame_runtime_metrics_snapshot(),
+            FrameRuntimeMetrics {
+                primary_fast_path_hits: 0,
+                inventory_collections: 1,
+                inventory_entry_steps: 3,
+                same_origin_probe_requests: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn frame_runtime_metrics_snapshot_tracks_primary_fast_path_hits() {
+        reset_frame_runtime_metrics();
+        super::FRAME_PRIMARY_FAST_PATH_HITS.with(|count| count.set(2));
+
+        assert_eq!(
+            frame_runtime_metrics_snapshot(),
+            FrameRuntimeMetrics {
+                primary_fast_path_hits: 2,
+                inventory_collections: 0,
+                inventory_entry_steps: 0,
+                same_origin_probe_requests: 0,
+            }
         );
     }
 }

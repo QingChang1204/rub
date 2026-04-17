@@ -79,16 +79,44 @@ impl CommandHistoryState {
         last: usize,
         dropped_before_projection: u64,
     ) -> CommandHistoryProjection {
+        self.projection_for_selection(last, None, None, dropped_before_projection)
+    }
+
+    pub fn projection_range(
+        &self,
+        from: Option<u64>,
+        to: Option<u64>,
+        dropped_before_projection: u64,
+    ) -> CommandHistoryProjection {
+        self.projection_for_selection(usize::MAX, from, to, dropped_before_projection)
+    }
+
+    fn projection_for_selection(
+        &self,
+        last: usize,
+        from: Option<u64>,
+        to: Option<u64>,
+        dropped_before_projection: u64,
+    ) -> CommandHistoryProjection {
         let count = self.entries.len();
-        let take = last.min(count);
-        let mut entries = self
-            .entries
-            .iter()
-            .rev()
-            .take(take)
-            .cloned()
-            .collect::<Vec<_>>();
-        entries.reverse();
+        let entries = if from.is_some() || to.is_some() {
+            self.entries
+                .iter()
+                .filter(|entry| matches_history_range(entry.sequence, from, to))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            let take = last.min(count);
+            let mut entries = self
+                .entries
+                .iter()
+                .rev()
+                .take(take)
+                .cloned()
+                .collect::<Vec<_>>();
+            entries.reverse();
+            entries
+        };
         let oldest_retained_sequence = self.entries.front().map(|entry| entry.sequence);
         let newest_retained_sequence = self.entries.back().map(|entry| entry.sequence);
         let dropped_before_retention = oldest_retained_sequence
@@ -106,6 +134,20 @@ impl CommandHistoryState {
 
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
+}
+
+fn matches_history_range(sequence: u64, from: Option<u64>, to: Option<u64>) -> bool {
+    if let Some(from) = from
+        && sequence < from
+    {
+        return false;
+    }
+    if let Some(to) = to
+        && sequence > to
+    {
+        return false;
+    }
+    true
 }
 
 fn interaction_confirmation(response: &IpcResponse) -> (Option<String>, Option<String>) {
@@ -207,5 +249,27 @@ mod tests {
         assert_eq!(projection.newest_retained_sequence, Some(70));
         assert_eq!(projection.dropped_before_retention, 6);
         assert_eq!(projection.dropped_before_projection, 0);
+    }
+
+    #[test]
+    fn history_projection_range_filters_entries_by_sequence() {
+        let mut history = CommandHistoryState::default();
+
+        for index in 0..5 {
+            let request = IpcRequest::new("open", serde_json::json!({ "index": index }), 1_000);
+            let response = rub_ipc::protocol::IpcResponse::success(
+                format!("req-{index}"),
+                serde_json::json!({}),
+            );
+            history.record(&request, &response);
+        }
+
+        let projection = history.projection_range(Some(2), Some(4), 0);
+        assert_eq!(projection.entries.len(), 3);
+        assert_eq!(projection.entries[0].sequence, 2);
+        assert_eq!(projection.entries[1].sequence, 3);
+        assert_eq!(projection.entries[2].sequence, 4);
+        assert_eq!(projection.oldest_retained_sequence, Some(1));
+        assert_eq!(projection.newest_retained_sequence, Some(5));
     }
 }

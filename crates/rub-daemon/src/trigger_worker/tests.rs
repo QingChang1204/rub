@@ -33,6 +33,7 @@ fn test_router() -> Arc<DaemonRouter> {
             headless: true,
             ignore_cert_errors: false,
             user_data_dir: None,
+            managed_profile_ephemeral: false,
             download_dir: None,
             profile_directory: None,
             hide_infobars: true,
@@ -483,7 +484,7 @@ async fn ready_trigger_reservation_completion_releases_idle_queue_permit() {
         None,
     ));
     let reserved = router
-        .begin_automation_transaction_until_shutdown_owned(&state, "queued_trigger")
+        .begin_automation_reservation_transaction_owned(&state, "queued_trigger")
         .await
         .expect("queued trigger reservation should acquire immediately in test");
     let mut worker_state = std::collections::HashMap::new();

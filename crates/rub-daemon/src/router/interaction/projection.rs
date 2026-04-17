@@ -4,7 +4,8 @@ use tokio::time::Duration;
 
 use super::super::*;
 use crate::runtime_refresh::{
-    refresh_live_frame_runtime, refresh_live_interference_state, refresh_live_runtime_state,
+    InterferenceRefreshIntent, refresh_live_frame_runtime, refresh_live_interference_state,
+    refresh_live_runtime_state,
 };
 use crate::session::SessionState;
 use rub_core::model::{
@@ -154,7 +155,12 @@ pub(super) async fn finalize_interaction_projection(
     let stable_projection = collect_stable_post_interaction_projection(state, baseline, || async {
         refresh_live_runtime_state(&router.browser, state).await;
         refresh_live_frame_runtime(&router.browser, state).await;
-        let _ = refresh_live_interference_state(&router.browser, state).await;
+        let _ = refresh_live_interference_state(
+            &router.browser,
+            state,
+            InterferenceRefreshIntent::PolicyDriven,
+        )
+        .await;
         let interference_after = state.interference_runtime().await;
         if should_promote_primary_context(outcome, &interference_after)
             && let Ok(tabs) = router.browser.list_tabs().await
@@ -223,7 +229,12 @@ pub(super) async fn finalize_select_projection(
     let stable_projection = collect_stable_post_interaction_projection(state, baseline, || async {
         refresh_live_runtime_state(&router.browser, state).await;
         refresh_live_frame_runtime(&router.browser, state).await;
-        let _ = refresh_live_interference_state(&router.browser, state).await;
+        let _ = refresh_live_interference_state(
+            &router.browser,
+            state,
+            InterferenceRefreshIntent::PolicyDriven,
+        )
+        .await;
     })
     .await;
     attach_select_projection(

@@ -1,7 +1,11 @@
 use super::*;
 
-pub(crate) async fn cmd_close(router: &DaemonRouter) -> Result<serde_json::Value, RubError> {
+pub(crate) async fn cmd_close(
+    router: &DaemonRouter,
+    state: &Arc<SessionState>,
+) -> Result<serde_json::Value, RubError> {
     router.browser.close().await?;
+    state.request_shutdown();
     Ok(serde_json::json!({
         "subject": {
             "kind": "session_browser",
@@ -9,7 +13,7 @@ pub(crate) async fn cmd_close(router: &DaemonRouter) -> Result<serde_json::Value
         "result": {
             "closed": true,
             "daemon_stopped": false,
-            "daemon_exit_policy": "idle_timeout_or_shutdown_signal",
+            "daemon_exit_policy": "shutdown_requested_by_close",
         }
     }))
 }
@@ -21,6 +25,7 @@ pub(crate) async fn cmd_handshake(
     let runtime_state = state.runtime_state_snapshot().await;
     let automation_scheduler = state.automation_scheduler_metrics().await;
     let browser_event_ingress = state.browser_event_ingress_metrics().await;
+    let launch_identity = state.launch_identity().await;
     Ok(serde_json::json!({
         "daemon_session_id": state.session_id,
         "ipc_protocol_version": IPC_PROTOCOL_VERSION,
@@ -29,6 +34,7 @@ pub(crate) async fn cmd_handshake(
         "browser_event_ingress_drop_count": state.browser_event_ingress_drop_count(),
         "browser_event_ingress": browser_event_ingress,
         "launch_policy": router.browser.launch_policy(),
+        "attachment_identity": launch_identity.attachment_identity,
         "integration_runtime": state.integration_runtime().await,
         "dialog_runtime": state.dialog_runtime().await,
         "download_runtime": state.download_runtime().await,

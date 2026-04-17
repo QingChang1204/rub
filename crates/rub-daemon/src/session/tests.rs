@@ -17,7 +17,7 @@ use rub_core::model::{
     TriggerConditionSpec,
 };
 use rub_core::storage::{StorageArea, StorageMutationKind, StorageRuntimeStatus, StorageSnapshot};
-use rub_ipc::protocol::IpcRequest;
+use rub_ipc::protocol::{IpcRequest, IpcResponse};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -84,6 +84,19 @@ async fn session_starts_with_inactive_normal_integration_runtime() {
     assert!(!integration.observatory_ready);
     assert!(!integration.readiness_ready);
     assert!(!integration.state_inspector_ready);
+}
+
+#[tokio::test]
+async fn request_shutdown_notifies_waiters_and_marks_draining() {
+    let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
+    let notifier = state.shutdown_notifier();
+    let waiter = notifier.notified();
+    tokio::pin!(waiter);
+
+    state.request_shutdown();
+
+    waiter.as_mut().await;
+    assert!(state.is_shutdown_requested());
 }
 
 #[tokio::test]
@@ -176,7 +189,11 @@ async fn automation_scheduler_metrics_track_queue_owned_worker_cycles() {
     );
     assert_eq!(
         metrics["reservation_wait_policy"]["worker_cycle"]["mode"],
-        serde_json::json!("persistent_queue_contender")
+        serde_json::json!("bounded_worker_cycle_budget")
+    );
+    assert_eq!(
+        metrics["reservation_wait_policy"]["worker_cycle"]["wait_budget_ms"],
+        serde_json::json!(500)
     );
     assert_eq!(
         metrics["reservation_wait_policy"]["active_orchestration_step"]["mode"],
@@ -758,6 +775,9 @@ async fn session_replay_claims_wait_until_owner_releases_and_can_be_reclaimed() 
         ReplayCommandClaim::Wait(notify) => notify,
         ReplayCommandClaim::Owner => panic!("second replay claim should wait on the owner"),
         ReplayCommandClaim::Cached(_) => panic!("second replay claim should not hit cache"),
+        ReplayCommandClaim::SpentWithoutCachedResponse => {
+            panic!("second replay claim should wait before any execution is spent")
+        }
         ReplayCommandClaim::Conflict => panic!("matching replay fingerprint should not conflict"),
     };
 
@@ -790,6 +810,35 @@ async fn session_replay_claims_wait_until_owner_releases_and_can_be_reclaimed() 
     assert!(matches!(
         state.claim_replay_command("cmd-1", "fingerprint-1".to_string()),
         ReplayCommandClaim::Owner
+    ));
+}
+
+#[tokio::test]
+async fn session_spent_replay_claim_survives_cached_response_eviction() {
+    let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
+    state.mark_replay_command_spent("cmd-1", "fingerprint-1");
+    state
+        .cache_response(
+            "cmd-1".to_string(),
+            "fingerprint-1".to_string(),
+            IpcResponse::success("req-1", serde_json::json!({ "ok": true })),
+        )
+        .await;
+
+    assert!(matches!(
+        state.claim_replay_command("cmd-1", "fingerprint-1".to_string()),
+        ReplayCommandClaim::Cached(_)
+    ));
+
+    state.evict_cached_replay_response_for_test("cmd-1");
+
+    assert!(matches!(
+        state.claim_replay_command("cmd-1", "fingerprint-1".to_string()),
+        ReplayCommandClaim::SpentWithoutCachedResponse
+    ));
+    assert!(matches!(
+        state.claim_replay_command("cmd-1", "fingerprint-2".to_string()),
+        ReplayCommandClaim::Conflict
     ));
 }
 
@@ -1746,6 +1795,39 @@ async fn stale_orchestration_runtime_sequence_does_not_override_newer_projection
 }
 
 #[tokio::test]
+async fn degraded_orchestration_runtime_clears_stale_known_sessions() {
+    let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
+    let current_session_id = state.session_id.clone();
+    let current_session_name = state.session_name.clone();
+    let sessions = vec![
+        crate::orchestration_runtime::projected_orchestration_session(
+            current_session_id,
+            current_session_name,
+            42,
+            "/tmp/rub-current.sock".to_string(),
+            true,
+            "1.0".to_string(),
+            None,
+        ),
+    ];
+
+    state.set_orchestration_runtime(1, sessions, None).await;
+    state
+        .mark_orchestration_runtime_degraded(2, "registry_read_failed:test")
+        .await;
+
+    let runtime = state.orchestration_runtime().await;
+    assert_eq!(
+        runtime.degraded_reason.as_deref(),
+        Some("registry_read_failed:test")
+    );
+    assert!(!runtime.addressing_supported);
+    assert!(!runtime.execution_supported);
+    assert!(runtime.known_sessions.is_empty());
+    assert_eq!(runtime.session_count, 0);
+}
+
+#[tokio::test]
 async fn handoff_projection_defaults_to_unavailable_and_drives_readiness_flag() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
     let initial = state.human_verification_handoff().await;
@@ -1863,12 +1945,29 @@ async fn degraded_request_rules_drive_integration_runtime_status_and_surface() {
 #[test]
 fn external_dom_change_respects_transaction_fence() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
-    assert_eq!(state.observe_external_dom_change(), Some(1));
+    assert_eq!(state.observe_external_dom_change(Some("target-1")), Some(1));
     state.in_flight_count.store(1, Ordering::SeqCst);
-    assert_eq!(state.observe_external_dom_change(), None);
+    assert_eq!(state.observe_external_dom_change(Some("target-1")), None);
     assert_eq!(state.current_epoch(), 1);
     assert!(state.take_pending_external_dom_change());
     assert!(!state.take_pending_external_dom_change());
+}
+
+#[test]
+fn external_dom_change_tracks_target_scoped_pending_authority() {
+    let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
+    state.in_flight_count.store(1, Ordering::SeqCst);
+    assert_eq!(state.observe_external_dom_change(Some("target-1")), None);
+    assert!(state.pending_external_dom_change_affects_target(Some("target-1")));
+    assert!(!state.pending_external_dom_change_affects_target(Some("target-2")));
+
+    state.mark_pending_external_dom_change();
+    assert!(state.pending_external_dom_change_affects_target(Some("target-2")));
+
+    let pending_scope = state.take_pending_external_dom_change_scope();
+    assert!(pending_scope.affects_target(Some("target-1")));
+    assert!(pending_scope.affects_target(Some("target-2")));
+    assert!(!state.has_pending_external_dom_change());
 }
 
 #[tokio::test]

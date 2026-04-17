@@ -144,11 +144,11 @@ mod tests {
         let trigger = state
             .record_outcome(
                 7,
-                TriggerStatus::Fired,
                 trigger.last_condition_evidence.clone(),
                 TriggerResultInfo {
                     trigger_id: 7,
                     status: TriggerStatus::Fired,
+                    next_status: TriggerStatus::Fired,
                     summary: "trigger action executed".to_string(),
                     command_id: None,
                     action: None,
@@ -172,6 +172,50 @@ mod tests {
         assert_eq!(trace.events.len(), 1);
         assert_eq!(trace.events[0].kind, TriggerEventKind::Fired);
         assert_eq!(trace.events[0].trigger_id, Some(7));
+    }
+
+    #[test]
+    fn trigger_failure_outcome_preserves_armed_lifecycle_while_recording_blocked_result() {
+        let mut state = TriggerRuntimeState::default();
+        state.replace(vec![trigger(14, TriggerStatus::Armed)]);
+
+        let trigger = state
+            .record_outcome(
+                14,
+                None,
+                TriggerResultInfo {
+                    trigger_id: 14,
+                    status: TriggerStatus::Blocked,
+                    next_status: TriggerStatus::Armed,
+                    summary: "trigger action blocked".to_string(),
+                    command_id: None,
+                    action: None,
+                    result: None,
+                    error_code: Some(rub_core::error::ErrorCode::InvalidInput),
+                    reason: Some("invalid_action".to_string()),
+                    consumed_evidence_fingerprint: None,
+                },
+            )
+            .expect("outcome");
+
+        assert_eq!(trigger.status, TriggerStatus::Armed);
+        assert_eq!(
+            trigger
+                .last_action_result
+                .as_ref()
+                .map(|result| result.status),
+            Some(TriggerStatus::Blocked)
+        );
+        assert_eq!(
+            trigger
+                .last_action_result
+                .as_ref()
+                .map(|result| result.next_status),
+            Some(TriggerStatus::Armed)
+        );
+        let trace = state.trace(10);
+        assert_eq!(trace.events.len(), 1);
+        assert_eq!(trace.events[0].kind, TriggerEventKind::Blocked);
     }
 
     #[test]
@@ -270,7 +314,6 @@ mod tests {
         let trigger = state
             .record_outcome(
                 11,
-                TriggerStatus::Armed,
                 Some(TriggerEvidenceInfo {
                     summary: "source_tab_text_present:Ready".to_string(),
                     fingerprint: Some("Ready".to_string()),
@@ -278,6 +321,7 @@ mod tests {
                 TriggerResultInfo {
                     trigger_id: 11,
                     status: TriggerStatus::Degraded,
+                    next_status: TriggerStatus::Armed,
                     summary: "trigger action failed: BROWSER_CRASHED: Trigger target continuity fence failed: frame context became unavailable".to_string(),
                     command_id: None,
                     action: None,
@@ -333,11 +377,11 @@ mod tests {
         let projection = state
             .record_outcome(
                 12,
-                TriggerStatus::Armed,
                 None,
                 TriggerResultInfo {
                     trigger_id: 12,
                     status: TriggerStatus::Blocked,
+                    next_status: TriggerStatus::Armed,
                     summary: "trigger action failed".to_string(),
                     command_id: None,
                     action: None,
@@ -372,7 +416,6 @@ mod tests {
         let trigger = state
             .record_outcome(
                 13,
-                TriggerStatus::Armed,
                 Some(TriggerEvidenceInfo {
                     summary: "network_request_matched:req-13".to_string(),
                     fingerprint: Some("req-13".to_string()),
@@ -380,6 +423,7 @@ mod tests {
                 TriggerResultInfo {
                     trigger_id: 13,
                     status: TriggerStatus::Blocked,
+                    next_status: TriggerStatus::Armed,
                     summary: "trigger action failed".to_string(),
                     command_id: Some("trigger:13:abcd".to_string()),
                     action: None,

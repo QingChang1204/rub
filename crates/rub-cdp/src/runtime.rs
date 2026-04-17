@@ -8,7 +8,9 @@ use tokio::time::{Duration, Instant, sleep};
 
 use crate::browser::BrowserLaunchOptions;
 use crate::identity_policy::IdentityPolicy;
-use crate::managed_browser::{is_profile_in_use, resolve_managed_profile_dir};
+use crate::managed_browser::{
+    is_profile_in_use, prepare_managed_profile_ownership_prelaunch, resolve_managed_profile_dir,
+};
 
 pub(crate) async fn launch_managed_browser(
     options: &BrowserLaunchOptions,
@@ -211,7 +213,10 @@ pub(crate) fn select_attached_page_index(
 }
 
 fn classify_managed_launch_error(options: &BrowserLaunchOptions, error: &str) -> RubError {
-    let profile = resolve_managed_profile_dir(options.user_data_dir.clone());
+    let profile = resolve_managed_profile_dir(
+        options.user_data_dir.clone(),
+        options.managed_profile_ephemeral,
+    );
     let context = serde_json::json!({
         "user_data_dir": profile.path.display().to_string(),
     });
@@ -265,7 +270,11 @@ fn build_managed_config_with_executable(
         config_builder = config_builder.arg("--ignore-certificate-errors");
     }
 
-    let profile = resolve_managed_profile_dir(options.user_data_dir.clone());
+    let profile = resolve_managed_profile_dir(
+        options.user_data_dir.clone(),
+        options.managed_profile_ephemeral,
+    );
+    prepare_managed_profile_ownership_prelaunch(&profile)?;
     config_builder = config_builder
         .user_data_dir(profile.path)
         .arg("--rub-managed-browser=1")
@@ -324,6 +333,7 @@ mod tests {
             headless,
             ignore_cert_errors: false,
             user_data_dir: None,
+            managed_profile_ephemeral: false,
             download_dir: None,
             profile_directory: None,
             hide_infobars: true,

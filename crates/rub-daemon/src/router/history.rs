@@ -55,7 +55,11 @@ pub(super) async fn cmd_history(
         return export_script_history(state, last, from, to, include_observation).await;
     }
 
-    let projection = state.command_history(last).await;
+    let projection = if from.is_some() || to.is_some() {
+        state.command_history_range(from, to).await
+    } else {
+        state.command_history(last).await
+    };
     let items = serde_json::to_value(&projection.entries).map_err(RubError::from)?;
     Ok(serde_json::json!({
         "subject": history_subject(last, from, to),
@@ -73,6 +77,7 @@ mod tests {
     use super::cmd_history;
     use super::export::{export_pipe_history, export_script_history};
     use crate::session::SessionState;
+    use crate::workflow_capture::WorkflowCaptureDeliveryState;
     use rub_ipc::protocol::IpcRequest;
     use std::sync::Arc;
 
@@ -211,6 +216,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_history_non_export_mode_honors_from_to_range() {
+        let home =
+            std::env::temp_dir().join(format!("rub-history-export-{}-range", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+        let state = Arc::new(SessionState::new("default", home, None));
+
+        for index in 0..4 {
+            let request = IpcRequest::new(
+                "open",
+                serde_json::json!({ "url": format!("https://example.com/{index}") }),
+                1_000,
+            );
+            let response = rub_ipc::protocol::IpcResponse::success(
+                format!("req-{index}"),
+                serde_json::json!({}),
+            );
+            state.record_command_history(&request, &response).await;
+        }
+
+        let history = cmd_history(&serde_json::json!({ "from": 2, "to": 3 }), &state)
+            .await
+            .expect("history command succeeds");
+        let items = history["result"]["items"]
+            .as_array()
+            .expect("history items should be an array");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["sequence"], serde_json::json!(2));
+        assert_eq!(items[1]["sequence"], serde_json::json!(3));
+    }
+
+    #[tokio::test]
     async fn export_pipe_history_redacts_args_with_current_secret_sources() {
         #[cfg(unix)]
         {
@@ -321,6 +358,44 @@ mod tests {
         );
         assert_eq!(exported["result"]["entries"][0]["command"], "type");
         assert_eq!(exported["result"]["entries"][1]["command"], "click");
+    }
+
+    #[tokio::test]
+    async fn export_pipe_history_surfaces_delivery_failed_after_commit_source_metadata() {
+        let home = std::env::temp_dir().join(format!(
+            "rub-history-export-{}-delivery-failure",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+        let state = Arc::new(SessionState::new("default", home, None));
+
+        let request = IpcRequest::new(
+            "open",
+            serde_json::json!({ "url": "https://example.com" }),
+            1_000,
+        )
+        .with_command_id("cmd-1")
+        .expect("static command_id must be valid");
+        let response =
+            rub_ipc::protocol::IpcResponse::success("req-1", serde_json::json!({ "ok": true }))
+                .with_command_id("cmd-1")
+                .expect("static command_id must be valid");
+        state
+            .record_workflow_capture_with_state(
+                &request,
+                &response,
+                WorkflowCaptureDeliveryState::DeliveryFailedAfterCommit,
+            )
+            .await;
+
+        let exported = export_pipe_history(&state, 10, None, None, false)
+            .await
+            .expect("export succeeds");
+        assert_eq!(
+            exported["result"]["entries"][0]["source"]["delivery_state"],
+            serde_json::json!("delivery_failed_after_commit")
+        );
     }
 
     #[tokio::test]

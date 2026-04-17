@@ -1,8 +1,11 @@
 use crate::binding_ctl::binding_path_state;
 use crate::commands::{EffectiveCli, SecretSubcommand};
-use rub_core::error::{ErrorCode, RubError};
+use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
+use rub_core::fs::FileCommitOutcome;
 use rub_core::model::CommandResult;
-use rub_core::secrets_env::{SecretEffectiveSource, is_valid_secret_name};
+use rub_core::secrets_env::{
+    SecretEffectiveSource, SecretsEnvPersistOutcome, is_valid_secret_name,
+};
 use rub_daemon::rub_paths::RubPaths;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -14,9 +17,7 @@ mod input;
 mod store;
 
 use self::input::{SecretInputMode, resolve_secret_input_value, secret_input_mode};
-use self::store::{
-    load_secret_store_unlocked, open_secret_lock, persist_secret_store_unlocked, read_secret_store,
-};
+use self::store::{update_secret_store, with_secret_store};
 
 pub(crate) fn handle_secret_command(
     cli: &EffectiveCli,
@@ -51,59 +52,61 @@ pub(crate) fn handle_secret_command(
 }
 
 fn project_secret_list(rub_home: &Path) -> Result<Value, RubError> {
-    let secrets = read_secret_store(rub_home)?;
-    let items = secrets
-        .keys()
-        .map(|name| {
-            let environment_override_present = secret_environment_override_present(name);
-            json!({
-                "name": name,
-                "source": "rub_home_secrets_env",
-                "effective_source": effective_secret_source(true, environment_override_present),
-                "environment_override_present": environment_override_present,
+    with_secret_store(rub_home, |secrets| {
+        let items = secrets
+            .keys()
+            .map(|name| {
+                let environment_override_present = secret_environment_override_present(name);
+                json!({
+                    "name": name,
+                    "source": "rub_home_secrets_env",
+                    "effective_source": effective_secret_source(true, environment_override_present),
+                    "environment_override_present": environment_override_present,
+                })
             })
-        })
-        .collect::<Vec<_>>();
+            .collect::<Vec<_>>();
 
-    Ok(json!({
-        "subject": secret_registry_subject(rub_home),
-        "result": {
-            "schema_version": SECRET_REGISTRY_SCHEMA_VERSION,
-            "count": items.len(),
-            "items": items,
-        }
-    }))
+        Ok(json!({
+            "subject": secret_registry_subject(rub_home),
+            "result": {
+                "schema_version": SECRET_REGISTRY_SCHEMA_VERSION,
+                "count": items.len(),
+                "items": items,
+            }
+        }))
+    })
 }
 
 fn inspect_secret_value(rub_home: &Path, name: &str) -> Result<Value, RubError> {
     let name = normalize_secret_name(name)?;
-    let secrets = read_secret_store(rub_home)?;
-    let local_store_present = secrets.contains_key(&name);
-    let environment_override_present = secret_environment_override_present(&name);
-    let effective_source =
-        effective_secret_source(local_store_present, environment_override_present);
+    with_secret_store(rub_home, |secrets| {
+        let local_store_present = secrets.contains_key(&name);
+        let environment_override_present = secret_environment_override_present(&name);
+        let effective_source =
+            effective_secret_source(local_store_present, environment_override_present);
 
-    if matches!(effective_source, SecretEffectiveSource::Unresolved) {
-        return Err(secret_name_not_found_error(rub_home, &name));
-    }
-
-    Ok(json!({
-        "subject": secret_subject(rub_home, &name),
-        "result": {
-            "secret": {
-                "name": name,
-                "reference": format!("${name}"),
-                "local_store_present": local_store_present,
-                "environment_override_present": environment_override_present,
-                "effective_source": effective_source,
-                "store_source": if local_store_present {
-                    Some("rub_home_secrets_env")
-                } else {
-                    None::<&str>
-                },
-            }
+        if matches!(effective_source, SecretEffectiveSource::Unresolved) {
+            return Err(secret_name_not_found_error(rub_home, &name));
         }
-    }))
+
+        Ok(json!({
+            "subject": secret_subject(rub_home, &name),
+            "result": {
+                "secret": {
+                    "name": name,
+                    "reference": format!("${name}"),
+                    "local_store_present": local_store_present,
+                    "environment_override_present": environment_override_present,
+                    "effective_source": effective_source,
+                    "store_source": if local_store_present {
+                        Some("rub_home_secrets_env")
+                    } else {
+                        None::<&str>
+                    },
+                }
+            }
+        }))
+    })
 }
 
 fn set_secret_value(
@@ -117,48 +120,50 @@ fn set_secret_value(
     let input_mode = secret_input_mode(inline_value, from_env, stdin)?;
     let resolved_value = resolve_secret_input_value(input_mode, inline_value, from_env)?;
 
-    let _lock = open_secret_lock(rub_home, true)?;
-    let mut secrets = load_secret_store_unlocked(rub_home)?;
-    let action = if secrets.contains_key(&name) {
-        "updated"
-    } else {
-        "created"
-    };
-    secrets.insert(name.clone(), resolved_value);
-    persist_secret_store_unlocked(rub_home, &secrets)?;
+    let (mut payload, persist_outcome) = update_secret_store(rub_home, |secrets| {
+        let action = if secrets.contains_key(&name) {
+            "updated"
+        } else {
+            "created"
+        };
+        secrets.insert(name.clone(), resolved_value);
 
-    Ok(json!({
-        "subject": secret_subject(rub_home, &name),
-        "result": {
-            "action": action,
-            "secret": {
-                "name": name,
-                "source": "rub_home_secrets_env",
-            },
-            "input_mode": match input_mode {
-                SecretInputMode::InlineValue => "inline_value",
-                SecretInputMode::Environment => "environment",
-                SecretInputMode::Stdin => "stdin",
-            },
-        }
-    }))
+        Ok(json!({
+            "subject": secret_subject(rub_home, &name),
+            "result": {
+                "action": action,
+                "secret": {
+                    "name": name,
+                    "source": "rub_home_secrets_env",
+                },
+                "input_mode": match input_mode {
+                    SecretInputMode::InlineValue => "inline_value",
+                    SecretInputMode::Environment => "environment",
+                    SecretInputMode::Stdin => "stdin",
+                },
+            }
+        }))
+    })?;
+    annotate_secret_registry_persistence(&mut payload, persist_outcome);
+    Ok(payload)
 }
 
 fn remove_secret_value(rub_home: &Path, name: &str) -> Result<Value, RubError> {
     let name = normalize_secret_name(name)?;
-    let _lock = open_secret_lock(rub_home, true)?;
-    let mut secrets = load_secret_store_unlocked(rub_home)?;
-    if secrets.remove(&name).is_none() {
-        return Err(secret_name_not_found_error(rub_home, &name));
-    }
-    persist_secret_store_unlocked(rub_home, &secrets)?;
-
-    Ok(json!({
-        "subject": secret_subject(rub_home, &name),
-        "result": {
-            "removed_name": name,
+    let (mut payload, persist_outcome) = update_secret_store(rub_home, |secrets| {
+        if secrets.remove(&name).is_none() {
+            return Err(secret_name_not_found_error(rub_home, &name));
         }
-    }))
+
+        Ok(json!({
+            "subject": secret_subject(rub_home, &name),
+            "result": {
+                "removed_name": name,
+            }
+        }))
+    })?;
+    annotate_secret_registry_persistence(&mut payload, persist_outcome);
+    Ok(payload)
 }
 
 fn normalize_secret_name(name: &str) -> Result<String, RubError> {
@@ -264,9 +269,38 @@ fn secret_environment_override_present(name: &str) -> bool {
     std::env::var_os(name).is_some()
 }
 
+fn annotate_secret_registry_persistence(payload: &mut Value, outcome: SecretsEnvPersistOutcome) {
+    let Some(result) = payload.get_mut("result").and_then(Value::as_object_mut) else {
+        return;
+    };
+
+    let durability = match outcome.durability() {
+        Some(FileCommitOutcome::Durable) => "durable",
+        Some(FileCommitOutcome::Published) => "published",
+        None => "not_applicable",
+    };
+    result.insert(
+        "projection_state".to_string(),
+        json!({
+            "truth_level": "local_persistence_projection",
+            "projection_kind": "cli_secret_registry_mutation",
+            "projection_authority": "cli.secret.registry_persistence",
+            "upstream_commit_truth": "secrets_env_mutation_attempt",
+            "control_role": "display_only",
+            "durability": durability,
+            "persist_action": outcome.action(),
+        }),
+    );
+    if matches!(outcome.durability(), Some(FileCommitOutcome::Published)) {
+        result.insert("durability_confirmed".to_string(), Value::Bool(false));
+    }
+}
+
 pub(super) fn secret_registry_io_error(
     rub_home: &Path,
     path: &Path,
+    path_authority: &str,
+    path_kind: &str,
     reason: &str,
     error: std::io::Error,
 ) -> RubError {
@@ -277,13 +311,52 @@ pub(super) fn secret_registry_io_error(
             "rub_home": rub_home.display().to_string(),
             "path": path.display().to_string(),
             "path_state": secret_path_state(
-                "cli.secret.subject.lock_path",
+                path_authority,
                 "cli_secret_registry",
-                "secrets_env_lock",
+                path_kind,
             ),
             "reason": reason,
         }),
     )
+}
+
+pub(super) fn secret_registry_error(
+    rub_home: &Path,
+    path: &Path,
+    path_authority: &str,
+    path_kind: &str,
+    reason: &str,
+    error: RubError,
+) -> RubError {
+    let mut envelope = error.into_envelope();
+    let mut context = match envelope.context.take() {
+        Some(serde_json::Value::Object(existing)) => existing,
+        Some(other) => {
+            let mut object = serde_json::Map::new();
+            object.insert("previous_context".to_string(), other);
+            object
+        }
+        None => serde_json::Map::new(),
+    };
+    context.insert(
+        "rub_home".to_string(),
+        json!(rub_home.display().to_string()),
+    );
+    context.insert("path".to_string(), json!(path.display().to_string()));
+    context.insert(
+        "path_state".to_string(),
+        serde_json::to_value(secret_path_state(
+            path_authority,
+            "cli_secret_registry",
+            path_kind,
+        ))
+        .unwrap_or_else(|_| json!({})),
+    );
+    context.insert("reason".to_string(), json!(reason));
+    RubError::Domain(ErrorEnvelope {
+        context: Some(serde_json::Value::Object(context)),
+        ..envelope
+    })
 }
 
 #[cfg(test)]

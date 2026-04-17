@@ -74,7 +74,8 @@ mod tests {
     use super::temp_runtime::{
         TempDaemonProcess, cleanup_temp_daemon_registry_state, daemon_process_matches_authority,
         extract_temp_browser_root, is_rub_daemon_command, is_temp_rub_home,
-        orphan_temp_browser_roots, revalidated_temp_daemon_tree, temp_daemon_processes,
+        orphan_temp_browser_roots, revalidated_temp_daemon_tree, root_has_live_browser_process,
+        temp_daemon_processes,
     };
     use super::upgrade_probe::{cleanup_upgrade_status_error, fetch_upgrade_status_for_session};
     use rub_core::error::ErrorCode;
@@ -210,6 +211,7 @@ mod tests {
             session_name: "default".to_string(),
             session_id: "sess-old".to_string(),
             rub_home: PathBuf::from("/tmp/rub-home"),
+            user_data_dir: None,
         };
         let matching = ProcessInfo {
             pid: 42,
@@ -296,6 +298,7 @@ mod tests {
             session_name: "default".to_string(),
             session_id: "sess-old".to_string(),
             rub_home: temp_home.clone(),
+            user_data_dir: None,
         });
 
         let registry = rub_daemon::session::read_registry(&temp_home).unwrap();
@@ -408,7 +411,7 @@ mod tests {
         let pid = 400_000u32 + (uuid::Uuid::now_v7().as_u128() % 100_000) as u32;
         let root = std::env::temp_dir().join(format!("rub-chrome-{pid}"));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        rub_core::managed_profile::sync_temp_owned_managed_profile_marker(&root, true).unwrap();
 
         let orphan_roots = orphan_temp_browser_roots(&[]);
         assert!(
@@ -417,6 +420,53 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn orphan_temp_browser_roots_include_session_scoped_profile_dirs_without_live_owner() {
+        let root =
+            rub_core::managed_profile::projected_managed_profile_path_for_session("sess-orphan");
+        let _ = std::fs::remove_dir_all(&root);
+        rub_core::managed_profile::sync_temp_owned_managed_profile_marker(&root, true).unwrap();
+
+        let orphan_roots = orphan_temp_browser_roots(&[]);
+        assert!(
+            orphan_roots.contains(&root),
+            "cleanup sweep should discover session-scoped managed browser profile residue without relying on pid-shaped directory names"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn orphan_temp_browser_roots_ignore_explicit_durable_tmp_profile_shape_without_marker() {
+        let root = std::env::temp_dir().join("rub-chrome-my-workspace");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let orphan_roots = orphan_temp_browser_roots(&[]);
+        assert!(
+            !orphan_roots.contains(&root),
+            "cleanup sweep must not authorize deletion from path shape alone"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn root_has_live_browser_process_treats_tmp_aliases_as_same_profile_authority() {
+        let snapshot = vec![ProcessInfo {
+            pid: 42,
+            ppid: 1,
+            command:
+                r#"chrome --type=browser --user-data-dir="/private/tmp/rub-chrome-session-alias""#
+                    .to_string(),
+        }];
+        let alias_root = PathBuf::from("/tmp/rub-chrome-session-alias");
+        assert!(
+            root_has_live_browser_process(&snapshot, &alias_root),
+            "liveness fence must compare managed profile aliases by normalized identity, not raw path strings"
+        );
     }
 
     #[tokio::test]

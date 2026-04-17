@@ -1,5 +1,6 @@
 //! Browser launch, tab projection, and health checking.
 
+mod control;
 mod runtime_authority;
 mod runtime_callbacks;
 #[cfg(test)]
@@ -7,14 +8,19 @@ mod tests;
 
 use chromiumoxide::Page;
 use chromiumoxide::browser::Browser;
+use chromiumoxide::cdp::browser_protocol::browser::GetVersionParams;
 use chromiumoxide::cdp::browser_protocol::target::{
     CloseTargetParams, EventTargetCreated, EventTargetDestroyed, EventTargetInfoChanged, TargetId,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{
+    Arc, RwLock as StdRwLock,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::Mutex;
-use tracing::info;
+use tokio::time::{Duration, timeout};
+use tracing::{info, warn};
 
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{
@@ -33,11 +39,15 @@ use crate::{
         ListenerGeneration, ListenerGenerationRx, ListenerGenerationTx,
         new_listener_generation_channel,
     },
-    managed_browser::{resolve_managed_profile_dir, shutdown_managed_browser},
+    managed_browser::{
+        ManagedProfileDir, projected_managed_profile_path_for_scope, resolve_managed_profile_dir,
+        shutdown_managed_browser,
+    },
     network_rules::NetworkRuleRuntime,
     request_correlation::RequestCorrelationRegistry,
     runtime_observatory::ObservatoryCallbacks,
     runtime_state::RuntimeStateCallbacks,
+    tab_projection::{CommittedTabProjection, LocalActiveTargetAuthority},
 };
 
 pub use crate::attachment::{CdpCandidate, discover_local_cdp};
@@ -47,6 +57,7 @@ pub struct BrowserLaunchOptions {
     pub headless: bool,
     pub ignore_cert_errors: bool,
     pub user_data_dir: Option<PathBuf>,
+    pub managed_profile_ephemeral: bool,
     pub download_dir: Option<PathBuf>,
     pub profile_directory: Option<String>,
     pub hide_infobars: bool,
@@ -60,9 +71,10 @@ pub struct BrowserLaunchOptions {
 pub struct BrowserManager {
     browser: Arc<Mutex<Option<Arc<Browser>>>>,
     launch_lock: Arc<Mutex<()>>,
-    page: Arc<Mutex<Option<Arc<Page>>>>,
-    pages: Arc<Mutex<Vec<Arc<Page>>>>,
-    active_target_id: Arc<Mutex<Option<TargetId>>>,
+    authority_commit_in_progress: Arc<AtomicBool>,
+    tab_projection: Arc<Mutex<CommittedTabProjection>>,
+    managed_profile: Arc<Mutex<Option<ManagedProfileDir>>>,
+    local_active_target_authority: Arc<Mutex<Option<LocalActiveTargetAuthority>>>,
     page_hook_states: Arc<Mutex<HashMap<String, PageHookInstallState>>>,
     options: BrowserLaunchOptions,
     headless_mode: StdRwLock<bool>,
@@ -88,6 +100,20 @@ pub struct BrowserManager {
     launch_policy_projection: Arc<StdRwLock<LaunchPolicyProjection>>,
     #[cfg(test)]
     force_reconcile_runtime_callbacks_failure: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    force_previous_authority_release_failure: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    force_current_authority_release_failure: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    force_generation_bound_runtime_reconcile_failure: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    force_managed_profile_ownership_commit_failure: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    pause_authority_commit_after_projection: Arc<AtomicBool>,
+    #[cfg(test)]
+    authority_commit_projected: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    resume_authority_commit: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -97,20 +123,27 @@ struct LaunchPolicyProjection {
 }
 
 impl BrowserManager {
-    pub fn new(options: BrowserLaunchOptions) -> Self {
+    pub fn new(mut options: BrowserLaunchOptions) -> Self {
+        let identity_seed = crate::fingerprint_profile::generate_session_seed();
+        if options.user_data_dir.is_none() {
+            options.user_data_dir = Some(projected_managed_profile_path_for_scope(&format!(
+                "manager-{identity_seed:016x}"
+            )));
+            options.managed_profile_ephemeral = true;
+        }
         let identity_policy = IdentityPolicy::from_options(&options);
         let initial_identity_coverage = IdentityCoverageRegistry::new(&identity_policy);
         let initial_stealth_coverage = initial_identity_coverage.project();
         let identity_coverage = Arc::new(Mutex::new(initial_identity_coverage));
         let initial_headless = options.headless;
-        let identity_seed = crate::fingerprint_profile::generate_session_seed();
         let (listener_generation_tx, _) = new_listener_generation_channel();
         Self {
             browser: Arc::new(Mutex::new(None)),
             launch_lock: Arc::new(Mutex::new(())),
-            page: Arc::new(Mutex::new(None)),
-            pages: Arc::new(Mutex::new(Vec::new())),
-            active_target_id: Arc::new(Mutex::new(None)),
+            authority_commit_in_progress: Arc::new(AtomicBool::new(false)),
+            tab_projection: Arc::new(Mutex::new(CommittedTabProjection::empty())),
+            managed_profile: Arc::new(Mutex::new(None)),
+            local_active_target_authority: Arc::new(Mutex::new(None)),
             page_hook_states: Arc::new(Mutex::new(HashMap::new())),
             options,
             headless_mode: StdRwLock::new(initial_headless),
@@ -139,7 +172,38 @@ impl BrowserManager {
             force_reconcile_runtime_callbacks_failure: Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
+            #[cfg(test)]
+            force_previous_authority_release_failure: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+            #[cfg(test)]
+            force_current_authority_release_failure: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+            #[cfg(test)]
+            force_generation_bound_runtime_reconcile_failure: Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
+            #[cfg(test)]
+            force_managed_profile_ownership_commit_failure: Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
+            #[cfg(test)]
+            pause_authority_commit_after_projection: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            authority_commit_projected: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            resume_authority_commit: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    fn authority_commit_in_progress(&self) -> bool {
+        self.authority_commit_in_progress.load(Ordering::SeqCst)
+    }
+
+    fn set_authority_commit_in_progress(&self, in_progress: bool) {
+        self.authority_commit_in_progress
+            .store(in_progress, Ordering::SeqCst);
     }
 
     fn current_headless(&self) -> bool {
@@ -221,8 +285,24 @@ impl BrowserManager {
     async fn ensure_browser_locked(&self) -> Result<(), RubError> {
         {
             let browser_guard = self.browser.lock().await;
-            if browser_guard.is_some() {
-                return Ok(());
+            if let Some(browser) = browser_guard.clone() {
+                drop(browser_guard);
+                let browser_live = timeout(
+                    Duration::from_secs(2),
+                    browser.execute(GetVersionParams::default()),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .is_some();
+                if browser_live {
+                    return Ok(());
+                }
+                warn!(
+                    "Existing browser authority became unavailable; clearing stale handle and relaunching"
+                );
+                self.bump_listener_generation();
+                self.clear_local_browser_authority().await;
             }
         }
 
@@ -230,11 +310,12 @@ impl BrowserManager {
         let install = self
             .resolve_browser_authority_install(existing_target)
             .await?;
-        self.install_runtime_state(
+        self.install_runtime_state_locked(
             install.browser,
             install.page,
             install.is_external,
             install.connection_target,
+            install.managed_profile,
         )
         .await?;
 
@@ -243,8 +324,8 @@ impl BrowserManager {
     }
 
     /// Set callback for epoch increment on CDP events.
-    pub async fn set_epoch_callback(&self, callback: Box<dyn Fn() + Send + Sync>) {
-        *self.epoch_callback.lock().await = Some(Arc::new(callback));
+    pub async fn set_epoch_callback(&self, callback: EpochCallback) {
+        *self.epoch_callback.lock().await = Some(callback);
     }
 
     /// Set callback sinks for runtime observability event projection.
@@ -347,10 +428,11 @@ impl BrowserManager {
     /// Replace the current browser-side mirror of the session-scoped network
     /// rule list and resync Fetch interception across active pages.
     pub async fn sync_network_rules(&self, rules: Vec<NetworkRule>) -> Result<(), RubError> {
-        self.ensure_browser().await?;
+        let _launch_guard = self.launch_lock.lock().await;
+        self.ensure_browser_locked().await?;
         self.network_rule_runtime.write().await.replace_rules(rules);
         self.sync_tabs_projection().await?;
-        let pages = self.pages.lock().await.clone();
+        let pages = self.tab_projection.lock().await.pages.clone();
         crate::network_rules::sync_fetch_domain_for_pages(&pages, self.network_rule_runtime.clone())
             .await
     }
@@ -361,18 +443,27 @@ impl BrowserManager {
         self.update_connection_target_projection(Some(target));
     }
 
+    #[cfg(test)]
+    pub(super) async fn managed_profile_authority_for_test(&self) -> Option<ManagedProfileDir> {
+        self.managed_profile.lock().await.clone()
+    }
+
     pub fn launch_policy_info(&self) -> LaunchPolicyInfo {
         let cached_projection = self
             .launch_policy_projection
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let connection_target = self
-            .connection_target
-            .try_lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .or(cached_projection.connection_target.clone());
+        let authority_commit_in_progress = self.authority_commit_in_progress();
+        let connection_target = if authority_commit_in_progress {
+            cached_projection.connection_target.clone()
+        } else {
+            self.connection_target
+                .try_lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .or(cached_projection.connection_target.clone())
+        };
         let options = self.current_options();
         let stealth_cfg = self.current_identity_policy().stealth_config();
         let stealth_patches = crate::tab_projection::projected_stealth_patch_names(
@@ -399,17 +490,23 @@ impl BrowserManager {
             stealth_default_enabled: Some(options.stealth),
             humanize_enabled: None,
             humanize_speed: None,
-            stealth_coverage: self
-                .identity_coverage
-                .try_lock()
-                .ok()
-                .map(|coverage| coverage.project())
-                .or(cached_projection.stealth_coverage),
+            stealth_coverage: if authority_commit_in_progress {
+                cached_projection.stealth_coverage
+            } else {
+                self.identity_coverage
+                    .try_lock()
+                    .ok()
+                    .map(|coverage| coverage.project())
+                    .or(cached_projection.stealth_coverage)
+            },
         }
     }
 
     /// Whether this manager is connected to an external browser.
     pub async fn is_external(&self) -> bool {
+        if self.authority_commit_in_progress() {
+            let _launch_guard = self.launch_lock.lock().await;
+        }
         *self.is_external.lock().await
     }
 
@@ -424,7 +521,7 @@ impl BrowserManager {
     ) -> Result<(), RubError> {
         let _launch_guard = self.launch_lock.lock().await;
         let (browser, page, connect_url) = crate::runtime::attach_external_browser(url).await?;
-        self.replace_browser_authority(browser, page, true, Some(target))
+        self.replace_browser_authority_locked(browser, page, true, Some(target), None)
             .await?;
 
         info!(
@@ -438,330 +535,18 @@ impl BrowserManager {
 
     /// Get the current active page.
     pub async fn page(&self) -> Result<Arc<Page>, RubError> {
-        self.ensure_browser().await?;
-        self.sync_tabs_projection().await?;
-
-        self.page
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| RubError::domain(ErrorCode::BrowserCrashed, "No active page"))
-    }
-
-    /// Handle a pending dialog on the page authority that actually surfaced it.
-    ///
-    /// Dialog runtime is session-scoped for projection convenience, but dialog
-    /// actuation must still bind back to the originating page target. Falling
-    /// back to the current active page would allow a background-tab dialog to
-    /// be accepted or dismissed against the wrong page authority.
-    pub async fn handle_dialog(
-        &self,
-        accept: bool,
-        prompt_text: Option<String>,
-    ) -> Result<(), RubError> {
-        let target_id = crate::dialogs::pending_dialog(&self.dialog_runtime())
-            .await
-            .and_then(|dialog| dialog.tab_target_id);
-        let page = if let Some(target_id) = target_id {
-            self.page_for_target_id(&target_id).await.map_err(|error| {
-                RubError::domain_with_context(
-                    ErrorCode::InvalidInput,
-                    format!("Pending JavaScript dialog target '{target_id}' is no longer live"),
-                    serde_json::json!({
-                        "pending_dialog_target_id": target_id,
-                        "reason": error.to_string(),
-                    }),
-                )
-            })?
-        } else {
-            self.page().await?
-        };
-        crate::dialogs::handle_dialog(&page, accept, prompt_text).await
-    }
-
-    /// Get one live page handle by stable target identity without mutating the
-    /// active-tab authority.
-    pub async fn page_for_target_id(&self, target_id: &str) -> Result<Arc<Page>, RubError> {
-        self.ensure_browser().await?;
-        self.sync_tabs_projection().await?;
-
-        self.pages
-            .lock()
-            .await
-            .iter()
-            .find(|page| page.target_id().as_ref() == target_id)
-            .cloned()
-            .ok_or_else(|| {
-                RubError::domain(
-                    ErrorCode::TabNotFound,
-                    format!("Tab target '{target_id}' is not present in the current session"),
-                )
-            })
-    }
-
-    /// Get all pages as TabInfo list.
-    pub async fn tab_list(&self) -> Result<Vec<TabInfo>, RubError> {
-        self.ensure_browser().await?;
-        self.sync_tabs_projection().await?;
-
-        let pages = self.pages.lock().await.clone();
-        let active_target_id = self.active_target_id.lock().await.clone();
-
-        let mut tabs = Vec::with_capacity(pages.len());
-        for (index, page) in pages.iter().enumerate() {
-            tabs.push(
-                crate::tab_projection::tab_info_for_page(
-                    index as u32,
-                    page,
-                    active_target_id.as_ref(),
-                )
-                .await,
-            );
-        }
-        Ok(tabs)
-    }
-
-    /// Switch to a tab by index and mark it as the active tab.
-    pub async fn switch_to_tab(&self, index: u32) -> Result<TabInfo, RubError> {
-        self.ensure_browser().await?;
-        self.sync_tabs_projection().await?;
-
-        let pages = self.pages.lock().await.clone();
-        let idx = index as usize;
-        if idx >= pages.len() {
-            return Err(crate::tab_projection::tab_not_found(index, pages.len()));
-        }
-
-        let target_page = pages[idx].clone();
-        target_page.activate().await.map_err(|e| {
-            RubError::Internal(format!("ActivateTarget failed for tab {index}: {e}"))
-        })?;
-
-        *self.active_target_id.lock().await = Some(target_page.target_id().clone());
-        *self.page.lock().await = Some(target_page.clone());
-        self.sync_tabs_projection().await?;
-
-        Ok(crate::tab_projection::tab_info_for_page(
-            index,
-            &target_page,
-            Some(target_page.target_id()),
-        )
-        .await)
-    }
-
-    /// Close a tab by index. If it is the last tab, create `about:blank` first.
-    pub async fn close_tab_at(&self, index: Option<u32>) -> Result<Vec<TabInfo>, RubError> {
-        self.ensure_browser().await?;
-        self.sync_tabs_projection().await?;
-
-        let pages_before = self.pages.lock().await.clone();
-        let active_before = self.active_target_id.lock().await.clone();
-        let active_index = active_before
-            .as_ref()
-            .and_then(|target| {
-                pages_before
-                    .iter()
-                    .position(|page| page.target_id() == target)
-            })
-            .unwrap_or(0);
-        let idx = index.map(|v| v as usize).unwrap_or(active_index);
-        if idx >= pages_before.len() {
-            return Err(crate::tab_projection::tab_not_found(
-                idx as u32,
-                pages_before.len(),
-            ));
-        }
-
-        let target_page = pages_before[idx].clone();
-        let closing_active = active_before
-            .as_ref()
-            .map(|target| target == target_page.target_id())
-            .unwrap_or(false);
-        if pages_before.len() == 1 {
-            target_page.goto("about:blank").await.map_err(|e| {
-                RubError::Internal(format!("Failed to reset last tab to about:blank: {e}"))
-            })?;
-            *self.active_target_id.lock().await = Some(target_page.target_id().clone());
-            *self.page.lock().await = Some(target_page);
-            return self.tab_list().await;
-        }
-
-        target_page
-            .execute(CloseTargetParams::new(target_page.target_id().clone()))
-            .await
-            .map_err(|e| RubError::Internal(format!("CloseTarget failed: {e}")))?;
-
-        self.sync_tabs_projection().await?;
-
-        let pages_after = self.pages.lock().await.clone();
-        if let Some(active_page) = self
-            .select_active_page_after_close(
-                &pages_after,
-                active_before.as_ref(),
-                closing_active,
-                idx,
-            )
-            .await?
-            && active_page.activate().await.is_ok()
-        {
-            *self.active_target_id.lock().await = Some(active_page.target_id().clone());
-            *self.page.lock().await = Some(active_page);
-        }
-
-        self.tab_list().await
-    }
-
-    /// CDP health check: Browser.getVersion().
-    pub async fn health_check(&self) -> Result<(), RubError> {
-        self.ensure_browser().await?;
-        let browser = self.browser_handle().await?;
-        browser
-            .execute(chromiumoxide::cdp::browser_protocol::browser::GetVersionParams::default())
-            .await
-            .map_err(|e| {
-                RubError::domain(
-                    ErrorCode::BrowserCrashed,
-                    format!("Health check failed: {e}"),
-                )
-            })?;
-        Ok(())
-    }
-
-    /// Recover from a browser crash by clearing local projections and relaunching.
-    pub async fn recover_browser(&self) -> Result<(), RubError> {
         let _launch_guard = self.launch_lock.lock().await;
-        tracing::warn!("Browser crash detected, auto-restarting");
-        self.bump_listener_generation();
-        self.clear_local_browser_authority().await;
-        self.ensure_browser_locked().await
-    }
-
-    /// Close the browser.
-    /// If external, only disconnects the CDP session (browser keeps running).
-    pub async fn close(&self) -> Result<(), RubError> {
-        let _launch_guard = self.launch_lock.lock().await;
-        self.bump_listener_generation();
-        self.release_current_browser_authority().await?;
-        Ok(())
-    }
-
-    /// Relaunch a managed headless browser as a visible managed browser while
-    /// keeping the same session/profile authority.
-    pub async fn elevate_to_visible(&self) -> Result<LaunchPolicyInfo, RubError> {
-        let _launch_guard = self.launch_lock.lock().await;
-        if *self.is_external.lock().await {
-            return Err(RubError::domain(
-                ErrorCode::InvalidInput,
-                "Takeover elevation is only supported for managed browser sessions",
-            ));
-        }
-
-        let previous_options = self.current_options();
-        if !previous_options.headless {
-            return Ok(self.launch_policy_info());
-        }
-
-        self.bump_listener_generation();
-        let restore_url = self.current_restore_url().await;
-        self.release_current_browser_authority().await?;
-
-        self.set_current_headless(false);
-        self.reset_identity_coverage().await;
-
-        if let Err(error) = self
-            .relaunch_and_restore_visible_locked(restore_url.as_deref())
-            .await
-        {
-            let rollback_cleanup = self.release_current_browser_authority().await;
-            self.set_current_headless(previous_options.headless);
-            self.reset_identity_coverage().await;
-            let restored = self
-                .relaunch_and_restore_visible_locked(restore_url.as_deref())
-                .await;
-            return Err(match restored {
-                Ok(()) => RubError::domain_with_context(
-                    ErrorCode::BrowserLaunchFailed,
-                    format!("Failed to elevate session to a visible browser: {error}"),
-                    serde_json::json!({
-                        "restore_succeeded": true,
-                        "rollback_cleanup_succeeded": rollback_cleanup.is_ok(),
-                        "target_visibility": "headed",
-                    }),
-                ),
-                Err(restore_error) => RubError::domain_with_context(
-                    ErrorCode::BrowserLaunchFailed,
-                    format!("Failed to elevate session to a visible browser: {error}"),
-                    serde_json::json!({
-                        "restore_succeeded": false,
-                        "rollback_cleanup_succeeded": rollback_cleanup.is_ok(),
-                        "rollback_cleanup_error": rollback_cleanup.err().map(|e| e.to_string()),
-                        "restore_error": restore_error.to_string(),
-                        "target_visibility": "headed",
-                    }),
-                ),
-            });
-        }
-
-        Ok(self.launch_policy_info())
-    }
-
-    async fn current_restore_url(&self) -> Option<String> {
-        let page = self.page.lock().await.clone();
-        let current_url = match page {
-            Some(page) => page.url().await.ok().flatten().map(|url| url.to_string()),
-            None => None,
-        };
-        current_url.filter(|url| !url.is_empty() && url != "about:blank")
-    }
-
-    async fn relaunch_and_restore_visible_locked(
-        &self,
-        restore_url: Option<&str>,
-    ) -> Result<(), RubError> {
         self.ensure_browser_locked().await?;
-        if let Some(url) = restore_url {
-            let page = self
-                .page
-                .lock()
-                .await
-                .clone()
-                .ok_or_else(|| RubError::domain(ErrorCode::BrowserCrashed, "No active page"))?;
-            crate::page::navigate(
-                &page,
-                url,
-                LoadStrategy::Load,
-                std::time::Duration::from_millis(rub_core::DEFAULT_WAIT_TIMEOUT_MS),
-            )
-            .await?;
-            self.sync_tabs_projection().await?;
-        }
-        Ok(())
-    }
-
-    pub async fn cancel_download(&self, guid: &str) -> Result<(), RubError> {
-        let browser = self.browser_handle().await?;
-        crate::downloads::cancel_download(&browser, guid).await
-    }
-
-    async fn browser_handle(&self) -> Result<Arc<Browser>, RubError> {
-        self.browser
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| RubError::domain(ErrorCode::BrowserCrashed, "Browser is not available"))
+        self.sync_tabs_projection().await?;
+        self.projected_active_page().await
     }
 
     async fn sync_tabs_projection(&self) -> Result<(), RubError> {
         let context = self
             .projection_context(self.browser_handle().await?, self.listener_generation())
             .await;
-        crate::tab_projection::sync_tabs_projection_with(
-            &context,
-            self.pages.clone(),
-            self.page.clone(),
-            self.active_target_id.clone(),
-        )
-        .await
+        crate::tab_projection::sync_tabs_projection_with(&context, self.tab_projection.clone())
+            .await
     }
 
     async fn spawn_target_listeners(
@@ -773,9 +558,7 @@ impl BrowserManager {
             .projection_context(browser.clone(), listener_generation)
             .await;
         if let Ok(mut listener) = browser.event_listener::<EventTargetCreated>().await {
-            let pages = self.pages.clone();
-            let current_page = self.page.clone();
-            let active_target_id = self.active_target_id.clone();
+            let tab_projection = self.tab_projection.clone();
             let context = context.clone();
             tokio::spawn(async move {
                 let mut generation_rx = context.listener_generation_rx.clone();
@@ -790,21 +573,23 @@ impl BrowserManager {
                         event.target_info.target_id.as_ref().to_string(),
                         event.target_info.r#type.clone(),
                     );
-                    let _ = crate::tab_projection::sync_tabs_projection_with(
+                    if let Err(error) = crate::tab_projection::sync_tabs_projection_with(
                         &context,
-                        pages.clone(),
-                        current_page.clone(),
-                        active_target_id.clone(),
+                        tab_projection.clone(),
                     )
-                    .await;
+                    .await
+                    {
+                        warn!(
+                            target_id = %event.target_info.target_id.as_ref(),
+                            "failed to sync tab projection after target_created: {error}"
+                        );
+                    }
                 }
             });
         }
 
         if let Ok(mut listener) = browser.event_listener::<EventTargetDestroyed>().await {
-            let pages = self.pages.clone();
-            let current_page = self.page.clone();
-            let active_target_id = self.active_target_id.clone();
+            let tab_projection = self.tab_projection.clone();
             let context = context.clone();
             tokio::spawn(async move {
                 let mut generation_rx = context.listener_generation_rx.clone();
@@ -825,21 +610,23 @@ impl BrowserManager {
                         .lock()
                         .await
                         .remove(event.target_id.as_ref());
-                    let _ = crate::tab_projection::sync_tabs_projection_with(
+                    if let Err(error) = crate::tab_projection::sync_tabs_projection_with(
                         &context,
-                        pages.clone(),
-                        current_page.clone(),
-                        active_target_id.clone(),
+                        tab_projection.clone(),
                     )
-                    .await;
+                    .await
+                    {
+                        warn!(
+                            target_id = %event.target_id.as_ref(),
+                            "failed to sync tab projection after target_destroyed: {error}"
+                        );
+                    }
                 }
             });
         }
 
         if let Ok(mut listener) = browser.event_listener::<EventTargetInfoChanged>().await {
-            let pages = self.pages.clone();
-            let current_page = self.page.clone();
-            let active_target_id = self.active_target_id.clone();
+            let tab_projection = self.tab_projection.clone();
             let context = context.clone();
             tokio::spawn(async move {
                 let mut generation_rx = context.listener_generation_rx.clone();
@@ -854,13 +641,17 @@ impl BrowserManager {
                         event.target_info.target_id.as_ref().to_string(),
                         event.target_info.r#type.clone(),
                     );
-                    let _ = crate::tab_projection::sync_tabs_projection_with(
+                    if let Err(error) = crate::tab_projection::sync_tabs_projection_with(
                         &context,
-                        pages.clone(),
-                        current_page.clone(),
-                        active_target_id.clone(),
+                        tab_projection.clone(),
                     )
-                    .await;
+                    .await
+                    {
+                        warn!(
+                            target_id = %event.target_info.target_id.as_ref(),
+                            "failed to sync tab projection after target_info_changed: {error}"
+                        );
+                    }
                 }
             });
         }
@@ -873,35 +664,40 @@ impl BrowserManager {
     ) {
         if let Ok(browser) = self.browser_handle().await {
             let context = self.projection_context(browser, listener_generation).await;
-            let _ = crate::tab_projection::ensure_page_hooks(page, &context, false).await;
+            if let Err(error) =
+                crate::tab_projection::ensure_page_hooks(page, &context, false).await
+            {
+                warn!("failed to ensure page hooks for epoch listener page: {error}");
+            }
         }
     }
+}
 
-    async fn select_active_page_after_close(
-        &self,
-        pages_after: &[Arc<Page>],
-        active_before: Option<&TargetId>,
-        closing_active: bool,
-        closed_index: usize,
-    ) -> Result<Option<Arc<Page>>, RubError> {
-        if pages_after.is_empty() {
-            return Ok(None);
+impl BrowserManager {
+    pub(super) async fn projected_continuity_page(&self) -> Option<Arc<Page>> {
+        self.tab_projection.lock().await.continuity_page.clone()
+    }
+
+    pub(super) async fn projected_active_page(&self) -> Result<Arc<Page>, RubError> {
+        let projection = self.tab_projection.lock().await.clone();
+        if let Some(page) = projection.current_page {
+            return Ok(page);
         }
+        Err(active_page_authority_error(projection.pages.len()))
+    }
+}
 
-        if closing_active {
-            let fallback_index = closed_index.min(pages_after.len().saturating_sub(1));
-            return Ok(pages_after.get(fallback_index).cloned());
-        }
-
-        if let Some(active_target) = active_before
-            && let Some(page) = pages_after
-                .iter()
-                .find(|page| page.target_id() == active_target)
-                .cloned()
-        {
-            return Ok(Some(page));
-        }
-
-        Ok(pages_after.first().cloned())
+pub(super) fn active_page_authority_error(projected_page_count: usize) -> RubError {
+    if projected_page_count == 0 {
+        RubError::domain(ErrorCode::BrowserCrashed, "No active page")
+    } else {
+        RubError::domain_with_context(
+            ErrorCode::TabNotFound,
+            "Active tab authority is unavailable because browser truth is ambiguous across live tabs",
+            serde_json::json!({
+                "reason": "active_tab_authority_unavailable",
+                "projected_page_count": projected_page_count,
+            }),
+        )
     }
 }

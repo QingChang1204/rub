@@ -117,6 +117,10 @@ fn blocker_diagnosis_marks_degraded_runtime_as_not_authoritative() {
     );
     assert_eq!(result["class"], "degraded_runtime");
     assert_eq!(result["authoritative"], false);
+    assert_eq!(
+        result["workflow_guidance"]["next_command_hints"][0]["command"],
+        "rub doctor"
+    );
 }
 
 #[test]

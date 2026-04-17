@@ -71,7 +71,7 @@ pub(crate) use self::protocol::{
     BROWSER_EVENT_PROGRESS_INGRESS_LIMIT, POST_COMMIT_PROJECTION_LIMIT,
     POST_COMMIT_PROJECTION_LIMIT_BYTES, PostCommitProjection, PostCommitProjectionQueue,
     REPLAY_CACHE_LIMIT, REPLAY_CACHE_LIMIT_BYTES, ReplayCacheEntry, ReplayInFlightEntry,
-    ReplayProtocolState,
+    ReplayProtocolState, ReplaySpentEntry,
 };
 
 /// Combined snapshot cache: LRU map + insertion order in one lock.
@@ -81,6 +81,41 @@ pub(crate) use self::protocol::{
 pub(crate) struct SnapshotCache {
     pub(crate) map: HashMap<String, Arc<Snapshot>>,
     pub(crate) order: VecDeque<String>,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub(crate) struct PendingExternalDomChangeState {
+    pub(crate) unknown_global: bool,
+    pub(crate) target_ids: BTreeSet<String>,
+}
+
+impl PendingExternalDomChangeState {
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.unknown_global && self.target_ids.is_empty()
+    }
+
+    pub(crate) fn mark(&mut self, target_id: Option<&str>) {
+        if let Some(target_id) = target_id.filter(|target_id| !target_id.is_empty()) {
+            self.target_ids.insert(target_id.to_string());
+        } else {
+            self.unknown_global = true;
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.unknown_global |= other.unknown_global;
+        self.target_ids.extend(other.target_ids);
+    }
+
+    pub(crate) fn affects_target(&self, target_id: Option<&str>) -> bool {
+        if self.unknown_global {
+            return true;
+        }
+        match target_id {
+            Some(target_id) if !target_id.is_empty() => self.target_ids.contains(target_id),
+            _ => !self.target_ids.is_empty(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -123,8 +158,9 @@ pub struct SessionState {
     pub session_id: String,
     pub session_name: String,
     pub dom_epoch: Arc<AtomicU64>,
-    pending_external_dom_change: AtomicBool,
+    pending_external_dom_change: StdMutex<PendingExternalDomChangeState>,
     shutdown_requested: AtomicBool,
+    shutdown_notify: Arc<Notify>,
     pub in_flight_count: AtomicU32,
     pub connected_client_count: AtomicU32,
     pub(crate) pre_request_response_fence_count: AtomicU32,
@@ -201,8 +237,9 @@ impl SessionState {
             session_id: session_id.into(),
             session_name: name.into(),
             dom_epoch: Arc::new(AtomicU64::new(0)),
-            pending_external_dom_change: AtomicBool::new(false),
+            pending_external_dom_change: StdMutex::new(PendingExternalDomChangeState::default()),
             shutdown_requested: AtomicBool::new(false),
+            shutdown_notify: Arc::new(Notify::new()),
             in_flight_count: AtomicU32::new(0),
             connected_client_count: AtomicU32::new(0),
             pre_request_response_fence_count: AtomicU32::new(0),

@@ -11,8 +11,11 @@ fn serialized_json_len<T: serde::Serialize>(value: &T) -> usize {
 fn post_commit_projection_bytes(
     request: &rub_ipc::protocol::IpcRequest,
     response: &rub_ipc::protocol::IpcResponse,
+    workflow_capture_response: &rub_ipc::protocol::IpcResponse,
 ) -> usize {
-    serialized_json_len(request).saturating_add(serialized_json_len(response))
+    serialized_json_len(request)
+        .saturating_add(serialized_json_len(response))
+        .saturating_add(serialized_json_len(workflow_capture_response))
 }
 
 fn trim_post_commit_projection_queue_with_limits(
@@ -67,6 +70,21 @@ impl SessionState {
         request: &rub_ipc::protocol::IpcRequest,
         response: &rub_ipc::protocol::IpcResponse,
     ) {
+        self.submit_post_commit_projection_with_capture(
+            request,
+            response,
+            response,
+            crate::workflow_capture::WorkflowCaptureDeliveryState::Delivered,
+        );
+    }
+
+    pub fn submit_post_commit_projection_with_capture(
+        &self,
+        request: &rub_ipc::protocol::IpcRequest,
+        response: &rub_ipc::protocol::IpcResponse,
+        workflow_capture_response: &rub_ipc::protocol::IpcResponse,
+        workflow_capture_delivery_state: crate::workflow_capture::WorkflowCaptureDeliveryState,
+    ) {
         let mut queue = self
             .post_commit_projections
             .lock()
@@ -74,7 +92,13 @@ impl SessionState {
         let projection = PostCommitProjection {
             request: request.clone(),
             response: response.clone(),
-            approx_bytes: post_commit_projection_bytes(request, response),
+            workflow_capture_response: workflow_capture_response.clone(),
+            workflow_capture_delivery_state,
+            approx_bytes: post_commit_projection_bytes(
+                request,
+                response,
+                workflow_capture_response,
+            ),
         };
         queue.total_bytes = queue.total_bytes.saturating_add(projection.approx_bytes);
         queue.entries.push_back(projection);
@@ -132,8 +156,12 @@ impl SessionState {
 
                 self.record_command_history(&projection.request, &projection.response)
                     .await;
-                self.record_workflow_capture(&projection.request, &projection.response)
-                    .await;
+                self.record_workflow_capture_with_state(
+                    &projection.request,
+                    &projection.workflow_capture_response,
+                    projection.workflow_capture_delivery_state,
+                )
+                .await;
             }
 
             self.post_commit_projection_drain_scheduled
@@ -178,6 +206,13 @@ impl SessionState {
             return ReplayCommandClaim::Wait(existing.sender.subscribe());
         }
 
+        if let Some(existing) = replay.spent.get(command_id) {
+            if existing.fingerprint != fingerprint {
+                return ReplayCommandClaim::Conflict;
+            }
+            return ReplayCommandClaim::SpentWithoutCachedResponse;
+        }
+
         let (sender, _receiver) = tokio::sync::watch::channel(ReplayFenceState::InFlight);
         replay.in_flight.insert(
             command_id.to_string(),
@@ -198,6 +233,29 @@ impl SessionState {
             .remove(command_id);
         if let Some(entry) = entry {
             let _ = entry.sender.send(ReplayFenceState::Released);
+        }
+    }
+
+    pub fn mark_replay_command_spent(&self, command_id: &str, fingerprint: &str) {
+        let mut replay = self
+            .replay
+            .lock()
+            .expect("replay mutex should not be poisoned");
+        match replay.spent.get(command_id) {
+            Some(existing) => {
+                debug_assert_eq!(
+                    existing.fingerprint, fingerprint,
+                    "spent replay command identity must remain stable for one command_id"
+                );
+            }
+            None => {
+                replay.spent.insert(
+                    command_id.to_string(),
+                    ReplaySpentEntry {
+                        fingerprint: fingerprint.to_string(),
+                    },
+                );
+            }
         }
     }
 
@@ -232,6 +290,18 @@ impl SessionState {
         trim_replay_cache(&mut replay);
     }
 
+    #[cfg(test)]
+    pub(crate) fn evict_cached_replay_response_for_test(&self, command_id: &str) {
+        let mut replay = self
+            .replay
+            .lock()
+            .expect("replay mutex should not be poisoned");
+        if let Some(previous) = replay.cache.remove(command_id) {
+            replay.total_bytes = replay.total_bytes.saturating_sub(previous.approx_bytes);
+        }
+        replay.order.retain(|existing| existing != command_id);
+    }
+
     pub async fn record_command_history(
         &self,
         request: &rub_ipc::protocol::IpcRequest,
@@ -246,6 +316,19 @@ impl SessionState {
             .read()
             .await
             .projection(last, self.post_commit_projection_drop_count())
+    }
+
+    pub async fn command_history_range(
+        &self,
+        from: Option<u64>,
+        to: Option<u64>,
+    ) -> CommandHistoryProjection {
+        self.drain_post_commit_projections().await;
+        self.history.read().await.projection_range(
+            from,
+            to,
+            self.post_commit_projection_drop_count(),
+        )
     }
 
     pub fn record_observatory_ingress_overflow(&self) -> u64 {
@@ -282,11 +365,25 @@ impl SessionState {
         request: &rub_ipc::protocol::IpcRequest,
         response: &rub_ipc::protocol::IpcResponse,
     ) {
+        self.record_workflow_capture_with_state(
+            request,
+            response,
+            crate::workflow_capture::WorkflowCaptureDeliveryState::Delivered,
+        )
+        .await;
+    }
+
+    pub async fn record_workflow_capture_with_state(
+        &self,
+        request: &rub_ipc::protocol::IpcRequest,
+        response: &rub_ipc::protocol::IpcResponse,
+        delivery_state: crate::workflow_capture::WorkflowCaptureDeliveryState,
+    ) {
         let captured_request = redacted_post_commit_request(request, &self.rub_home);
         self.workflow_capture
             .write()
             .await
-            .record(&captured_request, response);
+            .record(&captured_request, response, delivery_state);
     }
 
     pub async fn workflow_capture(&self, last: usize) -> WorkflowCaptureProjection {
@@ -352,8 +449,10 @@ impl SessionState {
 mod tests {
     use super::{
         PostCommitProjection, PostCommitProjectionQueue, ReplayCacheEntry, ReplayProtocolState,
-        trim_post_commit_projection_queue_with_limits, trim_replay_cache_with_limits,
+        ReplaySpentEntry, trim_post_commit_projection_queue_with_limits,
+        trim_replay_cache_with_limits,
     };
+    use crate::workflow_capture::WorkflowCaptureDeliveryState;
     use rub_ipc::protocol::{IpcRequest, IpcResponse};
     use std::collections::{HashMap, VecDeque};
 
@@ -365,6 +464,8 @@ mod tests {
         PostCommitProjection {
             request: IpcRequest::new(command, serde_json::json!({}), 1_000),
             response: IpcResponse::success(request_id, serde_json::json!({})),
+            workflow_capture_response: IpcResponse::success(request_id, serde_json::json!({})),
+            workflow_capture_delivery_state: WorkflowCaptureDeliveryState::Delivered,
             approx_bytes,
         }
     }
@@ -392,6 +493,7 @@ mod tests {
             cache: HashMap::new(),
             order: VecDeque::new(),
             in_flight: HashMap::new(),
+            spent: HashMap::new(),
             total_bytes: 0,
         };
         replay.cache.insert(
@@ -421,6 +523,47 @@ mod tests {
         assert_eq!(replay.cache.len(), 1);
         assert_eq!(replay.total_bytes, 6);
         assert!(replay.cache.contains_key("cmd-2"));
+        assert!(!replay.cache.contains_key("cmd-1"));
+    }
+
+    #[test]
+    fn replay_cache_eviction_does_not_clear_spent_command_authority() {
+        let mut replay = ReplayProtocolState {
+            cache: HashMap::new(),
+            order: VecDeque::new(),
+            in_flight: HashMap::new(),
+            spent: HashMap::from([(
+                "cmd-1".to_string(),
+                ReplaySpentEntry {
+                    fingerprint: "fp-1".to_string(),
+                },
+            )]),
+            total_bytes: 0,
+        };
+        replay.cache.insert(
+            "cmd-1".to_string(),
+            ReplayCacheEntry {
+                fingerprint: "fp-1".to_string(),
+                response: IpcResponse::success("req-1", serde_json::json!({})),
+                approx_bytes: 6,
+            },
+        );
+        replay.order.push_back("cmd-1".to_string());
+        replay.total_bytes += 6;
+        replay.cache.insert(
+            "cmd-2".to_string(),
+            ReplayCacheEntry {
+                fingerprint: "fp-2".to_string(),
+                response: IpcResponse::success("req-2", serde_json::json!({})),
+                approx_bytes: 6,
+            },
+        );
+        replay.order.push_back("cmd-2".to_string());
+        replay.total_bytes += 6;
+
+        trim_replay_cache_with_limits(&mut replay, 10, 8);
+
+        assert!(replay.spent.contains_key("cmd-1"));
         assert!(!replay.cache.contains_key("cmd-1"));
     }
 }

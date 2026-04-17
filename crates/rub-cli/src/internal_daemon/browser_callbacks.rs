@@ -17,8 +17,8 @@ pub(super) async fn install_browser_callbacks(
 
     let state_for_callback = state.clone();
     browser_manager
-        .set_epoch_callback(Box::new(move || {
-            let _ = state_for_callback.observe_external_dom_change();
+        .set_epoch_callback(std::sync::Arc::new(move |target_id| {
+            let _ = state_for_callback.observe_external_dom_change(target_id);
         }))
         .await;
 }
@@ -30,7 +30,7 @@ async fn install_observatory_callbacks(
     let (observatory_tx, mut observatory_rx) =
         tokio::sync::mpsc::channel::<ObservatoryMutation>(OBSERVATORY_INGRESS_LIMIT);
     let (network_request_tx, mut network_request_rx) = tokio::sync::mpsc::channel::<
-        Box<rub_core::model::NetworkRequestRecord>,
+        Box<rub_core::model::ObservedNetworkRequestRecord>,
     >(NETWORK_REQUEST_INGRESS_LIMIT);
     let observatory_state = state.clone();
     tokio::spawn(async move {
@@ -55,7 +55,7 @@ async fn install_observatory_callbacks(
     tokio::spawn(async move {
         while let Some(record) = network_request_rx.recv().await {
             request_record_state
-                .upsert_network_request_record(*record)
+                .upsert_observed_network_request_record(*record)
                 .await;
         }
     });

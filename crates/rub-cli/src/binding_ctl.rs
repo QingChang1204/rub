@@ -6,8 +6,9 @@ mod registry;
 pub(crate) use self::capture::build_binding_record_from_candidate;
 pub(crate) use self::capture::{BindingWriteMode, capture_binding_alias};
 pub(crate) use self::projection::{
-    binding_alias_not_found_error, load_live_registry_snapshot, project_binding_inspect,
-    project_binding_list, project_live_status, resolve_binding_target,
+    binding_alias_not_found_error, load_binding_resolution_state, load_live_registry_snapshot,
+    project_binding_inspect, project_binding_list, project_live_status, resolve_binding_target,
+    resolve_binding_target_from_state,
 };
 pub(crate) use self::registry::{
     normalize_binding_alias, read_binding_registry, write_binding_registry,

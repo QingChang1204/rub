@@ -1,6 +1,16 @@
+mod hints;
+mod target;
+
+use self::hints::{
+    interactability_has_page_level_blocker, interactability_has_target_waitable_blocker,
+    interactability_next_command_hints, interactability_wait_command,
+};
+use self::target::interactability_target_summary;
 use super::super::addressing::resolve_element;
 use super::*;
-use crate::runtime_refresh::{refresh_live_interference_state, refresh_live_runtime_state};
+use crate::runtime_refresh::{
+    InterferenceRefreshIntent, refresh_live_interference_state, refresh_live_runtime_state,
+};
 use crate::session::SessionState;
 use rub_core::error::ErrorCode;
 
@@ -13,7 +23,12 @@ pub(super) async fn cmd_interactability_probe(
     let resolved =
         resolve_element(router, args, state, deadline, "explain interactability").await?;
     refresh_live_runtime_state(&router.browser, state).await;
-    let _ = refresh_live_interference_state(&router.browser, state).await;
+    let _ = refresh_live_interference_state(
+        &router.browser,
+        state,
+        InterferenceRefreshIntent::ReadOnly,
+    )
+    .await;
     let readiness = state.readiness_state().await;
     let interference = state.interference_runtime().await;
 
@@ -89,87 +104,6 @@ fn interactability_assessment_payload(
         );
     }
     payload
-}
-
-fn interactability_target_summary(element: &rub_core::model::Element) -> serde_json::Value {
-    serde_json::json!({
-        "index": element.index,
-        "tag": element.tag,
-        "text": element.text,
-        "role": interactability_role(element),
-        "label": interactability_label(element),
-        "element_ref": element.element_ref,
-        "bbox": element.bounding_box,
-        "flags": interactability_target_flags(element),
-    })
-}
-
-fn interactability_target_flags(element: &rub_core::model::Element) -> Vec<&'static str> {
-    let mut flags = Vec::new();
-    if element.attributes.contains_key("disabled") {
-        flags.push("disabled");
-    }
-    if element
-        .attributes
-        .get("aria-disabled")
-        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
-    {
-        flags.push("aria_disabled");
-    }
-    if element.bounding_box.is_none() {
-        flags.push("bbox_unavailable");
-    }
-    flags
-}
-
-fn interactability_role(element: &rub_core::model::Element) -> String {
-    element
-        .ax_info
-        .as_ref()
-        .and_then(|info| info.role.as_deref())
-        .or_else(|| attribute_value(element, "role"))
-        .unwrap_or(match element.tag {
-            rub_core::model::ElementTag::Button => "button",
-            rub_core::model::ElementTag::Link => "link",
-            rub_core::model::ElementTag::Input | rub_core::model::ElementTag::TextArea => "textbox",
-            rub_core::model::ElementTag::Select => "combobox",
-            rub_core::model::ElementTag::Checkbox => "checkbox",
-            rub_core::model::ElementTag::Radio => "radio",
-            rub_core::model::ElementTag::Option => "option",
-            rub_core::model::ElementTag::Other => "generic",
-        })
-        .trim()
-        .to_string()
-}
-
-fn interactability_label(element: &rub_core::model::Element) -> String {
-    element
-        .ax_info
-        .as_ref()
-        .and_then(|info| info.accessible_name.as_deref())
-        .or_else(|| non_empty_string(&element.text))
-        .or_else(|| attribute_value(element, "aria-label"))
-        .or_else(|| attribute_value(element, "placeholder"))
-        .or_else(|| attribute_value(element, "name"))
-        .or_else(|| attribute_value(element, "value"))
-        .or_else(|| attribute_value(element, "title"))
-        .or_else(|| attribute_value(element, "alt"))
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
-
-fn attribute_value<'a>(element: &'a rub_core::model::Element, key: &str) -> Option<&'a str> {
-    element
-        .attributes
-        .get(key)
-        .map(String::as_str)
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn non_empty_string(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 fn interactability_assessment(
@@ -446,42 +380,6 @@ fn interactability_next_actions(
     actions
 }
 
-fn interactability_next_command_hints(
-    element: &rub_core::model::Element,
-    assessment: &serde_json::Value,
-    locator_request: &serde_json::Value,
-) -> Vec<serde_json::Value> {
-    let mut hints = Vec::new();
-
-    if let Some(command) =
-        interactability_direct_click_command(element, assessment, locator_request)
-    {
-        hints.push(interactability_command_hint(
-            &command,
-            "try the direct activation path; this target may be the control that clears the current page-level blocker",
-        ));
-    }
-    if interactability_has_target_waitable_blocker(assessment)
-        && let Some(wait_command) = interactability_wait_command(locator_request)
-    {
-        hints.push(interactability_command_hint(
-            &wait_command,
-            "wait for this target to become interactable before retrying the action",
-        ));
-    }
-    if interactability_has_page_level_blocker(assessment) {
-        hints.push(interactability_command_hint(
-            "rub explain blockers",
-            "inspect the dominant page-level blocker in the current runtime",
-        ));
-    }
-    hints.push(interactability_command_hint(
-        "rub explain locator ...",
-        "confirm the exact target if you still need to disambiguate candidates",
-    ));
-    hints
-}
-
 pub(super) async fn enrich_interactability_error_if_needed(
     router: &DaemonRouter,
     state: &Arc<SessionState>,
@@ -497,7 +395,12 @@ pub(super) async fn enrich_interactability_error_if_needed(
     }
 
     refresh_live_runtime_state(&router.browser, state).await;
-    let _ = refresh_live_interference_state(&router.browser, state).await;
+    let _ = refresh_live_interference_state(
+        &router.browser,
+        state,
+        InterferenceRefreshIntent::ReadOnly,
+    )
+    .await;
     let readiness = state.readiness_state().await;
     let interference = state.interference_runtime().await;
 
@@ -631,148 +534,6 @@ fn interactability_error_suggestion(
         );
         guidance.join(" ")
     }
-}
-
-fn interactability_has_target_waitable_blocker(assessment: &serde_json::Value) -> bool {
-    assessment
-        .get("blocker_details")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|details| {
-            details.iter().any(|detail| {
-                matches!(
-                    detail.get("code").and_then(serde_json::Value::as_str),
-                    Some("disabled_element" | "aria_disabled")
-                )
-            })
-        })
-}
-
-fn interactability_has_page_level_blocker(assessment: &serde_json::Value) -> bool {
-    assessment
-        .get("blocker_details")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|details| {
-            details.iter().any(|detail| {
-                matches!(
-                    detail.get("surface").and_then(serde_json::Value::as_str),
-                    Some("runtime.readiness" | "runtime.interference")
-                )
-            })
-        })
-}
-
-fn interactability_wait_command(locator_request: &serde_json::Value) -> Option<String> {
-    let mut parts = vec!["rub wait".to_string()];
-    parts.extend(interactability_locator_parts(locator_request)?);
-    parts.push("--state".to_string());
-    parts.push("interactable".to_string());
-    Some(parts.join(" "))
-}
-
-fn interactability_direct_click_command(
-    element: &rub_core::model::Element,
-    assessment: &serde_json::Value,
-    locator_request: &serde_json::Value,
-) -> Option<String> {
-    if interactability_has_target_waitable_blocker(assessment)
-        || !interactability_is_direct_recovery_candidate(element, assessment)
-    {
-        return None;
-    }
-    let mut parts = vec!["rub click".to_string()];
-    parts.extend(interactability_locator_parts(locator_request)?);
-    Some(parts.join(" "))
-}
-
-fn interactability_is_direct_recovery_candidate(
-    element: &rub_core::model::Element,
-    assessment: &serde_json::Value,
-) -> bool {
-    if !matches!(
-        element.tag,
-        rub_core::model::ElementTag::Button
-            | rub_core::model::ElementTag::Link
-            | rub_core::model::ElementTag::Other
-    ) {
-        return false;
-    }
-    let Some(details) = assessment
-        .get("blocker_details")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return false;
-    };
-    !details.is_empty()
-        && details.iter().all(|detail| {
-            matches!(
-                detail.get("code").and_then(serde_json::Value::as_str),
-                Some(
-                    "overlay_present"
-                        | "route_transitioning"
-                        | "loading_present"
-                        | "skeleton_present"
-                )
-            )
-        })
-}
-
-fn interactability_locator_parts(locator_request: &serde_json::Value) -> Option<Vec<String>> {
-    let object = locator_request.as_object()?;
-    let mut parts = Vec::new();
-    let mut has_locator = false;
-
-    for (flag, key) in [
-        ("--selector", "selector"),
-        ("--target-text", "target_text"),
-        ("--role", "role"),
-        ("--label", "label"),
-        ("--testid", "testid"),
-    ] {
-        if let Some(value) = object.get(key).and_then(serde_json::Value::as_str) {
-            parts.push(flag.to_string());
-            parts.push(shell_double_quoted(value));
-            has_locator = true;
-            break;
-        }
-    }
-    if !has_locator {
-        return None;
-    }
-    if object.get("first").and_then(serde_json::Value::as_bool) == Some(true) {
-        parts.push("--first".to_string());
-    }
-    if object.get("last").and_then(serde_json::Value::as_bool) == Some(true) {
-        parts.push("--last".to_string());
-    }
-    if let Some(nth) = object.get("nth").and_then(serde_json::Value::as_u64) {
-        parts.push("--nth".to_string());
-        parts.push(nth.to_string());
-    }
-    if object.get("topmost").and_then(serde_json::Value::as_bool) == Some(true) {
-        parts.push("--topmost".to_string());
-    }
-    if object.get("visible").and_then(serde_json::Value::as_bool) == Some(true) {
-        parts.push("--visible".to_string());
-    }
-    if object
-        .get("prefer_enabled")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
-        parts.push("--prefer-enabled".to_string());
-    }
-    Some(parts)
-}
-
-fn interactability_command_hint(command: &str, reason: &str) -> serde_json::Value {
-    serde_json::json!({
-        "command": command,
-        "reason": reason,
-    })
-}
-
-fn shell_double_quoted(value: &str) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
 }
 
 #[cfg(test)]

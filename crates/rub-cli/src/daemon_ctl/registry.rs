@@ -2,7 +2,7 @@ use std::path::Path;
 
 use rub_core::error::{ErrorCode, RubError};
 
-use super::process_identity::{process_matches_daemon_identity, process_matches_registry_entry};
+use super::process_identity::process_matches_registry_entry;
 use super::{DaemonCtlPathContext, daemon_ctl_path_error};
 
 pub(crate) fn cleanup_stale(rub_home: &Path, entry: &rub_daemon::session::RegistryEntry) {
@@ -82,13 +82,4 @@ pub(crate) fn registry_authority_snapshot(
             },
         )
     })
-}
-
-pub(crate) fn process_matches_failed_startup_identity(
-    rub_home: &Path,
-    session_name: &str,
-    session_id: &str,
-    daemon_pid: u32,
-) -> std::io::Result<bool> {
-    process_matches_daemon_identity(rub_home, session_name, Some(session_id), daemon_pid)
 }

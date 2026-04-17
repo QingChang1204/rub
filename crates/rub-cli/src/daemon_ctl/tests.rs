@@ -1,12 +1,17 @@
 #[cfg(unix)]
 use super::{FORCE_SETSID_FAILURE, detach_daemon_session};
 use super::{
-    ShutdownFenceStatus, StartupSignalFiles, acquire_startup_lock, classify_close_all_result,
-    close_all_session_targets, close_all_sessions, command_matches_daemon_identity,
+    ShutdownFenceStatus, StartupCleanupAuthorityKind, StartupCleanupProof, StartupSignalFiles,
+    acquire_startup_lock, apply_hard_cut_shutdown_outcome, classify_close_all_result,
+    cleanup_precommit_browser_authority_for_test, close_all_session_targets, close_all_sessions,
+    command_matches_daemon_identity, detect_or_connect_hardened_until, fetch_handshake_info_until,
     fetch_handshake_info_with_timeout, ipc_timeout_error, project_batch_close_result,
-    project_request_onto_deadline, read_startup_error, registry_authority_snapshot,
-    replay_retry_matches_daemon_authority, socket_candidates_for_session, startup_lock_scope_keys,
-    startup_signal_paths, try_lock_exclusive, unlock, wait_for_ready,
+    project_request_onto_deadline, read_startup_cleanup_proof, read_startup_error,
+    registry_authority_snapshot, replay_retry_matches_daemon_authority,
+    should_escalate_close_all_to_kill_fallback, socket_candidates_for_session,
+    startup_cleanup_signal_path, startup_lock_scope_keys, startup_signal_paths, try_lock_exclusive,
+    unlock, upgrade_startup_lock_to_canonical_attachment_until, wait_for_ready,
+    write_startup_cleanup_proof_at,
 };
 use crate::timeout_budget::WAIT_IPC_BUFFER_MS;
 use rub_core::error::ErrorCode;
@@ -451,6 +456,233 @@ async fn detect_or_connect_hardened_reconnects_after_successful_upgrade_probe() 
 }
 
 #[tokio::test]
+async fn detect_or_connect_hardened_until_projects_remaining_budget_onto_upgrade_and_handshake() {
+    let home = temp_home();
+    std::fs::create_dir_all(&home).unwrap();
+    let runtime = RubPaths::new(&home).session_runtime("default", "sess-default");
+    std::fs::create_dir_all(runtime.session_dir()).unwrap();
+    std::fs::create_dir_all(
+        runtime
+            .startup_committed_path()
+            .parent()
+            .expect("startup commit marker parent"),
+    )
+    .unwrap();
+    std::fs::write(runtime.pid_path(), std::process::id().to_string()).unwrap();
+    std::fs::write(runtime.startup_committed_path(), "sess-default").unwrap();
+
+    let socket_path = runtime.socket_path();
+    std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    write_registry(
+        &home,
+        &RegistryData {
+            sessions: vec![RegistryEntry {
+                session_id: "sess-default".to_string(),
+                session_name: "default".to_string(),
+                pid: std::process::id(),
+                socket_path: socket_path.display().to_string(),
+                created_at: "2026-04-09T00:00:00Z".to_string(),
+                ipc_protocol_version: "0.9".to_string(),
+                user_data_dir: None,
+                attachment_identity: None,
+                connection_target: None,
+            }],
+        },
+    )
+    .unwrap();
+
+    let server = tokio::spawn(async move {
+        for (index, expected_command) in ["_handshake", "_upgrade_check", "_handshake"]
+            .into_iter()
+            .enumerate()
+        {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let request: IpcRequest = NdJsonCodec::read(&mut reader)
+                .await
+                .expect("read request")
+                .expect("request");
+            assert_eq!(request.command, expected_command);
+            assert!(
+                request.timeout_ms < 3_000,
+                "existing-daemon attach must project the remaining top-level budget instead of using a fixed 3s lane"
+            );
+            let response = IpcResponse::success(
+                format!("response-{expected_command}"),
+                serde_json::json!({
+                    "daemon_session_id": "sess-default",
+                    "launch_policy": {
+                        "headless": true,
+                        "ignore_cert_errors": false,
+                        "hide_infobars": false
+                    }
+                }),
+            );
+            let write_result = NdJsonCodec::write(&mut writer, &response).await;
+            if index == 0 {
+                let _ = write_result;
+            } else {
+                write_result.expect("write response");
+            }
+        }
+    });
+
+    let resolution = detect_or_connect_hardened_until(
+        &home,
+        "default",
+        super::TransientSocketPolicy::NeedStartBeforeLock,
+        Instant::now() + Duration::from_millis(2_500),
+        2_500,
+    )
+    .await
+    .expect("budgeted existing-daemon attach should still succeed");
+    let super::DaemonConnection::Connected {
+        daemon_session_id, ..
+    } = resolution
+    else {
+        panic!("budgeted existing-daemon attach should resolve to the live daemon");
+    };
+    assert_eq!(daemon_session_id.as_deref(), Some("sess-default"));
+
+    server.await.expect("server task");
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[tokio::test]
+async fn detect_or_connect_hardened_until_fails_closed_when_attach_budget_is_already_exhausted() {
+    let home = temp_home();
+    std::fs::create_dir_all(&home).unwrap();
+    let runtime = RubPaths::new(&home).session_runtime("default", "sess-default");
+    std::fs::create_dir_all(runtime.session_dir()).unwrap();
+    std::fs::create_dir_all(
+        runtime
+            .startup_committed_path()
+            .parent()
+            .expect("startup commit marker parent"),
+    )
+    .unwrap();
+    std::fs::write(runtime.pid_path(), std::process::id().to_string()).unwrap();
+    std::fs::write(runtime.startup_committed_path(), "sess-default").unwrap();
+
+    let socket_path = runtime.socket_path();
+    std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&socket_path);
+    let _listener = UnixListener::bind(&socket_path).unwrap();
+    write_registry(
+        &home,
+        &RegistryData {
+            sessions: vec![RegistryEntry {
+                session_id: "sess-default".to_string(),
+                session_name: "default".to_string(),
+                pid: std::process::id(),
+                socket_path: socket_path.display().to_string(),
+                created_at: "2026-04-09T00:00:00Z".to_string(),
+                ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+                user_data_dir: None,
+                attachment_identity: None,
+                connection_target: None,
+            }],
+        },
+    )
+    .unwrap();
+
+    let error = match detect_or_connect_hardened_until(
+        &home,
+        "default",
+        super::TransientSocketPolicy::NeedStartBeforeLock,
+        Instant::now() - Duration::from_millis(1),
+        250,
+    )
+    .await
+    {
+        Ok(_) => panic!("attach should fail before connect when the top-level budget is exhausted"),
+        Err(error) => error,
+    };
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::IpcTimeout);
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("phase"))
+            .and_then(|value| value.as_str()),
+        Some("existing_daemon_connect")
+    );
+
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn hard_cut_upgrade_keeps_projection_when_profile_release_lags() {
+    let home = temp_home();
+    std::fs::create_dir_all(&home).unwrap();
+    let runtime = RubPaths::new(&home).session_runtime("default", "sess-default");
+    let projection = RubPaths::new(&home).session("default");
+    std::fs::create_dir_all(runtime.session_dir()).unwrap();
+    std::fs::create_dir_all(projection.projection_dir()).unwrap();
+    std::fs::create_dir_all(
+        runtime
+            .startup_committed_path()
+            .parent()
+            .expect("startup commit marker parent"),
+    )
+    .unwrap();
+    std::fs::write(runtime.pid_path(), "999999").unwrap();
+    std::fs::write(projection.canonical_pid_path(), "999999").unwrap();
+    std::fs::write(runtime.startup_committed_path(), "sess-default").unwrap();
+    std::fs::write(projection.startup_committed_path(), "sess-default").unwrap();
+
+    let entry = RegistryEntry {
+        session_id: "sess-default".to_string(),
+        session_name: "default".to_string(),
+        pid: 999_999,
+        socket_path: runtime.socket_path().display().to_string(),
+        created_at: "2026-04-15T00:00:00Z".to_string(),
+        ipc_protocol_version: "old".to_string(),
+        user_data_dir: Some("/tmp/rub-profile-lag".to_string()),
+        attachment_identity: None,
+        connection_target: None,
+    };
+
+    let error = apply_hard_cut_shutdown_outcome(
+        &home,
+        "default",
+        &entry,
+        ShutdownFenceStatus {
+            daemon_stopped: true,
+            profile_released: false,
+        },
+    )
+    .expect_err("profile lag must keep authority projection intact");
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::IpcVersionMismatch);
+    let context = envelope.context.expect("shutdown fence context");
+    assert_eq!(context["reason"], "hard_cut_upgrade_fence_incomplete");
+    assert_eq!(context["shutdown_fence"]["daemon_stopped"], true);
+    assert_eq!(context["shutdown_fence"]["profile_released"], false);
+
+    assert!(
+        runtime.pid_path().exists(),
+        "runtime authority must remain until the shutdown fence is fully released"
+    );
+    assert!(
+        projection.canonical_pid_path().exists(),
+        "projection authority must remain until the shutdown fence is fully released"
+    );
+    assert!(
+        projection.startup_committed_path().exists(),
+        "startup commit marker must not be cleaned early"
+    );
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[tokio::test]
 async fn close_all_sessions_noops_without_creating_rub_home() {
     let home = temp_home();
     let _ = std::fs::remove_dir_all(&home);
@@ -548,7 +780,7 @@ async fn close_all_targets_ignore_pending_replacement_for_same_session() {
 fn close_all_rejects_committed_shutdown_when_profile_release_lags() {
     let disposition = classify_close_all_result(
         true,
-        true,
+        false,
         ShutdownFenceStatus {
             daemon_stopped: true,
             profile_released: false,
@@ -556,6 +788,48 @@ fn close_all_rejects_committed_shutdown_when_profile_release_lags() {
         false,
     );
     assert_eq!(disposition, super::CloseAllDisposition::Failed);
+}
+
+#[test]
+fn close_all_kill_fallback_requires_release_fence_failure_with_live_authority() {
+    assert!(!should_escalate_close_all_to_kill_fallback(
+        ShutdownFenceStatus {
+            daemon_stopped: true,
+            profile_released: false,
+        },
+        false,
+        250,
+    ));
+    assert!(!should_escalate_close_all_to_kill_fallback(
+        ShutdownFenceStatus {
+            daemon_stopped: false,
+            profile_released: false,
+        },
+        true,
+        0,
+    ));
+    assert!(should_escalate_close_all_to_kill_fallback(
+        ShutdownFenceStatus {
+            daemon_stopped: false,
+            profile_released: false,
+        },
+        true,
+        250,
+    ));
+}
+
+#[test]
+fn close_all_reports_post_fallback_release_as_cleaned_stale_not_closed() {
+    let disposition = classify_close_all_result(
+        true,
+        true,
+        ShutdownFenceStatus {
+            daemon_stopped: true,
+            profile_released: true,
+        },
+        false,
+    );
+    assert_eq!(disposition, super::CloseAllDisposition::CleanedStale);
 }
 
 #[test]
@@ -645,6 +919,43 @@ async fn fetch_handshake_info_preserves_version_mismatch_code_and_context() {
     let _ = std::fs::remove_dir_all(&socket_dir);
 }
 
+#[tokio::test]
+async fn fetch_handshake_info_until_fails_closed_when_budget_is_already_exhausted() {
+    let socket_dir = std::path::PathBuf::from(format!("/tmp/rdi-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    let socket_path = socket_dir.join("ipc.sock");
+    let mut client = IpcClient::deferred(socket_path);
+
+    let error = fetch_handshake_info_until(
+        &mut client,
+        Instant::now() - Duration::from_millis(1),
+        250,
+        "existing_daemon_handshake",
+    )
+    .await
+    .expect_err("exhausted attach budget should fail before sending handshake");
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::IpcTimeout);
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("command_deadline_exhausted")
+    );
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("phase"))
+            .and_then(|value| value.as_str()),
+        Some("existing_daemon_handshake")
+    );
+
+    let _ = std::fs::remove_dir_all(&socket_dir);
+}
+
 #[cfg(unix)]
 #[test]
 fn detach_daemon_session_surfaces_setsid_failure() {
@@ -680,6 +991,56 @@ fn startup_lock_scopes_always_include_session_and_optionally_attachment() {
             "attachment-cdp:http://127.0.0.1:9222".to_string()
         ]
     );
+}
+
+#[tokio::test]
+async fn startup_lock_upgrade_adds_canonical_cdp_attachment_scope() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let home = temp_home();
+    std::fs::create_dir_all(&home).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("local addr");
+    let ws_url = format!("ws://{address}/devtools/browser/test");
+    let server = tokio::spawn({
+        let ws_url = ws_url.clone();
+        async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.expect("read request");
+            let body = format!(r#"{{"webSocketDebuggerUrl":"{ws_url}"}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        }
+    });
+
+    let requested_identity = format!("cdp:http://{address}");
+    let mut guard = acquire_startup_lock(&home, "default", Some(&requested_identity), 1_000)
+        .await
+        .expect("initial startup lock");
+    upgrade_startup_lock_to_canonical_attachment_until(
+        &mut guard,
+        &home,
+        Some(&requested_identity),
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .expect("canonical startup lock upgrade");
+
+    assert!(guard.holds_scope_key_for_test("session-default"));
+    assert!(guard.holds_scope_key_for_test(&format!("attachment-{requested_identity}")));
+    assert!(guard.holds_scope_key_for_test(&format!("attachment-cdp:{ws_url}")));
+
+    server.await.expect("server join");
 }
 
 #[tokio::test]
@@ -757,17 +1118,65 @@ fn read_startup_error_missing_file_preserves_error_file_state() {
 fn startup_signal_paths_reflect_environment() {
     let ready = temp_home().join("ready.signal");
     let error = temp_home().join("error.signal");
+    let cleanup = temp_home().join("cleanup.signal");
     unsafe {
         std::env::set_var("RUB_DAEMON_READY_FILE", &ready);
         std::env::set_var("RUB_DAEMON_ERROR_FILE", &error);
+        std::env::set_var("RUB_DAEMON_CLEANUP_FILE", &cleanup);
     }
     let (ready_path, error_path) = startup_signal_paths();
     assert_eq!(ready_path.as_deref(), Some(ready.as_path()));
     assert_eq!(error_path.as_deref(), Some(error.as_path()));
+    assert_eq!(
+        startup_cleanup_signal_path().as_deref(),
+        Some(cleanup.as_path())
+    );
     unsafe {
         std::env::remove_var("RUB_DAEMON_READY_FILE");
         std::env::remove_var("RUB_DAEMON_ERROR_FILE");
+        std::env::remove_var("RUB_DAEMON_CLEANUP_FILE");
     }
+}
+
+#[test]
+fn startup_cleanup_proof_round_trip_preserves_managed_browser_authority() {
+    let home = temp_home();
+    std::fs::create_dir_all(&home).unwrap();
+    let cleanup_file = home.join("startup.cleanup");
+    let proof = StartupCleanupProof {
+        kind: StartupCleanupAuthorityKind::ManagedBrowserProfile,
+        managed_user_data_dir: "/tmp/rub-managed-profile".to_string(),
+        ephemeral: true,
+    };
+
+    write_startup_cleanup_proof_at(&cleanup_file, &proof).expect("write cleanup proof");
+    let decoded = read_startup_cleanup_proof(&cleanup_file).expect("read cleanup proof");
+    assert_eq!(decoded, proof);
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[tokio::test]
+async fn failed_startup_cleanup_consumes_precommit_cleanup_proof() {
+    let home = temp_home();
+    std::fs::create_dir_all(&home).unwrap();
+    let cleanup_file = home.join("startup.cleanup");
+    let proof = StartupCleanupProof {
+        kind: StartupCleanupAuthorityKind::ManagedBrowserProfile,
+        managed_user_data_dir: home.join("managed-profile").display().to_string(),
+        ephemeral: true,
+    };
+    write_startup_cleanup_proof_at(&cleanup_file, &proof).expect("write cleanup proof");
+
+    let (attempted, succeeded, authority, error) =
+        cleanup_precommit_browser_authority_for_test(&cleanup_file).await;
+    assert!(attempted);
+    assert!(succeeded);
+    assert_eq!(authority, Some(proof));
+    assert!(error.is_none());
+    assert!(!cleanup_file.exists());
+
+    let _ = std::fs::remove_dir_all(home);
 }
 
 #[test]
@@ -804,6 +1213,8 @@ async fn wait_for_ready_requires_ready_commit_marker_and_handshake() {
     std::fs::create_dir_all(session_paths.session_dir()).unwrap();
     let ready_file = session_paths.startup_ready_path("startup");
     let error_file = session_paths.startup_error_path("startup");
+    let stderr_file = session_paths.startup_stderr_path("startup");
+    let cleanup_file = session_paths.startup_cleanup_path("startup");
     let socket_path = session_paths.socket_path();
     let listener = UnixListener::bind(&socket_path).unwrap();
 
@@ -871,6 +1282,8 @@ async fn wait_for_ready_requires_ready_commit_marker_and_handshake() {
     let signals = StartupSignalFiles {
         ready_file,
         error_file,
+        stderr_file,
+        cleanup_file,
         daemon_pid: std::process::id(),
         session_id: "sess-default".to_string(),
     };
@@ -900,6 +1313,8 @@ async fn wait_for_ready_fails_fast_when_daemon_dies_before_commit() {
     std::fs::create_dir_all(session_paths.session_dir()).unwrap();
     let ready_file = session_paths.startup_ready_path("startup");
     let error_file = session_paths.startup_error_path("startup");
+    let stderr_file = session_paths.startup_stderr_path("startup");
+    let cleanup_file = session_paths.startup_cleanup_path("startup");
     std::fs::write(&ready_file, b"ready").unwrap();
 
     let child = std::process::Command::new("sh")
@@ -913,6 +1328,8 @@ async fn wait_for_ready_fails_fast_when_daemon_dies_before_commit() {
     let signals = StartupSignalFiles {
         ready_file,
         error_file,
+        stderr_file,
+        cleanup_file,
         daemon_pid,
         session_id: "sess-dead".to_string(),
     };
@@ -936,12 +1353,70 @@ async fn wait_for_ready_fails_fast_when_daemon_dies_before_commit() {
 }
 
 #[tokio::test]
+async fn wait_for_ready_uses_startup_stderr_excerpt_when_daemon_dies_before_commit() {
+    let home = temp_home();
+    let session_paths = RubPaths::new(&home).session_runtime("default", "sess-dead-stderr");
+    std::fs::create_dir_all(session_paths.session_dir()).unwrap();
+    let ready_file = session_paths.startup_ready_path("startup");
+    let error_file = session_paths.startup_error_path("startup");
+    let stderr_file = session_paths.startup_stderr_path("startup");
+    let cleanup_file = session_paths.startup_cleanup_path("startup");
+    std::fs::write(&ready_file, b"ready").unwrap();
+    std::fs::write(
+        &stderr_file,
+        b"DAEMON_START_FAILED: session runtime dir create failed\n",
+    )
+    .unwrap();
+
+    let child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("exit 0")
+        .spawn()
+        .expect("spawn short-lived child");
+    let daemon_pid = child.id();
+    let _ = child.wait_with_output().expect("wait child");
+
+    let signals = StartupSignalFiles {
+        ready_file,
+        error_file,
+        stderr_file,
+        cleanup_file,
+        daemon_pid,
+        session_id: "sess-dead-stderr".to_string(),
+    };
+
+    let envelope = wait_for_ready(&home, "default", &signals, 3_000)
+        .await
+        .err()
+        .expect("stderr fallback should surface")
+        .into_envelope();
+    assert_eq!(
+        envelope.message,
+        "DAEMON_START_FAILED: session runtime dir create failed"
+    );
+    let context = envelope.context.expect("stderr fallback context");
+    assert_eq!(context["reason"], "daemon_exited_before_startup_commit");
+    assert_eq!(
+        context["startup_stderr_state"]["path_authority"],
+        "daemon_ctl.startup.stderr_file"
+    );
+    assert_eq!(
+        context["startup_stderr_excerpt"],
+        "DAEMON_START_FAILED: session runtime dir create failed"
+    );
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[tokio::test]
 async fn wait_for_ready_reports_existing_error_before_tiny_deadline_times_out() {
     let home = temp_home();
     let session_paths = RubPaths::new(&home).session_runtime("default", "sess-error");
     std::fs::create_dir_all(session_paths.session_dir()).unwrap();
     let ready_file = session_paths.startup_ready_path("startup");
     let error_file = session_paths.startup_error_path("startup");
+    let stderr_file = session_paths.startup_stderr_path("startup");
+    let cleanup_file = session_paths.startup_cleanup_path("startup");
     std::fs::write(
         &error_file,
         serde_json::to_vec(&rub_core::error::ErrorEnvelope::new(
@@ -955,6 +1430,8 @@ async fn wait_for_ready_reports_existing_error_before_tiny_deadline_times_out() 
     let signals = StartupSignalFiles {
         ready_file,
         error_file,
+        stderr_file,
+        cleanup_file,
         daemon_pid: std::process::id(),
         session_id: "sess-error".to_string(),
     };
@@ -1167,6 +1644,7 @@ async fn daemon_authority_mismatch_preserves_socket_path_state() {
             humanize_speed: None,
             stealth_coverage: None,
         },
+        attachment_identity: None,
     };
 
     let error = super::maybe_upgrade_if_needed(

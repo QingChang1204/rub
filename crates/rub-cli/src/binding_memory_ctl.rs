@@ -1,6 +1,7 @@
 use crate::binding_ctl::{
-    binding_alias_not_found_error, binding_path_state, normalize_binding_alias,
-    resolve_binding_target,
+    binding_alias_not_found_error, binding_path_state, load_binding_resolution_state,
+    normalize_binding_alias, read_binding_registry, resolve_binding_target,
+    resolve_binding_target_from_state,
 };
 use crate::commands::RememberedBindingAliasKindArg;
 use rub_core::error::{ErrorCode, RubError};
@@ -17,13 +18,14 @@ use self::registry::{
 
 pub(crate) fn project_remembered_alias_list(rub_home: &Path) -> Result<Value, RubError> {
     let registry = read_remembered_alias_registry(rub_home)?;
+    let binding_state = load_binding_resolution_state(rub_home)?;
     let items = registry
         .aliases
         .iter()
         .map(|alias| {
             Ok(json!({
                 "remembered_alias": alias,
-                "target": resolve_binding_target(rub_home, &alias.binding_alias)?,
+                "target": resolve_binding_target_from_state(&alias.binding_alias, &binding_state)?,
             }))
         })
         .collect::<Result<Vec<_>, RubError>>()?;
@@ -104,13 +106,14 @@ pub(crate) fn resolve_remembered_alias_target(
 > {
     let normalized = normalize_binding_alias(alias)?;
     let registry = read_remembered_alias_registry(rub_home)?;
+    let binding_state = load_binding_resolution_state(rub_home)?;
     let record = registry
         .aliases
         .iter()
         .find(|record| record.alias == normalized)
         .cloned()
         .ok_or_else(|| remembered_alias_not_found_error(rub_home, &normalized))?;
-    let target = resolve_binding_target(rub_home, &record.binding_alias)?;
+    let target = resolve_binding_target_from_state(&record.binding_alias, &binding_state)?;
     Ok((record, target))
 }
 
@@ -221,11 +224,16 @@ pub(crate) fn remembered_alias_subject(rub_home: &Path, alias: &str) -> Value {
 }
 
 fn ensure_binding_target_exists(rub_home: &Path, binding_alias: &str) -> Result<(), RubError> {
-    match resolve_binding_target(rub_home, binding_alias)? {
-        rub_core::model::RememberedBindingAliasTarget::Resolved { .. } => Ok(()),
-        rub_core::model::RememberedBindingAliasTarget::MissingBinding { .. } => {
-            Err(binding_alias_not_found_error(rub_home, binding_alias))
-        }
+    let normalized = normalize_binding_alias(binding_alias)?;
+    let registry = read_binding_registry(rub_home)?;
+    if registry
+        .bindings
+        .iter()
+        .any(|binding| binding.alias == normalized)
+    {
+        Ok(())
+    } else {
+        Err(binding_alias_not_found_error(rub_home, &normalized))
     }
 }
 

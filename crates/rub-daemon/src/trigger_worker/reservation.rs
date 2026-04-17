@@ -53,7 +53,7 @@ pub(super) fn spawn_trigger_reservation(
 ) -> PendingTriggerReservation {
     let task = tokio::spawn(async move {
         let result = router
-            .begin_automation_transaction_until_shutdown_owned(&state, "trigger_worker")
+            .begin_automation_reservation_transaction_owned(&state, "trigger_worker")
             .await;
         let _ = completions.send(TriggerReservationCompletion {
             trigger_id,

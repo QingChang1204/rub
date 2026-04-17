@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 use crate::commands::{Commands, EffectiveCli, InspectSubcommand};
 use crate::daemon_ctl;
 use crate::session_policy::{
-    materialize_connection_request, parse_connection_request, requested_attachment_identity,
-    requires_existing_session_validation, validate_existing_session_connection_request,
+    materialize_connection_request_with_deadline, parse_connection_request,
+    requested_attachment_identity, requires_existing_session_validation,
+    validate_existing_session_connection_request_with_deadline,
 };
 use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
 use rub_ipc::protocol::{IpcRequest, ResponseStatus};
@@ -136,7 +137,7 @@ pub(crate) async fn inspect_harvest(cli: &EffectiveCli) -> Result<serde_json::Va
         base_url: base_url.clone(),
         limit: *limit,
     };
-    let dispatch = HarvestDispatchContext::new(cli).await?;
+    let dispatch = HarvestDispatchContext::new(cli, deadline).await?;
     let mut attempted_count = 0u32;
     let mut harvested_count = 0u32;
     let mut failed_count = 0u32;
@@ -282,9 +283,13 @@ pub(crate) async fn inspect_harvest(cli: &EffectiveCli) -> Result<serde_json::Va
 }
 
 impl HarvestDispatchContext {
-    async fn new(cli: &EffectiveCli) -> Result<Self, RubError> {
-        let connection_request =
-            materialize_connection_request(&parse_connection_request(cli)?).await?;
+    async fn new(cli: &EffectiveCli, deadline: Instant) -> Result<Self, RubError> {
+        let connection_request = materialize_connection_request_with_deadline(
+            &parse_connection_request(cli)?,
+            Some(deadline),
+            Some(cli.timeout.max(1)),
+        )
+        .await?;
         Ok(Self {
             daemon_args: crate::daemon_args(cli, &connection_request),
             attachment_identity: requested_attachment_identity(cli, &connection_request),
@@ -305,22 +310,30 @@ impl HarvestDispatchContext {
             &cli.rub_home,
             &cli.session,
             deadline,
+            request.timeout_ms,
             &self.daemon_args,
             self.attachment_identity.as_deref(),
         )
         .await
         .map_err(|error| error.into_envelope())?;
+        let daemon_session_id = bootstrap.daemon_session_id;
+        let mut client = bootstrap.client;
         if requires_existing_session_validation(
             bootstrap.connected_to_existing_daemon,
             &self.connection_request,
             cli,
         ) {
-            validate_existing_session_connection_request(cli, &self.connection_request)
-                .await
-                .map_err(|error| error.into_envelope())?;
+            validate_existing_session_connection_request_with_deadline(
+                cli,
+                &self.connection_request,
+                &mut client,
+                daemon_session_id.as_deref(),
+                Some(deadline),
+                Some(cli.timeout.max(1)),
+            )
+            .await
+            .map_err(|error| error.into_envelope())?;
         }
-        let daemon_session_id = bootstrap.daemon_session_id;
-        let mut client = bootstrap.client;
         let response = daemon_ctl::send_request_with_replay_recovery(
             &mut client,
             request,

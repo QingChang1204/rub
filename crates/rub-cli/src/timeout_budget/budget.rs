@@ -1,6 +1,10 @@
 use crate::commands::{Commands, EffectiveCli};
+use crate::main_support::command_timeout_error;
 use rub_cdp::humanize::HumanizeSpeed;
+use rub_core::error::RubError;
 use serde_json::Value;
+use std::future::Future;
+use std::time::{Duration, Instant};
 
 use super::helpers::wait_after_is_configured;
 
@@ -14,6 +18,41 @@ pub(crate) fn command_timeout_ms(cli: &EffectiveCli) -> u64 {
             .saturating_add(humanize_budget_ms(cli))
             .saturating_add(wait_after_budget_ms(cli)),
     }
+}
+
+pub(crate) fn deadline_from_start(started_at: Instant, timeout_ms: u64) -> Instant {
+    started_at + Duration::from_millis(timeout_ms.max(1))
+}
+
+pub(crate) fn remaining_budget_duration(deadline: Instant) -> Option<Duration> {
+    deadline.checked_duration_since(Instant::now())
+}
+
+pub(crate) fn ensure_remaining_budget(
+    deadline: Instant,
+    timeout_ms: u64,
+    phase: &'static str,
+) -> Result<(), RubError> {
+    if remaining_budget_duration(deadline).is_none() {
+        return Err(command_timeout_error(timeout_ms, phase));
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_with_remaining_budget<T, Fut>(
+    deadline: Instant,
+    timeout_ms: u64,
+    phase: &'static str,
+    future: Fut,
+) -> Result<T, RubError>
+where
+    Fut: Future<Output = Result<T, RubError>>,
+{
+    let remaining = remaining_budget_duration(deadline)
+        .ok_or_else(|| command_timeout_error(timeout_ms, phase))?;
+    tokio::time::timeout(remaining, future)
+        .await
+        .map_err(|_| command_timeout_error(timeout_ms, phase))?
 }
 
 fn humanize_budget_ms(cli: &EffectiveCli) -> u64 {

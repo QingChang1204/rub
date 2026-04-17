@@ -95,9 +95,11 @@ pub(super) async fn scan_collection(
             break (false, "max_scrolls_reached");
         }
 
+        let scroll_frame_id = snapshot.frame_context.frame_id.clone();
         let position = router
             .browser
             .scroll(
+                Some(scroll_frame_id.as_str()),
                 rub_core::model::ScrollDirection::Down,
                 Some(scan.scroll_amount),
             )

@@ -1,6 +1,6 @@
 use super::{
-    ExtractedElementsPayload, extract_elements_script, highlight_overlay_js,
-    normalize_snapshot_limit,
+    ExtractedElementsPayload, highlight_overlay_js, normalize_snapshot_limit,
+    scripts::extract_elements_script,
 };
 use rub_core::model::{Element, ElementTag, FrameContextInfo, ScrollPosition, Snapshot};
 use rub_core::port::DEFAULT_SNAPSHOT_LIMIT;

@@ -4,9 +4,9 @@ use crate::error::RubError;
 use crate::locator::LiveLocator;
 use crate::model::{
     BoundingBox, ContentFindMatch, Cookie, DialogRuntimeInfo, Element, FrameInventoryEntry,
-    FrameRuntimeInfo, InteractionOutcome, KeyCombo, LaunchPolicyInfo, LoadStrategy, NetworkRule,
-    Page, RuntimeStateSnapshot, ScrollDirection, ScrollPosition, SelectOutcome, Snapshot, TabInfo,
-    WaitCondition,
+    FrameRuntimeInfo, HistoryNavigationResult, InteractionOutcome, KeyCombo, LaunchPolicyInfo,
+    LoadStrategy, NetworkRule, Page, RuntimeStateSnapshot, ScrollDirection, ScrollPosition,
+    SelectOutcome, Snapshot, TabInfo, WaitCondition,
 };
 use crate::observation::ObservationScope;
 use crate::storage::{StorageArea, StorageSnapshot};
@@ -74,8 +74,34 @@ pub trait BrowserPort: Send + Sync {
     /// Navigate back in browser history.
     async fn back(&self, timeout_ms: u64) -> Result<Page, RubError>;
 
+    /// Navigate back in browser history and capture the history boundary truth
+    /// from the same authoritative page handle.
+    async fn back_with_boundary(
+        &self,
+        timeout_ms: u64,
+    ) -> Result<HistoryNavigationResult, RubError> {
+        let page = self.back(timeout_ms).await?;
+        Ok(HistoryNavigationResult {
+            page,
+            at_boundary: None,
+        })
+    }
+
     /// Navigate forward in browser history.
     async fn forward(&self, timeout_ms: u64) -> Result<Page, RubError>;
+
+    /// Navigate forward in browser history and capture the history boundary
+    /// truth from the same authoritative page handle.
+    async fn forward_with_boundary(
+        &self,
+        timeout_ms: u64,
+    ) -> Result<HistoryNavigationResult, RubError> {
+        let page = self.forward(timeout_ms).await?;
+        Ok(HistoryNavigationResult {
+            page,
+            at_boundary: None,
+        })
+    }
 
     /// Reload the current page with the specified load strategy.
     async fn reload(&self, strategy: LoadStrategy, timeout_ms: u64) -> Result<Page, RubError>;
@@ -104,9 +130,10 @@ pub trait BrowserPort: Send + Sync {
     /// Implementations must return an error rather than silently no-op.
     fn clear_dialog_intercept(&self) -> Result<(), RubError>;
 
-    /// Scroll the viewport.
+    /// Scroll the viewport inside an explicit frame context (`None` = top/primary frame).
     async fn scroll(
         &self,
+        frame_id: Option<&str>,
         direction: ScrollDirection,
         amount: Option<u32>,
     ) -> Result<ScrollPosition, RubError>;

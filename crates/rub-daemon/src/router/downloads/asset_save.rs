@@ -10,6 +10,7 @@ use rub_core::model::SavedAssetEntry;
 use tokio::fs;
 
 use super::DaemonRouter;
+use crate::router::TransactionDeadline;
 
 mod execute;
 mod paths;
@@ -87,8 +88,12 @@ fn default_save_timeout_ms() -> u64 {
 pub(super) async fn cmd_download_save(
     router: &DaemonRouter,
     args: DownloadSaveArgs,
+    deadline: TransactionDeadline,
 ) -> Result<serde_json::Value, RubError> {
-    let batch = DownloadSaveBatch::new(DownloadSaveRequest::try_from(args)?)?;
+    let batch = DownloadSaveBatch::new(
+        DownloadSaveRequest::try_from(args)?,
+        deadline.remaining_ms(),
+    )?;
     batch.run(router).await
 }
 
@@ -127,8 +132,13 @@ impl TryFrom<DownloadSaveArgs> for DownloadSaveRequest {
 }
 
 impl DownloadSaveBatch {
-    fn new(request: DownloadSaveRequest) -> Result<Self, RubError> {
-        let deadline = Instant::now() + Duration::from_millis(request.timeout_ms.max(1));
+    fn new(
+        mut request: DownloadSaveRequest,
+        authoritative_timeout_ms: u64,
+    ) -> Result<Self, RubError> {
+        let effective_timeout_ms = request.timeout_ms.min(authoritative_timeout_ms);
+        let deadline = Instant::now() + Duration::from_millis(effective_timeout_ms.max(1));
+        request.timeout_ms = effective_timeout_ms;
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()
@@ -298,7 +308,7 @@ mod tests {
         asset_request_authority, lookup_json_path, parse_save_request, parse_text_asset_sources,
         resolve_asset_url, resolve_json_asset_root,
     };
-    use super::{DownloadSaveArgs, DownloadSaveRequest, MAX_SAVE_CONCURRENCY};
+    use super::{DownloadSaveArgs, DownloadSaveBatch, DownloadSaveRequest, MAX_SAVE_CONCURRENCY};
     use reqwest::header::HeaderValue;
     use rub_core::error::ErrorCode;
     use serde_json::json;
@@ -332,6 +342,30 @@ mod tests {
             build_base_filename("https://example.test/assets/photo", Some("cover.jpg")),
             "cover.jpg"
         );
+    }
+
+    #[test]
+    fn download_save_batch_uses_authoritative_timeout_budget() {
+        let request = DownloadSaveRequest {
+            file: PathBuf::from("/tmp/assets.json"),
+            output_dir: PathBuf::from("/tmp/out"),
+            input_field: None,
+            url_field: None,
+            name_field: None,
+            base_url: None,
+            cookie_url: None,
+            limit: None,
+            concurrency: 1,
+            overwrite: false,
+            timeout_ms: 30_000,
+        };
+
+        let batch = DownloadSaveBatch::new(request, 250).expect("batch should build");
+        assert!(
+            batch.deadline <= std::time::Instant::now() + std::time::Duration::from_millis(260),
+            "batch deadline should clamp to the authoritative timeout budget"
+        );
+        assert_eq!(batch.request.timeout_ms, 250);
     }
 
     #[test]

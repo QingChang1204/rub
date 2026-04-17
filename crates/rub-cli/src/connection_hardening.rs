@@ -50,23 +50,6 @@ impl RetryFailure {
     pub(crate) fn into_error(self) -> RubError {
         attach_connection_diagnostics(self.error, &self.attribution, self.final_failure_class)
     }
-
-    pub(crate) fn into_attempt_error(self) -> AttemptError {
-        let retry_reason = self.attribution.retry_reason.clone();
-        let final_failure_class = self.final_failure_class;
-        let error = self.into_error();
-        if matches!(
-            final_failure_class,
-            ConnectionFailureClass::TransportTransient
-        ) {
-            AttemptError::retryable(
-                error,
-                retry_reason.unwrap_or_else(|| "transport_transient".to_string()),
-            )
-        } else {
-            AttemptError::terminal(error, final_failure_class)
-        }
-    }
 }
 
 #[derive(Debug)]

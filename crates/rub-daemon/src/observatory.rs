@@ -58,7 +58,8 @@ mod tests {
     use super::{ObservatoryEventWindow, RuntimeObservatoryState};
     use rub_core::model::{
         ConsoleErrorEvent, NetworkBodyPreview, NetworkRequestLifecycle, NetworkRequestRecord,
-        RequestSummaryEvent, RuntimeObservatoryEventPayload, RuntimeObservatoryStatus,
+        ObservedNetworkRequestRecord, RequestSummaryEvent, RuntimeObservatoryEventPayload,
+        RuntimeObservatoryStatus,
     };
     use std::collections::BTreeMap;
 
@@ -218,6 +219,37 @@ mod tests {
                 .and_then(|body| body.preview.as_deref()),
             Some("{\"done\":true}")
         );
+    }
+
+    #[test]
+    fn observed_request_records_receive_sequence_only_at_daemon_authority() {
+        let mut state = RuntimeObservatoryState::default();
+        state.upsert_observed_request_record(ObservedNetworkRequestRecord {
+            request_id: "req-obs".to_string(),
+            lifecycle: NetworkRequestLifecycle::Pending,
+            url: "https://example.com/obs".to_string(),
+            method: "GET".to_string(),
+            tab_target_id: Some("tab-1".to_string()),
+            status: None,
+            request_headers: BTreeMap::new(),
+            response_headers: BTreeMap::new(),
+            request_body: None,
+            response_body: None,
+            original_url: None,
+            rewritten_url: None,
+            applied_rule_effects: Vec::new(),
+            error_text: None,
+            frame_id: None,
+            resource_type: Some("xhr".to_string()),
+            mime_type: None,
+        });
+
+        let record = state
+            .request_record("req-obs")
+            .expect("daemon should publish authoritative request record");
+        assert_eq!(record.sequence, 1);
+        assert_eq!(record.lifecycle, NetworkRequestLifecycle::Pending);
+        assert_eq!(record.url, "https://example.com/obs");
     }
 
     #[test]

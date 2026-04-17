@@ -25,6 +25,7 @@ use crate::session::SessionState;
 
 mod condition;
 
+pub(crate) use condition::orchestration_evidence_key;
 use condition::{
     commit_orchestration_network_progress, load_orchestration_condition_state,
     orchestration_rule_in_cooldown, reconcile_worker_state, record_orchestration_probe_failure,
@@ -373,7 +374,7 @@ fn spawn_orchestration_reservation(
 ) -> PendingOrchestrationReservation {
     let task = tokio::spawn(async move {
         let result = router
-            .begin_automation_transaction_until_shutdown_owned(&state, "orchestration_worker")
+            .begin_automation_reservation_transaction_owned(&state, "orchestration_worker")
             .await;
         let _ = reservation_tx.send(CompletedOrchestrationReservation {
             rule_id,
@@ -462,7 +463,14 @@ async fn handle_orchestration_reservation_completion(
         }
     };
 
-    let result = execute_orchestration_rule(router, state, &reserved.runtime, &reserved.rule).await;
+    let result = execute_orchestration_rule(
+        router,
+        state,
+        &reserved.runtime,
+        &reserved.rule,
+        Some(reserved.evidence_key.as_str()),
+    )
+    .await;
     commit_orchestration_execution(state, worker_entry, reserved, result).await;
 }
 

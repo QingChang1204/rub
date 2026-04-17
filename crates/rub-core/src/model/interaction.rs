@@ -406,3 +406,12 @@ pub struct Page {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub navigation_warning: Option<String>,
 }
+
+/// Page metadata plus same-page history boundary truth captured from the
+/// authoritative page handle that committed the navigation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryNavigationResult {
+    pub page: Page,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_boundary: Option<bool>,
+}

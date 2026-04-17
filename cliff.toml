@@ -1,0 +1,52 @@
+[changelog]
+# changelog header
+header = ""
+# template for the changelog body
+# https://keats.github.io/tera/docs/#introduction
+body = """
+{% if version %}\
+## {{ version }} — {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## Unreleased
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group }}
+{% for commit in commits %}
+- {{ commit.message | upper_first }}\
+{% if commit.breaking %} (**BREAKING**){% endif %}
+{% endfor %}
+{% endfor %}
+"""
+# remove the leading and trailing whitespace from the template
+trim = true
+# changelog footer
+footer = ""
+
+[git]
+# parse the commits based on https://www.conventionalcommits.org
+conventional_commits = true
+# filter out the commits that are not conventional
+filter_unconventional = false
+# process each line of a commit as an individual commit
+split_commits = false
+# regex for preprocessing the commit messages
+commit_preprocessors = []
+# regex for parsing and grouping commits
+commit_parsers = [
+  { message = "^feat", group = "🚀 Features" },
+  { message = "^fix", group = "🐛 Bug Fixes" },
+  { message = "^perf", group = "⚡ Performance" },
+  { message = "^docs", group = "📖 Documentation" },
+  { message = "^refactor", group = "🔧 Refactor" },
+  { message = "^test", group = "🧪 Tests" },
+  { message = "^ci", group = "⚙️ CI/CD" },
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^chore", group = "🏠 Chores" },
+  { body = ".*security", group = "🔐 Security" },
+]
+# filter out the commits that are not matched by commit parsers
+filter_commits = false
+# sort the tags topologically
+topo_order = false
+# sort the commits inside sections by oldest/newest order
+sort_commits = "oldest"

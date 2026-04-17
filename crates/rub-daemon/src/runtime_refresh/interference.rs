@@ -1,14 +1,21 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterferenceRefreshIntent {
+    ReadOnly,
+    PolicyDriven,
+}
+
 pub(crate) async fn refresh_live_interference_state(
     browser: &Arc<dyn BrowserPort>,
     state: &Arc<SessionState>,
+    intent: InterferenceRefreshIntent,
 ) -> Result<Vec<TabInfo>, RubError> {
     let launch_policy = browser.launch_policy();
     match browser.list_tabs().await {
         Ok(tabs) => {
             let runtime = state.classify_interference_runtime(&tabs).await;
-            apply_policy_driven_handoff(state, &runtime, &launch_policy).await;
+            apply_policy_driven_handoff(intent, state, &runtime, &launch_policy).await;
             Ok(tabs)
         }
         Err(error) => {
@@ -23,19 +30,25 @@ pub(crate) async fn refresh_live_interference_state(
 pub(crate) async fn refresh_live_runtime_and_interference(
     browser: &Arc<dyn BrowserPort>,
     state: &Arc<SessionState>,
+    intent: InterferenceRefreshIntent,
 ) -> Result<Vec<TabInfo>, RubError> {
     refresh_live_runtime_state(browser, state).await;
     refresh_live_frame_runtime(browser, state).await;
     refresh_live_storage_runtime(browser, state).await;
     refresh_takeover_runtime(browser, state).await;
-    refresh_live_interference_state(browser, state).await
+    refresh_live_interference_state(browser, state, intent).await
 }
 
 pub(super) async fn apply_policy_driven_handoff(
+    intent: InterferenceRefreshIntent,
     state: &Arc<SessionState>,
     runtime: &InterferenceRuntimeInfo,
     launch_policy: &LaunchPolicyInfo,
 ) {
+    if matches!(intent, InterferenceRefreshIntent::ReadOnly) {
+        return;
+    }
+
     let should_escalate = matches!(
         runtime
             .current_interference

@@ -56,7 +56,7 @@ fn strict_request_decode_surfaces_structured_contract_reason() {
             .as_ref()
             .and_then(|ctx| ctx.get("reason"))
             .and_then(|value| value.as_str()),
-        Some("invalid_ipc_request_contract")
+        Some("invalid_ipc_request_schema")
     );
 }
 
@@ -76,6 +76,39 @@ fn ipc_request_rejects_blank_command_id() {
         error.to_string().contains("non-empty and non-whitespace"),
         "{error}"
     );
+}
+
+#[test]
+fn ipc_request_rejects_blank_command() {
+    let error = serde_json::from_str::<IpcRequest>(
+        r#"{
+            "ipc_protocol_version":"1.0",
+            "command":" ",
+            "args":{},
+            "timeout_ms":1000
+        }"#,
+    )
+    .expect_err("blank command should be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("command must be non-empty and non-whitespace"),
+        "{error}"
+    );
+}
+
+#[test]
+fn ipc_request_rejects_protocol_version_mismatch() {
+    let error = serde_json::from_str::<IpcRequest>(
+        r#"{
+            "ipc_protocol_version":"0.9",
+            "command":"doctor",
+            "args":{},
+            "timeout_ms":1000
+        }"#,
+    )
+    .expect_err("protocol mismatch should be rejected");
+    assert!(error.to_string().contains("protocol mismatch"), "{error}");
 }
 
 #[test]

@@ -9,16 +9,20 @@ mod request;
 mod validation;
 
 pub(crate) use self::identity::{
-    effective_attachment_identity, requested_attachment_identity, requested_user_data_dir,
+    effective_attachment_identity, normalize_identity_path, requested_attachment_identity,
+    requested_user_data_dir, resolve_attachment_identity,
 };
-pub(crate) use self::request::{materialize_connection_request, parse_connection_request};
+pub(crate) use self::request::{
+    materialize_connection_request, materialize_connection_request_with_deadline,
+    parse_connection_request,
+};
 pub(crate) use self::validation::{
     compatibility_launch_policy, requires_existing_session_validation,
-    validate_existing_session_connection_request,
+    validate_existing_session_connection_request_with_deadline,
 };
 
 #[cfg(test)]
-use self::identity::{normalize_identity_path, request_needs_live_attachment_resolution};
+use self::identity::request_needs_live_attachment_resolution;
 #[cfg(test)]
 use self::projection::{requested_connection_projection, requested_session_policy_projection};
 #[cfg(test)]
@@ -31,7 +35,7 @@ use crate::commands::Commands;
 #[cfg(test)]
 use crate::commands::RequestedLaunchPolicy;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConnectionRequest {
     None,
     CdpUrl {

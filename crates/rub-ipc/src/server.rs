@@ -6,6 +6,7 @@ use std::os::unix::fs::FileTypeExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::BufReader;
 use tokio::net::{
     UnixListener, UnixStream,
@@ -31,6 +32,8 @@ pub struct SocketBindGuard {
     #[cfg(unix)]
     _lock_file: std::fs::File,
 }
+
+static STALE_SOCKET_QUARANTINE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl IpcServer {
     /// Bind to a Unix socket at the given path.
@@ -99,8 +102,10 @@ fn prepare_socket_path_for_bind_blocking(socket_path: &Path) -> io::Result<Socke
             ) =>
         {
             #[cfg(unix)]
-            stale_socket_replacement_fence(socket_path, original_identity)?;
-            match std::fs::remove_file(socket_path) {
+            let quarantine_path =
+                quarantine_stale_socket_after_replacement_fence(socket_path, original_identity)?;
+            #[cfg(unix)]
+            match std::fs::remove_file(&quarantine_path) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error),
@@ -187,6 +192,50 @@ fn stale_socket_replacement_fence(
     Ok(())
 }
 
+#[cfg(unix)]
+fn quarantine_stale_socket_after_replacement_fence(
+    socket_path: &Path,
+    original_identity: SocketIdentity,
+) -> io::Result<PathBuf> {
+    stale_socket_replacement_fence(socket_path, original_identity)?;
+    let quarantine_path = unique_stale_socket_quarantine_path(socket_path);
+    std::fs::rename(socket_path, &quarantine_path)?;
+
+    let metadata = std::fs::symlink_metadata(&quarantine_path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "Refusing to delete quarantined IPC socket {} because the fenced socket changed shape during stale cleanup",
+                quarantine_path.display()
+            ),
+        ));
+    }
+    if socket_identity(&metadata) != original_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "Refusing to delete quarantined IPC socket {} because the fenced socket identity changed during stale cleanup",
+                quarantine_path.display()
+            ),
+        ));
+    }
+    Ok(quarantine_path)
+}
+
+#[cfg(unix)]
+fn unique_stale_socket_quarantine_path(socket_path: &Path) -> PathBuf {
+    let file_name = socket_path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "rub-ipc.sock".to_string());
+    socket_path.with_file_name(format!(
+        ".{file_name}.stale.{}.{}",
+        uuid::Uuid::now_v7(),
+        STALE_SOCKET_QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 /// A single IPC connection from a CLI client.
 pub struct IpcConnection {
     reader: BufReader<OwnedReadHalf>,
@@ -229,7 +278,8 @@ impl IpcConnection {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_socket_bind_guard, prepare_socket_path_for_bind, socket_identity,
+        acquire_socket_bind_guard, prepare_socket_path_for_bind,
+        quarantine_stale_socket_after_replacement_fence, socket_identity,
         stale_socket_replacement_fence,
     };
     use serial_test::serial;
@@ -286,6 +336,34 @@ mod tests {
             .expect("same socket identity should remain eligible for stale cleanup");
 
         let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[serial]
+    fn quarantine_stale_socket_moves_fenced_identity_off_bind_path_before_delete() {
+        let root = std::env::temp_dir().join(format!("ri-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let socket_path = root.join("d.sock");
+
+        let stale_listener = UnixListener::bind(&socket_path).expect("bind stale socket");
+        let identity = {
+            let metadata = std::fs::symlink_metadata(&socket_path).expect("stale metadata");
+            socket_identity(&metadata)
+        };
+        drop(stale_listener);
+
+        let quarantine_path =
+            quarantine_stale_socket_after_replacement_fence(&socket_path, identity)
+                .expect("stale socket should move into quarantine");
+        assert!(
+            !socket_path.exists(),
+            "bind path must be cleared before stale cleanup deletes anything"
+        );
+        let quarantined = std::fs::symlink_metadata(&quarantine_path).expect("quarantine metadata");
+        assert_eq!(socket_identity(&quarantined), identity);
+
+        std::fs::remove_file(&quarantine_path).expect("remove quarantine path");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -2,9 +2,9 @@ use super::projection::{annotate_doctor_operator_path_states, runtime_projection
 use super::surface::runtime_summary;
 use super::*;
 use crate::runtime_refresh::{
-    refresh_live_dialog_runtime, refresh_live_frame_runtime, refresh_live_interference_state,
-    refresh_live_runtime_state, refresh_live_storage_runtime, refresh_live_trigger_runtime,
-    refresh_orchestration_runtime, refresh_takeover_runtime,
+    InterferenceRefreshIntent, refresh_live_dialog_runtime, refresh_live_frame_runtime,
+    refresh_live_interference_state, refresh_live_runtime_state, refresh_live_storage_runtime,
+    refresh_live_trigger_runtime, refresh_orchestration_runtime, refresh_takeover_runtime,
 };
 
 pub(crate) async fn cmd_doctor(
@@ -19,7 +19,12 @@ pub(crate) async fn cmd_doctor(
     refresh_takeover_runtime(&router.browser, state).await;
     refresh_orchestration_runtime(state).await;
     let _ = refresh_live_trigger_runtime(&router.browser, state).await;
-    let _ = refresh_live_interference_state(&router.browser, state).await;
+    let _ = refresh_live_interference_state(
+        &router.browser,
+        state,
+        InterferenceRefreshIntent::ReadOnly,
+    )
+    .await;
     let launch_policy = router.browser.launch_policy();
     let report = crate::health::build_report(
         &state.session_id,

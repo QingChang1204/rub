@@ -1,5 +1,4 @@
 use super::policy::command_allowed_during_handoff;
-use super::queue::request_owns_authoritative_timeout;
 use super::timeout::{
     TimeoutPhase, augment_wait_timeout_error, timeout_context, wait_timeout_error,
 };
@@ -30,6 +29,7 @@ fn test_router() -> DaemonRouter {
             headless: true,
             ignore_cert_errors: false,
             user_data_dir: None,
+            managed_profile_ephemeral: false,
             download_dir: None,
             profile_directory: None,
             hide_infobars: true,
@@ -90,7 +90,7 @@ fn epoch_command_matrix_matches_current_contract() {
 }
 
 #[test]
-fn fill_and_pipe_publish_current_dom_epoch_without_incrementing() {
+fn fill_publishes_current_dom_epoch_without_incrementing() {
     let state = Arc::new(SessionState::new(
         "default",
         PathBuf::from("/tmp/rub-router-epoch"),
@@ -108,6 +108,16 @@ fn fill_and_pipe_publish_current_dom_epoch_without_incrementing() {
         Some(current_epoch)
     );
     assert_eq!(state.current_epoch(), current_epoch);
+}
+
+#[test]
+fn pipe_does_not_publish_current_dom_epoch_without_child_effect_summary() {
+    let state = Arc::new(SessionState::new(
+        "default",
+        PathBuf::from("/tmp/rub-router-pipe-epoch"),
+        None,
+    ));
+    let current_epoch = state.increment_epoch();
 
     assert_eq!(
         super::policy::response_dom_epoch(
@@ -116,7 +126,7 @@ fn fill_and_pipe_publish_current_dom_epoch_without_incrementing() {
             &state,
             PendingExternalDomCommit::Clear,
         ),
-        Some(current_epoch)
+        None
     );
     assert_eq!(state.current_epoch(), current_epoch);
 }
@@ -183,29 +193,6 @@ fn incrementing_epoch_can_preserve_pending_external_dom_marker() {
     assert_eq!(epoch, Some(1));
     assert_eq!(state.current_epoch(), 1);
     assert!(state.has_pending_external_dom_change());
-}
-
-#[test]
-fn download_save_owns_its_authoritative_timeout_at_router_boundary() {
-    let request = IpcRequest::new(
-        "download",
-        serde_json::json!({
-            "sub": "save",
-            "file": "/tmp/assets.json",
-            "output_dir": "/tmp/out",
-        }),
-        30_000,
-    );
-    assert!(request_owns_authoritative_timeout(&request));
-
-    let wait_request = IpcRequest::new(
-        "download",
-        serde_json::json!({
-            "sub": "wait",
-        }),
-        30_000,
-    );
-    assert!(!request_owns_authoritative_timeout(&wait_request));
 }
 
 #[test]
@@ -1167,7 +1154,7 @@ async fn prepare_replay_fence_uses_remaining_transaction_budget() {
 }
 
 #[tokio::test]
-async fn replay_wait_without_cached_response_reclaims_released_owner() {
+async fn replay_wait_without_execution_start_reclaims_released_owner() {
     let state = Arc::new(SessionState::new(
         "default",
         PathBuf::from("/tmp/rub-router-test"),
@@ -1211,8 +1198,62 @@ async fn replay_wait_without_cached_response_reclaims_released_owner() {
 
     match state.claim_replay_command("cmd-missing", replay_request_fingerprint(&request)) {
         ReplayCommandClaim::Wait(_) => {}
+        ReplayCommandClaim::SpentWithoutCachedResponse => {
+            panic!("pre-execution release must not spend the command_id")
+        }
         other => panic!("reclaimed replay fence should now be owned in-flight, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn replay_after_execution_started_and_response_eviction_fails_closed() {
+    let state = Arc::new(SessionState::new(
+        "default",
+        PathBuf::from("/tmp/rub-router-test"),
+        None,
+    ));
+    let request = IpcRequest::new("doctor", serde_json::json!({}), 250)
+        .with_command_id("cmd-spent")
+        .expect("static command_id must be valid");
+    let mut replay_owner = prepare_replay_fence(
+        &request,
+        &state,
+        "req-1",
+        TransactionDeadline::new(request.timeout_ms),
+    )
+    .await
+    .expect("first request should become replay owner")
+    .expect("replay owner should be present");
+    replay_owner.mark_execution_started();
+
+    let response = IpcResponse::success("req-1", serde_json::json!({ "ok": true }));
+    let finalized = finalize_response(&request, response, false, Some(replay_owner), &state).await;
+    assert_eq!(finalized.command_id.as_deref(), Some("cmd-spent"));
+
+    state.evict_cached_replay_response_for_test("cmd-spent");
+
+    let replay = prepare_replay_fence(
+        &request,
+        &state,
+        "req-2",
+        TransactionDeadline::new(request.timeout_ms),
+    )
+    .await
+    .expect_err("evicted replay response must not let a spent command_id rerun");
+    assert_eq!(replay.command_id.as_deref(), Some("cmd-spent"));
+    assert_eq!(
+        replay.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::IpcProtocolError)
+    );
+    assert_eq!(
+        replay
+            .error
+            .as_ref()
+            .and_then(|error| error.context.as_ref())
+            .and_then(|context| context.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("replay_command_id_already_spent_original_response_evicted")
+    );
 }
 
 #[tokio::test]
