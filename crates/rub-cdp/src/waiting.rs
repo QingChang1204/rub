@@ -274,6 +274,7 @@ fn locator_wait_script(locator: &CanonicalLocator, state: WaitState) -> Result<S
             const locator = {locator};
             const state = {state};
             {LOCATOR_JS_HELPERS}
+            {top_level_hit_test_helpers}
             const isVisible = (el) =>{{
                 if (!el) return false;
                 const style = getComputedStyle(el);
@@ -291,6 +292,7 @@ fn locator_wait_script(locator: &CanonicalLocator, state: WaitState) -> Result<S
                 if (!el || !isVisible(el)) return false;
                 if (el.disabled === true || el.hasAttribute?.('disabled')) return false;
                 if (hasTruthyAriaFlag(el, 'aria-disabled')) return false;
+                if (!topLevelHitMatches(el)) return false;
                 const tag = String(el.tagName || '').toLowerCase();
                 const editorLike = el.isContentEditable || tag === 'input' || tag === 'textarea';
                 if (!editorLike) return true;
@@ -329,7 +331,8 @@ fn locator_wait_script(locator: &CanonicalLocator, state: WaitState) -> Result<S
             }}
         }})()"#,
         invalid_selector = invalid_selector,
-        ambiguous_locator = ambiguous_locator
+        ambiguous_locator = ambiguous_locator,
+        top_level_hit_test_helpers = crate::targeting::TOP_LEVEL_HIT_TEST_HELPERS
     ))
 }
 
@@ -617,6 +620,24 @@ mod tests {
         assert!(script.contains("readonly"), "{script}");
         assert!(script.contains("isContentEditable"), "{script}");
         assert!(script.contains("case 'interactable'"), "{script}");
+    }
+
+    #[test]
+    fn locator_interactable_wait_script_uses_top_level_hit_test_authority() {
+        let script = locator_wait_script(
+            &CanonicalLocator::Selector {
+                css: ".composer".to_string(),
+                selection: Some(LocatorSelection::First),
+            },
+            WaitState::Interactable,
+        )
+        .expect("selector locator should serialize");
+        assert!(script.contains("topLevelHitMatches(el)"), "{script}");
+        assert!(
+            script.contains("window.top.document.elementFromPoint"),
+            "{script}"
+        );
+        assert!(script.contains("current.frameElement"), "{script}");
     }
 
     #[test]

@@ -42,7 +42,6 @@ impl InterferenceRuntimeState {
         readiness: &ReadinessInfo,
         handoff: &HumanVerificationHandoffInfo,
     ) -> InterferenceRuntimeInfo {
-        self.prime_baseline_from_tabs(tabs);
         let classified = classify(
             &self.projection,
             &self.baseline,
@@ -53,6 +52,15 @@ impl InterferenceRuntimeState {
         );
         self.projection = classified.projection;
         self.baseline = classified.baseline;
+        if self.baseline.primary_target_id.is_none()
+            && self.baseline.primary_url.is_none()
+            && matches!(
+                self.projection.status,
+                rub_core::model::InterferenceRuntimeStatus::Inactive
+            )
+        {
+            self.prime_baseline_from_tabs(tabs);
+        }
         self.projection.clone()
     }
 }

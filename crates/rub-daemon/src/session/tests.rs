@@ -29,6 +29,7 @@ fn sample_orchestration_rule(id: u32) -> OrchestrationRuleInfo {
     OrchestrationRuleInfo {
         id,
         status: OrchestrationRuleStatus::Armed,
+        lifecycle_generation: 1,
         source: OrchestrationAddressInfo {
             session_id: "sess-source".to_string(),
             session_name: "source".to_string(),
@@ -1785,7 +1786,19 @@ async fn stale_orchestration_runtime_sequence_does_not_override_newer_projection
         .set_orchestration_runtime(2, newer_sessions.clone(), None)
         .await;
     state
-        .mark_orchestration_runtime_degraded(1, "stale_registry_error")
+        .mark_orchestration_runtime_degraded(
+            1,
+            crate::orchestration_runtime::projected_orchestration_session(
+                current_session_id,
+                current_session_name,
+                42,
+                "/tmp/rub-current.sock".to_string(),
+                true,
+                "1.0".to_string(),
+                None,
+            ),
+            "stale_registry_error",
+        )
         .await;
 
     let runtime = state.orchestration_runtime().await;
@@ -1795,7 +1808,7 @@ async fn stale_orchestration_runtime_sequence_does_not_override_newer_projection
 }
 
 #[tokio::test]
-async fn degraded_orchestration_runtime_clears_stale_known_sessions() {
+async fn degraded_orchestration_runtime_preserves_current_session_execution_authority() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
     let current_session_id = state.session_id.clone();
     let current_session_name = state.session_name.clone();
@@ -1813,7 +1826,19 @@ async fn degraded_orchestration_runtime_clears_stale_known_sessions() {
 
     state.set_orchestration_runtime(1, sessions, None).await;
     state
-        .mark_orchestration_runtime_degraded(2, "registry_read_failed:test")
+        .mark_orchestration_runtime_degraded(
+            2,
+            crate::orchestration_runtime::projected_orchestration_session(
+                state.session_id.clone(),
+                state.session_name.clone(),
+                42,
+                "/tmp/rub-current.sock".to_string(),
+                true,
+                "1.0".to_string(),
+                None,
+            ),
+            "registry_read_failed:test",
+        )
         .await;
 
     let runtime = state.orchestration_runtime().await;
@@ -1822,9 +1847,10 @@ async fn degraded_orchestration_runtime_clears_stale_known_sessions() {
         Some("registry_read_failed:test")
     );
     assert!(!runtime.addressing_supported);
-    assert!(!runtime.execution_supported);
-    assert!(runtime.known_sessions.is_empty());
-    assert_eq!(runtime.session_count, 0);
+    assert!(runtime.execution_supported);
+    assert_eq!(runtime.known_sessions.len(), 1);
+    assert!(runtime.known_sessions[0].current);
+    assert_eq!(runtime.session_count, 1);
 }
 
 #[tokio::test]

@@ -1,6 +1,7 @@
 use crate::connection_hardening::ConnectionFailureClass;
 use crate::timeout_budget::helpers::mutating_request;
 use rub_core::error::{ErrorCode, RubError};
+use rub_daemon::session::RegistrySessionSnapshot;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,86 @@ fn augment_close_existing_error(
     RubError::Domain(envelope)
 }
 
+fn close_existing_authority_resolution_error(
+    session_name: &str,
+    snapshot: &RegistrySessionSnapshot,
+) -> RubError {
+    RubError::domain_with_context(
+        ErrorCode::IpcProtocolError,
+        format!(
+            "Close target for session '{session_name}' has no authoritative live daemon and the registry projection is stale or inconclusive"
+        ),
+        serde_json::json!({
+            "reason": "close_existing_authority_unavailable",
+            "session": session_name,
+            "latest_entry": snapshot.latest_entry().map(|entry| {
+                serde_json::json!({
+                    "daemon_session_id": entry.entry.session_id,
+                    "liveness": format!("{:?}", entry.liveness),
+                })
+            }),
+            "stale_session_ids": snapshot.stale_entries().into_iter().map(|entry| entry.session_id).collect::<Vec<_>>(),
+            "has_uncertain_entries": snapshot.has_uncertain_entries(),
+        }),
+    )
+}
+
+fn close_existing_authority_disappeared_error(
+    session_name: &str,
+    authoritative_daemon_session_id: &str,
+    expected_daemon_session_id: Option<&str>,
+) -> RubError {
+    RubError::domain_with_context(
+        ErrorCode::IpcProtocolError,
+        format!(
+            "Close target for session '{session_name}' lost its authoritative live daemon before dispatch"
+        ),
+        serde_json::json!({
+            "reason": "close_existing_authority_disappeared_before_dispatch",
+            "session": session_name,
+            "authoritative_daemon_session_id": authoritative_daemon_session_id,
+            "expected_daemon_session_id": expected_daemon_session_id,
+        }),
+    )
+}
+
+fn close_selector_authority_resolution_error(
+    requested_attachment_identity: &str,
+    candidate_entries: &[rub_daemon::session::RegistryEntry],
+) -> RubError {
+    RubError::domain_with_context(
+        ErrorCode::IpcProtocolError,
+        format!(
+            "Close selector matched projected daemon authority for attachment '{}' but no authoritative live daemon confirmed that binding",
+            requested_attachment_identity
+        ),
+        serde_json::json!({
+            "reason": "close_selector_authority_unavailable",
+            "requested_attachment_identity": requested_attachment_identity,
+            "projected_candidates": candidate_entries.iter().map(|entry| {
+                serde_json::json!({
+                    "session": entry.session_name,
+                    "daemon_session_id": entry.session_id,
+                    "socket_path": entry.socket_path,
+                })
+            }).collect::<Vec<_>>(),
+        }),
+    )
+}
+
+fn close_selector_handshake_transport_failed(error: &RubError) -> bool {
+    matches!(
+        error,
+        RubError::Domain(envelope)
+            if envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("reason"))
+                .and_then(|value| value.as_str())
+                == Some("handshake_transport_failed")
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExistingCloseTargetAuthority {
     pub(crate) session_name: String,
@@ -61,6 +142,17 @@ pub(crate) async fn close_existing_session_targeted(
         return Ok(ExistingCloseOutcome::Noop);
     }
 
+    let snapshot = registry_authority_snapshot(rub_home)?;
+    let Some(session_snapshot) = snapshot.session(session_name) else {
+        return Ok(ExistingCloseOutcome::Noop);
+    };
+    let Some(authoritative_entry) = session_snapshot.authoritative_entry() else {
+        return Err(close_existing_authority_resolution_error(
+            session_name,
+            session_snapshot,
+        ));
+    };
+
     let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
 
     let (mut client, daemon_session_id) = match detect_or_connect_hardened_until(
@@ -76,7 +168,13 @@ pub(crate) async fn close_existing_session_targeted(
             client,
             daemon_session_id,
         } => (client, daemon_session_id),
-        DaemonConnection::NeedStart => return Ok(ExistingCloseOutcome::Noop),
+        DaemonConnection::NeedStart => {
+            return Err(close_existing_authority_disappeared_error(
+                session_name,
+                authoritative_entry.entry.session_id.as_str(),
+                expected_daemon_session_id,
+            ));
+        }
     };
     if let Some(expected) = expected_daemon_session_id
         && daemon_session_id.as_deref() != Some(expected)
@@ -144,7 +242,7 @@ pub(crate) async fn resolve_existing_close_target_by_attachment_identity(
     }
 
     let mut matches = Vec::new();
-    for entry in candidate_entries {
+    for entry in &candidate_entries {
         let remaining_timeout_ms = super::remaining_budget_ms(deadline);
         if remaining_timeout_ms == 0 {
             return Err(ipc_budget_exhausted_error(
@@ -175,7 +273,12 @@ pub(crate) async fn resolve_existing_close_target_by_attachment_identity(
             Err(failure) => return Err(failure.into_error()),
         };
         let handshake =
-            fetch_handshake_info_with_timeout(&mut client, remaining_timeout_ms.max(1)).await?;
+            match fetch_handshake_info_with_timeout(&mut client, remaining_timeout_ms.max(1)).await
+            {
+                Ok(handshake) => handshake,
+                Err(error) if close_selector_handshake_transport_failed(&error) => continue,
+                Err(error) => return Err(error),
+            };
         if handshake.daemon_session_id != entry.session_id {
             continue;
         }
@@ -208,6 +311,13 @@ pub(crate) async fn resolve_existing_close_target_by_attachment_identity(
         ));
     }
 
+    if matches.is_empty() {
+        return Err(close_selector_authority_resolution_error(
+            requested_attachment_identity,
+            &candidate_entries,
+        ));
+    }
+
     Ok(matches.into_iter().next())
 }
 
@@ -218,6 +328,7 @@ mod tests {
         close_existing_session_targeted, resolve_existing_close_target_by_attachment_identity,
     };
     use rub_core::error::{ErrorCode, RubError};
+    use rub_core::model::LaunchPolicyInfo;
     use rub_daemon::rub_paths::RubPaths;
     use rub_daemon::session::{RegistryData, RegistryEntry, write_registry};
     use rub_ipc::codec::NdJsonCodec;
@@ -500,6 +611,141 @@ mod tests {
         assert_eq!(
             error.context.as_ref().and_then(|ctx| ctx.get("reason")),
             Some(&serde_json::json!("close_existing_authority_mismatch"))
+        );
+
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn close_existing_session_rejects_stale_session_projection() {
+        let home = temp_home();
+        std::fs::create_dir_all(&home).unwrap();
+        let runtime = RubPaths::new(&home).session_runtime("default", "sess-stale");
+        std::fs::create_dir_all(runtime.session_dir()).unwrap();
+        std::fs::create_dir_all(
+            runtime
+                .startup_committed_path()
+                .parent()
+                .expect("startup commit parent"),
+        )
+        .unwrap();
+        std::fs::write(runtime.pid_path(), "999999").unwrap();
+        std::fs::write(runtime.startup_committed_path(), "sess-stale").unwrap();
+        write_registry(
+            &home,
+            &RegistryData {
+                sessions: vec![RegistryEntry {
+                    session_id: "sess-stale".to_string(),
+                    session_name: "default".to_string(),
+                    pid: 999_999,
+                    socket_path: runtime.socket_path().display().to_string(),
+                    created_at: "2026-04-17T00:00:00Z".to_string(),
+                    ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+                    user_data_dir: None,
+                    attachment_identity: None,
+                    connection_target: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        let error = close_existing_session_targeted(&home, "default", None, 1_000)
+            .await
+            .expect_err("stale session projection must fail closed")
+            .into_envelope();
+        assert_eq!(error.code, ErrorCode::IpcProtocolError);
+        assert_eq!(
+            error.context.as_ref().and_then(|ctx| ctx.get("reason")),
+            Some(&serde_json::json!("close_existing_authority_unavailable"))
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn resolve_close_target_by_attachment_identity_rejects_stale_projection_without_live_match()
+     {
+        let home = temp_home();
+        std::fs::create_dir_all(&home).unwrap();
+        let runtime = RubPaths::new(&home).session_runtime("default", "sess-default");
+        std::fs::create_dir_all(runtime.session_dir()).unwrap();
+        std::fs::create_dir_all(
+            runtime
+                .startup_committed_path()
+                .parent()
+                .expect("startup commit parent"),
+        )
+        .unwrap();
+        std::fs::write(runtime.pid_path(), std::process::id().to_string()).unwrap();
+        std::fs::write(runtime.startup_committed_path(), "sess-default").unwrap();
+        std::fs::create_dir_all(
+            runtime
+                .socket_path()
+                .parent()
+                .expect("socket path parent should exist"),
+        )
+        .unwrap();
+        let listener = UnixListener::bind(runtime.socket_path()).unwrap();
+        write_registry(
+            &home,
+            &RegistryData {
+                sessions: vec![RegistryEntry {
+                    session_id: "sess-default".to_string(),
+                    session_name: "default".to_string(),
+                    pid: std::process::id(),
+                    socket_path: runtime.socket_path().display().to_string(),
+                    created_at: "2026-04-17T00:00:00Z".to_string(),
+                    ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+                    user_data_dir: Some("/tmp/profile".to_string()),
+                    attachment_identity: Some("user_data_dir:/tmp/profile".to_string()),
+                    connection_target: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let _request: serde_json::Value =
+                NdJsonCodec::read(&mut reader).await.unwrap().unwrap();
+            let response = IpcResponse::success(
+                "handshake",
+                serde_json::json!({
+                    "daemon_session_id": "sess-default",
+                    "attachment_identity": "user_data_dir:/tmp/other",
+                    "launch_policy": serde_json::to_value(LaunchPolicyInfo {
+                        headless: true,
+                        ignore_cert_errors: false,
+                        hide_infobars: false,
+                        user_data_dir: None,
+                        connection_target: None,
+                        stealth_level: None,
+                        stealth_patches: None,
+                        stealth_default_enabled: None,
+                        humanize_enabled: None,
+                        humanize_speed: None,
+                        stealth_coverage: None,
+                    }).unwrap(),
+                }),
+            );
+            let _ = NdJsonCodec::write(&mut writer, &response).await;
+        });
+
+        let error = resolve_existing_close_target_by_attachment_identity(
+            &home,
+            "user_data_dir:/tmp/profile",
+            1_000,
+        )
+        .await
+        .expect_err("stale selector projection must fail closed")
+        .into_envelope();
+        assert_eq!(error.code, ErrorCode::IpcProtocolError);
+        assert_eq!(
+            error.context.as_ref().and_then(|ctx| ctx.get("reason")),
+            Some(&serde_json::json!("close_selector_authority_unavailable"))
         );
 
         server.await.unwrap();

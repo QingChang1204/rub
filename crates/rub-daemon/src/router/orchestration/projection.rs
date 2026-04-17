@@ -57,6 +57,7 @@ mod tests {
         let rule = OrchestrationRuleInfo {
             id: 7,
             status: OrchestrationRuleStatus::Armed,
+            lifecycle_generation: 1,
             source: OrchestrationAddressInfo {
                 session_id: "source-id".to_string(),
                 session_name: "source".to_string(),

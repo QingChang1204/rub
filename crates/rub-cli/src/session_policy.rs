@@ -11,6 +11,7 @@ mod validation;
 pub(crate) use self::identity::{
     effective_attachment_identity, normalize_identity_path, requested_attachment_identity,
     requested_user_data_dir, resolve_attachment_identity,
+    resolve_attachment_identity_with_deadline,
 };
 pub(crate) use self::request::{
     materialize_connection_request, materialize_connection_request_with_deadline,
@@ -181,6 +182,8 @@ mod tests {
         let mut humanize_cli = default_cli.clone();
         humanize_cli.requested_launch_policy.humanize = true;
         humanize_cli.effective_launch_policy.humanize = true;
+        let mut remembered_cli = default_cli.clone();
+        remembered_cli.session_id = Some("sess-live".to_string());
 
         assert!(!requires_existing_session_validation(
             false,
@@ -203,6 +206,11 @@ mod tests {
             true,
             &ConnectionRequest::None,
             &humanize_cli,
+        ));
+        assert!(requires_existing_session_validation(
+            true,
+            &ConnectionRequest::None,
+            &remembered_cli,
         ));
     }
 

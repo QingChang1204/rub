@@ -4,6 +4,7 @@ use tokio::time::{Duration, sleep};
 
 use super::super::TransactionDeadline;
 use super::super::snapshot::build_stable_snapshot;
+use super::ExtractAuthorityMode;
 use super::collection::{ExtractCollectionSpec, extract_collection};
 use crate::router::DaemonRouter;
 use crate::session::SessionState;
@@ -58,8 +59,14 @@ pub(super) async fn scan_collection(
         let snapshot =
             build_stable_snapshot(router, args, state, deadline, Some(0), false, false).await?;
         let snapshot = state.cache_snapshot(snapshot).await;
-        let batch_value =
-            extract_collection(router, &snapshot, collection_name, collection).await?;
+        let batch_value = extract_collection(
+            router,
+            &snapshot,
+            collection_name,
+            collection,
+            ExtractAuthorityMode::LiveAllowed,
+        )
+        .await?;
         let batch_rows = batch_value.as_array().cloned().ok_or_else(|| {
             RubError::Internal("collection scan expected array payload".to_string())
         })?;
@@ -138,8 +145,14 @@ pub(super) async fn wait_for_collection_match(
         let snapshot =
             build_stable_snapshot(router, args, state, deadline, Some(0), false, false).await?;
         let snapshot = state.cache_snapshot(snapshot).await;
-        let batch_value =
-            extract_collection(router, &snapshot, collection_name, collection).await?;
+        let batch_value = extract_collection(
+            router,
+            &snapshot,
+            collection_name,
+            collection,
+            ExtractAuthorityMode::LiveAllowed,
+        )
+        .await?;
         let rows = batch_value.as_array().cloned().ok_or_else(|| {
             RubError::Internal("collection wait expected array payload".to_string())
         })?;

@@ -20,6 +20,7 @@ use crate::session_policy::{
 use crate::teardown_ctl;
 use crate::timeout_budget::run_with_remaining_budget;
 use crate::workflow_assets;
+use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
 use rub_core::model::BindingExecutionResolutionInfo;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -39,6 +40,27 @@ pub(crate) fn close_all_selector_error() -> rub_core::error::RubError {
         serde_json::json!({
             "reason": "close_all_selector_not_supported",
         }),
+    )
+}
+
+pub(crate) fn close_all_partial_failure_error(
+    rub_home: &Path,
+    result: &daemon_ctl::BatchCloseResult,
+) -> RubError {
+    let failed_count = result.failed.len();
+    RubError::Domain(
+        ErrorEnvelope::new(
+            ErrorCode::IpcProtocolError,
+            format!("Failed to close {failed_count} session(s) during close --all"),
+        )
+        .with_suggestion(
+            "Inspect result.failed, rerun 'rub close <session>' for those sessions, or use 'rub doctor' before retrying.",
+        )
+        .with_context(serde_json::json!({
+            "reason": "close_all_partial_failure",
+            "close_all": daemon_ctl::project_batch_close_result(rub_home, result),
+            "failed_sessions": result.failed,
+        })),
     )
 }
 
@@ -314,7 +336,7 @@ pub(crate) async fn try_handle_prebootstrap_command(
             std::process::exit(1);
         }
         match daemon_ctl::close_all_sessions(rub_home, timeout).await {
-            Ok(result) => {
+            Ok(result) if result.failed.is_empty() => {
                 println!(
                     "{}",
                     output::format_cli_success(
@@ -327,6 +349,18 @@ pub(crate) async fn try_handle_prebootstrap_command(
                     )
                 );
                 return true;
+            }
+            Ok(result) => {
+                println!(
+                    "{}",
+                    output::format_cli_error(
+                        "close",
+                        session,
+                        close_all_partial_failure_error(rub_home, &result).into_envelope(),
+                        pretty,
+                    )
+                );
+                std::process::exit(1);
             }
             Err(error) => {
                 println!(

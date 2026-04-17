@@ -9,7 +9,7 @@ mod tests;
 
 use self::projection::project_collection_entry;
 use self::schema::{build_collection_extract_script, collection_locator_context};
-use super::{ExtractFieldSpec, execute_json_payload_in_frame};
+use super::{ExtractAuthorityMode, ExtractFieldSpec, execute_json_payload_in_frame};
 use crate::router::DaemonRouter;
 
 #[derive(Debug, serde::Deserialize)]
@@ -68,7 +68,21 @@ pub(super) async fn extract_collection(
     snapshot: &rub_core::model::Snapshot,
     name: &str,
     collection: &ExtractCollectionSpec,
+    authority_mode: ExtractAuthorityMode,
 ) -> Result<serde_json::Value, RubError> {
+    if authority_mode == ExtractAuthorityMode::SnapshotOnly {
+        return Err(RubError::domain_with_context_and_suggestion(
+            ErrorCode::InvalidInput,
+            format!(
+                "snapshot-addressed extract cannot read collection '{name}' because collection extraction requires live DOM evaluation"
+            ),
+            serde_json::json!({
+                "field": name,
+                "authority_state": "snapshot_extract_live_collection_unsupported",
+            }),
+            "Remove --snapshot-id to allow live collection extraction, or switch to snapshot-addressed field reads only",
+        ));
+    }
     let payload = execute_collection_extract(router, snapshot, collection).await?;
     if let Some(selector_error) = payload.selector_error {
         return Err(RubError::domain_with_context(

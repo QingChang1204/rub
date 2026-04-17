@@ -4,7 +4,7 @@ use std::sync::Arc;
 use rub_core::error::RubError;
 use rub_core::model::{
     HumanVerificationHandoffStatus, InterferenceKind, InterferenceRuntimeInfo, LaunchPolicyInfo,
-    TabInfo,
+    ReadinessInfo, TabInfo,
 };
 use rub_core::port::BrowserPort;
 
@@ -18,8 +18,8 @@ mod surfaces;
 #[cfg(test)]
 use interference::apply_policy_driven_handoff;
 pub(crate) use interference::{
-    InterferenceRefreshIntent, refresh_live_interference_state,
-    refresh_live_runtime_and_interference,
+    InterferenceRefreshIntent, InterferenceRefreshSnapshot, refresh_live_interference_state,
+    refresh_live_runtime_and_interference, refresh_live_runtime_and_interference_snapshot,
 };
 pub(crate) use orchestration::refresh_orchestration_runtime;
 pub(crate) use surfaces::{
@@ -355,9 +355,20 @@ mod tests {
             runtime.degraded_reason.as_deref(),
             Some("current_session_missing_from_live_registry")
         );
-        assert_eq!(runtime.known_sessions.len(), 1);
-        assert_eq!(runtime.known_sessions[0].session_id, "sess-other");
-        assert!(!runtime.known_sessions[0].current);
+        assert_eq!(runtime.known_sessions.len(), 2);
+        assert!(
+            runtime
+                .known_sessions
+                .iter()
+                .any(|session| session.session_id == "sess-other" && !session.current)
+        );
+        assert!(
+            runtime
+                .known_sessions
+                .iter()
+                .any(|session| session.session_id == state.session_id && session.current)
+        );
+        assert!(runtime.execution_supported);
 
         let _ = std::fs::remove_dir_all(home);
         fixture.join();
@@ -428,7 +439,10 @@ mod tests {
         let runtime = state.orchestration_runtime().await;
         assert_eq!(runtime.status, OrchestrationRuntimeStatus::Degraded);
         assert!(!runtime.addressing_supported);
-        assert!(!runtime.execution_supported);
+        assert!(runtime.execution_supported);
+        assert_eq!(runtime.known_sessions.len(), 1);
+        assert!(runtime.known_sessions[0].current);
+        assert_eq!(runtime.known_sessions[0].session_id, state.session_id);
         assert_eq!(
             runtime.degraded_reason.as_deref(),
             Some("live_registry_empty")

@@ -9,7 +9,7 @@ use std::time::Instant;
 use super::ConnectionRequest;
 use super::identity::{
     request_needs_live_attachment_resolution, requested_attachment_identity,
-    resolve_attachment_identity,
+    resolve_attachment_identity, resolve_attachment_identity_with_deadline,
 };
 use super::projection::{requested_connection_projection, requested_session_policy_projection};
 
@@ -62,7 +62,20 @@ pub(crate) async fn validate_existing_session_connection_request_with_deadline(
         authority.attachment_identity.as_deref(),
         request,
     ) {
-        resolve_attachment_identity(cli, request, None).await?
+        match (deadline, timeout_ms) {
+            (Some(deadline), Some(timeout_ms)) => {
+                resolve_attachment_identity_with_deadline(
+                    cli,
+                    request,
+                    None,
+                    deadline,
+                    timeout_ms,
+                    "existing_session_validation_attachment_identity_resolution",
+                )
+                .await?
+            }
+            _ => resolve_attachment_identity(cli, request, None).await?,
+        }
     } else {
         requested_attachment_identity(cli, request)
     };
@@ -145,7 +158,8 @@ pub(crate) fn requires_existing_session_validation(
     cli: &EffectiveCli,
 ) -> bool {
     connected_to_existing_daemon
-        && (!matches!(request, ConnectionRequest::None)
+        && (cli.session_id.is_some()
+            || !matches!(request, ConnectionRequest::None)
             || compatibility_launch_policy(cli, request).has_any())
 }
 
@@ -218,6 +232,8 @@ mod tests {
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
     use tokio::net::UnixListener;
 
     fn temp_home() -> PathBuf {
@@ -299,6 +315,37 @@ mod tests {
             serde_json::to_writer(&mut writer, &response).expect("encode handshake response");
             writer.write_all(b"\n").expect("newline handshake response");
         })
+    }
+
+    fn spawn_delayed_cdp_identity_server(delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
+        let runtime = tokio::runtime::Handle::current();
+        let std_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind delayed cdp server");
+        std_listener
+            .set_nonblocking(true)
+            .expect("set delayed cdp server nonblocking");
+        let address = std_listener.local_addr().expect("local addr");
+        let endpoint = format!("http://{address}/json/version");
+        let handle = tokio::task::spawn_blocking(move || {
+            let listener =
+                TcpListener::from_std(std_listener).expect("convert tcp listener to tokio");
+            runtime.block_on(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept delayed cdp client");
+                let body =
+                    format!(r#"{{"webSocketDebuggerUrl":"ws://{address}/devtools/browser/test"}}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                tokio::time::sleep(delay).await;
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write delayed cdp response");
+            });
+        });
+        (endpoint, handle)
     }
 
     #[tokio::test]
@@ -388,6 +435,101 @@ mod tests {
         );
 
         server.abort();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn existing_session_validation_fails_closed_for_connection_none_when_cli_session_id_is_authoritative()
+     {
+        let home = temp_home();
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let socket_path = home.join("v.sock");
+        let server = spawn_handshake_server(&socket_path, "sess-replacement", None);
+
+        let mut cli = cli_with(Commands::Doctor, &home);
+        cli.session_id = Some("sess-live".to_string());
+
+        let mut client = IpcClient::connect(&socket_path)
+            .await
+            .expect("connect validation client");
+
+        let error = validate_existing_session_connection_request_with_deadline(
+            &cli,
+            &ConnectionRequest::None,
+            &mut client,
+            cli.session_id.as_deref(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("remembered daemon authority mismatch must fail closed");
+
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|value| value.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("existing_session_validation_authority_mismatch")
+        );
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|value| value.get("expected_daemon_session_id"))
+                .and_then(|value| value.as_str()),
+            Some("sess-live")
+        );
+
+        server.await.expect("join handshake server");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn existing_session_validation_uses_remaining_budget_for_live_attachment_identity_resolution()
+     {
+        let home = temp_home();
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let socket_path = home.join("v.sock");
+        let handshake_server = spawn_handshake_server(
+            &socket_path,
+            "sess-live",
+            Some("cdp:ws://127.0.0.1:9222/devtools/browser/live"),
+        );
+        let (cdp_url, cdp_server) = spawn_delayed_cdp_identity_server(Duration::from_millis(200));
+
+        let cli = cli_with(Commands::Doctor, &home);
+        let request = ConnectionRequest::CdpUrl { url: cdp_url };
+        let mut client = IpcClient::connect(&socket_path)
+            .await
+            .expect("connect validation client");
+
+        let error = validate_existing_session_connection_request_with_deadline(
+            &cli,
+            &request,
+            &mut client,
+            Some("sess-live"),
+            Some(Instant::now() + Duration::from_millis(50)),
+            Some(50),
+        )
+        .await
+        .expect_err("live attachment identity resolution must share the validation budget");
+
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::IpcTimeout);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|value| value.get("phase"))
+                .and_then(|value| value.as_str()),
+            Some("existing_session_validation_attachment_identity_resolution")
+        );
+
+        handshake_server.await.expect("join handshake server");
+        cdp_server.await.expect("join delayed cdp server");
         let _ = std::fs::remove_dir_all(&home);
     }
 }

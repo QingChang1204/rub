@@ -89,6 +89,12 @@ async fn write_response_with_timeout_duration<W: tokio::io::AsyncWrite + Unpin>(
     response: &IpcResponse,
     timeout: std::time::Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    response.validate_contract().map_err(|envelope| {
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            envelope.message,
+        )) as Box<dyn std::error::Error + Send + Sync>
+    })?;
     match tokio::time::timeout(timeout, NdJsonCodec::write(writer, response)).await {
         Ok(result) => result,
         Err(_) => Err(std::io::Error::new(
@@ -234,6 +240,25 @@ mod tests {
             .downcast::<std::io::Error>()
             .expect("timeout helper should return an io::Error");
         assert_eq!(io_error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn response_write_rejects_invalid_contract_before_transport_commit() {
+        let (mut writer, _reader) = tokio::io::duplex(128);
+        let response = IpcResponse::success("   ", serde_json::json!({"ok": true}));
+
+        let error = write_response_with_timeout_duration(
+            &mut writer,
+            &response,
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .expect_err("invalid contract should fail before transport commit");
+
+        let io_error = error
+            .downcast::<std::io::Error>()
+            .expect("contract failure should be reported as io::Error");
+        assert_eq!(io_error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

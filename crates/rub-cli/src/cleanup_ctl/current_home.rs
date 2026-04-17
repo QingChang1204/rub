@@ -1,13 +1,16 @@
 use super::CleanupResult;
 use super::projection::{CleanupPathContext, cleanup_path_error};
-use super::upgrade_probe::fetch_upgrade_status_for_session;
+use super::upgrade_probe::fetch_upgrade_status_for_session_with_deadline;
 use std::path::Path;
+use std::time::Instant;
 
 use rub_core::error::{ErrorCode, RubError};
 use rub_daemon::rub_paths::RubPaths;
 
 pub(super) async fn cleanup_current_home_stale(
     rub_home: &Path,
+    deadline: Instant,
+    timeout_ms: u64,
     result: &mut CleanupResult,
 ) -> Result<(), RubError> {
     let snapshot = match rub_daemon::session::registry_authority_snapshot(rub_home) {
@@ -37,13 +40,24 @@ pub(super) async fn cleanup_current_home_stale(
             let session_name = entry.session_name.clone();
             let session_paths =
                 RubPaths::new(rub_home).session_runtime(&session_name, &entry.session_id);
-            match fetch_upgrade_status_for_session(&session_paths).await {
+            match fetch_upgrade_status_for_session_with_deadline(
+                &session_paths,
+                deadline,
+                timeout_ms,
+                "cleanup_current_home_upgrade_check",
+            )
+            .await
+            {
                 Ok(Some(_)) => {
                     result.kept_active_sessions.push(session_name);
                     continue;
                 }
                 Ok(None) => {}
-                Err(_) => {
+                Err(error) => {
+                    if matches!(&error, RubError::Domain(envelope) if envelope.code == ErrorCode::IpcTimeout)
+                    {
+                        return Err(error);
+                    }
                     if pending_startup || live_authority {
                         result.skipped_unreachable_sessions.push(session_name);
                         continue;

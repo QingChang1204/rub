@@ -495,4 +495,5 @@ fn orchestration_target_dispatch_command_id(
 }
 
 #[cfg(test)]
+#[path = "target_tests.rs"]
 mod tests;

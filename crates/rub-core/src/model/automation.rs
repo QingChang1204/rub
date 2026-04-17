@@ -285,6 +285,10 @@ fn default_orchestration_mode() -> OrchestrationMode {
     OrchestrationMode::Once
 }
 
+fn default_orchestration_rule_generation() -> u64 {
+    1
+}
+
 /// User-supplied execution policy for orchestration rules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -356,6 +360,8 @@ pub struct OrchestrationRegistrationSpec {
 pub struct OrchestrationRuleInfo {
     pub id: u32,
     pub status: OrchestrationRuleStatus,
+    #[serde(default = "default_orchestration_rule_generation", skip_serializing)]
+    pub lifecycle_generation: u64,
     pub source: OrchestrationAddressInfo,
     pub target: OrchestrationAddressInfo,
     pub mode: OrchestrationMode,

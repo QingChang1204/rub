@@ -1,6 +1,8 @@
 use super::{ConnectionRequest, EffectiveCli};
+use crate::timeout_budget::run_with_remaining_budget;
 use rub_core::error::RubError;
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 
 pub(crate) fn requested_user_data_dir(
     cli: &EffectiveCli,
@@ -61,19 +63,65 @@ pub(crate) async fn resolve_attachment_identity(
     request: &ConnectionRequest,
     effective_user_data_dir: Option<&str>,
 ) -> Result<Option<String>, RubError> {
+    resolve_attachment_identity_internal(
+        cli,
+        request,
+        effective_user_data_dir,
+        None,
+        None,
+        "attachment_identity_resolution",
+    )
+    .await
+}
+
+pub(crate) async fn resolve_attachment_identity_with_deadline(
+    cli: &EffectiveCli,
+    request: &ConnectionRequest,
+    effective_user_data_dir: Option<&str>,
+    deadline: Instant,
+    timeout_ms: u64,
+    phase: &'static str,
+) -> Result<Option<String>, RubError> {
+    resolve_attachment_identity_internal(
+        cli,
+        request,
+        effective_user_data_dir,
+        Some(deadline),
+        Some(timeout_ms),
+        phase,
+    )
+    .await
+}
+
+async fn resolve_attachment_identity_internal(
+    cli: &EffectiveCli,
+    request: &ConnectionRequest,
+    effective_user_data_dir: Option<&str>,
+    deadline: Option<Instant>,
+    timeout_ms: Option<u64>,
+    phase: &'static str,
+) -> Result<Option<String>, RubError> {
     match request {
         ConnectionRequest::Profile { resolved_path, .. } => {
             Ok(Some(format!("profile:{resolved_path}")))
         }
         ConnectionRequest::CdpUrl { url } => Ok(Some(format!(
             "cdp:{}",
-            rub_cdp::attachment::canonical_external_browser_identity(url).await?
+            canonical_external_browser_identity_with_budget(url, deadline, timeout_ms, phase)
+                .await?
         ))),
         ConnectionRequest::AutoDiscover => {
-            let candidate = rub_cdp::attachment::resolve_unique_local_cdp_candidate().await?;
+            let candidate =
+                resolve_unique_local_cdp_candidate_with_budget(deadline, timeout_ms, phase).await?;
             Ok(Some(format!(
                 "cdp:{}",
-                rub_cdp::attachment::canonical_external_browser_identity(&candidate.ws_url).await?
+                canonical_external_browser_identity_with_budget(
+                    &candidate.ws_url,
+                    deadline,
+                    timeout_ms,
+                    phase,
+                )
+                .await?
             )))
         }
         ConnectionRequest::UserDataDir { path } => Ok(Some(format!(
@@ -88,6 +136,39 @@ pub(crate) async fn resolve_attachment_identity(
                 .as_deref()
                 .map(|path| format!("user_data_dir:{}", normalize_identity_path(path))))
         }
+    }
+}
+
+async fn canonical_external_browser_identity_with_budget(
+    url: &str,
+    deadline: Option<Instant>,
+    timeout_ms: Option<u64>,
+    phase: &'static str,
+) -> Result<String, RubError> {
+    match (deadline, timeout_ms) {
+        (Some(deadline), Some(timeout_ms)) => {
+            run_with_remaining_budget(deadline, timeout_ms, phase, async {
+                rub_cdp::attachment::canonical_external_browser_identity(url).await
+            })
+            .await
+        }
+        _ => rub_cdp::attachment::canonical_external_browser_identity(url).await,
+    }
+}
+
+async fn resolve_unique_local_cdp_candidate_with_budget(
+    deadline: Option<Instant>,
+    timeout_ms: Option<u64>,
+    phase: &'static str,
+) -> Result<rub_cdp::attachment::CdpCandidate, RubError> {
+    match (deadline, timeout_ms) {
+        (Some(deadline), Some(timeout_ms)) => {
+            run_with_remaining_budget(deadline, timeout_ms, phase, async {
+                rub_cdp::attachment::resolve_unique_local_cdp_candidate().await
+            })
+            .await
+        }
+        _ => rub_cdp::attachment::resolve_unique_local_cdp_candidate().await,
     }
 }
 

@@ -54,7 +54,8 @@ pub fn confirm_daemon_session_identity(
             Some(session_id) if session_id == expected_session_id => {
                 SocketSessionIdentityConfirmation::ConfirmedMatch
             }
-            Some(_) | None => SocketSessionIdentityConfirmation::ConfirmedMismatch,
+            Some(_) => SocketSessionIdentityConfirmation::ConfirmedMismatch,
+            None => SocketSessionIdentityConfirmation::Inconclusive,
         })
     }
 
@@ -146,6 +147,46 @@ mod tests {
         assert_eq!(
             confirmation,
             SocketSessionIdentityConfirmation::ConfirmedMismatch
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handshake_identity_treats_missing_session_id_as_inconclusive() {
+        use crate::codec::NdJsonCodec;
+        use crate::protocol::IpcResponse;
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+
+        let (socket_path, socket_dir) = unique_socket_path();
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind handshake socket");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept handshake connection");
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone accepted stream for reading"),
+            );
+            let _: crate::protocol::IpcRequest = NdJsonCodec::read_blocking(&mut reader)
+                .expect("read request")
+                .expect("request");
+            let response = IpcResponse::success("req-1", serde_json::json!({}));
+            let encoded = NdJsonCodec::encode(&response).expect("encode response");
+            stream
+                .write_all(&encoded)
+                .expect("write handshake response");
+        });
+
+        let confirmation = confirm_daemon_session_identity(&socket_path, "sess-live")
+            .expect("probe should complete");
+        server.join().expect("handshake server should join");
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&socket_dir);
+
+        assert_eq!(
+            confirmation,
+            SocketSessionIdentityConfirmation::Inconclusive
         );
     }
 }

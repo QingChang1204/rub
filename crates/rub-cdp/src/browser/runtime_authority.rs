@@ -14,6 +14,8 @@ pub(super) struct BrowserAuthoritySnapshot {
     dialog_intercept: Option<rub_core::model::DialogInterceptPolicy>,
     network_rule_runtime: NetworkRuleRuntime,
     request_correlation: RequestCorrelationRegistry,
+    observatory_pending_registries:
+        HashMap<String, crate::runtime_observatory::SharedPendingRequestRegistry>,
     identity_coverage: IdentityCoverageRegistry,
 }
 
@@ -463,6 +465,8 @@ impl BrowserManager {
         let dialog_intercept = self.snapshot_dialog_intercept_state();
         let network_rule_runtime = self.network_rule_runtime.read().await.clone();
         let request_correlation = self.request_correlation.lock().await.clone();
+        let observatory_pending_registries =
+            self.observatory_pending_registries.lock().await.clone();
         let identity_coverage = self.identity_coverage.lock().await.clone();
         Some(BrowserAuthoritySnapshot {
             browser,
@@ -475,6 +479,7 @@ impl BrowserManager {
             dialog_intercept,
             network_rule_runtime,
             request_correlation,
+            observatory_pending_registries,
             identity_coverage,
         })
     }
@@ -546,6 +551,8 @@ impl BrowserManager {
         self.restore_dialog_intercept_state(snapshot.dialog_intercept.clone());
         *self.network_rule_runtime.write().await = snapshot.network_rule_runtime.clone();
         *self.request_correlation.lock().await = snapshot.request_correlation.clone();
+        *self.observatory_pending_registries.lock().await =
+            snapshot.observatory_pending_registries.clone();
         *self.local_active_target_authority.lock().await =
             snapshot.local_active_target_authority.clone();
         *self.identity_coverage.lock().await = snapshot.identity_coverage.clone();

@@ -1,7 +1,7 @@
 use super::UpgradeStatus;
 use super::projection::cleanup_runtime_path_state;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rub_core::error::{ErrorCode, RubError};
 use rub_daemon::rub_paths::SessionPaths;
@@ -45,8 +45,25 @@ pub(super) fn registry_entry_for_home_session_id(
         .find(|entry| entry.session_id == session_id)
 }
 
+#[cfg(test)]
 pub(super) async fn fetch_upgrade_status_for_session(
     session_paths: &SessionPaths,
+) -> Result<Option<(UpgradeStatus, PathBuf)>, RubError> {
+    let timeout_ms = 3_000;
+    fetch_upgrade_status_for_session_with_deadline(
+        session_paths,
+        Instant::now() + Duration::from_millis(timeout_ms),
+        timeout_ms,
+        "cleanup_upgrade_check",
+    )
+    .await
+}
+
+pub(super) async fn fetch_upgrade_status_for_session_with_deadline(
+    session_paths: &SessionPaths,
+    deadline: Instant,
+    timeout_ms: u64,
+    phase: &'static str,
 ) -> Result<Option<(UpgradeStatus, PathBuf)>, RubError> {
     // Teardown and upgrade checks must target the concrete runtime socket for
     // this session authority. The canonical session-name socket is a shared
@@ -54,15 +71,31 @@ pub(super) async fn fetch_upgrade_status_for_session(
     // For session-name-only paths, actual_socket_paths() collapses to the same
     // canonical path, so this stays correct for temp-home discovery.
     for socket_path in session_paths.actual_socket_paths() {
-        let mut client = match IpcClient::connect(&socket_path).await {
-            Ok(client) => client,
-            Err(_) => continue,
+        crate::timeout_budget::ensure_remaining_budget(deadline, timeout_ms, phase)?;
+        let mut client = match crate::timeout_budget::run_with_remaining_budget(
+            deadline,
+            timeout_ms,
+            phase,
+            async { Ok::<_, RubError>(IpcClient::connect(&socket_path).await.ok()) },
+        )
+        .await?
+        {
+            Some(client) => client,
+            None => continue,
         };
-        let request = IpcRequest::new("_upgrade_check", serde_json::json!({}), 3_000);
-        let response = client
-            .send(&request)
-            .await
-            .map_err(|error| cleanup_upgrade_probe_send_error(&socket_path, error))?;
+        let request = IpcRequest::new(
+            "_upgrade_check",
+            serde_json::json!({}),
+            remaining_budget_ms(deadline, timeout_ms, phase)?,
+        );
+        let response =
+            crate::timeout_budget::run_with_remaining_budget(deadline, timeout_ms, phase, async {
+                client
+                    .send(&request)
+                    .await
+                    .map_err(|error| cleanup_upgrade_probe_send_error(&socket_path, error))
+            })
+            .await?;
         if response.status == ResponseStatus::Error {
             return Err(cleanup_upgrade_probe_response_error(&socket_path, response));
         }
@@ -75,6 +108,16 @@ pub(super) async fn fetch_upgrade_status_for_session(
         )));
     }
     Ok(None)
+}
+
+fn remaining_budget_ms(
+    deadline: Instant,
+    timeout_ms: u64,
+    phase: &'static str,
+) -> Result<u64, RubError> {
+    crate::timeout_budget::remaining_budget_duration(deadline)
+        .map(|remaining| remaining.as_millis().clamp(1, u64::MAX as u128) as u64)
+        .ok_or_else(|| crate::main_support::command_timeout_error(timeout_ms, phase))
 }
 
 fn cleanup_upgrade_probe_response_error(
@@ -129,22 +172,35 @@ fn cleanup_upgrade_probe_send_error(socket_path: &Path, error: IpcClientError) -
     }
 }
 
-pub(super) async fn wait_for_shutdown_paths(socket_paths: &[PathBuf]) {
+pub(super) async fn wait_for_shutdown_paths_until(
+    socket_paths: &[PathBuf],
+    deadline: Instant,
+    timeout_ms: u64,
+    phase: &'static str,
+) -> Result<(), RubError> {
     for _ in 0..20 {
         if socket_paths.iter().all(|socket_path| !socket_path.exists()) {
-            return;
+            return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let remaining = crate::timeout_budget::remaining_budget_duration(deadline)
+            .ok_or_else(|| crate::main_support::command_timeout_error(timeout_ms, phase))?;
+        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
     }
+    crate::timeout_budget::ensure_remaining_budget(deadline, timeout_ms, phase)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::cleanup_upgrade_probe_response_error;
+    use super::{
+        cleanup_upgrade_probe_response_error, fetch_upgrade_status_for_session_with_deadline,
+        wait_for_shutdown_paths_until,
+    };
     use std::path::Path;
+    use std::time::Instant;
 
     use rub_core::error::{ErrorCode, ErrorEnvelope};
     use rub_core::model::Timing;
+    use rub_daemon::rub_paths::RubPaths;
 
     #[test]
     fn upgrade_probe_error_response_preserves_socket_path_context() {
@@ -189,5 +245,48 @@ mod tests {
             error.context.expect("context")["reason"],
             serde_json::json!("cleanup_upgrade_check_response_missing_error_envelope")
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_upgrade_status_respects_shared_deadline() {
+        let home = std::env::temp_dir().join(format!("rub-cleanup-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create cleanup budget home");
+        let session_paths = RubPaths::new(&home).session("default");
+
+        let error = fetch_upgrade_status_for_session_with_deadline(
+            &session_paths,
+            Instant::now(),
+            1,
+            "cleanup_upgrade_check",
+        )
+        .await
+        .expect_err("expired cleanup deadline must fail closed");
+        assert_eq!(error.into_envelope().code, ErrorCode::IpcTimeout);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn shutdown_wait_respects_shared_deadline() {
+        let socket_dir =
+            std::env::temp_dir().join(format!("rub-cleanup-socket-{}", std::process::id()));
+        let socket_path = socket_dir.join("live.sock");
+        let _ = std::fs::remove_dir_all(&socket_dir);
+        std::fs::create_dir_all(&socket_dir).expect("create socket dir");
+        std::fs::write(&socket_path, b"live").expect("seed pseudo socket file");
+
+        let error = wait_for_shutdown_paths_until(
+            std::slice::from_ref(&socket_path),
+            Instant::now(),
+            1,
+            "cleanup_shutdown_wait",
+        )
+        .await
+        .expect_err("expired cleanup deadline must fail closed");
+        assert_eq!(error.into_envelope().code, ErrorCode::IpcTimeout);
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&socket_dir);
     }
 }

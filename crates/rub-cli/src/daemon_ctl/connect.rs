@@ -200,6 +200,7 @@ fn transport_reason_from_error(error: &RubError) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn detect_or_connect_hardened(
     rub_home: &Path,
     session_name: &str,

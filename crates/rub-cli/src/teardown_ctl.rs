@@ -6,6 +6,7 @@ use rub_daemon::rub_paths::is_temp_owned_home;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::path::Path;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TeardownResult {
@@ -19,10 +20,19 @@ pub async fn teardown_runtime(
     rub_home: &Path,
     timeout_ms: u64,
 ) -> Result<TeardownResult, RubError> {
+    let deadline = crate::timeout_budget::deadline_from_start(Instant::now(), timeout_ms);
+    teardown_runtime_until(rub_home, deadline, timeout_ms).await
+}
+
+async fn teardown_runtime_until(
+    rub_home: &Path,
+    deadline: Instant,
+    timeout_ms: u64,
+) -> Result<TeardownResult, RubError> {
     let temp_owned_home = rub_home.exists() && is_temp_owned_home(rub_home);
-    let close_all = daemon_ctl::close_all_sessions(rub_home, timeout_ms).await?;
+    let close_all = daemon_ctl::close_all_sessions_until(rub_home, deadline).await?;
     let cleanup = if rub_home.exists() {
-        cleanup_ctl::cleanup_runtime(rub_home, timeout_ms)
+        cleanup_ctl::cleanup_runtime_until(rub_home, deadline, timeout_ms)
             .await
             .map_err(|error| augment_cleanup_error(rub_home, &close_all, error))?
     } else {
@@ -159,6 +169,7 @@ mod tests {
     use rub_core::error::ErrorCode;
     use serde_json::json;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn project_teardown_result_combines_close_and_cleanup_surfaces() {
@@ -282,6 +293,37 @@ mod tests {
         assert!(result.fully_released);
         assert!(!result.rub_home_removed);
         assert!(home.exists(), "non-temp-owned home should be preserved");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn teardown_runtime_uses_one_shared_deadline_across_close_all_and_cleanup() {
+        let home = std::env::temp_dir().join(format!(
+            "rub-teardown-shared-deadline-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create teardown home");
+
+        let error =
+            super::teardown_runtime_until(&home, Instant::now() - Duration::from_millis(1), 1_500)
+                .await
+                .expect_err(
+                    "expired teardown budget must remain expired across close_all and cleanup",
+                );
+
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::IpcTimeout);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|value| value.get("phase"))
+                .and_then(|value| value.as_str()),
+            Some("cleanup_orphan_browser_sweep")
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }

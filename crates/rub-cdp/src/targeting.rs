@@ -12,6 +12,102 @@ use std::sync::Arc;
 
 const READ_FALLBACK_SELECTOR: &str = "*";
 
+pub(crate) const TOP_LEVEL_BOUNDING_BOX_FUNCTION: &str = r#"function() {
+    const rect = this.getBoundingClientRect();
+    let x = Number.isFinite(rect.x) ? rect.x : 0;
+    let y = Number.isFinite(rect.y) ? rect.y : 0;
+    let current = window;
+    while (current !== current.top) {
+        try {
+            const frameEl = current.frameElement;
+            if (!frameEl) break;
+            const frameRect = frameEl.getBoundingClientRect();
+            x += Number.isFinite(frameRect.x) ? frameRect.x : 0;
+            y += Number.isFinite(frameRect.y) ? frameRect.y : 0;
+            current = current.parent;
+        } catch (_) {
+            break;
+        }
+    }
+    return {
+        x,
+        y,
+        width: Number.isFinite(rect.width) ? rect.width : 0,
+        height: Number.isFinite(rect.height) ? rect.height : 0
+    };
+}"#;
+
+pub(crate) const TOP_LEVEL_HIT_TEST_HELPERS: &str = r#"
+const topLevelBoundingBox = (el) => {
+    const rect = el.getBoundingClientRect();
+    let x = Number.isFinite(rect.x) ? rect.x : 0;
+    let y = Number.isFinite(rect.y) ? rect.y : 0;
+    let current = window;
+    while (current !== current.top) {
+        try {
+            const frameEl = current.frameElement;
+            if (!frameEl) break;
+            const frameRect = frameEl.getBoundingClientRect();
+            x += Number.isFinite(frameRect.x) ? frameRect.x : 0;
+            y += Number.isFinite(frameRect.y) ? frameRect.y : 0;
+            current = current.parent;
+        } catch (_) {
+            break;
+        }
+    }
+    return {
+        x,
+        y,
+        width: Number.isFinite(rect.width) ? rect.width : 0,
+        height: Number.isFinite(rect.height) ? rect.height : 0
+    };
+};
+const topLevelHitPointMatches = (el, x, y) => {
+    try {
+        let currentX = x;
+        let currentY = y;
+        let hit = window.top.document.elementFromPoint(currentX, currentY);
+        while (hit) {
+            if (
+                hit === el
+                || (typeof el.contains === 'function' && el.contains(hit))
+                || (typeof hit.contains === 'function' && hit.contains(el))
+            ) {
+                return true;
+            }
+            if (!hit.contentDocument) {
+                return false;
+            }
+            try {
+                const frameRect = hit.getBoundingClientRect();
+                currentX -= frameRect.left;
+                currentY -= frameRect.top;
+                hit = hit.contentDocument.elementFromPoint(currentX, currentY);
+            } catch (_) {
+                return false;
+            }
+        }
+        return false;
+    } catch (_) {
+        return false;
+    }
+};
+const topLevelHitMatches = (el) => {
+    const rect = topLevelBoundingBox(el);
+    if (!(rect.width > 0 && rect.height > 0)) return false;
+    const insetX = Math.min(Math.max(rect.width * 0.2, 1), 8);
+    const insetY = Math.min(Math.max(rect.height * 0.2, 1), 8);
+    const points = [
+        { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 },
+        { x: rect.x + insetX, y: rect.y + insetY },
+        { x: rect.x + rect.width - insetX, y: rect.y + insetY },
+        { x: rect.x + insetX, y: rect.y + rect.height - insetY },
+        { x: rect.x + rect.width - insetX, y: rect.y + rect.height - insetY },
+    ];
+    return points.some((point) => topLevelHitPointMatches(el, point.x, point.y));
+};
+"#;
+
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedElement {
     pub remote_object_id: RemoteObjectId,
@@ -374,38 +470,14 @@ async fn hit_test_matches(
         object_id,
         &format!(
             "function() {{
-                // GetContentQuads returns top-level viewport coordinates regardless
-                // of whether the element lives in an iframe. Use the top-level
-                // document for hit-testing to avoid execution-context /
-                // coordinate-space mismatches that arise when the remote_object_id
-                // is resolved via the top-level page context (making `window` in
-                // this function refer to the top window even for iframe elements).
+                {helpers}
                 const x = {:.3};
                 const y = {:.3};
-                try {{
-                    const topDoc = window.top.document;
-                    const hit = topDoc.elementFromPoint(x, y);
-                    if (!hit) return false;
-                    // Fast path: hit is the element or an ancestor/descendant.
-                    if (hit === this || this.contains(hit) || hit.contains(this)) return true;
-                    // Cross-iframe path: if the top-level hit is an <iframe>,
-                    // descend into its contentDocument and re-test using
-                    // frame-local coordinates.
-                    if (hit.contentDocument) {{
-                        try {{
-                            const fr = hit.getBoundingClientRect();
-                            const inner = hit.contentDocument.elementFromPoint(
-                                x - fr.left, y - fr.top
-                            );
-                            if (inner && (inner === this || this.contains(inner) || inner.contains(this))) return true;
-                        }} catch (_inner) {{}}
-                    }}
-                    return false;
-                }} catch (_error) {{
-                    return false;
-                }}
+                return topLevelHitPointMatches(this, x, y);
             }}",
-            point.x, point.y
+            point.x,
+            point.y,
+            helpers = TOP_LEVEL_HIT_TEST_HELPERS
         ),
     )
     .await?;
@@ -561,20 +633,9 @@ async fn candidate_bounding_box(
     page: &Arc<Page>,
     object_id: &RemoteObjectId,
 ) -> Result<BoundingBox, RubError> {
-    let value = crate::js::call_function_returning_value(
-        page,
-        object_id,
-        r#"function() {
-            const r = this.getBoundingClientRect();
-            return {
-                x: Number.isFinite(r.x) ? r.x : 0,
-                y: Number.isFinite(r.y) ? r.y : 0,
-                width: Number.isFinite(r.width) ? r.width : 0,
-                height: Number.isFinite(r.height) ? r.height : 0
-            };
-        }"#,
-    )
-    .await?;
+    let value =
+        crate::js::call_function_returning_value(page, object_id, TOP_LEVEL_BOUNDING_BOX_FUNCTION)
+            .await?;
     serde_json::from_value(value)
         .map_err(|e| RubError::Internal(format!("Candidate bounding box parse failed: {e}")))
 }

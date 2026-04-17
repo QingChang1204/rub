@@ -20,6 +20,12 @@ pub(crate) use sessions::{
 
 const ORCHESTRATION_EVENT_LIMIT: usize = 64;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrchestrationOutcomeCommit {
+    Applied(Option<OrchestrationRuleInfo>),
+    Stale(Option<OrchestrationRuleInfo>),
+}
+
 /// Session-local orchestration authority built on top of the RUB_HOME registry foundation.
 #[derive(Debug, Default)]
 pub struct OrchestrationRuntimeState {
@@ -56,8 +62,8 @@ impl OrchestrationRuntimeState {
 mod tests {
     use super::projection::current_time_ms;
     use super::{
-        OrchestrationRuntimeState, extend_orchestration_session_path_context,
-        projected_orchestration_session,
+        OrchestrationOutcomeCommit, OrchestrationRuntimeState,
+        extend_orchestration_session_path_context, projected_orchestration_session,
     };
     use rub_core::model::{
         OrchestrationAddressInfo, OrchestrationEventKind, OrchestrationExecutionPolicyInfo,
@@ -78,10 +84,20 @@ mod tests {
         )
     }
 
+    fn applied_rule(commit: OrchestrationOutcomeCommit) -> Option<OrchestrationRuleInfo> {
+        match commit {
+            OrchestrationOutcomeCommit::Applied(rule) => rule,
+            OrchestrationOutcomeCommit::Stale(rule) => {
+                panic!("expected applied orchestration outcome, got stale: {rule:?}")
+            }
+        }
+    }
+
     fn rule(source_session_id: &str, target_session_id: &str) -> OrchestrationRuleInfo {
         OrchestrationRuleInfo {
             id: 1,
             status: OrchestrationRuleStatus::Armed,
+            lifecycle_generation: 1,
             source: OrchestrationAddressInfo {
                 session_id: source_session_id.to_string(),
                 session_name: "source".to_string(),
@@ -289,24 +305,24 @@ mod tests {
         state
             .register(rule("sess-source", "sess-target"))
             .expect("orchestration rule should register");
-        let rule = state
-            .record_outcome(
-                1,
-                None,
-                OrchestrationResultInfo {
-                    rule_id: 1,
-                    status: OrchestrationRuleStatus::Fired,
-                    next_status: OrchestrationRuleStatus::Fired,
-                    summary: "orchestration rule 1 committed 1/1 action(s)".to_string(),
-                    committed_steps: 1,
-                    total_steps: 1,
-                    steps: Vec::new(),
-                    cooldown_until_ms: None,
-                    error_code: None,
-                    reason: None,
-                },
-            )
-            .expect("outcome should record");
+        let rule = state.record_outcome(
+            1,
+            Some(1),
+            None,
+            OrchestrationResultInfo {
+                rule_id: 1,
+                status: OrchestrationRuleStatus::Fired,
+                next_status: OrchestrationRuleStatus::Fired,
+                summary: "orchestration rule 1 committed 1/1 action(s)".to_string(),
+                committed_steps: 1,
+                total_steps: 1,
+                steps: Vec::new(),
+                cooldown_until_ms: None,
+                error_code: None,
+                reason: None,
+            },
+        );
+        let rule = applied_rule(rule).expect("outcome should record");
         assert_eq!(rule.status, OrchestrationRuleStatus::Fired);
         assert_eq!(
             rule.last_result
@@ -352,24 +368,24 @@ mod tests {
             .register(rule("sess-source", "sess-target"))
             .expect("orchestration rule should register");
 
-        let rule = state
-            .record_outcome(
-                1,
-                None,
-                OrchestrationResultInfo {
-                    rule_id: 1,
-                    status: OrchestrationRuleStatus::Degraded,
-                    next_status: OrchestrationRuleStatus::Armed,
-                    summary: "orchestration condition evaluation failed".to_string(),
-                    committed_steps: 0,
-                    total_steps: 1,
-                    steps: Vec::new(),
-                    cooldown_until_ms: None,
-                    error_code: Some(rub_core::error::ErrorCode::BrowserCrashed),
-                    reason: Some("probe_failed".to_string()),
-                },
-            )
-            .expect("outcome should record");
+        let rule = state.record_outcome(
+            1,
+            Some(1),
+            None,
+            OrchestrationResultInfo {
+                rule_id: 1,
+                status: OrchestrationRuleStatus::Degraded,
+                next_status: OrchestrationRuleStatus::Armed,
+                summary: "orchestration condition evaluation failed".to_string(),
+                committed_steps: 0,
+                total_steps: 1,
+                steps: Vec::new(),
+                cooldown_until_ms: None,
+                error_code: Some(rub_core::error::ErrorCode::BrowserCrashed),
+                reason: Some("probe_failed".to_string()),
+            },
+        );
+        let rule = applied_rule(rule).expect("outcome should record");
 
         assert_eq!(rule.status, OrchestrationRuleStatus::Armed);
         let runtime = state.projection();
@@ -412,6 +428,7 @@ mod tests {
         let live_rule = state.record_outcome_with_fallback(
             &rule,
             None,
+            None,
             OrchestrationResultInfo {
                 rule_id: rule.id,
                 status: OrchestrationRuleStatus::Fired,
@@ -426,7 +443,10 @@ mod tests {
             },
         );
 
-        assert!(live_rule.is_none());
+        assert!(matches!(
+            live_rule,
+            OrchestrationOutcomeCommit::Applied(None)
+        ));
         let runtime = state.projection();
         assert_eq!(runtime.last_rule_id, Some(rule.id));
         assert_eq!(
@@ -440,6 +460,64 @@ mod tests {
         assert!(
             trace.events.iter().any(|event| {
                 event.rule_id == Some(rule.id) && event.kind == OrchestrationEventKind::Fired
+            }),
+            "{trace:?}"
+        );
+    }
+
+    #[test]
+    fn orchestration_runtime_preserves_newer_lifecycle_when_outcome_generation_is_stale() {
+        let mut state = OrchestrationRuntimeState::default();
+        state.replace(
+            1,
+            "sess-source".to_string(),
+            "source".to_string(),
+            vec![
+                session("sess-source", "source", true),
+                session("sess-target", "target", false),
+            ],
+            None,
+        );
+        state
+            .register(rule("sess-source", "sess-target"))
+            .expect("orchestration rule should register");
+        let paused = state
+            .update_status(1, OrchestrationRuleStatus::Paused)
+            .expect("pause should update rule");
+        assert_eq!(paused.lifecycle_generation, 2);
+
+        let outcome = state.record_outcome(
+            1,
+            Some(1),
+            None,
+            OrchestrationResultInfo {
+                rule_id: 1,
+                status: OrchestrationRuleStatus::Fired,
+                next_status: OrchestrationRuleStatus::Fired,
+                summary: "orchestration rule 1 committed 1/1 action(s)".to_string(),
+                committed_steps: 1,
+                total_steps: 1,
+                steps: Vec::new(),
+                cooldown_until_ms: None,
+                error_code: None,
+                reason: None,
+            },
+        );
+
+        assert!(matches!(
+            outcome,
+            OrchestrationOutcomeCommit::Stale(Some(ref rule))
+                if rule.status == OrchestrationRuleStatus::Paused
+        ));
+        let runtime = state.projection();
+        assert_eq!(runtime.rules[0].status, OrchestrationRuleStatus::Paused);
+        assert_eq!(runtime.rules[0].lifecycle_generation, 2);
+        assert!(runtime.rules[0].last_result.is_none());
+        let trace = state.trace(8);
+        assert!(
+            trace.events.iter().any(|event| {
+                event.kind == OrchestrationEventKind::Degraded
+                    && event.reason.as_deref() == Some("orchestration_lifecycle_generation_stale")
             }),
             "{trace:?}"
         );
@@ -466,24 +544,24 @@ mod tests {
             .expect("repeat orchestration rule should register");
 
         let cooldown_until_ms = current_time_ms() + 5_000;
-        let rule = state
-            .record_outcome(
-                1,
-                None,
-                OrchestrationResultInfo {
-                    rule_id: 1,
-                    status: OrchestrationRuleStatus::Fired,
-                    next_status: OrchestrationRuleStatus::Armed,
-                    summary: "repeat orchestration rule 1 committed 1/1 action(s)".to_string(),
-                    committed_steps: 1,
-                    total_steps: 1,
-                    steps: Vec::new(),
-                    cooldown_until_ms: Some(cooldown_until_ms),
-                    error_code: None,
-                    reason: None,
-                },
-            )
-            .expect("repeat outcome should record");
+        let rule = state.record_outcome(
+            1,
+            Some(1),
+            None,
+            OrchestrationResultInfo {
+                rule_id: 1,
+                status: OrchestrationRuleStatus::Fired,
+                next_status: OrchestrationRuleStatus::Armed,
+                summary: "repeat orchestration rule 1 committed 1/1 action(s)".to_string(),
+                committed_steps: 1,
+                total_steps: 1,
+                steps: Vec::new(),
+                cooldown_until_ms: Some(cooldown_until_ms),
+                error_code: None,
+                reason: None,
+            },
+        );
+        let rule = applied_rule(rule).expect("repeat outcome should record");
         assert_eq!(rule.status, OrchestrationRuleStatus::Armed);
         assert_eq!(
             rule.execution_policy.cooldown_until_ms,

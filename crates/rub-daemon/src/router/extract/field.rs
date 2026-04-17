@@ -1,5 +1,6 @@
 use serde::de::DeserializeOwned;
 
+use super::ExtractAuthorityMode;
 use super::spec::{ContentExtractPayload, ExtractFieldSpec, ExtractKind};
 use crate::router::DaemonRouter;
 use crate::router::addressing::resolve_elements_against_snapshot;
@@ -60,6 +61,7 @@ pub(super) async fn extract_field(
     snapshot: &rub_core::model::Snapshot,
     field_name: &str,
     field: &ExtractFieldSpec,
+    authority_mode: ExtractAuthorityMode,
 ) -> Result<serde_json::Value, RubError> {
     let locator_args = locator_json(LocatorRequestArgs {
         index: field.index,
@@ -85,10 +87,14 @@ pub(super) async fn extract_field(
                 &resolved.elements,
                 field,
                 ExtractMatchSurface::InteractiveField,
+                authority_mode,
             )
             .await
         }
-        Err(error) if should_fallback_to_content(field, &error) => {
+        Err(error)
+            if authority_mode == ExtractAuthorityMode::LiveAllowed
+                && should_fallback_to_content(field, &error) =>
+        {
             let selector = field.selector.as_deref().ok_or_else(|| {
                 RubError::domain(
                     ErrorCode::ElementNotFound,
@@ -96,6 +102,20 @@ pub(super) async fn extract_field(
                 )
             })?;
             extract_content_field_value(router, snapshot, field_name, selector, field).await
+        }
+        Err(error)
+            if authority_mode == ExtractAuthorityMode::SnapshotOnly
+                && should_fallback_to_content(field, &error) =>
+        {
+            let selector = field.selector.as_deref().ok_or_else(|| {
+                RubError::domain(
+                    ErrorCode::ElementNotFound,
+                    "extract field did not resolve to any content element",
+                )
+            })?;
+            Err(snapshot_extract_content_fallback_error(
+                field_name, selector, field,
+            ))
         }
         Err(error) => Err(error),
     }
@@ -107,6 +127,7 @@ async fn extract_field_value(
     elements: &[rub_core::model::Element],
     field: &ExtractFieldSpec,
     surface: ExtractMatchSurface<'_>,
+    authority_mode: ExtractAuthorityMode,
 ) -> Result<serde_json::Value, RubError> {
     if !field.many && elements.len() > 1 {
         return Err(RubError::domain_with_context_and_suggestion(
@@ -120,7 +141,7 @@ async fn extract_field_value(
     if field.many {
         let mut values = Vec::with_capacity(elements.len());
         for element in elements {
-            values.push(extract_single_value(router, element, field).await?);
+            values.push(extract_single_value(router, element, field, authority_mode).await?);
         }
         return Ok(serde_json::Value::Array(values));
     }
@@ -131,14 +152,18 @@ async fn extract_field_value(
             "extract field did not resolve to any interactive snapshot element",
         )
     })?;
-    extract_single_value(router, element, field).await
+    extract_single_value(router, element, field, authority_mode).await
 }
 
 async fn extract_single_value(
     router: &DaemonRouter,
     element: &rub_core::model::Element,
     field: &ExtractFieldSpec,
+    authority_mode: ExtractAuthorityMode,
 ) -> Result<serde_json::Value, RubError> {
+    if authority_mode == ExtractAuthorityMode::SnapshotOnly {
+        return extract_single_snapshot_value(element, field);
+    }
     match field.kind {
         ExtractKind::Text => Ok(serde_json::json!(router.browser.get_text(element).await?)),
         ExtractKind::Value => Ok(serde_json::json!(router.browser.get_value(element).await?)),
@@ -166,6 +191,93 @@ async fn extract_single_value(
             })
         }
     }
+}
+
+fn extract_single_snapshot_value(
+    element: &rub_core::model::Element,
+    field: &ExtractFieldSpec,
+) -> Result<serde_json::Value, RubError> {
+    match field.kind {
+        ExtractKind::Text => Ok(serde_json::json!(element.text)),
+        ExtractKind::Value => Ok(serde_json::json!(
+            element.attributes.get("value").cloned().unwrap_or_default()
+        )),
+        ExtractKind::Html => Err(snapshot_extract_live_only_kind_error(
+            field.kind,
+            element.index,
+        )),
+        ExtractKind::Bbox => element
+            .bounding_box
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(RubError::from)?
+            .ok_or_else(|| snapshot_bbox_unavailable_error(element.index)),
+        ExtractKind::Attributes => {
+            serde_json::to_value(&element.attributes).map_err(RubError::from)
+        }
+        ExtractKind::Attribute => {
+            let attribute_name = field.attribute.as_deref().ok_or_else(|| {
+                RubError::domain(
+                    ErrorCode::InvalidInput,
+                    "extract field kind 'attribute' requires an 'attribute' name",
+                )
+            })?;
+            Ok(match element.attributes.get(attribute_name) {
+                Some(value) => serde_json::json!(value),
+                None => serde_json::Value::Null,
+            })
+        }
+    }
+}
+
+fn snapshot_extract_content_fallback_error(
+    field_name: &str,
+    selector: &str,
+    field: &ExtractFieldSpec,
+) -> RubError {
+    RubError::domain_with_context_and_suggestion(
+        ErrorCode::ElementNotFound,
+        format!(
+            "snapshot-addressed extract cannot resolve field '{field_name}' because it would need a live content fallback outside snapshot authority"
+        ),
+        serde_json::json!({
+            "field": field_name,
+            "selector": selector,
+            "kind": field.kind.as_str(),
+            "authority_state": "snapshot_extract_live_content_fallback_required",
+        }),
+        "Remove --snapshot-id to allow live content extraction, or use index/ref or a locator that resolves directly to an interactive snapshot element",
+    )
+}
+
+fn snapshot_extract_live_only_kind_error(kind: ExtractKind, element_index: u32) -> RubError {
+    RubError::domain_with_context_and_suggestion(
+        ErrorCode::InvalidInput,
+        format!(
+            "snapshot-addressed extract cannot read {} for element {element_index} because that field kind requires live DOM authority",
+            kind.as_str()
+        ),
+        serde_json::json!({
+            "element_index": element_index,
+            "kind": kind.as_str(),
+            "authority_state": "snapshot_extract_live_only_field_kind",
+        }),
+        "Remove --snapshot-id to allow a live DOM read for this field kind",
+    )
+}
+
+fn snapshot_bbox_unavailable_error(element_index: u32) -> RubError {
+    RubError::domain_with_context_and_suggestion(
+        ErrorCode::InvalidInput,
+        format!(
+            "snapshot-addressed extract cannot read bbox for element {element_index} because the cached snapshot does not carry a bounding box for that element"
+        ),
+        serde_json::json!({
+            "element_index": element_index,
+            "authority_state": "snapshot_extract_bbox_unavailable",
+        }),
+        "Remove --snapshot-id to allow a live bbox read, or refresh state and target an element with snapshot bbox projection",
+    )
 }
 
 async fn extract_content_field_value(
@@ -489,4 +601,121 @@ pub(super) async fn execute_json_payload_in_frame<T: DeserializeOwned>(
             "extract {payload_kind} payload parse failed: {error}; payload={payload_json}"
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        snapshot_bbox_unavailable_error, snapshot_extract_content_fallback_error,
+        snapshot_extract_live_only_kind_error,
+    };
+    use crate::router::extract::spec::{ExtractFieldSpec, ExtractKind};
+    use rub_core::error::ErrorCode;
+    use rub_core::model::{BoundingBox, Element, ElementTag};
+    use std::collections::HashMap;
+
+    fn snapshot_element() -> Element {
+        let mut attributes = HashMap::new();
+        attributes.insert("value".to_string(), "42".to_string());
+        attributes.insert("data-kind".to_string(), "answer".to_string());
+        Element {
+            index: 7,
+            tag: ElementTag::Input,
+            text: "Hello snapshot".to_string(),
+            attributes,
+            element_ref: Some("main:7".to_string()),
+            bounding_box: Some(BoundingBox {
+                x: 10.0,
+                y: 20.0,
+                width: 30.0,
+                height: 40.0,
+            }),
+            ax_info: None,
+            listeners: None,
+            depth: Some(1),
+        }
+    }
+
+    fn field(kind: ExtractKind) -> ExtractFieldSpec {
+        ExtractFieldSpec {
+            index: None,
+            element_ref: None,
+            selector: None,
+            target_text: None,
+            role: None,
+            label: None,
+            testid: None,
+            first: false,
+            last: false,
+            nth: None,
+            kind,
+            attribute: None,
+            many: false,
+            value_type: None,
+            required: true,
+            default: None,
+            map: Default::default(),
+            transform: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_value_extract_uses_snapshot_projection() {
+        let element = snapshot_element();
+        let value = super::extract_single_snapshot_value(&element, &field(ExtractKind::Value))
+            .expect("snapshot value read should use cached attributes");
+        assert_eq!(value, serde_json::json!("42"));
+    }
+
+    #[test]
+    fn snapshot_attributes_extract_uses_snapshot_projection() {
+        let element = snapshot_element();
+        let value = super::extract_single_snapshot_value(&element, &field(ExtractKind::Attributes))
+            .expect("snapshot attributes read should use cached attributes");
+        assert_eq!(value["data-kind"], "answer");
+    }
+
+    #[test]
+    fn snapshot_bbox_extract_requires_snapshot_bbox_projection() {
+        let mut element = snapshot_element();
+        element.bounding_box = None;
+        let error = super::extract_single_snapshot_value(&element, &field(ExtractKind::Bbox))
+            .expect_err("snapshot bbox read must fail closed when bbox projection is absent");
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::InvalidInput);
+        assert_eq!(
+            envelope.context.expect("bbox context")["authority_state"],
+            "snapshot_extract_bbox_unavailable"
+        );
+    }
+
+    #[test]
+    fn snapshot_html_extract_fails_closed() {
+        let error = snapshot_extract_live_only_kind_error(ExtractKind::Html, 9).into_envelope();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        assert_eq!(
+            error.context.expect("html context")["authority_state"],
+            "snapshot_extract_live_only_field_kind"
+        );
+    }
+
+    #[test]
+    fn snapshot_content_fallback_error_explains_live_authority_crossing() {
+        let mut field = field(ExtractKind::Text);
+        field.selector = Some(".headline".to_string());
+        let envelope =
+            snapshot_extract_content_fallback_error("title", ".headline", &field).into_envelope();
+        assert_eq!(envelope.code, ErrorCode::ElementNotFound);
+        assert_eq!(
+            envelope.context.expect("fallback context")["authority_state"],
+            "snapshot_extract_live_content_fallback_required"
+        );
+    }
+
+    #[test]
+    fn snapshot_bbox_error_projects_context() {
+        let envelope = snapshot_bbox_unavailable_error(3).into_envelope();
+        assert_eq!(envelope.code, ErrorCode::InvalidInput);
+        assert_eq!(envelope.context.expect("bbox context")["element_index"], 3);
+    }
 }

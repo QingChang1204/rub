@@ -170,7 +170,7 @@ impl IpcResponse {
         Self {
             ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
             command_id: None,
-            request_id: validated_request_id(request_id),
+            request_id: request_id.into(),
             status: ResponseStatus::Success,
             data: Some(data),
             error: None,
@@ -182,7 +182,7 @@ impl IpcResponse {
         Self {
             ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
             command_id: None,
-            request_id: validated_request_id(request_id),
+            request_id: request_id.into(),
             status: ResponseStatus::Error,
             data: None,
             error: Some(envelope),
@@ -442,11 +442,6 @@ fn validate_request_id(request_id: String) -> Result<String, String> {
     }
 }
 
-fn validated_request_id(request_id: impl Into<String>) -> String {
-    validate_request_id(request_id.into())
-        .expect("IPC request_id must be non-empty and non-whitespace")
-}
-
 fn validate_optional_daemon_session_id(
     daemon_session_id: Option<String>,
 ) -> Result<Option<String>, String> {
@@ -488,9 +483,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "IPC request_id must be non-empty and non-whitespace")]
-    fn response_builder_rejects_blank_request_id() {
-        let _ = IpcResponse::success("   ", serde_json::json!({"ok": true}));
+    fn response_builder_preserves_blank_request_id_for_typed_contract_validation() {
+        let error = IpcResponse::success("   ", serde_json::json!({"ok": true}))
+            .validate_contract()
+            .expect_err("blank request_id must fail contract validation");
+        assert_eq!(error.code, rub_core::error::ErrorCode::IpcProtocolError);
+        assert_eq!(error.context.expect("context")["field"], "request_id");
     }
 
     #[test]

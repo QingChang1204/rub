@@ -297,6 +297,7 @@ fn read_query_script(locator: &LiveLocator, kind: ReadQueryKind) -> Result<Strin
             const locator = {locator};
             const kind = {kind};
             {LOCATOR_JS_HELPERS}
+            {top_level_bbox_helpers}
             const readOne = (el) => {{
                 switch (kind) {{
                     case 'text':
@@ -310,13 +311,7 @@ fn read_query_script(locator: &LiveLocator, kind: ReadQueryKind) -> Result<Strin
                             Array.from(el.attributes || []).map(attr => [attr.name, attr.value])
                         );
                     case 'bbox': {{
-                        const rect = el.getBoundingClientRect();
-                        return {{
-                            x: rect.x || 0,
-                            y: rect.y || 0,
-                            width: rect.width || 0,
-                            height: rect.height || 0
-                        }};
+                        return topLevelBoundingBox(el);
                     }}
                     default:
                         return null;
@@ -342,7 +337,8 @@ fn read_query_script(locator: &LiveLocator, kind: ReadQueryKind) -> Result<Strin
                     values: [],
                 }};
             }}
-        }})())"#
+        }})())"#,
+        top_level_bbox_helpers = crate::targeting::TOP_LEVEL_HIT_TEST_HELPERS
     ))
 }
 
@@ -380,5 +376,20 @@ mod tests {
         assert!(script.contains("const kind = \"html\""));
         assert!(script.contains("outerHTML"));
         assert!(script.contains("values: selected.map(readOne)"));
+    }
+
+    #[test]
+    fn read_query_bbox_uses_top_level_coordinate_projection() {
+        let locator = LiveLocator::try_from(CanonicalLocator::Selector {
+            css: ".card".to_string(),
+            selection: Some(LocatorSelection::First),
+        })
+        .expect("selector should be a valid live locator");
+        let script = read_query_script(&locator, ReadQueryKind::Bbox)
+            .expect("read query script should serialize");
+
+        assert!(script.contains("topLevelBoundingBox(el)"), "{script}");
+        assert!(script.contains("current.frameElement"), "{script}");
+        assert!(script.contains("current = current.parent"), "{script}");
     }
 }

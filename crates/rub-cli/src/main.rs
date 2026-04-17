@@ -233,6 +233,7 @@ async fn main() {
     let bootstrap = match daemon_ctl::bootstrap_client(
         &rub_home,
         session,
+        cli.session_id.as_deref(),
         command_deadline,
         request.timeout_ms,
         &daemon_args,
@@ -257,7 +258,7 @@ async fn main() {
             &cli,
             &connection_request,
             &mut client,
-            daemon_session_id.as_deref(),
+            cli.session_id.as_deref().or(daemon_session_id.as_deref()),
             Some(command_deadline),
             Some(request.timeout_ms),
         )

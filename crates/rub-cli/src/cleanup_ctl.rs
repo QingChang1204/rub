@@ -7,6 +7,7 @@ mod temp_sweep;
 mod upgrade_probe;
 
 use std::path::Path;
+use std::time::Instant;
 
 use rub_core::error::RubError;
 use serde::Serialize;
@@ -33,15 +34,38 @@ struct UpgradeStatus {
 }
 
 pub async fn cleanup_runtime(rub_home: &Path, timeout_ms: u64) -> Result<CleanupResult, RubError> {
+    let deadline = crate::timeout_budget::deadline_from_start(Instant::now(), timeout_ms);
+    cleanup_runtime_until(rub_home, deadline, timeout_ms).await
+}
+
+pub(crate) async fn cleanup_runtime_until(
+    rub_home: &Path,
+    deadline: Instant,
+    timeout_ms: u64,
+) -> Result<CleanupResult, RubError> {
     let mut result = CleanupResult::default();
-    cleanup_current_home_stale(rub_home, &mut result).await?;
+    cleanup_current_home_stale(rub_home, deadline, timeout_ms, &mut result).await?;
 
     let snapshot = process_snapshot()?;
     let active_temp_homes =
-        sweep_temp_daemons(rub_home, &snapshot, timeout_ms, &mut result).await?;
+        sweep_temp_daemons(rub_home, &snapshot, deadline, timeout_ms, &mut result).await?;
 
     let post_daemon_snapshot = process_snapshot()?;
-    sweep_orphan_temp_browsers(&post_daemon_snapshot, &mut result).await;
+    crate::timeout_budget::run_with_remaining_budget(
+        deadline,
+        timeout_ms,
+        "cleanup_orphan_browser_sweep",
+        async {
+            sweep_orphan_temp_browsers(&post_daemon_snapshot, &mut result).await;
+            Ok::<(), RubError>(())
+        },
+    )
+    .await?;
+    crate::timeout_budget::ensure_remaining_budget(
+        deadline,
+        timeout_ms,
+        "cleanup_temp_home_sweep",
+    )?;
     sweep_stale_temp_homes(rub_home, &active_temp_homes, &mut result);
 
     sort_and_dedup(&mut result.cleaned_stale_sessions);
@@ -513,10 +537,15 @@ mod tests {
         std::fs::write(&home, b"not-a-directory").expect("seed invalid rub_home");
 
         let mut result = CleanupResult::default();
-        let envelope = cleanup_current_home_stale(&home, &mut result)
-            .await
-            .expect_err("registry read failure should propagate")
-            .into_envelope();
+        let envelope = cleanup_current_home_stale(
+            &home,
+            std::time::Instant::now() + std::time::Duration::from_millis(1_000),
+            1_000,
+            &mut result,
+        )
+        .await
+        .expect_err("registry read failure should propagate")
+        .into_envelope();
         let context = envelope.context.expect("cleanup registry error context");
         assert_eq!(context["reason"], "cleanup_registry_read_failed");
         assert_eq!(
@@ -556,9 +585,14 @@ mod tests {
         .unwrap();
 
         let mut result = CleanupResult::default();
-        cleanup_current_home_stale(&home, &mut result)
-            .await
-            .unwrap();
+        cleanup_current_home_stale(
+            &home,
+            std::time::Instant::now() + std::time::Duration::from_millis(1_000),
+            1_000,
+            &mut result,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.skipped_unreachable_sessions, vec!["default"]);
         let registry = rub_daemon::session::read_registry(&home).unwrap();

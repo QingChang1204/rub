@@ -11,6 +11,7 @@ pub(crate) use self::hooks::{
 };
 pub(crate) use self::tabs::{
     CommittedTabProjection, LocalActiveTargetAuthority, projected_stealth_patch_names,
-    resolve_active_target_authority, resolve_active_target_from_browser_truth, tab_info_for_page,
-    tab_not_found, wait_for_startup_page,
+    resolve_active_page_index_from_browser_truth, resolve_active_target_authority,
+    resolve_active_target_from_browser_truth, tab_info_for_page, tab_not_found,
+    wait_for_startup_page,
 };

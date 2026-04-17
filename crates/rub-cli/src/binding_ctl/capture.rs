@@ -3,6 +3,7 @@ use crate::daemon_ctl;
 use crate::session_policy::{
     materialize_connection_request_with_deadline, parse_connection_request,
     requested_attachment_identity, requires_existing_session_validation,
+    resolve_attachment_identity_with_deadline,
     validate_existing_session_connection_request_with_deadline,
 };
 use rub_core::error::{ErrorCode, RubError};
@@ -142,12 +143,20 @@ async fn fetch_binding_capture_candidate(
     )
     .await?;
     let daemon_args = crate::daemon_args(cli, &connection_request);
-    let attachment_identity = requested_attachment_identity(cli, &connection_request);
+    let attachment_identity = authoritative_binding_capture_attachment_identity(
+        cli,
+        &connection_request,
+        deadline,
+        timeout_ms,
+    )
+    .await?;
 
-    let (mut client, daemon_session_id) = match daemon_ctl::detect_or_connect_hardened(
+    let (mut client, daemon_session_id) = match daemon_ctl::detect_or_connect_hardened_until(
         &cli.rub_home,
         &cli.session,
         daemon_ctl::TransientSocketPolicy::FailAfterLock,
+        deadline,
+        timeout_ms,
     )
     .await?
     {
@@ -176,7 +185,7 @@ async fn fetch_binding_capture_candidate(
             cli,
             &connection_request,
             &mut client,
-            daemon_session_id.as_deref(),
+            cli.session_id.as_deref().or(daemon_session_id.as_deref()),
             Some(deadline),
             Some(timeout_ms),
         )
@@ -239,6 +248,29 @@ async fn fetch_binding_capture_candidate(
                 "missing error envelope in binding capture candidate response",
             )
         })),
+    }
+}
+
+async fn authoritative_binding_capture_attachment_identity(
+    cli: &EffectiveCli,
+    request: &crate::session_policy::ConnectionRequest,
+    deadline: Instant,
+    timeout_ms: u64,
+) -> Result<Option<String>, RubError> {
+    match request {
+        crate::session_policy::ConnectionRequest::CdpUrl { .. }
+        | crate::session_policy::ConnectionRequest::AutoDiscover => {
+            resolve_attachment_identity_with_deadline(
+                cli,
+                request,
+                None,
+                deadline,
+                timeout_ms,
+                "binding_capture_attachment_identity_resolution",
+            )
+            .await
+        }
+        _ => Ok(requested_attachment_identity(cli, request)),
     }
 }
 
@@ -343,4 +375,66 @@ fn rfc3339_now() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| OffsetDateTime::now_utc().unix_timestamp().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::authoritative_binding_capture_attachment_identity;
+    use crate::commands::{Commands, EffectiveCli, RequestedLaunchPolicy};
+    use crate::session_policy::ConnectionRequest;
+    use rub_core::error::ErrorCode;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    fn cli_with(command: Commands) -> EffectiveCli {
+        EffectiveCli {
+            session: "default".to_string(),
+            session_id: None,
+            rub_home: PathBuf::from("/tmp/rub-test"),
+            timeout: 30_000,
+            headed: false,
+            ignore_cert_errors: false,
+            user_data_dir: None,
+            hide_infobars: true,
+            json_pretty: false,
+            verbose: false,
+            trace: false,
+            command,
+            cdp_url: None,
+            connect: false,
+            profile: None,
+            use_alias: None,
+            no_stealth: false,
+            humanize: false,
+            humanize_speed: "normal".to_string(),
+            requested_launch_policy: RequestedLaunchPolicy::default(),
+            effective_launch_policy: RequestedLaunchPolicy::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn binding_capture_attachment_identity_resolution_uses_remaining_deadline() {
+        let cli = cli_with(Commands::Doctor);
+        let error = authoritative_binding_capture_attachment_identity(
+            &cli,
+            &ConnectionRequest::CdpUrl {
+                url: "http://127.0.0.1:9222/json/version".to_string(),
+            },
+            Instant::now() - Duration::from_millis(1),
+            1_500,
+        )
+        .await
+        .expect_err("expired binding capture budget must fail before live identity resolution");
+
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::IpcTimeout);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|value| value.get("phase"))
+                .and_then(|value| value.as_str()),
+            Some("binding_capture_attachment_identity_resolution")
+        );
+    }
 }

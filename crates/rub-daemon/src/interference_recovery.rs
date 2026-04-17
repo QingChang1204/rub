@@ -6,14 +6,16 @@ use tokio::time::{Instant, sleep};
 
 use rub_core::model::{
     HumanVerificationHandoffStatus, InterferenceKind, InterferenceRecoveryAction,
-    InterferenceRecoveryReport, InterferenceRecoveryResult, InterferenceRuntimeInfo,
-    InterferenceRuntimeStatus, KeyCombo, OverlayState, ReadinessInfo, ReadinessStatus,
-    RouteStability, TabInfo,
+    InterferenceRecoveryReport, InterferenceRecoveryResult, InterferenceRuntimeStatus, KeyCombo,
+    OverlayState, ReadinessInfo, ReadinessStatus, RouteStability, TabInfo,
 };
 use rub_core::port::BrowserPort;
 
 use crate::interference::InterferenceRecoveryContext;
-use crate::runtime_refresh::{InterferenceRefreshIntent, refresh_live_runtime_and_interference};
+use crate::runtime_refresh::{
+    InterferenceRefreshIntent, InterferenceRefreshSnapshot, refresh_live_runtime_and_interference,
+    refresh_live_runtime_and_interference_snapshot,
+};
 use crate::session::SessionState;
 
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(4);
@@ -136,14 +138,14 @@ pub(crate) async fn recover(
     browser: &Arc<dyn BrowserPort>,
     state: &Arc<SessionState>,
 ) -> InterferenceRecoveryReport {
-    let tabs = match refresh_live_runtime_and_interference(
+    let refresh = match refresh_live_runtime_and_interference_snapshot(
         browser,
         state,
         InterferenceRefreshIntent::ReadOnly,
     )
     .await
     {
-        Ok(tabs) => tabs,
+        Ok(snapshot) => snapshot,
         Err(error) => {
             return InterferenceRecoveryReport {
                 reason: Some(format!("live_refresh_failed:{error}")),
@@ -152,7 +154,8 @@ pub(crate) async fn recover(
         }
     };
 
-    let context = state.interference_recovery_context().await;
+    let mut context = state.interference_recovery_context().await;
+    context.projection = refresh.interference.clone();
     let Some(current) = context.projection.current_interference.as_ref() else {
         return InterferenceRecoveryReport {
             reason: Some("no_active_interference".to_string()),
@@ -160,7 +163,7 @@ pub(crate) async fn recover(
         };
     };
 
-    let Some(action) = select_recovery_action(&context, &tabs) else {
+    let Some(action) = select_recovery_action(&context, &refresh.tabs) else {
         state
             .record_interference_recovery_outcome(None, InterferenceRecoveryResult::Abandoned)
             .await;
@@ -212,7 +215,7 @@ pub(crate) async fn recover(
         };
     }
 
-    if let Err(reason) = apply_recovery_action(browser, action, &context, &tabs).await {
+    if let Err(reason) = apply_recovery_action(browser, action, &context, &refresh.tabs).await {
         let _ = refresh_live_runtime_and_interference(
             browser,
             state,
@@ -319,21 +322,19 @@ async fn wait_for_recovery_fence(
     let mut poll_count = 0u32;
 
     loop {
-        let tabs = match refresh_live_runtime_and_interference(
+        let refresh = match refresh_live_runtime_and_interference_snapshot(
             browser,
             state,
             InterferenceRefreshIntent::ReadOnly,
         )
         .await
         {
-            Ok(tabs) => tabs,
+            Ok(snapshot) => snapshot,
             Err(error) => return (false, Some(format!("live_refresh_failed:{error}"))),
         };
-        let runtime = state.interference_runtime().await;
-        let readiness = state.readiness_state().await;
 
-        if recovery_fence_satisfied(action, context, &tabs, &runtime, &readiness) {
-            return (true, Some("primary_context_restored".to_string()));
+        if recovery_fence_satisfied(action, context, &refresh) {
+            return (true, Some(recovery_success_reason(action).to_string()));
         }
 
         if Instant::now() >= deadline {
@@ -354,21 +355,22 @@ fn recovery_poll_delay(poll_count: u32) -> Duration {
 fn recovery_fence_satisfied(
     action: InterferenceRecoveryAction,
     context: &InterferenceRecoveryContext,
-    tabs: &[TabInfo],
-    runtime: &InterferenceRuntimeInfo,
-    readiness: &ReadinessInfo,
+    refresh: &InterferenceRefreshSnapshot,
 ) -> bool {
     if matches!(action, InterferenceRecoveryAction::EscalateToHandoff) {
         return false;
     }
 
-    if !matches!(runtime.status, InterferenceRuntimeStatus::Inactive) {
+    if !matches!(
+        refresh.interference.status,
+        InterferenceRuntimeStatus::Inactive
+    ) {
         return false;
     }
-    if runtime.current_interference.is_some() {
+    if refresh.interference.current_interference.is_some() {
         return false;
     }
-    let Some(active_tab) = find_active_tab(tabs) else {
+    let Some(active_tab) = find_active_tab(&refresh.tabs) else {
         return false;
     };
 
@@ -381,20 +383,30 @@ fn recovery_fence_satisfied(
         InterferenceRecoveryAction::CloseUnexpectedTab => {
             let primary_ok = primary_context_restored(active_tab, context);
             let tab_count_ok = context.baseline.last_tab_count == 0
-                || tabs.len() <= context.baseline.last_tab_count;
+                || refresh.tabs.len() <= context.baseline.last_tab_count;
             primary_ok && tab_count_ok
         }
         InterferenceRecoveryAction::RestorePrimaryContext => {
-            if !readiness_allows_resume(readiness) {
+            if !readiness_allows_resume(&refresh.readiness) {
                 return false;
             }
             primary_context_restored(active_tab, context)
         }
         InterferenceRecoveryAction::DismissOverlay => {
-            overlay_dismiss_fence_satisfied(readiness)
+            overlay_dismiss_fence_satisfied(&refresh.readiness)
                 && primary_context_restored(active_tab, context)
         }
         InterferenceRecoveryAction::EscalateToHandoff => false,
+    }
+}
+
+fn recovery_success_reason(action: InterferenceRecoveryAction) -> &'static str {
+    match action {
+        InterferenceRecoveryAction::BackNavigate => "back_navigation_fence_satisfied",
+        InterferenceRecoveryAction::CloseUnexpectedTab => "unexpected_tab_closed",
+        InterferenceRecoveryAction::RestorePrimaryContext => "primary_context_restored",
+        InterferenceRecoveryAction::DismissOverlay => "overlay_dismissed",
+        InterferenceRecoveryAction::EscalateToHandoff => "handoff_activated",
     }
 }
 
@@ -498,7 +510,8 @@ async fn dismiss_overlay(browser: &Arc<dyn BrowserPort>) -> Result<(), String> {
 mod tests {
     use super::{
         find_primary_tab, overlay_dismiss_fence_satisfied, primary_context_restored,
-        readiness_allows_resume, recovery_poll_delay, select_recovery_action,
+        readiness_allows_resume, recovery_poll_delay, recovery_success_reason,
+        select_recovery_action,
     };
     use crate::interference::InterferenceRecoveryContext;
     use crate::interference_classifier::InterferenceBaseline;
@@ -610,5 +623,25 @@ mod tests {
         assert_eq!(recovery_poll_delay(1), Duration::from_millis(200));
         assert_eq!(recovery_poll_delay(2), Duration::from_millis(300));
         assert_eq!(recovery_poll_delay(8), Duration::from_millis(300));
+    }
+
+    #[test]
+    fn recovery_success_reason_is_action_specific() {
+        assert_eq!(
+            recovery_success_reason(InterferenceRecoveryAction::BackNavigate),
+            "back_navigation_fence_satisfied"
+        );
+        assert_eq!(
+            recovery_success_reason(InterferenceRecoveryAction::CloseUnexpectedTab),
+            "unexpected_tab_closed"
+        );
+        assert_eq!(
+            recovery_success_reason(InterferenceRecoveryAction::RestorePrimaryContext),
+            "primary_context_restored"
+        );
+        assert_eq!(
+            recovery_success_reason(InterferenceRecoveryAction::DismissOverlay),
+            "overlay_dismissed"
+        );
     }
 }

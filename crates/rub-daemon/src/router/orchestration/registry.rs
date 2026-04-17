@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{
-    OrchestrationExecutionPolicyInfo, OrchestrationRegistrationSpec, OrchestrationRuleInfo,
-    OrchestrationRuleStatus,
+    OrchestrationAddressInfo, OrchestrationExecutionPolicyInfo, OrchestrationRegistrationSpec,
+    OrchestrationRuleInfo, OrchestrationRuleStatus,
 };
 use rub_ipc::protocol::IpcRequest;
 
@@ -55,9 +55,9 @@ pub(super) async fn cmd_orchestration_add(
     .await?;
 
     let default_correlation_key =
-        default_orchestration_registration_key("correlation", &spec, args.paused);
+        default_orchestration_registration_key("correlation", &source, &target, &spec, args.paused);
     let default_idempotency_key =
-        default_orchestration_registration_key("idempotency", &spec, args.paused);
+        default_orchestration_registration_key("idempotency", &source, &target, &spec, args.paused);
     let correlation_key = spec.correlation_key.unwrap_or(default_correlation_key);
     let idempotency_key = spec.idempotency_key.unwrap_or(default_idempotency_key);
     let rule = state
@@ -68,6 +68,7 @@ pub(super) async fn cmd_orchestration_add(
             } else {
                 OrchestrationRuleStatus::Armed
             },
+            lifecycle_generation: 1,
             source,
             target,
             mode: spec.mode,
@@ -208,14 +209,18 @@ pub(super) async fn cmd_orchestration_export(
 
 fn default_orchestration_registration_key(
     kind: &str,
+    source: &OrchestrationAddressInfo,
+    target: &OrchestrationAddressInfo,
     spec: &OrchestrationRegistrationSpec,
     paused: bool,
 ) -> String {
-    let identity = orchestration_registration_request_identity(spec, paused);
+    let identity = orchestration_registration_request_identity(source, target, spec, paused);
     format!("orchestration_{kind}\u{1f}{identity}")
 }
 
 fn orchestration_registration_request_identity(
+    source: &OrchestrationAddressInfo,
+    target: &OrchestrationAddressInfo,
     spec: &OrchestrationRegistrationSpec,
     paused: bool,
 ) -> String {
@@ -223,7 +228,16 @@ fn orchestration_registration_request_identity(
         "orchestration.add",
         serde_json::json!({
             "paused": paused,
-            "spec": spec,
+            "resolved": {
+                "source": source,
+                "target": target,
+            },
+            "spec": {
+                "mode": spec.mode,
+                "execution_policy": spec.execution_policy,
+                "condition": spec.condition,
+                "actions": spec.actions,
+            },
         }),
         0,
     );
@@ -244,6 +258,21 @@ mod tests {
 
     fn parse_registration_spec(json: &str) -> OrchestrationRegistrationSpec {
         serde_json::from_str(json).expect("registration spec should parse")
+    }
+
+    fn resolved_address(
+        session_id: &str,
+        session_name: &str,
+        tab_index: u32,
+        tab_target_id: &str,
+    ) -> OrchestrationAddressInfo {
+        OrchestrationAddressInfo {
+            session_id: session_id.to_string(),
+            session_name: session_name.to_string(),
+            tab_index: Some(tab_index),
+            tab_target_id: Some(tab_target_id.to_string()),
+            frame_id: None,
+        }
     }
 
     #[test]
@@ -287,17 +316,49 @@ mod tests {
             }"#,
         );
 
+        let source = resolved_address("sess-source", "source", 0, "SOURCE_TAB");
+        let target = resolved_address("sess-target", "target", 1, "TARGET_TAB");
         assert_eq!(
-            orchestration_registration_request_identity(&spec_a, false),
-            orchestration_registration_request_identity(&spec_b, false)
+            orchestration_registration_request_identity(&source, &target, &spec_a, false),
+            orchestration_registration_request_identity(&source, &target, &spec_b, false)
         );
         assert_eq!(
-            default_orchestration_registration_key("correlation", &spec_a, false),
-            default_orchestration_registration_key("correlation", &spec_b, false)
+            default_orchestration_registration_key("correlation", &source, &target, &spec_a, false),
+            default_orchestration_registration_key("correlation", &source, &target, &spec_b, false)
         );
         assert_eq!(
-            default_orchestration_registration_key("idempotency", &spec_a, false),
-            default_orchestration_registration_key("idempotency", &spec_b, false)
+            default_orchestration_registration_key("idempotency", &source, &target, &spec_a, false),
+            default_orchestration_registration_key("idempotency", &source, &target, &spec_b, false)
+        );
+    }
+
+    #[test]
+    fn omitted_registration_keys_absorb_resolved_tab_authority() {
+        let spec = parse_registration_spec(
+            r##"{
+                "source": { "session_id": "sess-source" },
+                "target": { "session_id": "sess-target" },
+                "condition": { "kind": "text_present", "text": "Ready" },
+                "actions": [
+                    {
+                        "kind": "browser_command",
+                        "command": "click",
+                        "payload": { "selector": "#continue" }
+                    }
+                ]
+            }"##,
+        );
+        let source_a = resolved_address("sess-source", "source", 0, "SOURCE_TAB_A");
+        let source_b = resolved_address("sess-source", "source", 1, "SOURCE_TAB_B");
+        let target = resolved_address("sess-target", "target", 4, "TARGET_TAB");
+
+        assert_ne!(
+            default_orchestration_registration_key("correlation", &source_a, &target, &spec, false),
+            default_orchestration_registration_key("correlation", &source_b, &target, &spec, false)
+        );
+        assert_ne!(
+            default_orchestration_registration_key("idempotency", &source_a, &target, &spec, false),
+            default_orchestration_registration_key("idempotency", &source_b, &target, &spec, false)
         );
     }
 
@@ -309,6 +370,7 @@ mod tests {
         OrchestrationRuleInfo {
             id: 0,
             status: OrchestrationRuleStatus::Armed,
+            lifecycle_generation: 1,
             source: OrchestrationAddressInfo {
                 session_id: spec.source.session_id.clone(),
                 session_name: "source".to_string(),
@@ -356,12 +418,22 @@ mod tests {
                 ]
             }"##,
         );
-        let correlation_key = default_orchestration_registration_key("correlation", &spec, false);
-        let idempotency_key = default_orchestration_registration_key("idempotency", &spec, false);
+        let source = resolved_address("sess-source", "source", 0, "SOURCE_TAB");
+        let target = resolved_address("sess-target", "target", 1, "TARGET_TAB");
+        let correlation_key =
+            default_orchestration_registration_key("correlation", &source, &target, &spec, false);
+        let idempotency_key =
+            default_orchestration_registration_key("idempotency", &source, &target, &spec, false);
+
+        let mut resolved_spec = spec.clone();
+        resolved_spec.source.tab_index = source.tab_index;
+        resolved_spec.source.tab_target_id = source.tab_target_id.clone();
+        resolved_spec.target.tab_index = target.tab_index;
+        resolved_spec.target.tab_target_id = target.tab_target_id.clone();
 
         let first = state
             .register_orchestration_rule(rule_from_spec(
-                &spec,
+                &resolved_spec,
                 correlation_key.clone(),
                 idempotency_key.clone(),
             ))
@@ -369,7 +441,7 @@ mod tests {
             .expect("first rule should register");
         let duplicate = state
             .register_orchestration_rule(rule_from_spec(
-                &spec,
+                &resolved_spec,
                 correlation_key.clone(),
                 idempotency_key.clone(),
             ))

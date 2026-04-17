@@ -1,8 +1,9 @@
 use super::{
-    allow_global_read_fallback, ambiguous_read_target_error, bounding_box_center_distance,
-    bounding_box_match_score, bounding_box_shape_matches, candidate_points,
-    frame_scoped_read_target_error, parse_backend_node_id, parse_element_ref_frame_id,
-    snapshot_candidate_match_rank, tag_matches, unverified_write_target_error,
+    TOP_LEVEL_BOUNDING_BOX_FUNCTION, TOP_LEVEL_HIT_TEST_HELPERS, allow_global_read_fallback,
+    ambiguous_read_target_error, bounding_box_center_distance, bounding_box_match_score,
+    bounding_box_shape_matches, candidate_points, frame_scoped_read_target_error,
+    parse_backend_node_id, parse_element_ref_frame_id, snapshot_candidate_match_rank, tag_matches,
+    unverified_write_target_error,
 };
 use rub_core::error::ErrorCode;
 use rub_core::model::{BoundingBox, Element, ElementTag};
@@ -37,6 +38,30 @@ fn parse_element_ref_frame_id_reads_frame_prefix() {
 fn global_read_fallback_is_disabled_for_frame_scoped_reads() {
     assert!(!allow_global_read_fallback(Some("frame-1")));
     assert!(allow_global_read_fallback(None));
+}
+
+#[test]
+fn top_level_bounding_box_function_accumulates_frame_offsets() {
+    assert!(
+        TOP_LEVEL_BOUNDING_BOX_FUNCTION.contains("current.frameElement"),
+        "{TOP_LEVEL_BOUNDING_BOX_FUNCTION}"
+    );
+    assert!(
+        TOP_LEVEL_BOUNDING_BOX_FUNCTION.contains("current = current.parent"),
+        "{TOP_LEVEL_BOUNDING_BOX_FUNCTION}"
+    );
+}
+
+#[test]
+fn top_level_hit_test_helpers_descend_through_nested_iframes() {
+    assert!(
+        TOP_LEVEL_HIT_TEST_HELPERS.contains("hit.contentDocument.elementFromPoint"),
+        "{TOP_LEVEL_HIT_TEST_HELPERS}"
+    );
+    assert!(
+        TOP_LEVEL_HIT_TEST_HELPERS.contains("topLevelHitPointMatches"),
+        "{TOP_LEVEL_HIT_TEST_HELPERS}"
+    );
 }
 
 #[test]

@@ -323,6 +323,6 @@ pub(super) async fn record_orchestration_probe_failure(
         "Reactive orchestration condition probe failed"
     );
     state
-        .record_orchestration_outcome_with_fallback(rule, None, result)
+        .record_orchestration_outcome_with_fallback(rule, None, None, result)
         .await;
 }

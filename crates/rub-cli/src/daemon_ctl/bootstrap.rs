@@ -1,9 +1,11 @@
 use std::path::Path;
 use std::time::Instant;
 
+use rub_core::error::ErrorCode;
 use rub_core::error::RubError;
 use rub_daemon::rub_paths::RubPaths;
 use rub_ipc::client::IpcClient;
+use serde_json::json;
 
 use super::connect::{TransientSocketPolicy, detect_or_connect_hardened_until};
 use super::process_identity::process_matches_failed_startup_identity;
@@ -69,6 +71,7 @@ pub(crate) async fn cleanup_precommit_browser_authority_for_test(
 pub async fn bootstrap_client(
     rub_home: &Path,
     session_name: &str,
+    expected_daemon_session_id: Option<&str>,
     command_deadline: Instant,
     command_timeout_ms: u64,
     extra_args: &[String],
@@ -86,11 +89,25 @@ pub async fn bootstrap_client(
         DaemonConnection::Connected {
             client,
             daemon_session_id,
-        } => BootstrapResolution::connected(client, daemon_session_id),
+        } => {
+            validate_existing_bootstrap_authority(
+                session_name,
+                expected_daemon_session_id,
+                daemon_session_id.as_deref(),
+            )?;
+            BootstrapResolution::connected(client, daemon_session_id)
+        }
         DaemonConnection::NeedStart => {
+            if let Some(expected_daemon_session_id) = expected_daemon_session_id {
+                return Err(existing_bootstrap_authority_unavailable(
+                    session_name,
+                    expected_daemon_session_id,
+                ));
+            }
             resolve_bootstrap_after_lock(
                 rub_home,
                 session_name,
+                expected_daemon_session_id,
                 command_deadline,
                 command_timeout_ms,
                 extra_args,
@@ -110,6 +127,7 @@ pub async fn bootstrap_client(
 async fn resolve_bootstrap_after_lock(
     rub_home: &Path,
     session_name: &str,
+    expected_daemon_session_id: Option<&str>,
     command_deadline: Instant,
     command_timeout_ms: u64,
     extra_args: &[String],
@@ -136,8 +154,21 @@ async fn resolve_bootstrap_after_lock(
         DaemonConnection::Connected {
             client,
             daemon_session_id,
-        } => Ok(BootstrapResolution::connected(client, daemon_session_id)),
+        } => {
+            validate_existing_bootstrap_authority(
+                session_name,
+                expected_daemon_session_id,
+                daemon_session_id.as_deref(),
+            )?;
+            Ok(BootstrapResolution::connected(client, daemon_session_id))
+        }
         DaemonConnection::NeedStart => {
+            if let Some(expected_daemon_session_id) = expected_daemon_session_id {
+                return Err(existing_bootstrap_authority_unavailable(
+                    session_name,
+                    expected_daemon_session_id,
+                ));
+            }
             upgrade_startup_lock_to_canonical_attachment_until(
                 &mut startup_lock,
                 rub_home,
@@ -158,7 +189,14 @@ async fn resolve_bootstrap_after_lock(
                 DaemonConnection::Connected {
                     client,
                     daemon_session_id,
-                } => Ok(BootstrapResolution::connected(client, daemon_session_id)),
+                } => {
+                    validate_existing_bootstrap_authority(
+                        session_name,
+                        expected_daemon_session_id,
+                        daemon_session_id.as_deref(),
+                    )?;
+                    Ok(BootstrapResolution::connected(client, daemon_session_id))
+                }
                 DaemonConnection::NeedStart => {
                     start_new_daemon_bootstrap(
                         rub_home,
@@ -175,6 +213,64 @@ async fn resolve_bootstrap_after_lock(
 
     drop(startup_lock);
     resolution
+}
+
+fn validate_existing_bootstrap_authority(
+    session_name: &str,
+    expected_daemon_session_id: Option<&str>,
+    actual_daemon_session_id: Option<&str>,
+) -> Result<(), RubError> {
+    let Some(expected_daemon_session_id) = expected_daemon_session_id else {
+        return Ok(());
+    };
+
+    match actual_daemon_session_id {
+        Some(actual_daemon_session_id)
+            if actual_daemon_session_id == expected_daemon_session_id =>
+        {
+            Ok(())
+        }
+        Some(actual_daemon_session_id) => Err(RubError::domain_with_context(
+            ErrorCode::IpcProtocolError,
+            format!(
+                "Session '{}' resolved to daemon '{}' but bootstrap connected to '{}'",
+                session_name, expected_daemon_session_id, actual_daemon_session_id
+            ),
+            json!({
+                "reason": "existing_session_bootstrap_authority_mismatch",
+                "expected_daemon_session_id": expected_daemon_session_id,
+                "actual_daemon_session_id": actual_daemon_session_id,
+            }),
+        )),
+        None => Err(RubError::domain_with_context(
+            ErrorCode::IpcProtocolError,
+            format!(
+                "Session '{}' resolved to daemon '{}' but bootstrap could not confirm the connected daemon identity",
+                session_name, expected_daemon_session_id
+            ),
+            json!({
+                "reason": "existing_session_bootstrap_authority_missing",
+                "expected_daemon_session_id": expected_daemon_session_id,
+            }),
+        )),
+    }
+}
+
+fn existing_bootstrap_authority_unavailable(
+    session_name: &str,
+    expected_daemon_session_id: &str,
+) -> RubError {
+    RubError::domain_with_context(
+        ErrorCode::DaemonNotRunning,
+        format!(
+            "Session '{}' previously resolved to daemon '{}' but that live daemon is no longer available",
+            session_name, expected_daemon_session_id
+        ),
+        json!({
+            "reason": "existing_session_bootstrap_authority_unavailable",
+            "expected_daemon_session_id": expected_daemon_session_id,
+        }),
+    )
 }
 
 async fn start_new_daemon_bootstrap(
@@ -340,4 +436,45 @@ fn annotate_failed_startup_cleanup(
     }
     envelope.context = Some(serde_json::Value::Object(context));
     RubError::Domain(envelope)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_existing_bootstrap_authority_rejects_connected_daemon_session_mismatch() {
+        let error = validate_existing_bootstrap_authority(
+            "default",
+            Some("sess-expected"),
+            Some("sess-live"),
+        )
+        .expect_err("mismatched daemon session authority must fail closed");
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("existing_session_bootstrap_authority_mismatch")
+        );
+    }
+
+    #[test]
+    fn validate_existing_bootstrap_authority_rejects_missing_connected_daemon_session() {
+        let error = validate_existing_bootstrap_authority("default", Some("sess-expected"), None)
+            .expect_err("missing daemon session authority must fail closed");
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("existing_session_bootstrap_authority_missing")
+        );
+    }
 }

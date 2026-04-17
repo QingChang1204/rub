@@ -87,6 +87,7 @@ struct PendingOrchestrationConditionPolicy {
     preserved_triggered: Option<TriggeredOrchestrationCondition>,
     requires_revalidation_after_queue: bool,
     rule_semantics_fingerprint: String,
+    rule_lifecycle_generation: u64,
 }
 
 struct PendingOrchestrationReservation {
@@ -357,6 +358,7 @@ async fn process_orchestration_rule(
                 preserved_triggered: (!requires_revalidation).then_some(triggered.clone()),
                 requires_revalidation_after_queue: requires_revalidation,
                 rule_semantics_fingerprint,
+                rule_lifecycle_generation: rule.lifecycle_generation,
             },
             reservation_tx.clone(),
         ),
@@ -515,6 +517,10 @@ async fn complete_orchestration_reservation(
         drop(transaction);
         return Ok(None);
     }
+    if latest_rule.lifecycle_generation != condition_policy.rule_lifecycle_generation {
+        drop(transaction);
+        return Ok(None);
+    }
 
     let triggered = if live_requires_revalidation {
         match load_orchestration_condition_state(router, state, &latest_rule, worker_entry).await? {
@@ -556,6 +562,7 @@ async fn commit_orchestration_execution(
     state
         .record_orchestration_outcome_with_fallback(
             &reserved.rule,
+            Some(reserved.rule.lifecycle_generation),
             Some(reserved.evidence.clone()),
             result.clone(),
         )
@@ -590,8 +597,14 @@ fn reconcile_pending_orchestration_reservations(
         .collect::<std::collections::HashMap<_, _>>();
     pending_reservations.retain(|rule_id, pending| {
         let keep = live_fingerprints.get(rule_id).is_some_and(|fingerprint| {
-            pending.condition_policy.requires_revalidation_after_queue
-                || pending.condition_policy.rule_semantics_fingerprint == *fingerprint
+            pending.condition_policy.rule_lifecycle_generation
+                == rules
+                    .iter()
+                    .find(|rule| rule.id == *rule_id)
+                    .map(|rule| rule.lifecycle_generation)
+                    .unwrap_or_default()
+                && (pending.condition_policy.requires_revalidation_after_queue
+                    || pending.condition_policy.rule_semantics_fingerprint == *fingerprint)
         });
         if keep {
             return true;

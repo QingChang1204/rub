@@ -60,6 +60,7 @@ fn rule(id: u32, status: OrchestrationRuleStatus) -> OrchestrationRuleInfo {
     OrchestrationRuleInfo {
         id,
         status,
+        lifecycle_generation: 1,
         source: OrchestrationAddressInfo {
             session_id: "source-session".to_string(),
             session_name: "source".to_string(),
@@ -291,6 +292,7 @@ async fn ready_orchestration_reservation_completion_releases_idle_queue_permit()
                 preserved_triggered: None,
                 requires_revalidation_after_queue: true,
                 rule_semantics_fingerprint: String::new(),
+                rule_lifecycle_generation: 1,
             },
             task: tokio::spawn(async {}),
         },
@@ -356,6 +358,7 @@ async fn pending_network_request_orchestration_is_not_re_evaluated_during_queue_
                 preserved_triggered: None,
                 requires_revalidation_after_queue: false,
                 rule_semantics_fingerprint: orchestration_rule_semantics_fingerprint(&network_rule),
+                rule_lifecycle_generation: network_rule.lifecycle_generation,
             },
             task: tokio::spawn(async {}),
         },
@@ -396,6 +399,7 @@ async fn reconcile_pending_network_request_orchestration_drops_semantics_drift()
                 preserved_triggered: None,
                 requires_revalidation_after_queue: false,
                 rule_semantics_fingerprint: orchestration_rule_semantics_fingerprint(&stale_rule),
+                rule_lifecycle_generation: stale_rule.lifecycle_generation,
             },
             task: tokio::spawn(async {}),
         },
@@ -453,6 +457,67 @@ async fn complete_network_request_orchestration_reservation_fails_closed_on_sema
             }),
             requires_revalidation_after_queue: false,
             rule_semantics_fingerprint: orchestration_rule_semantics_fingerprint(&stale_rule),
+            rule_lifecycle_generation: stale_rule.lifecycle_generation,
+        },
+    )
+    .await
+    .expect("reservation completion should fail closed, not error");
+
+    assert!(reserved.is_none());
+}
+
+#[tokio::test]
+async fn complete_orchestration_reservation_fails_closed_on_lifecycle_generation_drift() {
+    let router = test_router();
+    let state = Arc::new(SessionState::new(
+        "default",
+        temp_home("reservation-generation-drift"),
+        None,
+    ));
+    let live_rule = state
+        .register_orchestration_rule(rule(7, OrchestrationRuleStatus::Armed))
+        .await
+        .expect("rule should register");
+    state
+        .set_orchestration_rule_status(live_rule.id, OrchestrationRuleStatus::Paused)
+        .await
+        .expect("pause should update rule");
+    state
+        .set_orchestration_rule_status(live_rule.id, OrchestrationRuleStatus::Armed)
+        .await
+        .expect("resume should update rule");
+
+    let transaction = router
+        .begin_automation_reservation_transaction_owned(&state, "queued_orchestration")
+        .await
+        .expect("reservation should acquire");
+    let mut worker_entry = OrchestrationWorkerEntry {
+        last_status: OrchestrationRuleStatus::Armed,
+        network_cursor: 0,
+        network_cursor_primed: true,
+        observatory_drop_count: 0,
+        latched_evidence_key: None,
+    };
+
+    let reserved = complete_orchestration_reservation(
+        &router,
+        &state,
+        live_rule.id,
+        &mut worker_entry,
+        transaction,
+        None,
+        PendingOrchestrationConditionPolicy {
+            preserved_triggered: Some(TriggeredOrchestrationCondition {
+                evidence: TriggerEvidenceInfo {
+                    summary: "source_tab_text_present:Ready".to_string(),
+                    fingerprint: Some("Ready".to_string()),
+                },
+                evidence_key: "source_tab_text_present:Ready::Ready".to_string(),
+                network_progress: None,
+            }),
+            requires_revalidation_after_queue: false,
+            rule_semantics_fingerprint: orchestration_rule_semantics_fingerprint(&live_rule),
+            rule_lifecycle_generation: live_rule.lifecycle_generation,
         },
     )
     .await

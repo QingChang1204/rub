@@ -1,9 +1,10 @@
+use crate::timeout_budget::deadline_from_start;
 use crate::timeout_budget::helpers::mutating_request;
 use rub_core::error::RubError;
 use rub_daemon::rub_paths::RubPaths;
 use rub_ipc::client::IpcClient;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::{
     BatchCloseResult, ShutdownFenceStatus, cleanup_stale, registry_authority_snapshot,
@@ -30,7 +31,14 @@ pub(crate) async fn close_all_sessions(
     rub_home: &Path,
     timeout: u64,
 ) -> Result<BatchCloseResult, RubError> {
-    let command_deadline = Instant::now() + Duration::from_millis(timeout.max(1));
+    let command_deadline = deadline_from_start(Instant::now(), timeout);
+    close_all_sessions_until(rub_home, command_deadline).await
+}
+
+pub(crate) async fn close_all_sessions_until(
+    rub_home: &Path,
+    command_deadline: Instant,
+) -> Result<BatchCloseResult, RubError> {
     if !rub_home.exists() {
         return Ok(BatchCloseResult {
             closed: Vec::new(),

@@ -118,6 +118,67 @@ mod tests {
     }
 
     #[test]
+    fn interference_runtime_state_does_not_prime_baseline_from_interfered_context() {
+        let mut state = InterferenceRuntimeState::default();
+        let projection = state.classify(
+            &[TabInfo {
+                index: 0,
+                target_id: "target-1".to_string(),
+                url: "https://app.example.com/interstitial".to_string(),
+                title: "Interstitial".to_string(),
+                active: true,
+            }],
+            &RuntimeObservatoryInfo::default(),
+            &ReadinessInfo::default(),
+            &HumanVerificationHandoffInfo::default(),
+        );
+
+        assert_eq!(projection.status, InterferenceRuntimeStatus::Active);
+        assert!(state.baseline.primary_target_id.is_none());
+        assert!(state.baseline.primary_url.is_none());
+    }
+
+    #[test]
+    fn interference_runtime_state_primes_baseline_only_after_inactive_refresh() {
+        let mut state = InterferenceRuntimeState::default();
+        state.classify(
+            &[TabInfo {
+                index: 0,
+                target_id: "target-1".to_string(),
+                url: "https://app.example.com/interstitial".to_string(),
+                title: "Interstitial".to_string(),
+                active: true,
+            }],
+            &RuntimeObservatoryInfo::default(),
+            &ReadinessInfo::default(),
+            &HumanVerificationHandoffInfo::default(),
+        );
+
+        let projection = state.classify(
+            &[TabInfo {
+                index: 0,
+                target_id: "target-1".to_string(),
+                url: "https://app.example.com/home".to_string(),
+                title: "Home".to_string(),
+                active: true,
+            }],
+            &RuntimeObservatoryInfo::default(),
+            &ReadinessInfo::default(),
+            &HumanVerificationHandoffInfo::default(),
+        );
+
+        assert_eq!(projection.status, InterferenceRuntimeStatus::Inactive);
+        assert_eq!(
+            state.baseline.primary_target_id.as_deref(),
+            Some("target-1")
+        );
+        assert_eq!(
+            state.baseline.primary_url.as_deref(),
+            Some("https://app.example.com/home")
+        );
+    }
+
+    #[test]
     fn interference_runtime_state_does_not_overwrite_existing_baseline() {
         let mut state = InterferenceRuntimeState::default();
         state.prime_baseline_from_tabs(&[TabInfo {

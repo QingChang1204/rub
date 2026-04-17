@@ -271,6 +271,9 @@ impl IpcConnection {
         &mut self,
         response: &IpcResponse,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        response.validate_contract().map_err(|envelope| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, envelope.message)
+        })?;
         NdJsonCodec::write(&mut self.writer, response).await
     }
 }

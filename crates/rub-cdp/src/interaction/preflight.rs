@@ -3,26 +3,59 @@ use chromiumoxide::cdp::js_protocol::runtime::{ExecutionContextId, RemoteObjectI
 use rub_core::error::{ErrorCode, RubError};
 use std::sync::Arc;
 
+const ACTIVE_TEXT_TARGET_EDITABLE_JS: &str = r#"(function() {
+    const el = document.activeElement;
+    if (!el) return 'NO_ACTIVE';
+    const tag = String(el.tagName || '').toLowerCase();
+    if (el.isContentEditable) return 'OK';
+    const inputType = tag === 'input' ? String(el.getAttribute('type') || '').toLowerCase() : '';
+    const textLikeInput =
+        tag === 'input'
+        && !['checkbox', 'radio', 'file', 'submit', 'button', 'reset', 'image', 'color', 'range', 'hidden'].includes(inputType);
+    const editable = tag === 'textarea' || textLikeInput;
+    if (!editable) return 'NOT_EDITABLE';
+    if (typeof el.disabled === 'boolean' && el.disabled) return 'DISABLED';
+    if (typeof el.readOnly === 'boolean' && el.readOnly) return 'READONLY';
+    return 'OK';
+})()"#;
+
+const FRAME_SCOPED_ACTIVE_TEXT_TARGET_EDITABLE_JS: &str = r#"(function() {
+    const activeFrameBridgeReady = () => {
+        let current = window;
+        while (current !== current.top) {
+            try {
+                const frameEl = current.frameElement;
+                const parent = current.parent;
+                if (!frameEl || !parent || parent.document.activeElement !== frameEl) {
+                    return false;
+                }
+                current = parent;
+            } catch (_) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    const el = document.activeElement;
+    if (!el) return 'NO_ACTIVE';
+    const tag = String(el.tagName || '').toLowerCase();
+    if (el.isContentEditable) {
+        return activeFrameBridgeReady() ? 'OK' : 'FRAME_NOT_ACTIVE_IN_PAGE';
+    }
+    const inputType = tag === 'input' ? String(el.getAttribute('type') || '').toLowerCase() : '';
+    const textLikeInput =
+        tag === 'input'
+        && !['checkbox', 'radio', 'file', 'submit', 'button', 'reset', 'image', 'color', 'range', 'hidden'].includes(inputType);
+    const editable = tag === 'textarea' || textLikeInput;
+    if (!editable) return 'NOT_EDITABLE';
+    if (typeof el.disabled === 'boolean' && el.disabled) return 'DISABLED';
+    if (typeof el.readOnly === 'boolean' && el.readOnly) return 'READONLY';
+    return activeFrameBridgeReady() ? 'OK' : 'FRAME_NOT_ACTIVE_IN_PAGE';
+})()"#;
+
 pub(crate) async fn ensure_active_text_target_editable(page: &Arc<Page>) -> Result<(), RubError> {
-    let state = crate::js::evaluate_returning_string(
-        page,
-        r#"(function() {
-            const el = document.activeElement;
-            if (!el) return 'NO_ACTIVE';
-            const tag = String(el.tagName || '').toLowerCase();
-            if (el.isContentEditable) return 'OK';
-            const inputType = tag === 'input' ? String(el.getAttribute('type') || '').toLowerCase() : '';
-            const textLikeInput =
-                tag === 'input'
-                && !['checkbox', 'radio', 'file', 'submit', 'button', 'reset', 'image', 'color', 'range', 'hidden'].includes(inputType);
-            const editable = tag === 'textarea' || textLikeInput;
-            if (!editable) return 'NOT_EDITABLE';
-            if (typeof el.disabled === 'boolean' && el.disabled) return 'DISABLED';
-            if (typeof el.readOnly === 'boolean' && el.readOnly) return 'READONLY';
-            return 'OK';
-        })()"#,
-    )
-    .await?;
+    let state = crate::js::evaluate_returning_string(page, ACTIVE_TEXT_TARGET_EDITABLE_JS).await?;
 
     match state.as_str() {
         "DISABLED" => Err(RubError::domain(
@@ -48,21 +81,7 @@ pub(crate) async fn ensure_active_text_target_editable_in_context(
     let state = crate::js::evaluate_returning_string_in_context(
         page,
         context_id,
-        r#"(function() {
-            const el = document.activeElement;
-            if (!el) return 'NO_ACTIVE';
-            const tag = String(el.tagName || '').toLowerCase();
-            if (el.isContentEditable) return 'OK';
-            const inputType = tag === 'input' ? String(el.getAttribute('type') || '').toLowerCase() : '';
-            const textLikeInput =
-                tag === 'input'
-                && !['checkbox', 'radio', 'file', 'submit', 'button', 'reset', 'image', 'color', 'range', 'hidden'].includes(inputType);
-            const editable = tag === 'textarea' || textLikeInput;
-            if (!editable) return 'NOT_EDITABLE';
-            if (typeof el.disabled === 'boolean' && el.disabled) return 'DISABLED';
-            if (typeof el.readOnly === 'boolean' && el.readOnly) return 'READONLY';
-            return 'OK';
-        })()"#,
+        FRAME_SCOPED_ACTIVE_TEXT_TARGET_EDITABLE_JS,
     )
     .await?;
 
@@ -74,6 +93,10 @@ pub(crate) async fn ensure_active_text_target_editable_in_context(
         "READONLY" => Err(RubError::domain(
             ErrorCode::ElementNotInteractable,
             "Active element is readonly",
+        )),
+        "FRAME_NOT_ACTIVE_IN_PAGE" => Err(RubError::domain(
+            ErrorCode::ElementNotInteractable,
+            "Active frame does not currently own page-global keyboard focus",
         )),
         "NOT_EDITABLE" | "NO_ACTIVE" => Err(RubError::domain(
             ErrorCode::ElementNotInteractable,
@@ -187,4 +210,30 @@ async fn call_function(
     await_promise: bool,
 ) -> Result<(), RubError> {
     crate::js::call_function(page, object_id, function_declaration, await_promise).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ACTIVE_TEXT_TARGET_EDITABLE_JS, FRAME_SCOPED_ACTIVE_TEXT_TARGET_EDITABLE_JS};
+
+    #[test]
+    fn frame_scoped_text_target_script_requires_page_global_frame_bridge() {
+        assert!(
+            FRAME_SCOPED_ACTIVE_TEXT_TARGET_EDITABLE_JS
+                .contains("parent.document.activeElement !== frameEl"),
+            "{FRAME_SCOPED_ACTIVE_TEXT_TARGET_EDITABLE_JS}"
+        );
+        assert!(
+            FRAME_SCOPED_ACTIVE_TEXT_TARGET_EDITABLE_JS.contains("FRAME_NOT_ACTIVE_IN_PAGE"),
+            "{FRAME_SCOPED_ACTIVE_TEXT_TARGET_EDITABLE_JS}"
+        );
+    }
+
+    #[test]
+    fn top_level_text_target_script_does_not_require_frame_bridge() {
+        assert!(
+            !ACTIVE_TEXT_TARGET_EDITABLE_JS.contains("FRAME_NOT_ACTIVE_IN_PAGE"),
+            "{ACTIVE_TEXT_TARGET_EDITABLE_JS}"
+        );
+    }
 }

@@ -617,6 +617,39 @@ async fn detect_or_connect_hardened_until_fails_closed_when_attach_budget_is_alr
     let _ = std::fs::remove_dir_all(home);
 }
 
+#[tokio::test]
+async fn bootstrap_client_refuses_to_start_when_expected_session_authority_is_missing() {
+    let home = temp_home();
+    std::fs::create_dir_all(&home).unwrap();
+
+    let error = match super::bootstrap_client(
+        &home,
+        "default",
+        Some("sess-remembered"),
+        Instant::now() + Duration::from_secs(1),
+        1_000,
+        &[],
+        None,
+    )
+    .await
+    {
+        Ok(_) => panic!("remembered live reuse must not start a replacement daemon"),
+        Err(error) => error,
+    };
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::DaemonNotRunning);
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("existing_session_bootstrap_authority_unavailable")
+    );
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
 #[test]
 fn hard_cut_upgrade_keeps_projection_when_profile_release_lags() {
     let home = temp_home();

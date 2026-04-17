@@ -1,9 +1,11 @@
 use super::{
-    ExtractCommand, ExtractFieldSpec, ExtractKind, builder_locator_expression,
+    ExtractCommand, ExtractEntrySpec, ExtractFieldSpec, ExtractKind, builder_locator_expression,
     explain_extract_spec_contract, extract_builder_field_examples,
+    validate_snapshot_extract_contract,
 };
 use crate::router::extract_postprocess::ExtractValueType;
 use serde_json::json;
+use std::collections::BTreeMap;
 
 #[test]
 fn extract_field_supports_type_shorthand_for_kind() {
@@ -206,4 +208,53 @@ fn explain_extract_spec_contract_enriches_parse_errors_with_guidance() {
     let context = envelope.context.expect("context");
     assert_eq!(context["schema_command"], "rub extract --schema");
     assert_eq!(context["examples_command"], "rub extract --examples");
+}
+
+#[test]
+fn snapshot_extract_contract_rejects_collection_entries() {
+    let fields = BTreeMap::from([(
+        "items".to_string(),
+        ExtractEntrySpec::Collection(
+            serde_json::from_value(json!({
+                "selector": ".item",
+                "fields": {
+                    "title": {
+                        "selector": ".title",
+                        "kind": "text"
+                    }
+                }
+            }))
+            .expect("collection spec should deserialize"),
+        ),
+    )]);
+
+    let error = validate_snapshot_extract_contract(&fields)
+        .expect_err("snapshot extract must fail closed for collection extraction");
+    let envelope = error.into_envelope();
+    assert_eq!(
+        envelope.context.expect("collection context")["authority_state"],
+        "snapshot_extract_live_collection_unsupported"
+    );
+}
+
+#[test]
+fn snapshot_extract_contract_rejects_html_fields() {
+    let fields = BTreeMap::from([(
+        "html".to_string(),
+        ExtractEntrySpec::Field(
+            serde_json::from_value(json!({
+                "selector": "article",
+                "kind": "html"
+            }))
+            .expect("html field should deserialize"),
+        ),
+    )]);
+
+    let error = validate_snapshot_extract_contract(&fields)
+        .expect_err("snapshot extract must fail closed for html field kinds");
+    let envelope = error.into_envelope();
+    assert_eq!(
+        envelope.context.expect("html context")["authority_state"],
+        "snapshot_extract_live_only_field_kind"
+    );
 }

@@ -744,6 +744,12 @@ async fn replace_browser_authority_rolls_back_when_previous_release_fails() {
             applied_rule_effects: Vec::new(),
         },
     );
+    let previous_pending_registry =
+        crate::runtime_observatory::new_shared_pending_request_registry();
+    manager.observatory_pending_registries.lock().await.insert(
+        previous_target_id.clone(),
+        previous_pending_registry.clone(),
+    );
     {
         let dialog_runtime = manager.dialog_runtime();
         let mut runtime = dialog_runtime.write().await;
@@ -854,6 +860,17 @@ async fn replace_browser_authority_rolls_back_when_previous_release_fails() {
             )
             .is_some(),
         "rollback should preserve prior request-correlation authority"
+    );
+    let restored_pending_registry = manager
+        .observatory_pending_registries
+        .lock()
+        .await
+        .get(&previous_target_id)
+        .cloned()
+        .expect("rollback should restore observatory pending registry authority");
+    assert!(
+        Arc::ptr_eq(&restored_pending_registry, &previous_pending_registry),
+        "rollback should restore the previous observatory pending-registry authority"
     );
     let restored_intercept = manager
         .dialog_intercept
@@ -1158,6 +1175,12 @@ async fn replace_browser_authority_resets_generation_bound_runtime_state_on_comm
             applied_rule_effects: Vec::new(),
         },
     );
+    let stale_pending_registry = crate::runtime_observatory::new_shared_pending_request_registry();
+    manager
+        .observatory_pending_registries
+        .lock()
+        .await
+        .insert(previous_target_id.clone(), stale_pending_registry.clone());
     {
         let dialog_runtime = manager.dialog_runtime();
         let mut runtime = dialog_runtime.write().await;
@@ -1243,6 +1266,18 @@ async fn replace_browser_authority_resets_generation_bound_runtime_state_on_comm
             .is_none(),
         "replacement authority should not inherit stale request correlation state"
     );
+    if let Some(committed_pending_registry) = manager
+        .observatory_pending_registries
+        .lock()
+        .await
+        .get(&previous_target_id)
+        .cloned()
+    {
+        assert!(
+            !Arc::ptr_eq(&committed_pending_registry, &stale_pending_registry),
+            "replacement authority should not retain stale observatory pending-registry authority on commit"
+        );
+    }
     assert!(
         manager
             .dialog_intercept

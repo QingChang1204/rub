@@ -309,6 +309,7 @@ impl HarvestDispatchContext {
         let bootstrap = daemon_ctl::bootstrap_client(
             &cli.rub_home,
             &cli.session,
+            cli.session_id.as_deref(),
             deadline,
             request.timeout_ms,
             &self.daemon_args,
@@ -327,7 +328,7 @@ impl HarvestDispatchContext {
                 cli,
                 &self.connection_request,
                 &mut client,
-                daemon_session_id.as_deref(),
+                cli.session_id.as_deref().or(daemon_session_id.as_deref()),
                 Some(deadline),
                 Some(cli.timeout.max(1)),
             )

@@ -266,6 +266,7 @@ impl<'a> ReplaySendLifecycle<'a> {
             ReplayReconnectStrategy::Bootstrap(recovery) => bootstrap_client(
                 recovery.rub_home,
                 recovery.session,
+                None,
                 self.deadline,
                 attempt.original_timeout_ms,
                 recovery.daemon_args,

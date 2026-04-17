@@ -37,27 +37,24 @@ pub(super) async fn resolve_orchestration_address(
                 ),
             )
         })?;
-    let (tab_index, tab_target_id) = if spec.tab_index.is_some() || spec.tab_target_id.is_some() {
-        let tabs = if session.session_id == state.session_id {
-            router.browser.list_tabs().await.map_err(|error| {
-                RubError::domain_with_context(
-                    ErrorCode::BrowserCrashed,
-                    format!("Unable to query local orchestration {role} tab inventory: {error}"),
-                    serde_json::json!({
-                        "reason": format!("orchestration_{}_local_tabs_query_failed", role),
-                        "session_id": session.session_id,
-                        "session_name": session.session_name,
-                    }),
-                )
-            })?
-        } else {
-            list_remote_orchestration_tabs(session, role).await?
-        };
-        let tab = resolve_orchestration_tab_binding(&tabs, spec, role)?;
-        (Some(tab.index), Some(tab.target_id.clone()))
+    let tabs = if session.session_id == state.session_id {
+        router.browser.list_tabs().await.map_err(|error| {
+            RubError::domain_with_context(
+                ErrorCode::BrowserCrashed,
+                format!("Unable to query local orchestration {role} tab inventory: {error}"),
+                serde_json::json!({
+                    "reason": format!("orchestration_{}_local_tabs_query_failed", role),
+                    "session_id": session.session_id,
+                    "session_name": session.session_name,
+                }),
+            )
+        })?
     } else {
-        (None, None)
+        list_remote_orchestration_tabs(session, role).await?
     };
+    let tab = resolve_orchestration_tab_binding(&tabs, spec, role)?;
+    let tab_index = Some(tab.index);
+    let tab_target_id = Some(tab.target_id.clone());
     if let (Some(tab_target_id), Some(frame_id)) =
         (tab_target_id.as_deref(), spec.frame_id.as_deref())
     {

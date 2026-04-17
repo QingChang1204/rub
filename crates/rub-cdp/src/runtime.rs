@@ -39,7 +39,7 @@ pub(crate) async fn attach_external_browser(
     wait_for_external_targets_ready(&mut browser, url, deadline).await?;
 
     let pages_result = wait_for_external_pages_ready(&browser, url, deadline).await?;
-    let page = select_external_active_page(&mut browser, pages_result, url, deadline).await?;
+    let page = select_external_active_page(pages_result, url).await?;
     let browser = Arc::new(browser);
 
     Ok((browser, Arc::new(page), connect_url))
@@ -115,12 +115,7 @@ async fn wait_for_external_pages_ready(
     }
 }
 
-async fn select_external_active_page(
-    browser: &mut Browser,
-    pages: Vec<Page>,
-    url: &str,
-    deadline: Instant,
-) -> Result<Page, RubError> {
+async fn select_external_active_page(pages: Vec<Page>, url: &str) -> Result<Page, RubError> {
     if pages.len() == 1 {
         return pages.into_iter().next().ok_or_else(|| {
             RubError::domain(
@@ -130,45 +125,14 @@ async fn select_external_active_page(
         });
     }
 
-    let targets = tokio::time::timeout(remaining_attach_budget(deadline)?, browser.fetch_targets())
-        .await
-        .map_err(|_| {
-            RubError::domain(
-                ErrorCode::CdpConnectionFailed,
-                format!("Timed out resolving active page authority for external browser at {url}"),
-            )
-        })?
-        .map_err(|error| {
-            RubError::domain(
-                ErrorCode::CdpConnectionFailed,
-                format!(
-                    "Failed to resolve active page authority for external browser at {url}: {error}"
-                ),
-            )
-        })?;
-
-    let attached_target_ids = targets
-        .into_iter()
-        .filter(|target| {
-            target.r#type == "page"
-                && target.attached
-                && target.subtype.as_deref() != Some("prerender")
-        })
-        .map(|target| target.target_id.as_ref().to_string())
-        .collect::<Vec<_>>();
-
-    let attached_page_index = select_attached_external_page_index(
-        &pages
-            .iter()
-            .map(|page| page.target_id().as_ref().to_string())
-            .collect::<Vec<_>>(),
-        &attached_target_ids,
-    );
-
-    let Some(index) = attached_page_index else {
+    let Some(index) =
+        crate::tab_projection::resolve_active_page_index_from_browser_truth(&pages).await
+    else {
         return Err(RubError::domain(
             ErrorCode::CdpConnectionFailed,
-            format!("External browser at {url} did not expose any attachable page authority"),
+            format!(
+                "External browser at {url} did not expose a unique browser-truth active page authority"
+            ),
         ));
     };
 
@@ -178,38 +142,6 @@ async fn select_external_active_page(
             format!("External browser at {url} lost the selected page authority during attach"),
         )
     })
-}
-
-fn select_attached_external_page_index(
-    page_target_ids: &[String],
-    attached_target_ids: &[String],
-) -> Option<usize> {
-    if page_target_ids.is_empty() {
-        return None;
-    }
-
-    let attached_matches = page_target_ids
-        .iter()
-        .enumerate()
-        .filter_map(|(index, target_id)| {
-            attached_target_ids
-                .iter()
-                .any(|attached| attached == target_id)
-                .then_some(index)
-        })
-        .collect::<Vec<_>>();
-
-    match attached_matches.as_slice() {
-        [index] => Some(*index),
-        _ => None,
-    }
-}
-
-pub(crate) fn select_attached_page_index(
-    page_target_ids: &[String],
-    attached_target_ids: &[String],
-) -> Option<usize> {
-    select_attached_external_page_index(page_target_ids, attached_target_ids)
 }
 
 fn classify_managed_launch_error(options: &BrowserLaunchOptions, error: &str) -> RubError {
@@ -321,10 +253,7 @@ fn spawn_handler_loop(mut handler: chromiumoxide::handler::Handler) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        browser_launch_error_is_profile_in_use, build_managed_config_with_executable,
-        select_attached_external_page_index, select_attached_page_index,
-    };
+    use super::{browser_launch_error_is_profile_in_use, build_managed_config_with_executable};
     use crate::browser::BrowserLaunchOptions;
     use crate::identity_policy::IdentityPolicy;
 
@@ -339,40 +268,6 @@ mod tests {
             hide_infobars: true,
             stealth: true,
         }
-    }
-
-    #[test]
-    fn attached_external_page_selection_prefers_unique_attached_target() {
-        let pages = vec![
-            "tab-1".to_string(),
-            "tab-2".to_string(),
-            "tab-3".to_string(),
-        ];
-        let attached = vec!["tab-2".to_string()];
-        assert_eq!(
-            select_attached_external_page_index(&pages, &attached),
-            Some(1)
-        );
-        assert_eq!(select_attached_page_index(&pages, &attached), Some(1));
-    }
-
-    #[test]
-    fn attached_external_page_selection_fails_closed_when_ambiguous() {
-        let pages = vec![
-            "tab-1".to_string(),
-            "tab-2".to_string(),
-            "tab-3".to_string(),
-        ];
-        let attached = vec!["tab-1".to_string(), "tab-3".to_string()];
-        assert_eq!(select_attached_external_page_index(&pages, &attached), None);
-        assert_eq!(select_attached_page_index(&pages, &attached), None);
-    }
-
-    #[test]
-    fn attached_external_page_selection_fails_closed_without_attached_targets() {
-        let pages = vec!["tab-1".to_string(), "tab-2".to_string()];
-        assert_eq!(select_attached_external_page_index(&pages, &[]), None);
-        assert_eq!(select_attached_page_index(&pages, &[]), None);
     }
 
     #[test]

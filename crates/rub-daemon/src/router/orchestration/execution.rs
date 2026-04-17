@@ -10,6 +10,7 @@ use crate::orchestration_executor::execute_orchestration_rule;
 use crate::orchestration_probe::{
     dispatch_remote_orchestration_probe, evaluate_orchestration_probe_for_tab,
 };
+use crate::orchestration_runtime::OrchestrationOutcomeCommit;
 use crate::orchestration_worker::orchestration_evidence_key;
 use crate::runtime_refresh::refresh_orchestration_runtime;
 use crate::session::SessionState;
@@ -57,20 +58,16 @@ pub(super) async fn cmd_orchestration_execute(
         capture_manual_orchestration_condition_evidence(router, state, &runtime, &rule).await?;
     if orchestration_rule_in_cooldown(&rule) {
         let result = blocked_cooldown_result(&rule);
-        let rule = state
+        let outcome_commit = state
             .record_orchestration_outcome(
                 id,
+                Some(rule.lifecycle_generation),
                 execution_evidence
                     .clone()
                     .or_else(|| rule.last_condition_evidence.clone()),
                 result.clone(),
             )
-            .await
-            .ok_or_else(|| {
-                RubError::Internal(format!(
-                    "Orchestration rule id {id} disappeared while recording cooldown outcome"
-                ))
-            })?;
+            .await;
         refresh_orchestration_runtime(state).await;
         let runtime = state.orchestration_runtime().await;
         let rule = runtime
@@ -78,13 +75,26 @@ pub(super) async fn cmd_orchestration_execute(
             .iter()
             .find(|entry| entry.id == id)
             .cloned()
-            .unwrap_or(rule);
+            .or_else(|| match &outcome_commit {
+                OrchestrationOutcomeCommit::Applied(Some(rule))
+                | OrchestrationOutcomeCommit::Stale(Some(rule)) => Some(rule.clone()),
+                OrchestrationOutcomeCommit::Applied(None)
+                | OrchestrationOutcomeCommit::Stale(None) => None,
+            })
+            .ok_or_else(|| {
+                RubError::Internal(format!(
+                    "Orchestration rule id {id} disappeared while recording cooldown outcome"
+                ))
+            })?;
+        let lifecycle_commit = matches!(outcome_commit, OrchestrationOutcomeCommit::Stale(_))
+            .then_some("stale_rule_generation");
 
         return Ok(orchestration_payload(
             orchestration_rule_subject(id),
             serde_json::json!({
                 "rule": rule,
                 "execution": result,
+                "lifecycle_commit": lifecycle_commit,
             }),
             &runtime,
         ));
@@ -100,14 +110,14 @@ pub(super) async fn cmd_orchestration_execute(
         manual_command_identity_key.as_deref(),
     )
     .await;
-    let rule = state
-        .record_orchestration_outcome(id, execution_evidence, result.clone())
-        .await
-        .ok_or_else(|| {
-            RubError::Internal(format!(
-                "Orchestration rule id {id} disappeared while recording execution outcome"
-            ))
-        })?;
+    let outcome_commit = state
+        .record_orchestration_outcome(
+            id,
+            Some(rule.lifecycle_generation),
+            execution_evidence,
+            result.clone(),
+        )
+        .await;
     refresh_orchestration_runtime(state).await;
     let runtime = state.orchestration_runtime().await;
     let rule = runtime
@@ -115,13 +125,27 @@ pub(super) async fn cmd_orchestration_execute(
         .iter()
         .find(|entry| entry.id == id)
         .cloned()
-        .unwrap_or(rule);
+        .or_else(|| match &outcome_commit {
+            OrchestrationOutcomeCommit::Applied(Some(rule))
+            | OrchestrationOutcomeCommit::Stale(Some(rule)) => Some(rule.clone()),
+            OrchestrationOutcomeCommit::Applied(None) | OrchestrationOutcomeCommit::Stale(None) => {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            RubError::Internal(format!(
+                "Orchestration rule id {id} disappeared while recording execution outcome"
+            ))
+        })?;
+    let lifecycle_commit = matches!(outcome_commit, OrchestrationOutcomeCommit::Stale(_))
+        .then_some("stale_rule_generation");
 
     Ok(orchestration_payload(
         orchestration_rule_subject(id),
         serde_json::json!({
             "rule": rule,
             "execution": result,
+            "lifecycle_commit": lifecycle_commit,
         }),
         &runtime,
     ))

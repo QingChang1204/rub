@@ -95,15 +95,19 @@ pub fn unregister_external_chrome(pid: u32) {
     entries.retain(|(existing_pid, _)| *existing_pid != pid);
 }
 
-pub fn cleanup_registered_artifacts() {
-    if std::thread::panicking() {
-        return;
-    }
-
-    let homes = registered_homes().lock().unwrap().clone();
+fn cleanup_registered_artifacts_with<F, G>(
+    homes: Vec<String>,
+    external: Vec<(u32, PathBuf)>,
+    mut cleanup_home: F,
+    mut cleanup_external: G,
+) -> (Vec<String>, Vec<(u32, PathBuf)>)
+where
+    F: FnMut(&str) -> Result<CleanupVerification, String>,
+    G: FnMut(u32, &Path) -> Result<CleanupVerification, String>,
+{
     let mut failed_homes = Vec::new();
     for home in homes {
-        match cleanup::try_cleanup_home_allow_harness_fallback(&home) {
+        match cleanup_home(&home) {
             Ok(
                 CleanupVerification::Verified | CleanupVerification::VerifiedWithHarnessFallback,
             ) => {}
@@ -113,10 +117,9 @@ pub fn cleanup_registered_artifacts() {
         }
     }
 
-    let external = registered_external_chromes().lock().unwrap().clone();
     let mut failed_external = Vec::new();
     for (pid, profile_dir) in external {
-        match external_chrome::try_cleanup_external_chrome(pid, &profile_dir) {
+        match cleanup_external(pid, &profile_dir) {
             Ok(
                 CleanupVerification::Verified | CleanupVerification::VerifiedWithHarnessFallback,
             ) => {}
@@ -125,6 +128,19 @@ pub fn cleanup_registered_artifacts() {
             }
         }
     }
+
+    (failed_homes, failed_external)
+}
+
+pub fn cleanup_registered_artifacts() {
+    let homes = registered_homes().lock().unwrap().clone();
+    let external = registered_external_chromes().lock().unwrap().clone();
+    let (failed_homes, failed_external) = cleanup_registered_artifacts_with(
+        homes,
+        external,
+        cleanup::try_cleanup_home_allow_harness_fallback,
+        external_chrome::try_cleanup_external_chrome,
+    );
 
     *registered_homes().lock().unwrap() = failed_homes;
     *registered_external_chromes().lock().unwrap() = failed_external;
@@ -271,7 +287,11 @@ impl Drop for ManagedBrowserSession {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_test_rub_binary_path;
+    use super::{
+        CleanupVerification, cleanup_registered_artifacts_with, resolve_test_rub_binary_path,
+    };
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn resolve_test_rub_binary_path_prefers_explicit_test_binary() {
@@ -291,5 +311,31 @@ mod tests {
             Some("/workspace/crates/rub-test-harness"),
         );
         assert_eq!(resolved, "/tmp/target/debug/rub");
+    }
+
+    #[test]
+    fn registered_artifact_cleanup_attempts_best_effort_work_even_for_skipped_panic_verification() {
+        let home_calls = AtomicUsize::new(0);
+        let external_calls = AtomicUsize::new(0);
+        let homes = vec!["/tmp/rub-home-a".to_string()];
+        let external = vec![(41, std::path::PathBuf::from("/tmp/rub-profile-a"))];
+
+        let (failed_homes, failed_external) = cleanup_registered_artifacts_with(
+            homes.clone(),
+            external.clone(),
+            |_: &str| {
+                home_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CleanupVerification::SkippedDuringPanic)
+            },
+            |_: u32, _: &Path| {
+                external_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CleanupVerification::SkippedDuringPanic)
+            },
+        );
+
+        assert_eq!(home_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(external_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failed_homes, homes);
+        assert_eq!(failed_external, external);
     }
 }

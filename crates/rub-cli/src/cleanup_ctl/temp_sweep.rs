@@ -5,12 +5,14 @@ use super::temp_runtime::{
     orphan_temp_browser_roots, process_snapshot, root_has_live_browser_process,
     temp_daemon_processes, temp_roots, terminate_process_tree, terminate_revalidated_temp_daemon,
 };
-use super::upgrade_probe::{fetch_upgrade_status_for_session, wait_for_shutdown_paths};
+use super::upgrade_probe::{
+    fetch_upgrade_status_for_session_with_deadline, wait_for_shutdown_paths_until,
+};
 use crate::daemon_ctl::send_existing_request_with_replay_recovery;
 use crate::timeout_budget::helpers::mutating_request;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use rub_core::error::RubError;
 use rub_core::managed_profile::{
@@ -23,6 +25,7 @@ use rub_ipc::client::IpcClient;
 pub(super) async fn sweep_temp_daemons(
     current_rub_home: &Path,
     snapshot: &[ProcessInfo],
+    deadline: Instant,
     timeout_ms: u64,
     result: &mut CleanupResult,
 ) -> Result<HashSet<PathBuf>, RubError> {
@@ -38,31 +41,80 @@ pub(super) async fn sweep_temp_daemons(
             continue;
         }
 
-        match fetch_upgrade_status_for_session(&session_paths).await {
+        match fetch_upgrade_status_for_session_with_deadline(
+            &session_paths,
+            deadline,
+            timeout_ms,
+            "cleanup_temp_daemon_upgrade_check",
+        )
+        .await
+        {
             Ok(Some((status, socket_path))) => {
                 if status.idle {
-                    let request =
-                        mutating_request("close", serde_json::json!({}), timeout_ms.max(1_000));
+                    let request = mutating_request(
+                        "close",
+                        serde_json::json!({}),
+                        remaining_cleanup_budget_ms(
+                            deadline,
+                            timeout_ms,
+                            "cleanup_temp_daemon_close",
+                        )?,
+                    );
                     let key = format!("{}@{}", daemon.session_name, daemon.rub_home.display());
-                    match IpcClient::connect(&socket_path).await {
-                        Ok(mut client) => {
-                            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-                            let _ = send_existing_request_with_replay_recovery(
-                                &mut client,
-                                &request,
+                    match crate::timeout_budget::run_with_remaining_budget(
+                        deadline,
+                        timeout_ms,
+                        "cleanup_temp_daemon_connect",
+                        async { Ok::<_, RubError>(IpcClient::connect(&socket_path).await.ok()) },
+                    )
+                    .await?
+                    {
+                        Some(mut client) => {
+                            let _ = crate::timeout_budget::run_with_remaining_budget(
                                 deadline,
-                                &daemon.rub_home,
-                                &daemon.session_name,
-                                Some(daemon.session_id.as_str()),
+                                timeout_ms,
+                                "cleanup_temp_daemon_close",
+                                send_existing_request_with_replay_recovery(
+                                    &mut client,
+                                    &request,
+                                    deadline,
+                                    &daemon.rub_home,
+                                    &daemon.session_name,
+                                    Some(daemon.session_id.as_str()),
+                                ),
                             )
                             .await;
                         }
-                        Err(_) => {
-                            terminate_revalidated_temp_daemon(&daemon).await;
+                        None => {
+                            crate::timeout_budget::run_with_remaining_budget(
+                                deadline,
+                                timeout_ms,
+                                "cleanup_temp_daemon_force_terminate",
+                                async {
+                                    terminate_revalidated_temp_daemon(&daemon).await;
+                                    Ok::<(), RubError>(())
+                                },
+                            )
+                            .await?;
                         }
                     }
-                    wait_for_shutdown_paths(&session_paths.actual_socket_paths()).await;
-                    terminate_revalidated_temp_daemon(&daemon).await;
+                    wait_for_shutdown_paths_until(
+                        &session_paths.actual_socket_paths(),
+                        deadline,
+                        timeout_ms,
+                        "cleanup_temp_daemon_shutdown_wait",
+                    )
+                    .await?;
+                    crate::timeout_budget::run_with_remaining_budget(
+                        deadline,
+                        timeout_ms,
+                        "cleanup_temp_daemon_force_terminate",
+                        async {
+                            terminate_revalidated_temp_daemon(&daemon).await;
+                            Ok::<(), RubError>(())
+                        },
+                    )
+                    .await?;
                     cleanup_temp_daemon_registry_state(&daemon);
                     result.cleaned_temp_daemons.push(key);
                 } else {
@@ -76,6 +128,10 @@ pub(super) async fn sweep_temp_daemons(
                 continue;
             }
             Ok(None) => {}
+            Err(error) if matches!(&error, RubError::Domain(envelope) if envelope.code == rub_core::error::ErrorCode::IpcTimeout) =>
+            {
+                return Err(error);
+            }
             Err(_) if is_process_alive(daemon.pid) => {
                 active_temp_homes.insert(daemon.rub_home.clone());
                 result.skipped_busy_temp_daemons.push(format!(
@@ -88,7 +144,16 @@ pub(super) async fn sweep_temp_daemons(
             Err(_) => {}
         }
 
-        terminate_revalidated_temp_daemon(&daemon).await;
+        crate::timeout_budget::run_with_remaining_budget(
+            deadline,
+            timeout_ms,
+            "cleanup_temp_daemon_force_terminate",
+            async {
+                terminate_revalidated_temp_daemon(&daemon).await;
+                Ok::<(), RubError>(())
+            },
+        )
+        .await?;
         cleanup_temp_daemon_registry_state(&daemon);
         result.cleaned_temp_daemons.push(format!(
             "{}@{}",
@@ -98,6 +163,16 @@ pub(super) async fn sweep_temp_daemons(
     }
 
     Ok(active_temp_homes)
+}
+
+fn remaining_cleanup_budget_ms(
+    deadline: Instant,
+    timeout_ms: u64,
+    phase: &'static str,
+) -> Result<u64, RubError> {
+    crate::timeout_budget::remaining_budget_duration(deadline)
+        .map(|remaining| remaining.as_millis().clamp(1, u64::MAX as u128) as u64)
+        .ok_or_else(|| crate::main_support::command_timeout_error(timeout_ms, phase))
 }
 
 pub(super) async fn sweep_orphan_temp_browsers(

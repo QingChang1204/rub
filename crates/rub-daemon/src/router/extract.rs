@@ -30,6 +30,12 @@ const DEFAULT_SCAN_SCROLL_AMOUNT: u32 = 1_800;
 const DEFAULT_SCAN_SETTLE_MS: u64 = 1_200;
 const DEFAULT_SCAN_STALL_LIMIT: u32 = 3;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExtractAuthorityMode {
+    SnapshotOnly,
+    LiveAllowed,
+}
+
 pub(super) async fn cmd_extract(
     router: &DaemonRouter,
     args: &serde_json::Value,
@@ -45,6 +51,15 @@ pub(super) async fn cmd_extract(
     let wait = parsed_args.wait_config()?;
     let is_inspect_list = matches!(&parsed_args, ExtractCommand::List(_));
     let source_kind = parsed_args.source_kind();
+    let authority_mode = if parsed_args.snapshot_id().is_some() {
+        ExtractAuthorityMode::SnapshotOnly
+    } else {
+        ExtractAuthorityMode::LiveAllowed
+    };
+
+    if authority_mode == ExtractAuthorityMode::SnapshotOnly {
+        validate_snapshot_extract_contract(&fields)?;
+    }
 
     if scan.is_some() && parsed_args.snapshot_id().is_some() {
         return Err(RubError::domain(
@@ -188,7 +203,14 @@ pub(super) async fn cmd_extract(
 
     let mut data = if is_inspect_list {
         let (collection_name, collection) = resolve_single_collection(&fields, "inspect list")?;
-        let items = extract_collection(router, &snapshot, collection_name, collection).await?;
+        let items = extract_collection(
+            router,
+            &snapshot,
+            collection_name,
+            collection,
+            authority_mode,
+        )
+        .await?;
         let item_count = items.as_array().map(|value| value.len()).unwrap_or(0);
         extract_payload(
             serde_json::json!({
@@ -208,7 +230,7 @@ pub(super) async fn cmd_extract(
         for (name, entry) in fields {
             let value = match entry {
                 ExtractEntrySpec::Field(field) => {
-                    match extract_field(router, &snapshot, &name, &field).await {
+                    match extract_field(router, &snapshot, &name, &field, authority_mode).await {
                         Ok(value) => apply_field_postprocess(&name, &field, value)?,
                         Err(error) if should_substitute_missing_field(&field, &error) => {
                             resolve_missing_field(&name, field.required, field.default.as_ref())?
@@ -217,7 +239,8 @@ pub(super) async fn cmd_extract(
                     }
                 }
                 ExtractEntrySpec::Collection(collection) => {
-                    extract_collection(router, &snapshot, &name, &collection).await?
+                    extract_collection(router, &snapshot, &name, &collection, authority_mode)
+                        .await?
                 }
             };
             extracted.insert(name, value);
@@ -245,6 +268,57 @@ fn extract_payload(subject: serde_json::Value, result: serde_json::Value) -> ser
         "subject": subject,
         "result": result,
     })
+}
+
+fn validate_snapshot_extract_contract(
+    fields: &BTreeMap<String, ExtractEntrySpec>,
+) -> Result<(), RubError> {
+    for (name, entry) in fields {
+        validate_snapshot_extract_entry(name, entry)?;
+    }
+    Ok(())
+}
+
+fn validate_snapshot_extract_entry(path: &str, entry: &ExtractEntrySpec) -> Result<(), RubError> {
+    match entry {
+        ExtractEntrySpec::Field(field) => {
+            if matches!(field.kind, ExtractKind::Html) {
+                return Err(snapshot_extract_live_only_kind_error(path, field.kind));
+            }
+            Ok(())
+        }
+        ExtractEntrySpec::Collection(_) => Err(snapshot_extract_collection_error(path)),
+    }
+}
+
+fn snapshot_extract_live_only_kind_error(path: &str, kind: ExtractKind) -> RubError {
+    RubError::domain_with_context_and_suggestion(
+        ErrorCode::InvalidInput,
+        format!(
+            "snapshot-addressed extract cannot read '{path}' as {} because that field kind requires live DOM authority",
+            kind.as_str()
+        ),
+        serde_json::json!({
+            "field": path,
+            "kind": kind.as_str(),
+            "authority_state": "snapshot_extract_live_only_field_kind",
+        }),
+        "Remove --snapshot-id to allow a live DOM read for this field, or use a snapshot-supported kind such as text, value, attributes, attribute, or bbox",
+    )
+}
+
+fn snapshot_extract_collection_error(path: &str) -> RubError {
+    RubError::domain_with_context_and_suggestion(
+        ErrorCode::InvalidInput,
+        format!(
+            "snapshot-addressed extract cannot read collection '{path}' because collection extraction requires live DOM evaluation",
+        ),
+        serde_json::json!({
+            "field": path,
+            "authority_state": "snapshot_extract_live_collection_unsupported",
+        }),
+        "Remove --snapshot-id to allow live collection extraction, or switch to snapshot-addressed field reads only",
+    )
 }
 
 pub(crate) fn explain_extract_spec_contract(

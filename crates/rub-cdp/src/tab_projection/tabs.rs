@@ -139,32 +139,11 @@ pub(crate) async fn wait_for_startup_page(browser: &mut Browser) -> Result<Page,
         } else if pages.len() == 1 {
             return Ok(pages.into_iter().next().expect("single startup page"));
         } else {
-            let targets = browser.fetch_targets().await.map_err(|e| {
-                RubError::domain(
-                    ErrorCode::BrowserLaunchFailed,
-                    format!("Failed to resolve startup page authority: {e}"),
-                )
-            })?;
-            let attached_target_ids = targets
-                .into_iter()
-                .filter(|target| {
-                    target.r#type == "page"
-                        && target.attached
-                        && target.subtype.as_deref() != Some("prerender")
-                })
-                .map(|target| target.target_id.as_ref().to_string())
-                .collect::<Vec<_>>();
-            let page_target_ids = pages
-                .iter()
-                .map(|page| page.target_id().as_ref().to_string())
-                .collect::<Vec<_>>();
-            if let Some(index) =
-                crate::runtime::select_attached_page_index(&page_target_ids, &attached_target_ids)
-            {
+            if let Some(index) = resolve_active_page_index_from_browser_truth(&pages).await {
                 return Ok(pages
                     .into_iter()
                     .nth(index)
-                    .expect("attached startup page index should be valid"));
+                    .expect("browser-truth startup page index should be valid"));
             }
             last_error =
                 "Browser did not expose a unique authoritative startup page before startup commit"
@@ -230,11 +209,23 @@ pub(crate) async fn resolve_active_target_from_browser_truth(
         probe_states.push(probe_active_tab_state(page).await);
     }
 
-    choose_active_target_from_probe_states(
-        pages.iter().map(|page| page.target_id()),
-        probe_states.iter(),
-    )
-    .cloned()
+    choose_active_probe_index(probe_states.iter()).map(|index| pages[index].target_id().clone())
+}
+
+pub(crate) async fn resolve_active_page_index_from_browser_truth(pages: &[Page]) -> Option<usize> {
+    if pages.is_empty() {
+        return None;
+    }
+    if pages.len() == 1 {
+        return Some(0);
+    }
+
+    let mut probe_states = Vec::with_capacity(pages.len());
+    for page in pages {
+        probe_states.push(probe_active_tab_state(page).await);
+    }
+
+    choose_active_probe_index(probe_states.iter())
 }
 
 pub(crate) fn resolve_active_target_authority<'a, I>(
@@ -307,7 +298,7 @@ pub(super) fn projected_tab_title(title: Option<String>) -> String {
     title.unwrap_or_else(|| TAB_TITLE_PROBE_UNAVAILABLE.to_string())
 }
 
-async fn probe_active_tab_state(page: &Arc<Page>) -> Option<ActiveTabProbe> {
+async fn probe_active_tab_state(page: &Page) -> Option<ActiveTabProbe> {
     let probe = tokio::time::timeout(
         ACTIVE_TAB_PROBE_TIMEOUT,
         page.evaluate(
@@ -324,6 +315,48 @@ async fn probe_active_tab_state(page: &Arc<Page>) -> Option<ActiveTabProbe> {
     probe.into_value::<ActiveTabProbe>().ok()
 }
 
+fn choose_active_probe_index<'a, I>(probe_states: I) -> Option<usize>
+where
+    I: IntoIterator<Item = &'a Option<ActiveTabProbe>>,
+{
+    let entries = probe_states
+        .into_iter()
+        .enumerate()
+        .collect::<Vec<(usize, &Option<ActiveTabProbe>)>>();
+
+    let focused_visible = entries
+        .iter()
+        .filter_map(|(index, probe)| {
+            probe
+                .as_ref()
+                .filter(|probe| probe.focused && probe.visible)
+                .map(|_| *index)
+        })
+        .collect::<Vec<_>>();
+    if focused_visible.len() == 1 {
+        return focused_visible.into_iter().next();
+    }
+
+    let visible = entries
+        .iter()
+        .filter_map(|(index, probe)| probe.as_ref().filter(|probe| probe.visible).map(|_| *index))
+        .collect::<Vec<_>>();
+    if visible.len() == 1 {
+        return visible.into_iter().next();
+    }
+
+    let focused = entries
+        .iter()
+        .filter_map(|(index, probe)| probe.as_ref().filter(|probe| probe.focused).map(|_| *index))
+        .collect::<Vec<_>>();
+    if focused.len() == 1 {
+        return focused.into_iter().next();
+    }
+
+    None
+}
+
+#[cfg(test)]
 fn choose_active_target_from_probe_states<'a, I, J>(
     target_ids: I,
     probe_states: J,
@@ -336,53 +369,15 @@ where
         .into_iter()
         .zip(probe_states)
         .collect::<Vec<(&TargetId, &Option<ActiveTabProbe>)>>();
-
-    let focused_visible = entries
-        .iter()
-        .filter_map(|(target_id, probe)| {
-            probe
-                .as_ref()
-                .filter(|probe| probe.focused && probe.visible)
-                .map(|_| *target_id)
-        })
-        .collect::<Vec<_>>();
-    if focused_visible.len() == 1 {
-        return focused_visible.into_iter().next();
-    }
-
-    let visible = entries
-        .iter()
-        .filter_map(|(target_id, probe)| {
-            probe
-                .as_ref()
-                .filter(|probe| probe.visible)
-                .map(|_| *target_id)
-        })
-        .collect::<Vec<_>>();
-    if visible.len() == 1 {
-        return visible.into_iter().next();
-    }
-
-    let focused = entries
-        .iter()
-        .filter_map(|(target_id, probe)| {
-            probe
-                .as_ref()
-                .filter(|probe| probe.focused)
-                .map(|_| *target_id)
-        })
-        .collect::<Vec<_>>();
-    if focused.len() == 1 {
-        return focused.into_iter().next();
-    }
-    None
+    choose_active_probe_index(entries.iter().map(|(_, probe)| *probe)).map(|index| entries[index].0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         ActiveTabProbe, CommittedTabProjection, LocalActiveTargetAuthority,
-        choose_active_target_from_probe_states, resolve_active_target_authority,
+        choose_active_probe_index, choose_active_target_from_probe_states,
+        resolve_active_target_authority,
     };
     use chromiumoxide::cdp::browser_protocol::target::TargetId;
 
@@ -452,6 +447,39 @@ mod tests {
         assert!(
             target.is_none(),
             "ambiguous browser-side probes must fail closed instead of reusing a stale hint"
+        );
+    }
+
+    #[test]
+    fn active_page_index_prefers_unique_focused_visible_probe() {
+        let index = choose_active_probe_index([
+            &Some(ActiveTabProbe {
+                visible: false,
+                focused: false,
+            }),
+            &Some(ActiveTabProbe {
+                visible: true,
+                focused: true,
+            }),
+        ]);
+        assert_eq!(index, Some(1));
+    }
+
+    #[test]
+    fn active_page_index_degrades_when_browser_truth_is_ambiguous() {
+        let index = choose_active_probe_index([
+            &Some(ActiveTabProbe {
+                visible: true,
+                focused: false,
+            }),
+            &Some(ActiveTabProbe {
+                visible: true,
+                focused: false,
+            }),
+        ]);
+        assert!(
+            index.is_none(),
+            "startup/external page selection must fail closed when browser-truth probes are ambiguous"
         );
     }
 

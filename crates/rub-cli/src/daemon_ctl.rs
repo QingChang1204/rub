@@ -47,24 +47,25 @@ mod startup;
 #[cfg(test)]
 pub(crate) use self::bootstrap::cleanup_precommit_browser_authority_for_test;
 pub use self::bootstrap::{BootstrapClient, bootstrap_client};
-pub(crate) use self::close_all::close_all_sessions;
 #[cfg(test)]
 pub(crate) use self::close_all::{
     CloseAllDisposition, classify_close_all_result, close_all_session_targets,
     should_escalate_close_all_to_kill_fallback,
 };
+pub(crate) use self::close_all::{close_all_sessions, close_all_sessions_until};
 pub use self::close_existing::close_existing_session;
 pub(crate) use self::close_existing::{
     close_existing_session_targeted, resolve_existing_close_target_by_attachment_identity,
 };
 pub(crate) use self::connect::{
     ShutdownFenceStatus, TransientSocketPolicy, authority_bound_deferred_client, connect_ipc_once,
-    connect_ipc_with_retry, detect_or_connect_hardened, detect_or_connect_hardened_until,
-    remaining_budget_duration, remaining_budget_ms, wait_for_shutdown_until,
+    connect_ipc_with_retry, detect_or_connect_hardened_until, remaining_budget_duration,
+    remaining_budget_ms, wait_for_shutdown_until,
 };
 #[cfg(test)]
 pub(crate) use self::connect::{
-    apply_hard_cut_shutdown_outcome, maybe_upgrade_if_needed, socket_candidates_for_session,
+    apply_hard_cut_shutdown_outcome, detect_or_connect_hardened, maybe_upgrade_if_needed,
+    socket_candidates_for_session,
 };
 use self::handshake::handshake_attempt_error;
 pub(crate) use self::handshake::{

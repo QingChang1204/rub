@@ -60,6 +60,7 @@ fn sample_rule() -> OrchestrationRuleInfo {
     OrchestrationRuleInfo {
         id: 7,
         status: OrchestrationRuleStatus::Armed,
+        lifecycle_generation: 1,
         source: OrchestrationAddressInfo {
             session_id: "source".to_string(),
             session_name: "Source".to_string(),

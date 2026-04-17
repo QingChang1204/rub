@@ -4,6 +4,7 @@ use crate::binding_execution_ctl::resolve_command_execution_binding;
 use crate::binding_memory_ctl::remember_binding_alias;
 use crate::commands::EffectiveCli;
 use crate::commands::RememberedBindingAliasKindArg;
+use crate::main_dispatch::close_all_partial_failure_error;
 use crate::main_support::project_sessions_result;
 use crate::session_policy::ConnectionRequest;
 use rub_core::error::ErrorCode;
@@ -294,6 +295,31 @@ fn close_all_selector_error_is_invalid_input() {
     assert_eq!(
         envelope.context.expect("context")["reason"],
         serde_json::json!("close_all_selector_not_supported")
+    );
+}
+
+#[test]
+fn close_all_partial_failure_error_reports_failed_sessions_as_non_success() {
+    let envelope = close_all_partial_failure_error(
+        std::path::Path::new("/tmp/rub-home"),
+        &crate::daemon_ctl::BatchCloseResult {
+            closed: vec!["default".to_string()],
+            cleaned_stale: vec!["work".to_string()],
+            failed: vec!["broken".to_string()],
+        },
+    )
+    .into_envelope();
+    assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
+    assert_eq!(
+        envelope.context.as_ref().and_then(|ctx| ctx.get("reason")),
+        Some(&serde_json::json!("close_all_partial_failure"))
+    );
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("failed_sessions")),
+        Some(&serde_json::json!(["broken"]))
     );
 }
 

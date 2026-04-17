@@ -31,13 +31,15 @@ macro_rules! assert_json_success {
         );
         assert!(
             json.get("request_id")
-                .is_some_and(|value| value.is_string()),
-            "Missing request_id"
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty()),
+            "Expected request_id to be a non-empty string"
         );
         assert!(
             json.get("command_id")
-                .is_none_or(|value| value.is_null() || value.is_string()),
-            "Expected command_id to be null/absent or a string"
+                .is_none_or(|value| value.is_null()
+                    || value.as_str().is_some_and(|id| !id.trim().is_empty())),
+            "Expected command_id to be null/absent or a non-empty string"
         );
         assert!(
             json.get("command").is_some_and(|value| value.is_string()),
@@ -99,13 +101,15 @@ macro_rules! assert_json_error {
         );
         assert!(
             json.get("request_id")
-                .is_some_and(|value| value.is_string()),
-            "Missing request_id"
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty()),
+            "Expected request_id to be a non-empty string"
         );
         assert!(
             json.get("command_id")
-                .is_none_or(|value| value.is_null() || value.is_string()),
-            "Expected command_id to be null/absent or a string"
+                .is_none_or(|value| value.is_null()
+                    || value.as_str().is_some_and(|id| !id.trim().is_empty())),
+            "Expected command_id to be null/absent or a non-empty string"
         );
         assert!(
             json.get("command").is_some_and(|value| value.is_string()),
@@ -204,13 +208,15 @@ macro_rules! assert_post_commit_local_failure {
         );
         assert!(
             json.get("request_id")
-                .is_some_and(|value| value.is_string()),
-            "Missing request_id"
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty()),
+            "Expected request_id to be a non-empty string"
         );
         assert!(
             json.get("command_id")
-                .is_none_or(|value| value.is_null() || value.is_string()),
-            "Expected command_id to be null/absent or a string"
+                .is_none_or(|value| value.is_null()
+                    || value.as_str().is_some_and(|id| !id.trim().is_empty())),
+            "Expected command_id to be null/absent or a non-empty string"
         );
         assert!(
             json.get("command").is_some_and(|value| value.is_string()),
@@ -556,6 +562,42 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
+    fn success_macro_rejects_blank_request_id() {
+        let json = serde_json::json!({
+            "success": true,
+            "command": "open",
+            "stdout_schema_version": "3.0",
+            "request_id": "   ",
+            "session": "default",
+            "timing": {},
+            "data": {},
+            "error": null,
+        });
+        crate::assert_json_success!(json);
+    }
+
+    #[test]
+    #[should_panic]
+    fn error_macro_rejects_blank_command_id() {
+        let json = serde_json::json!({
+            "success": false,
+            "command": "open",
+            "stdout_schema_version": "3.0",
+            "request_id": "req-1",
+            "command_id": "   ",
+            "session": "default",
+            "timing": {},
+            "error": {
+                "code": "INVALID_INPUT",
+                "message": "bad input",
+                "suggestion": "fix it"
+            }
+        });
+        crate::assert_json_error!(json, "INVALID_INPUT");
+    }
+
+    #[test]
     fn raw_stdout_macro_evaluates_input_once_and_trims_newline() {
         let calls = AtomicUsize::new(0);
         crate::assert_raw_stdout!(counted_raw_stdout(&calls), "The Page Title");
@@ -643,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Expected command_id to be null/absent or a string")]
+    #[should_panic(expected = "Expected command_id to be null/absent or a non-empty string")]
     fn success_macro_rejects_non_string_command_id() {
         let json = serde_json::json!({
             "success": true,

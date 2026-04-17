@@ -274,6 +274,7 @@ mod tests {
         let exported = orchestration_rule_to_registration_spec(&OrchestrationRuleInfo {
             id: 9,
             status: OrchestrationRuleStatus::Armed,
+            lifecycle_generation: 1,
             source: OrchestrationAddressInfo {
                 session_id: "sess-source".to_string(),
                 session_name: "source".to_string(),

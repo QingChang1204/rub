@@ -1,4 +1,5 @@
 use super::*;
+use crate::orchestration_runtime::OrchestrationOutcomeCommit;
 
 impl SessionState {
     /// Current session-scoped trigger runtime projection.
@@ -36,12 +37,13 @@ impl SessionState {
     pub async fn mark_orchestration_runtime_degraded(
         &self,
         sequence: u64,
+        current_session: rub_core::model::OrchestrationSessionInfo,
         reason: impl Into<String>,
     ) -> rub_core::model::OrchestrationRuntimeInfo {
         self.orchestration_runtime
             .write()
             .await
-            .mark_degraded(sequence, reason)
+            .mark_degraded(sequence, current_session, reason)
     }
 
     pub async fn orchestration_trace(&self, last: usize) -> OrchestrationTraceProjection {
@@ -87,13 +89,16 @@ impl SessionState {
     pub async fn record_orchestration_outcome(
         &self,
         id: u32,
+        expected_generation: Option<u64>,
         evidence: Option<rub_core::model::TriggerEvidenceInfo>,
         result: OrchestrationResultInfo,
-    ) -> Option<OrchestrationRuleInfo> {
-        self.orchestration_runtime
-            .write()
-            .await
-            .record_outcome(id, evidence, result)
+    ) -> OrchestrationOutcomeCommit {
+        self.orchestration_runtime.write().await.record_outcome(
+            id,
+            expected_generation,
+            evidence,
+            result,
+        )
     }
 
     pub async fn set_orchestration_condition_evidence(
@@ -110,13 +115,14 @@ impl SessionState {
     pub async fn record_orchestration_outcome_with_fallback(
         &self,
         rule_snapshot: &rub_core::model::OrchestrationRuleInfo,
+        expected_generation: Option<u64>,
         evidence: Option<rub_core::model::TriggerEvidenceInfo>,
         result: OrchestrationResultInfo,
-    ) -> Option<rub_core::model::OrchestrationRuleInfo> {
+    ) -> OrchestrationOutcomeCommit {
         self.orchestration_runtime
             .write()
             .await
-            .record_outcome_with_fallback(rule_snapshot, evidence, result)
+            .record_outcome_with_fallback(rule_snapshot, expected_generation, evidence, result)
     }
 
     /// Whether the session currently owns any armed orchestration rules
