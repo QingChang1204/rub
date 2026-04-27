@@ -256,25 +256,278 @@ impl IpcConnection {
     pub async fn read_request(
         &mut self,
     ) -> Result<Option<IpcRequest>, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(value) = NdJsonCodec::read::<serde_json::Value, _>(&mut self.reader).await? else {
+        let Some(frame) = NdJsonCodec::read_frame_bytes(&mut self.reader).await? else {
             return Ok(None);
         };
-        let request = IpcRequest::from_value_strict(value).map_err(|envelope| {
-            Box::new(IpcProtocolDecodeError::new(envelope))
-                as Box<dyn std::error::Error + Send + Sync>
+        let correlation = RequestCorrelation::from_request_frame(&frame);
+        let value = serde_json::from_slice::<serde_json::Value>(&frame).map_err(|error| {
+            let envelope = transport_read_failure_envelope(Box::new(error));
+            Box::new(IpcProtocolDecodeError::with_request_correlation(
+                envelope,
+                correlation.command_id,
+                correlation.daemon_session_id,
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        let correlation = RequestCorrelation::from_request_value(&value);
+        let request = IpcRequest::from_value_transport(value).map_err(|envelope| {
+            Box::new(IpcProtocolDecodeError::with_request_correlation(
+                envelope,
+                correlation.command_id,
+                correlation.daemon_session_id,
+            )) as Box<dyn std::error::Error + Send + Sync>
         })?;
         Ok(Some(request))
     }
 
-    /// Send a response to the client.
-    pub async fn write_response(
+    /// Send a response after validating it against the request authority that
+    /// opened this IPC transaction.
+    pub async fn write_response_for_request(
         &mut self,
+        request: &IpcRequest,
         response: &IpcResponse,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        response.validate_contract().map_err(|envelope| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, envelope.message)
-        })?;
+        response
+            .validate_transport_contract(request)
+            .map_err(|envelope| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, envelope.message)
+            })?;
+        response
+            .validate_correlated_contract(request)
+            .map_err(|envelope| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, envelope.message)
+            })?;
         NdJsonCodec::write(&mut self.writer, response).await
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RequestCorrelation {
+    command_id: Option<String>,
+    daemon_session_id: Option<String>,
+}
+
+impl RequestCorrelation {
+    fn from_request_value(value: &serde_json::Value) -> Self {
+        let Some(object) = value.as_object() else {
+            return Self::default();
+        };
+        Self {
+            command_id: sanitize_optional_protocol_string(object.get("command_id")),
+            daemon_session_id: sanitize_optional_protocol_string(object.get("daemon_session_id")),
+        }
+    }
+
+    fn from_request_frame(frame: &[u8]) -> Self {
+        Self {
+            command_id: recover_top_level_string_field_from_frame(frame, "command_id"),
+            daemon_session_id: recover_top_level_string_field_from_frame(
+                frame,
+                "daemon_session_id",
+            ),
+        }
+    }
+}
+
+fn sanitize_optional_protocol_string(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value.and_then(serde_json::Value::as_str)?;
+    (!value.trim().is_empty()).then(|| value.to_string())
+}
+
+fn transport_read_failure_envelope(
+    error: Box<dyn std::error::Error + Send + Sync>,
+) -> rub_core::error::ErrorEnvelope {
+    match error.downcast::<IpcProtocolDecodeError>() {
+        Ok(protocol_error) => protocol_error.into_envelope(),
+        Err(error) => match error.downcast::<std::io::Error>() {
+            Ok(io_error) => {
+                let reason = match io_error.kind() {
+                    std::io::ErrorKind::UnexpectedEof => "partial_ndjson_frame",
+                    std::io::ErrorKind::InvalidData
+                        if crate::codec::is_oversized_frame_io_error(io_error.as_ref()) =>
+                    {
+                        "oversized_ndjson_frame"
+                    }
+                    std::io::ErrorKind::InvalidData => "invalid_ndjson_frame",
+                    _ => "ipc_read_failure",
+                };
+                rub_core::error::ErrorEnvelope::new(
+                    rub_core::error::ErrorCode::IpcProtocolError,
+                    format!("Invalid NDJSON request: {io_error}"),
+                )
+                .with_context(serde_json::json!({
+                    "phase": "ipc_read",
+                    "reason": reason,
+                }))
+            }
+            Err(error) => match error.downcast::<serde_json::Error>() {
+                Ok(json_error) => rub_core::error::ErrorEnvelope::new(
+                    rub_core::error::ErrorCode::IpcProtocolError,
+                    format!("Invalid JSON request body: {json_error}"),
+                )
+                .with_context(serde_json::json!({
+                    "phase": "ipc_read",
+                    "reason": "invalid_json_request",
+                })),
+                Err(error) => rub_core::error::ErrorEnvelope::new(
+                    rub_core::error::ErrorCode::IpcProtocolError,
+                    format!("Failed to read IPC request: {error}"),
+                )
+                .with_context(serde_json::json!({
+                    "phase": "ipc_read",
+                    "reason": "ipc_read_failure",
+                })),
+            },
+        },
+    }
+}
+
+fn recover_top_level_string_field_from_frame(frame: &[u8], field: &str) -> Option<String> {
+    let bytes = frame;
+    let mut cursor = 0usize;
+    skip_json_whitespace(bytes, &mut cursor);
+    if bytes.get(cursor) != Some(&b'{') {
+        return None;
+    }
+    cursor += 1;
+
+    loop {
+        skip_json_whitespace(bytes, &mut cursor);
+        if bytes.get(cursor) == Some(&b'}') {
+            return None;
+        }
+        let key = parse_json_string(bytes, &mut cursor)?;
+        skip_json_whitespace(bytes, &mut cursor);
+        if bytes.get(cursor) != Some(&b':') {
+            return None;
+        }
+        cursor += 1;
+        skip_json_whitespace(bytes, &mut cursor);
+
+        if key == field {
+            if bytes.get(cursor) == Some(&b'"') {
+                let value = parse_json_string(bytes, &mut cursor)?;
+                return (!value.trim().is_empty()).then_some(value);
+            }
+            return None;
+        }
+
+        skip_json_value(bytes, &mut cursor)?;
+        skip_json_whitespace(bytes, &mut cursor);
+        match bytes.get(cursor) {
+            Some(b',') => {
+                cursor += 1;
+            }
+            Some(b'}') => return None,
+            _ => return None,
+        }
+    }
+}
+
+fn skip_json_whitespace(bytes: &[u8], cursor: &mut usize) {
+    while let Some(byte) = bytes.get(*cursor) {
+        if !byte.is_ascii_whitespace() {
+            break;
+        }
+        *cursor += 1;
+    }
+}
+
+fn parse_json_string(bytes: &[u8], cursor: &mut usize) -> Option<String> {
+    if bytes.get(*cursor) != Some(&b'"') {
+        return None;
+    }
+    let start = *cursor;
+    *cursor += 1;
+    let mut escaped = false;
+    while let Some(byte) = bytes.get(*cursor) {
+        *cursor += 1;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match *byte {
+            b'\\' => escaped = true,
+            b'"' => {
+                let slice = std::str::from_utf8(&bytes[start..*cursor]).ok()?;
+                return serde_json::from_str::<String>(slice).ok();
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn skip_json_value(bytes: &[u8], cursor: &mut usize) -> Option<()> {
+    match bytes.get(*cursor)? {
+        b'"' => {
+            parse_json_string(bytes, cursor)?;
+            Some(())
+        }
+        b'{' => {
+            *cursor += 1;
+            loop {
+                skip_json_whitespace(bytes, cursor);
+                match bytes.get(*cursor)? {
+                    b'}' => {
+                        *cursor += 1;
+                        return Some(());
+                    }
+                    b'"' => {
+                        parse_json_string(bytes, cursor)?;
+                        skip_json_whitespace(bytes, cursor);
+                        if bytes.get(*cursor)? != &b':' {
+                            return None;
+                        }
+                        *cursor += 1;
+                        skip_json_whitespace(bytes, cursor);
+                        skip_json_value(bytes, cursor)?;
+                        skip_json_whitespace(bytes, cursor);
+                        match bytes.get(*cursor)? {
+                            b',' => *cursor += 1,
+                            b'}' => {
+                                *cursor += 1;
+                                return Some(());
+                            }
+                            _ => return None,
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        b'[' => {
+            *cursor += 1;
+            loop {
+                skip_json_whitespace(bytes, cursor);
+                match bytes.get(*cursor)? {
+                    b']' => {
+                        *cursor += 1;
+                        return Some(());
+                    }
+                    _ => {
+                        skip_json_value(bytes, cursor)?;
+                        skip_json_whitespace(bytes, cursor);
+                        match bytes.get(*cursor)? {
+                            b',' => *cursor += 1,
+                            b']' => {
+                                *cursor += 1;
+                                return Some(());
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            while let Some(byte) = bytes.get(*cursor) {
+                match *byte {
+                    b',' | b']' | b'}' if !byte.is_ascii_whitespace() => break,
+                    _ => *cursor += 1,
+                }
+            }
+            Some(())
+        }
     }
 }
 
@@ -285,10 +538,13 @@ mod tests {
         quarantine_stale_socket_after_replacement_fence, socket_identity,
         stale_socket_replacement_fence,
     };
+    use crate::protocol::{IpcProtocolDecodeError, IpcRequest, IpcResponse};
     use serial_test::serial;
     use std::os::unix::net::UnixListener;
     use std::sync::mpsc;
     use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
 
     #[test]
     fn stale_socket_fence_rejects_identity_change_before_unlink() {
@@ -459,5 +715,98 @@ mod tests {
         lock_holder.join().expect("lock-holder join");
         let _ = std::fs::remove_file(root.join(".d.sock.bind.lock"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn read_request_preserves_correlation_on_transport_contract_failure() {
+        let (mut client, server) = UnixStream::pair().expect("unix pair");
+        let mut connection = super::IpcConnection::new(server);
+        client
+            .write_all(
+                br#"{"ipc_protocol_version":"0.9","command":"doctor","command_id":"cmd-1","daemon_session_id":"sess-1","args":{},"timeout_ms":1000}
+"#,
+            )
+            .await
+            .expect("write request frame");
+        drop(client);
+
+        let error = connection
+            .read_request()
+            .await
+            .expect_err("transport contract failure must fail closed");
+        let protocol_error = error
+            .downcast::<IpcProtocolDecodeError>()
+            .expect("should expose protocol decode error");
+        assert_eq!(protocol_error.command_id(), Some("cmd-1"));
+        assert_eq!(protocol_error.daemon_session_id(), Some("sess-1"));
+        assert_eq!(
+            protocol_error
+                .envelope()
+                .context
+                .as_ref()
+                .and_then(|context| context.get("field"))
+                .and_then(|value| value.as_str()),
+            Some("ipc_protocol_version")
+        );
+    }
+
+    #[tokio::test]
+    async fn read_request_recovers_correlation_from_invalid_json_frame() {
+        let (mut client, server) = UnixStream::pair().expect("unix pair");
+        let mut connection = super::IpcConnection::new(server);
+        client
+            .write_all(
+                br#"{"ipc_protocol_version":"1.1","command":"doctor","command_id":"cmd-json","daemon_session_id":"sess-json","args":{"broken": },"timeout_ms":1000}
+"#,
+            )
+            .await
+            .expect("write malformed frame");
+        drop(client);
+
+        let error = connection
+            .read_request()
+            .await
+            .expect_err("invalid JSON must fail closed");
+        let protocol_error = error
+            .downcast::<IpcProtocolDecodeError>()
+            .expect("should expose protocol decode error");
+        assert_eq!(protocol_error.command_id(), Some("cmd-json"));
+        assert_eq!(protocol_error.daemon_session_id(), Some("sess-json"));
+        assert_eq!(
+            protocol_error
+                .envelope()
+                .context
+                .as_ref()
+                .and_then(|context| context.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("invalid_json_request")
+        );
+    }
+
+    #[tokio::test]
+    async fn write_response_for_request_rejects_uncorrelated_response() {
+        let (client, server) = UnixStream::pair().expect("unix pair");
+        drop(client);
+        let mut connection = super::IpcConnection::new(server);
+        let request = IpcRequest::new("doctor", serde_json::json!({}), 1_000)
+            .with_daemon_session_id("sess-1")
+            .expect("daemon_session_id should be valid");
+        let response = IpcResponse::success("req-1", serde_json::json!({"ok": true}))
+            .with_command_id("different-command")
+            .expect("command_id should be valid")
+            .with_daemon_session_id("sess-1")
+            .expect("daemon_session_id should be valid");
+
+        let error = connection
+            .write_response_for_request(&request, &response)
+            .await
+            .expect_err("server write fence must reject uncorrelated response");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("correlation failure should become io invalid data")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 }

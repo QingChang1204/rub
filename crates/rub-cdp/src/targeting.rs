@@ -3,14 +3,11 @@ use chromiumoxide::cdp::browser_protocol::dom::{
     BackendNodeId, DescribeNodeParams, GetContentQuadsParams, RequestNodeParams, ResolveNodeParams,
 };
 use chromiumoxide::cdp::js_protocol::runtime::RemoteObjectId;
-use chromiumoxide::element::Element as CdpElement;
 use chromiumoxide::layout::Point;
 use rub_core::error::{ErrorCode, RubError};
-use rub_core::model::{BoundingBox, Element, ElementTag};
-use std::collections::HashMap;
+use rub_core::model::BoundingBox;
+use rub_core::model::{Element, ElementTag};
 use std::sync::Arc;
-
-const READ_FALLBACK_SELECTOR: &str = "*";
 
 pub(crate) const TOP_LEVEL_BOUNDING_BOX_FUNCTION: &str = r#"function() {
     const rect = this.getBoundingClientRect();
@@ -20,13 +17,15 @@ pub(crate) const TOP_LEVEL_BOUNDING_BOX_FUNCTION: &str = r#"function() {
     while (current !== current.top) {
         try {
             const frameEl = current.frameElement;
-            if (!frameEl) break;
+            if (!frameEl) {
+                throw new Error('top_level_bbox_frame_element_unavailable');
+            }
             const frameRect = frameEl.getBoundingClientRect();
             x += Number.isFinite(frameRect.x) ? frameRect.x : 0;
             y += Number.isFinite(frameRect.y) ? frameRect.y : 0;
             current = current.parent;
         } catch (_) {
-            break;
+            throw new Error('top_level_bbox_parent_chain_unavailable');
         }
     }
     return {
@@ -46,13 +45,15 @@ const topLevelBoundingBox = (el) => {
     while (current !== current.top) {
         try {
             const frameEl = current.frameElement;
-            if (!frameEl) break;
+            if (!frameEl) {
+                throw new Error('top_level_bbox_frame_element_unavailable');
+            }
             const frameRect = frameEl.getBoundingClientRect();
             x += Number.isFinite(frameRect.x) ? frameRect.x : 0;
             y += Number.isFinite(frameRect.y) ? frameRect.y : 0;
             current = current.parent;
         } catch (_) {
-            break;
+            throw new Error('top_level_bbox_parent_chain_unavailable');
         }
     }
     return {
@@ -63,34 +64,35 @@ const topLevelBoundingBox = (el) => {
     };
 };
 const topLevelHitPointMatches = (el, x, y) => {
+    let currentX = x;
+    let currentY = y;
+    let hit;
     try {
-        let currentX = x;
-        let currentY = y;
-        let hit = window.top.document.elementFromPoint(currentX, currentY);
-        while (hit) {
-            if (
-                hit === el
-                || (typeof el.contains === 'function' && el.contains(hit))
-                || (typeof hit.contains === 'function' && hit.contains(el))
-            ) {
-                return true;
-            }
-            if (!hit.contentDocument) {
-                return false;
-            }
-            try {
-                const frameRect = hit.getBoundingClientRect();
-                currentX -= frameRect.left;
-                currentY -= frameRect.top;
-                hit = hit.contentDocument.elementFromPoint(currentX, currentY);
-            } catch (_) {
-                return false;
-            }
-        }
-        return false;
+        hit = window.top.document.elementFromPoint(currentX, currentY);
     } catch (_) {
-        return false;
+        throw new Error('top_level_hit_test_parent_chain_unavailable');
     }
+    while (hit) {
+        if (
+            hit === el
+            || (typeof el.contains === 'function' && el.contains(hit))
+            || (typeof hit.contains === 'function' && hit.contains(el))
+        ) {
+            return true;
+        }
+        if (!hit.contentDocument) {
+            return false;
+        }
+        try {
+            const frameRect = hit.getBoundingClientRect();
+            currentX -= frameRect.left;
+            currentY -= frameRect.top;
+            hit = hit.contentDocument.elementFromPoint(currentX, currentY);
+        } catch (_) {
+            throw new Error('top_level_hit_test_frame_descent_unavailable');
+        }
+    }
+    return false;
 };
 const topLevelHitMatches = (el) => {
     const rect = topLevelBoundingBox(el);
@@ -125,6 +127,7 @@ pub(crate) async fn resolve_element(
     page: &Arc<Page>,
     element: &Element,
 ) -> Result<ResolvedElement, RubError> {
+    let expected_frame_id = parse_element_ref_frame_id(element.element_ref.as_deref());
     let Some(backend_node_id) = parse_backend_node_id(element.element_ref.as_deref()) else {
         return Err(unverified_write_target_error(
             element,
@@ -132,7 +135,7 @@ pub(crate) async fn resolve_element(
         ));
     };
 
-    let remote_object_id = resolve_remote_object(page, backend_node_id)
+    let remote_object_id = resolve_remote_object(page, backend_node_id, expected_frame_id)
         .await
         .map_err(|_| {
             unverified_write_target_error(
@@ -152,77 +155,44 @@ pub(crate) async fn resolve_read_element(
     page: &Arc<Page>,
     element: &Element,
 ) -> Result<ResolvedElement, RubError> {
-    resolve_element_with_fallback_selector(
-        page,
-        element,
-        READ_FALLBACK_SELECTOR,
-        "Fallback element query failed",
-    )
-    .await
+    let expected_frame_id = parse_element_ref_frame_id(element.element_ref.as_deref());
+    let Some(backend_node_id) = parse_backend_node_id(element.element_ref.as_deref()) else {
+        return Err(unverified_read_target_error(
+            element,
+            "snapshot element does not carry a verified backend node id",
+        ));
+    };
+
+    let remote_object_id = resolve_remote_object(page, backend_node_id, expected_frame_id)
+        .await
+        .map_err(|_| {
+            unverified_read_target_error(
+                element,
+                "snapshot element backend node id no longer resolves in the live DOM",
+            )
+        })?;
+
+    Ok(ResolvedElement {
+        remote_object_id,
+        backend_node_id: Some(backend_node_id),
+        verified: true,
+    })
 }
 
-async fn resolve_element_with_fallback_selector(
-    page: &Arc<Page>,
-    element: &Element,
-    fallback_selector: &str,
-    query_failure_label: &str,
-) -> Result<ResolvedElement, RubError> {
-    let frame_id = parse_element_ref_frame_id(element.element_ref.as_deref());
-    if let Some(backend_node_id) = parse_backend_node_id(element.element_ref.as_deref())
-        && let Ok(remote_object_id) = resolve_remote_object(page, backend_node_id).await
+pub(crate) fn snapshot_element_replay_matches_authority(
+    expected: &Element,
+    candidate: &Element,
+) -> bool {
+    if expected
+        .listeners
+        .as_ref()
+        .is_some_and(|listeners| !listeners.is_empty())
+        && candidate.listeners.as_ref() != expected.listeners.as_ref()
     {
-        return Ok(ResolvedElement {
-            remote_object_id,
-            backend_node_id: Some(backend_node_id),
-            verified: true,
-        });
+        return false;
     }
 
-    if frame_id.is_some()
-        && let Some(resolved) =
-            resolve_element_within_frame_snapshot(page, element, frame_id).await?
-    {
-        return Ok(resolved);
-    }
-
-    if !allow_global_read_fallback(frame_id) {
-        return Err(frame_scoped_read_target_error(element));
-    }
-
-    let candidates = page
-        .find_elements(fallback_selector)
-        .await
-        .map_err(|e| RubError::Internal(format!("{query_failure_label}: {e}")))?;
-
-    let mut matching_candidates = Vec::new();
-
-    for candidate in candidates {
-        if let Some(rank) = candidate_match_rank(page, element, &candidate).await? {
-            let resolved = ResolvedElement {
-                remote_object_id: candidate.remote_object_id.clone(),
-                backend_node_id: Some(candidate.backend_node_id),
-                verified: false,
-            };
-            matching_candidates.push((rank, resolved));
-        }
-    }
-
-    if matching_candidates.len() > 1 {
-        return Err(ambiguous_read_target_error(
-            element,
-            "global_read_fallback_ambiguous",
-            matching_candidates.len(),
-        ));
-    }
-
-    if let Some((_, resolved)) = matching_candidates.into_iter().next() {
-        return Ok(resolved);
-    }
-
-    Err(RubError::domain(
-        ErrorCode::ElementNotFound,
-        format!("Could not resolve element index {}", element.index),
-    ))
+    snapshot_candidate_match_rank(expected, candidate).is_some()
 }
 
 fn unverified_write_target_error(element: &Element, reason: &str) -> RubError {
@@ -239,76 +209,18 @@ fn unverified_write_target_error(element: &Element, reason: &str) -> RubError {
     )
 }
 
-fn frame_scoped_read_target_error(element: &Element) -> RubError {
+fn unverified_read_target_error(element: &Element, reason: &str) -> RubError {
     RubError::domain_with_context(
         ErrorCode::StaleSnapshot,
-        "Frame-scoped reads require a target that can still be resolved inside the selected frame authority",
+        "Snapshot-bound reads require a verified target from the current snapshot authority",
         serde_json::json!({
-            "authority_state": "frame_scoped_read_target_stale",
+            "reason": "unverified_read_target",
+            "detail": reason,
             "element_index": element.index,
-        }),
-    )
-}
-
-fn ambiguous_read_target_error(
-    element: &Element,
-    authority_state: &str,
-    candidate_count: usize,
-) -> RubError {
-    RubError::domain_with_context(
-        ErrorCode::StaleSnapshot,
-        "Read fallback found multiple live candidates and cannot choose a non-authoritative target",
-        serde_json::json!({
-            "authority_state": authority_state,
-            "element_index": element.index,
-            "candidate_count": candidate_count,
             "element_ref": element.element_ref,
+            "tag": element.tag,
         }),
     )
-}
-
-fn allow_global_read_fallback(frame_id: Option<&str>) -> bool {
-    frame_id.is_none()
-}
-
-async fn resolve_element_within_frame_snapshot(
-    page: &Arc<Page>,
-    expected: &Element,
-    frame_id: Option<&str>,
-) -> Result<Option<ResolvedElement>, RubError> {
-    let snapshot = crate::dom::build_snapshot_for_frame(page, 0, Some(0), frame_id).await?;
-    let mut matching_candidates = Vec::new();
-
-    for candidate in snapshot.elements {
-        let Some(rank) = snapshot_candidate_match_rank(expected, &candidate) else {
-            continue;
-        };
-        let Some(backend_node_id) = parse_backend_node_id(candidate.element_ref.as_deref()) else {
-            continue;
-        };
-        let Ok(remote_object_id) = resolve_remote_object(page, backend_node_id).await else {
-            continue;
-        };
-        let resolved = ResolvedElement {
-            remote_object_id,
-            backend_node_id: Some(backend_node_id),
-            verified: false,
-        };
-        matching_candidates.push((rank, resolved));
-    }
-
-    if matching_candidates.len() > 1 {
-        return Err(ambiguous_read_target_error(
-            expected,
-            "frame_scoped_read_fallback_ambiguous",
-            matching_candidates.len(),
-        ));
-    }
-
-    Ok(matching_candidates
-        .into_iter()
-        .next()
-        .map(|(_, resolved)| resolved))
 }
 
 pub(crate) async fn resolve_activation_target(
@@ -387,13 +299,58 @@ pub(crate) async fn filter_snapshot_elements_by_hit_test(
     elements: &[Element],
 ) -> Result<Vec<Element>, RubError> {
     let mut filtered = Vec::with_capacity(elements.len());
+    let mut authority_error: Option<RubError> = None;
+    let mut lost_snapshot_authority = false;
     for element in elements {
-        let Ok(resolved) = resolve_element(page, element).await else {
-            continue;
+        let resolved = match resolve_element(page, element).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                if authority_error.is_none()
+                    && matches!(
+                        &error,
+                        RubError::Domain(envelope) if envelope.code == ErrorCode::StaleSnapshot
+                    )
+                {
+                    authority_error = Some(error);
+                    lost_snapshot_authority = true;
+                }
+                continue;
+            }
         };
-        if resolve_pointer_point(page, &resolved).await.is_ok() {
-            filtered.push(element.clone());
+        match resolve_pointer_point(page, &resolved).await {
+            Ok(_) => filtered.push(element.clone()),
+            Err(error) => {
+                if authority_error.is_none() && is_hit_test_authority_error(&error) {
+                    authority_error = Some(error);
+                    lost_snapshot_authority = true;
+                }
+            }
         }
+    }
+    finalize_hit_test_ranking(filtered, authority_error, lost_snapshot_authority)
+}
+
+fn is_hit_test_authority_error(error: &RubError) -> bool {
+    matches!(error, RubError::Domain(envelope) if envelope.code == ErrorCode::StaleSnapshot)
+        || matches!(
+            error,
+            RubError::Domain(envelope)
+                if envelope
+                    .context
+                    .as_ref()
+                    .and_then(|context| context.get("authority"))
+                    .and_then(|value| value.as_str())
+                    == Some("top_level_frame_geometry")
+        )
+}
+
+fn finalize_hit_test_ranking(
+    filtered: Vec<Element>,
+    authority_error: Option<RubError>,
+    lost_snapshot_authority: bool,
+) -> Result<Vec<Element>, RubError> {
+    if lost_snapshot_authority && let Some(error) = authority_error {
+        return Err(error);
     }
     Ok(filtered)
 }
@@ -412,13 +369,18 @@ pub(crate) fn parse_element_ref_frame_id(element_ref: Option<&str>) -> Option<&s
 async fn resolve_remote_object(
     page: &Arc<Page>,
     backend_node_id: BackendNodeId,
+    expected_frame_id: Option<&str>,
 ) -> Result<RemoteObjectId, RubError> {
+    let mut params = ResolveNodeParams::builder().backend_node_id(backend_node_id);
+    if let Some(frame_id) = expected_frame_id {
+        let frame_context =
+            crate::frame_runtime::resolve_frame_context(page, Some(frame_id)).await?;
+        if let Some(execution_context_id) = frame_context.execution_context_id {
+            params = params.execution_context_id(execution_context_id);
+        }
+    }
     let response = page
-        .execute(
-            ResolveNodeParams::builder()
-                .backend_node_id(backend_node_id)
-                .build(),
-        )
+        .execute(params.build())
         .await
         .map_err(|e| RubError::Internal(format!("ResolveNode failed: {e}")))?;
 
@@ -480,9 +442,44 @@ async fn hit_test_matches(
             helpers = TOP_LEVEL_HIT_TEST_HELPERS
         ),
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        let message = error.to_string();
+        if top_level_geometry_error_reason(&message).is_some() {
+            top_level_geometry_authority_error(&message)
+        } else {
+            error
+        }
+    })?;
 
     Ok(value.as_bool().unwrap_or(false))
+}
+
+pub(crate) fn top_level_geometry_error_reason(message: &str) -> Option<&'static str> {
+    if message.contains("top_level_bbox_frame_element_unavailable") {
+        Some("top_level_bbox_frame_element_unavailable")
+    } else if message.contains("top_level_bbox_parent_chain_unavailable") {
+        Some("top_level_bbox_parent_chain_unavailable")
+    } else if message.contains("top_level_hit_test_parent_chain_unavailable") {
+        Some("top_level_hit_test_parent_chain_unavailable")
+    } else if message.contains("top_level_hit_test_frame_descent_unavailable") {
+        Some("top_level_hit_test_frame_descent_unavailable")
+    } else {
+        None
+    }
+}
+
+pub(crate) fn top_level_geometry_authority_error(message: &str) -> RubError {
+    let reason = top_level_geometry_error_reason(message)
+        .unwrap_or("top_level_geometry_authority_unavailable");
+    RubError::domain_with_context(
+        ErrorCode::InvalidInput,
+        "Top-level frame geometry authority is unavailable for the selected frame",
+        serde_json::json!({
+            "reason": reason,
+            "authority": "top_level_frame_geometry",
+        }),
+    )
 }
 
 fn candidate_points(values: &[f64]) -> Vec<Point> {
@@ -528,66 +525,6 @@ async fn call_function_returning_object_id(
     crate::js::call_function_returning_object_id(page, object_id, function_declaration).await
 }
 
-async fn candidate_match_rank(
-    page: &Arc<Page>,
-    expected: &Element,
-    candidate: &CdpElement,
-) -> Result<Option<CandidateMatchRank>, RubError> {
-    let description = candidate
-        .description()
-        .await
-        .map_err(|e| RubError::Internal(format!("Describe fallback element failed: {e}")))?;
-    let attrs = attrs_to_map(description.attributes.as_deref().unwrap_or(&[]));
-    let local_name = description.local_name.to_lowercase();
-    if !tag_matches(
-        expected.tag,
-        &local_name,
-        attrs.get("type").map(String::as_str),
-    ) {
-        return Ok(None);
-    }
-
-    for key in [
-        "href",
-        "placeholder",
-        "aria-label",
-        "type",
-        "name",
-        "value",
-        "role",
-        "title",
-        "alt",
-    ] {
-        if let Some(expected_value) = expected.attributes.get(key)
-            && attrs.get(key) != Some(expected_value)
-        {
-            return Ok(None);
-        }
-    }
-
-    if !expected.text.trim().is_empty() {
-        let candidate_text = candidate
-            .inner_text()
-            .await
-            .map_err(|e| RubError::Internal(format!("Read fallback element text failed: {e}")))?
-            .unwrap_or_default();
-
-        if normalize_text(&candidate_text) != normalize_text(&expected.text) {
-            return Ok(None);
-        }
-    }
-
-    if let Some(expected_box) = expected.bounding_box {
-        let candidate_box = candidate_bounding_box(page, &candidate.remote_object_id).await?;
-        if let Some(score) = bounding_box_match_score(expected_box, candidate_box) {
-            return Ok(Some(CandidateMatchRank::Scored(score)));
-        }
-        return Ok(None);
-    }
-
-    Ok(Some(CandidateMatchRank::Unscored))
-}
-
 fn snapshot_candidate_match_rank(
     expected: &Element,
     candidate: &Element,
@@ -629,25 +566,6 @@ fn snapshot_candidate_match_rank(
     Some(CandidateMatchRank::Unscored)
 }
 
-async fn candidate_bounding_box(
-    page: &Arc<Page>,
-    object_id: &RemoteObjectId,
-) -> Result<BoundingBox, RubError> {
-    let value =
-        crate::js::call_function_returning_value(page, object_id, TOP_LEVEL_BOUNDING_BOX_FUNCTION)
-            .await?;
-    serde_json::from_value(value)
-        .map_err(|e| RubError::Internal(format!("Candidate bounding box parse failed: {e}")))
-}
-
-fn attrs_to_map(flat: &[String]) -> HashMap<String, String> {
-    let mut attrs = HashMap::new();
-    for pair in flat.chunks_exact(2) {
-        attrs.insert(pair[0].clone(), pair[1].clone());
-    }
-    attrs
-}
-
 fn normalize_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -684,6 +602,7 @@ fn shape_tolerance(expected_extent: f64) -> f64 {
     (expected_extent.abs() * 0.2).clamp(4.0, 24.0)
 }
 
+#[cfg(test)]
 fn tag_matches(tag: ElementTag, local_name: &str, input_type: Option<&str>) -> bool {
     match tag {
         ElementTag::Button => local_name == "button",

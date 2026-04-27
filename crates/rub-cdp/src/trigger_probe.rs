@@ -33,28 +33,38 @@ pub(crate) async fn page_has_text(
         }})())"#
     );
 
-    let payload: TextPresencePayload = if let Some(frame_id) = frame_id {
-        let frame_context =
-            crate::frame_runtime::resolve_frame_context(page, Some(frame_id)).await?;
-        let raw = serde_json::from_value::<String>(
-            crate::evaluation::execute_js_in_context(
-                page,
-                script.as_str(),
-                frame_context.execution_context_id,
-            )
-            .await?,
+    let frame_context = crate::frame_runtime::resolve_frame_context(page, frame_id).await?;
+    let document_before = crate::runtime_state::probe_live_read_document_fence(
+        page,
+        frame_context.execution_context_id,
+    )
+    .await;
+    let raw = serde_json::from_value::<String>(
+        crate::evaluation::execute_js_in_context(
+            page,
+            script.as_str(),
+            frame_context.execution_context_id,
         )
-        .map_err(|error| {
-            RubError::Internal(format!("Parse trigger text-probe payload failed: {error}"))
-        })?;
-        serde_json::from_str(&raw).map_err(|error| {
-            RubError::Internal(format!("Parse trigger text-probe payload failed: {error}"))
-        })?
-    } else {
-        serde_json::from_str(&crate::js::evaluate_returning_string(page, &script).await?).map_err(
-            |error| RubError::Internal(format!("Parse trigger text-probe payload failed: {error}")),
-        )?
-    };
+        .await?,
+    )
+    .map_err(|error| {
+        RubError::Internal(format!("Parse trigger text-probe payload failed: {error}"))
+    })?;
+    let document_after = crate::runtime_state::probe_live_read_document_fence(
+        page,
+        frame_context.execution_context_id,
+    )
+    .await;
+    crate::runtime_state::ensure_live_read_document_fence(
+        "trigger_text_probe",
+        frame_context.frame.frame_id.as_str(),
+        document_before.as_ref(),
+        document_after.as_ref(),
+    )?;
+
+    let payload: TextPresencePayload = serde_json::from_str(&raw).map_err(|error| {
+        RubError::Internal(format!("Parse trigger text-probe payload failed: {error}"))
+    })?;
     Ok(payload.found)
 }
 

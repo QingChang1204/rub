@@ -1,5 +1,6 @@
 use crate::binding_execution_ctl;
 use crate::commands::{Commands, EffectiveCli};
+use crate::daemon_ctl::compatibility_degraded_owned_from_snapshot;
 use crate::explain_ctl;
 use crate::orchestration_assets;
 use crate::output;
@@ -8,6 +9,22 @@ use crate::workflow_assets;
 use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
 use rub_core::model::BindingExecutionResolutionInfo;
 use rub_ipc::protocol::{IpcResponse, ResponseStatus};
+
+pub(crate) struct FinalizedResponseOutput {
+    pub(crate) output: String,
+    pub(crate) success: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FinalizeResponseContext<'a> {
+    pub(crate) command_name: &'a str,
+    pub(crate) session: &'a str,
+    pub(crate) rub_home: &'a std::path::Path,
+    pub(crate) pretty: bool,
+    pub(crate) command_deadline: std::time::Instant,
+    pub(crate) timeout_ms: u64,
+    pub(crate) binding_execution_projection: Option<&'a BindingExecutionResolutionInfo>,
+}
 
 pub(crate) fn use_alias_local_surface_error(cli: &EffectiveCli) -> Option<ErrorEnvelope> {
     let alias = cli.use_alias.as_deref()?;
@@ -102,13 +119,37 @@ fn local_session_path_state(
     local_runtime_path_state(path_authority, "cli_sessions_projection", path_kind)
 }
 
+fn registry_liveness_name(liveness: rub_daemon::session::RegistryEntryLiveness) -> &'static str {
+    match liveness {
+        rub_daemon::session::RegistryEntryLiveness::Live => "live",
+        rub_daemon::session::RegistryEntryLiveness::BusyOrUnknown => "busy_or_unknown",
+        rub_daemon::session::RegistryEntryLiveness::ProbeContractFailure => {
+            "probe_contract_failure"
+        }
+        rub_daemon::session::RegistryEntryLiveness::ProtocolIncompatible => "protocol_incompatible",
+        rub_daemon::session::RegistryEntryLiveness::HardCutReleasePending => {
+            "hard_cut_release_pending"
+        }
+        rub_daemon::session::RegistryEntryLiveness::PendingStartup => "pending_startup",
+        rub_daemon::session::RegistryEntryLiveness::Dead => "dead",
+    }
+}
+
+fn attach_supported_for_registry_liveness(
+    liveness: rub_daemon::session::RegistryEntryLiveness,
+) -> bool {
+    matches!(liveness, rub_daemon::session::RegistryEntryLiveness::Live)
+}
+
 pub(crate) fn project_sessions_result(
     rub_home: &std::path::Path,
-    entries: Vec<rub_daemon::session::RegistryEntry>,
+    entries: Vec<rub_daemon::session::RegistryEntrySnapshot>,
 ) -> serde_json::Value {
     let items = entries
         .into_iter()
-        .map(|entry| {
+        .map(|entry_snapshot| {
+            let compatibility_degraded_owned =
+                compatibility_degraded_owned_from_snapshot(&entry_snapshot);
             let rub_daemon::session::RegistryEntry {
                 session_id,
                 session_name,
@@ -118,7 +159,8 @@ pub(crate) fn project_sessions_result(
                 ipc_protocol_version,
                 user_data_dir,
                 ..
-            } = entry;
+            } = entry_snapshot.entry;
+            let liveness = entry_snapshot.liveness;
 
             serde_json::json!({
                 "id": session_id,
@@ -131,6 +173,11 @@ pub(crate) fn project_sessions_result(
                 ),
                 "created_at": created_at,
                 "ipc_protocol_version": ipc_protocol_version,
+                "liveness": registry_liveness_name(liveness),
+                "attach_supported": attach_supported_for_registry_liveness(liveness),
+                "compatibility_degraded_owned_reason": compatibility_degraded_owned
+                    .as_ref()
+                    .map(|degraded| degraded.reason),
                 "user_data_dir": user_data_dir,
                 "user_data_dir_state": user_data_dir.as_ref().map(|_| {
                     local_session_path_state(
@@ -162,36 +209,32 @@ pub(crate) fn handle_sessions(
     session: &str,
     pretty: bool,
 ) -> Result<(), RubError> {
-    use rub_core::model::CommandResult;
-
-    let entries = rub_daemon::session::active_registry_entries(rub_home).map_err(|error| {
-        RubError::domain_with_context(
-            ErrorCode::IoError,
-            format!("Failed to read session registry: {error}"),
-            serde_json::json!({
-                "rub_home": rub_home.display().to_string(),
-                "rub_home_state": local_runtime_path_state(
-                    "cli.sessions.subject.rub_home",
-                    "cli_rub_home",
-                    "session_registry_home",
-                ),
-                "reason": "session_registry_read_failed",
-            }),
-        )
-    })?;
+    let entries =
+        rub_daemon::session::active_registry_entry_snapshots(rub_home).map_err(|error| {
+            RubError::domain_with_context(
+                ErrorCode::IoError,
+                format!("Failed to read session registry: {error}"),
+                serde_json::json!({
+                    "rub_home": rub_home.display().to_string(),
+                    "rub_home_state": local_runtime_path_state(
+                        "cli.sessions.subject.rub_home",
+                        "cli_rub_home",
+                        "session_registry_home",
+                    ),
+                    "reason": "session_registry_read_failed",
+                }),
+            )
+        })?;
     let sessions_data = project_sessions_result(rub_home, entries);
 
-    let result = CommandResult::success(
+    let output = output::format_cli_success(
         "sessions",
         session,
-        uuid::Uuid::now_v7().to_string(),
+        rub_home,
         sessions_data,
+        pretty,
+        output::InteractionTraceMode::Compact,
     );
-    let output = if pretty {
-        serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
-    } else {
-        serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
-    };
     println!("{output}");
     Ok(())
 }
@@ -238,13 +281,17 @@ pub(crate) fn daemon_args(cli: &EffectiveCli, request: &ConnectionRequest) -> Ve
         ConnectionRequest::Profile { name, .. } => {
             args.push("--profile".to_string());
             args.push(name.clone());
+            if let ConnectionRequest::Profile { resolved_path, .. } = request {
+                args.push("--profile-resolved-path".to_string());
+                args.push(resolved_path.clone());
+            }
         }
         ConnectionRequest::None => {}
     }
     args
 }
 
-fn format_post_commit_error_output(
+fn format_committed_local_failure_output(
     response: &IpcResponse,
     command_name: &str,
     session: &str,
@@ -263,35 +310,74 @@ fn format_post_commit_error_output(
         "daemon_request_committed".to_string(),
         serde_json::json!(true),
     );
+    context.insert(
+        "committed_response_projection".to_string(),
+        response.data.clone().unwrap_or(serde_json::Value::Null),
+    );
     envelope.context = Some(serde_json::Value::Object(context));
-    output::format_post_commit_cli_error(response, command_name, session, envelope, pretty)
+    output::format_committed_cli_error(response, command_name, session, envelope, pretty)
+}
+
+fn project_locator_explain_or_committed_failure(
+    target: &crate::commands::ElementAddressArgs,
+    response: &mut IpcResponse,
+    command_name: &str,
+    session: &str,
+    pretty: bool,
+    reason: &'static str,
+) -> Result<Option<String>, String> {
+    let original_data = response.data.take();
+    match explain_ctl::project_locator_explain_response(target, original_data.clone()) {
+        Ok(data) => {
+            response.data = Some(data);
+            Ok(None)
+        }
+        Err(error) => {
+            response.data = original_data;
+            Ok(Some(format_committed_local_failure_output(
+                response,
+                command_name,
+                session,
+                pretty,
+                error,
+                reason,
+            )))
+        }
+    }
 }
 
 pub(crate) fn finalize_response_output(
     cli: &EffectiveCli,
-    command_name: &str,
-    session: &str,
-    rub_home: &std::path::Path,
-    pretty: bool,
-    binding_execution_projection: Option<&BindingExecutionResolutionInfo>,
+    context: FinalizeResponseContext<'_>,
     response: &mut IpcResponse,
-) -> Result<String, String> {
+) -> FinalizedResponseOutput {
+    let FinalizeResponseContext {
+        command_name,
+        session,
+        rub_home,
+        pretty,
+        command_deadline,
+        timeout_ms,
+        binding_execution_projection,
+    } = context;
     if response.status == ResponseStatus::Success
         && let Commands::Explain {
             subcommand: crate::commands::ExplainSubcommand::Locator { target },
         } = &cli.command
+        && let Some(output) = project_locator_explain_or_committed_failure(
+            target,
+            response,
+            command_name,
+            session,
+            pretty,
+            "post_commit_locator_explain_failed",
+        )
+        .expect("post-commit explain projection should surface as local follow-up output")
     {
-        match explain_ctl::project_locator_explain_response(target, response.data.take()) {
-            Ok(data) => response.data = Some(data),
-            Err(error) => {
-                return Err(output::format_cli_error(
-                    command_name,
-                    session,
-                    error.into_envelope(),
-                    pretty,
-                ));
-            }
-        }
+        return FinalizedResponseOutput {
+            output,
+            success: false,
+        };
     }
     if response.status == ResponseStatus::Success
         && let Commands::Find {
@@ -300,68 +386,102 @@ pub(crate) fn finalize_response_output(
             explain: true,
             ..
         } = &cli.command
-    {
-        match explain_ctl::project_locator_explain_response(target, response.data.take()) {
-            Ok(data) => response.data = Some(data),
-            Err(error) => {
-                return Err(output::format_cli_error(
-                    command_name,
-                    session,
-                    error.into_envelope(),
-                    pretty,
-                ));
-            }
-        }
-    }
-    if response.status == ResponseStatus::Success
-        && let Some(data) = response.data.as_mut()
-        && let Err(error) = workflow_assets::persist_history_export_asset(cli, data)
-    {
-        return Err(format_post_commit_error_output(
+        && let Some(output) = project_locator_explain_or_committed_failure(
+            target,
             response,
             command_name,
             session,
             pretty,
-            error,
-            "post_commit_history_export_failed",
-        ));
+            "post_commit_find_locator_explain_failed",
+        )
+        .expect("post-commit find projection should surface as local follow-up output")
+    {
+        return FinalizedResponseOutput {
+            output,
+            success: false,
+        };
     }
     if response.status == ResponseStatus::Success
         && let Some(data) = response.data.as_mut()
-        && let Err(error) = orchestration_assets::persist_orchestration_export_asset(cli, data)
+        && let Err(error) = workflow_assets::persist_history_export_asset_until(
+            cli,
+            data,
+            command_deadline,
+            timeout_ms,
+        )
     {
-        return Err(format_post_commit_error_output(
-            response,
-            command_name,
-            session,
-            pretty,
-            error,
-            "post_commit_orchestration_export_failed",
-        ));
+        return FinalizedResponseOutput {
+            output: format_committed_local_failure_output(
+                response,
+                command_name,
+                session,
+                pretty,
+                error,
+                "post_commit_history_export_failed",
+            ),
+            success: false,
+        };
+    }
+    if response.status == ResponseStatus::Success
+        && let Some(data) = response.data.as_mut()
+        && let Err(error) = orchestration_assets::persist_orchestration_export_asset_until(
+            cli,
+            data,
+            command_deadline,
+            timeout_ms,
+        )
+    {
+        return FinalizedResponseOutput {
+            output: format_committed_local_failure_output(
+                response,
+                command_name,
+                session,
+                pretty,
+                error,
+                "post_commit_orchestration_export_failed",
+            ),
+            success: false,
+        };
     }
     if let Some(projection) = binding_execution_projection {
         binding_execution_ctl::attach_binding_execution_projection(&mut response.data, projection);
     }
-    let output = if exec_raw_requested(&cli.command) {
-        output::format_exec_raw_response(response, pretty).unwrap_or_else(|| {
-            output::format_response(
+    if exec_raw_requested(&cli.command) && response.status == ResponseStatus::Success {
+        if let Some(output) = output::format_exec_raw_response(response, pretty) {
+            return FinalizedResponseOutput {
+                output,
+                success: true,
+            };
+        }
+        return FinalizedResponseOutput {
+            output: format_committed_local_failure_output(
                 response,
                 command_name,
                 session,
-                rub_home,
                 pretty,
-                output_trace_mode(cli),
-            )
-        })
-    } else {
-        output::format_response(
-            response,
-            command_name,
-            session,
-            rub_home,
-            pretty,
-            output_trace_mode(cli),
-        )
-    };
-    Ok(output)
+                RubError::domain_with_context(
+                    ErrorCode::IpcProtocolError,
+                    "exec --raw response is missing data.result".to_string(),
+                    serde_json::json!({
+                        "reason": "exec_raw_result_missing",
+                    }),
+                ),
+                "post_commit_exec_raw_projection_failed",
+            ),
+            success: false,
+        };
+    }
+
+    let output = output::format_response_with_success(
+        response,
+        command_name,
+        session,
+        rub_home,
+        pretty,
+        output_trace_mode(cli),
+    );
+    FinalizedResponseOutput {
+        output: output.output,
+        success: output.success,
+    }
 }

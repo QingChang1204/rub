@@ -45,52 +45,124 @@ pub fn cleanup(home: &str) {
 }
 
 pub fn prepare_home(home: &str) {
-    if let Err(message) = try_prepare_home(home) {
+    let observed = observe_home_cleanup(home);
+    if let Err(message) = try_prepare_home(home, &observed) {
         panic!("{message}");
     }
 }
 
 pub(super) fn try_cleanup_home(home: &str) -> Result<CleanupVerification, String> {
-    let verification = try_cleanup_home_allow_harness_fallback(home)?;
-    require_product_teardown_verification(home, verification)
+    let observed = observe_home_cleanup(home);
+    let outcome = try_cleanup_home_allow_harness_fallback_with_observation(home, &observed)?;
+    require_product_teardown_verification_with_details(
+        home,
+        outcome.verification,
+        Some(&outcome.details),
+    )
 }
 
 pub(super) fn try_cleanup_home_allow_harness_fallback(
     home: &str,
 ) -> Result<CleanupVerification, String> {
-    let verification = try_prepare_home(home)?;
+    let observed = observe_home_cleanup(home);
+    try_cleanup_home_allow_harness_fallback_with_observation(home, &observed)
+        .map(|outcome| outcome.verification)
+}
+
+fn try_cleanup_home_allow_harness_fallback_with_observation(
+    home: &str,
+    observed: &HomeCleanupObservation,
+) -> Result<CleanupOutcome, String> {
+    if std::thread::panicking() {
+        return Ok(CleanupOutcome {
+            verification: CleanupVerification::SkippedDuringPanic,
+            details: CleanupAttemptDetails::default(),
+        });
+    }
+    let outcome = try_prepare_home(home, observed)?;
     if matches!(
-        verification,
+        outcome.verification,
         CleanupVerification::Verified | CleanupVerification::VerifiedWithHarnessFallback
     ) {
         unregister_home(home);
     }
-    Ok(verification)
+    Ok(outcome)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn require_product_teardown_verification(
     home: &str,
     verification: CleanupVerification,
 ) -> Result<CleanupVerification, String> {
+    require_product_teardown_verification_with_details(home, verification, None)
+}
+
+fn require_product_teardown_verification_with_details(
+    home: &str,
+    verification: CleanupVerification,
+    details: Option<&CleanupAttemptDetails>,
+) -> Result<CleanupVerification, String> {
     match verification {
         CleanupVerification::Verified | CleanupVerification::SkippedDuringPanic => Ok(verification),
-        CleanupVerification::VerifiedWithHarnessFallback => Err(format!(
-            "browser-backed cleanup for {home} required harness fallback; product teardown must verify without harness-owned cleanup by default"
-        )),
+        CleanupVerification::VerifiedWithHarnessFallback => {
+            let detail_suffix = details
+                .map(|details| {
+                    format!(
+                        "; product_lane={{request_product_teardown:{}, managed_browser_released:{:?}, home_removed_after_teardown:{:?}}}; fallback_lane={{cleanup_runtime_requested:{}, wait_for_exit:{}, home_exists_after_fallback:{}}}",
+                        details.request_product_teardown,
+                        details.managed_browser_released,
+                        details.home_removed_after_teardown,
+                        details.request_cleanup_runtime,
+                        details.wait_for_exit_after_fallback,
+                        details.home_exists_after_fallback,
+                    )
+                })
+                .unwrap_or_default();
+            Err(format!(
+                "browser-backed cleanup for {home} required harness fallback; product teardown must verify without harness-owned cleanup by default{detail_suffix}"
+            ))
+        }
     }
 }
 
-fn try_prepare_home(home: &str) -> Result<CleanupVerification, String> {
-    let observed = observe_home_cleanup(home);
-    let cleanup_path = cleanup_impl(home, &observed);
-    verify_home_cleanup_complete(home, &observed)?;
-    Ok(cleanup_verification_for_path(cleanup_path))
+fn try_prepare_home(
+    home: &str,
+    observed: &HomeCleanupObservation,
+) -> Result<CleanupOutcome, String> {
+    let outcome = cleanup_impl(home, observed);
+    verify_home_cleanup_complete(home, observed)?;
+    Ok(CleanupOutcome {
+        verification: cleanup_verification_for_path(outcome.path),
+        details: outcome.details,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CleanupPath {
     ProductTeardownVerified,
     HarnessFallbackVerified,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CleanupAttemptDetails {
+    request_product_teardown: bool,
+    managed_browser_released: Option<bool>,
+    home_removed_after_teardown: Option<bool>,
+    request_cleanup_runtime: bool,
+    wait_for_exit_after_fallback: bool,
+    home_exists_after_fallback: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CleanupPathOutcome {
+    path: CleanupPath,
+    details: CleanupAttemptDetails,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CleanupOutcome {
+    verification: CleanupVerification,
+    details: CleanupAttemptDetails,
 }
 
 fn cleanup_verification_for_path(path: CleanupPath) -> CleanupVerification {
@@ -114,7 +186,7 @@ struct CleanupOps {
     remove_dir_all: fn(&str),
 }
 
-fn cleanup_impl(home: &str, observed: &HomeCleanupObservation) -> CleanupPath {
+fn cleanup_impl(home: &str, observed: &HomeCleanupObservation) -> CleanupPathOutcome {
     cleanup_impl_with(
         home,
         observed,
@@ -134,27 +206,51 @@ fn cleanup_impl_with(
     home: &str,
     observed: &HomeCleanupObservation,
     ops: CleanupOps,
-) -> CleanupPath {
+) -> CleanupPathOutcome {
     if !Path::new(home).exists() {
-        return CleanupPath::ProductTeardownVerified;
+        return CleanupPathOutcome {
+            path: CleanupPath::ProductTeardownVerified,
+            details: CleanupAttemptDetails {
+                request_product_teardown: false,
+                managed_browser_released: Some(true),
+                home_removed_after_teardown: Some(true),
+                request_cleanup_runtime: false,
+                wait_for_exit_after_fallback: false,
+                home_exists_after_fallback: false,
+            },
+        };
     }
+    let mut details = CleanupAttemptDetails::default();
     if (ops.request_product_teardown)(home, Duration::from_secs(5)) {
+        details.request_product_teardown = true;
         let managed_browser_released =
             (ops.wait_for_managed_browser_authority_release)(observed, Duration::from_secs(5));
         let home_removed = !Path::new(home).exists();
+        details.managed_browser_released = Some(managed_browser_released);
+        details.home_removed_after_teardown = Some(home_removed);
         if managed_browser_released && home_removed {
-            return CleanupPath::ProductTeardownVerified;
+            return CleanupPathOutcome {
+                path: CleanupPath::ProductTeardownVerified,
+                details,
+            };
         }
     }
 
     (ops.kill_home_process_tree)(home);
-    let _ = (ops.request_cleanup_runtime)(home, Duration::from_secs(5));
-    if (ops.wait_for_exit)(home, Duration::from_secs(5)) {
-        let _ = (ops.request_cleanup_runtime)(home, Duration::from_secs(5));
+    details.request_cleanup_runtime = (ops.request_cleanup_runtime)(home, Duration::from_secs(5));
+    details.wait_for_exit_after_fallback = (ops.wait_for_exit)(home, Duration::from_secs(5));
+    if details.wait_for_exit_after_fallback {
+        details.request_cleanup_runtime =
+            (ops.request_cleanup_runtime)(home, Duration::from_secs(5))
+                || details.request_cleanup_runtime;
         (ops.reap_managed_browser_authority_residue)(observed, Duration::from_secs(5));
         (ops.remove_dir_all)(home);
     }
-    CleanupPath::HarnessFallbackVerified
+    details.home_exists_after_fallback = Path::new(home).exists();
+    CleanupPathOutcome {
+        path: CleanupPath::HarnessFallbackVerified,
+        details,
+    }
 }
 
 fn request_product_teardown(home: &str, timeout: Duration) -> bool {
@@ -162,7 +258,22 @@ fn request_product_teardown(home: &str, timeout: Duration) -> bool {
     let output = rub_cmd(home)
         .args(["--timeout", &timeout_ms, "teardown"])
         .output();
-    matches!(output, Ok(result) if result.status.success())
+    match output {
+        Ok(result) if result.status.success() => true,
+        Ok(result) => {
+            eprintln!(
+                "teardown failure for {home}: status={}; stdout={}; stderr={}",
+                result.status,
+                String::from_utf8_lossy(&result.stdout).trim(),
+                String::from_utf8_lossy(&result.stderr).trim(),
+            );
+            false
+        }
+        Err(error) => {
+            eprintln!("teardown spawn failure for {home}: {error}");
+            false
+        }
+    }
 }
 
 fn request_cleanup_runtime(home: &str, timeout: Duration) -> bool {
@@ -267,6 +378,7 @@ fn home_artifact_daemon_authorities(home: &str) -> Vec<HomeDaemonAuthority> {
     }
 
     collect_pid_file_authorities(Path::new(home), home, &mut authorities);
+    finalize_home_daemon_authorities(home, &mut authorities);
     authorities.into_values().collect()
 }
 
@@ -316,9 +428,13 @@ fn collect_pid_file_authorities(
         {
             let session_id = session_id_from_pid_path(&path);
             let session_name = session_name_from_pid_path(&path);
-            let socket_path = session_id
-                .as_deref()
-                .map(|session_id| runtime_socket_path_for_session_id(home, session_id));
+            let socket_path =
+                match (session_name.as_deref(), session_id.as_deref()) {
+                    (Some(session_name), Some(session_id)) => Some(
+                        runtime_socket_path_for_session(home, session_name, session_id),
+                    ),
+                    _ => None,
+                };
             merge_home_daemon_authority(
                 authorities,
                 HomeDaemonAuthority {
@@ -333,9 +449,34 @@ fn collect_pid_file_authorities(
     }
 }
 
+fn finalize_home_daemon_authorities(
+    home: &str,
+    authorities: &mut std::collections::BTreeMap<u32, HomeDaemonAuthority>,
+) {
+    for authority in authorities.values_mut() {
+        if authority.socket_path.is_none()
+            && let (Some(session_name), Some(session_id)) = (
+                authority.session_name.as_deref(),
+                authority.session_id.as_deref(),
+            )
+        {
+            authority.socket_path = Some(runtime_socket_path_for_session(
+                home,
+                session_name,
+                session_id,
+            ));
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn runtime_socket_path_for_session_id(home: &str, session_id: &str) -> PathBuf {
+    runtime_socket_path_for_session(home, "default", session_id)
+}
+
+fn runtime_socket_path_for_session(home: &str, session_name: &str, session_id: &str) -> PathBuf {
     RubPaths::new(home)
-        .session_runtime("default", session_id)
+        .session_runtime(session_name, session_id)
         .socket_path()
 }
 
@@ -516,8 +657,14 @@ pub fn daemon_processes_for_home(home: &str) -> Vec<String> {
 }
 
 fn daemon_root_pids_for_home(home: &str) -> Vec<u32> {
-    daemon_processes_for_home(home)
-        .into_iter()
+    daemon_root_pids_for_home_in_snapshot(home, &process_command_snapshot())
+}
+
+fn daemon_root_pids_for_home_in_snapshot(home: &str, snapshot: &str) -> Vec<u32> {
+    snapshot
+        .lines()
+        .map(str::trim)
+        .filter(|line| daemon_command_matches_home(line, home))
         .filter_map(|line| line.split_whitespace().next()?.parse::<u32>().ok())
         .collect()
 }
@@ -541,13 +688,14 @@ fn proven_home_daemon_root_pids(home: &str) -> Vec<u32> {
 fn proven_home_daemon_root_pids_with_snapshot(home: &str, snapshot: &str) -> Vec<u32> {
     let mut roots = Vec::new();
     let authorities = home_artifact_daemon_authorities(home);
+    let has_artifact_authority = !authorities.is_empty();
     for authority in &authorities {
         if home_daemon_authority_matches_snapshot(snapshot, home, authority) {
             roots.push(authority.pid);
         }
     }
-    if roots.is_empty() {
-        roots.extend(daemon_root_pids_for_home(home));
+    if roots.is_empty() && !has_artifact_authority {
+        roots.extend(daemon_root_pids_for_home_in_snapshot(home, snapshot));
     }
     roots
 }
@@ -571,10 +719,7 @@ fn home_daemon_authority_matches_snapshot(
     if !command_matches {
         return false;
     }
-    !matches!(
-        authority_socket_identity_confirmation(authority),
-        SocketIdentityConfirmation::ConfirmedMismatch
-    )
+    socket_identity_confirms_expected_authority(authority_socket_identity_confirmation(authority))
 }
 
 fn daemon_command_matches_home_authority(
@@ -613,6 +758,10 @@ fn authority_socket_identity_confirmation(
         return SocketIdentityConfirmation::Inconclusive;
     };
     socket_identity_confirmation(socket_path, session_id)
+}
+
+fn socket_identity_confirms_expected_authority(confirmation: SocketIdentityConfirmation) -> bool {
+    matches!(confirmation, SocketIdentityConfirmation::ConfirmedMatch)
 }
 
 fn socket_identity_confirmation(

@@ -2,8 +2,10 @@ use super::{
     CleanupOps, CleanupPath, HomeCleanupObservation, HomeDaemonAuthority,
     SocketIdentityConfirmation, cleanup_impl_with, cleanup_verification_for_path,
     daemon_command_matches_home, daemon_command_matches_home_authority,
-    daemon_pid_matches_home_in_snapshot, require_product_teardown_verification,
-    runtime_socket_path_for_session_id, socket_identity_confirmation,
+    daemon_pid_matches_home_in_snapshot, daemon_root_pids_for_home_in_snapshot,
+    home_artifact_daemon_authorities, proven_home_daemon_root_pids_with_snapshot,
+    require_product_teardown_verification, runtime_socket_path_for_session_id, session_pid_path,
+    socket_identity_confirmation, socket_identity_confirms_expected_authority,
 };
 use crate::browser_session::CleanupVerification;
 use rub_core::managed_profile::{
@@ -118,6 +120,45 @@ fn test_remove_dir_counter(home: &str) {
 fn test_noop_remove_dir(_home: &str) {}
 
 #[test]
+fn panic_path_home_cleanup_retains_home_for_retry_authority() {
+    struct CleanupDuringPanic {
+        home: String,
+        result: std::sync::Arc<std::sync::Mutex<Option<CleanupVerification>>>,
+    }
+
+    impl Drop for CleanupDuringPanic {
+        fn drop(&mut self) {
+            let verification = super::try_cleanup_home_allow_harness_fallback(&self.home)
+                .expect("panic-path home cleanup should not fail");
+            *self.result.lock().expect("result lock") = Some(verification);
+        }
+    }
+
+    let home = unique_cleanup_home();
+    let verification = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let observed = verification.clone();
+
+    let _ = std::panic::catch_unwind(|| {
+        let _guard = CleanupDuringPanic {
+            home: home.clone(),
+            result: observed,
+        };
+        panic!("trigger home cleanup while panicking");
+    });
+
+    assert_eq!(
+        *verification.lock().expect("result lock"),
+        Some(CleanupVerification::SkippedDuringPanic)
+    );
+    assert!(
+        std::path::Path::new(&home).exists(),
+        "panic-path home cleanup must not destructively remove the home during unwind"
+    );
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
 fn cleanup_verification_distinguishes_harness_fallback_from_product_teardown() {
     let _serial = cleanup_test_serial().lock().expect("cleanup test serial");
     let product_verified = cleanup_verification_for_path(CleanupPath::ProductTeardownVerified);
@@ -181,7 +222,7 @@ fn graceful_cleanup_path_does_not_invoke_harness_kill() {
     );
     set_product_cleanup_home(None);
 
-    assert_eq!(path, CleanupPath::ProductTeardownVerified);
+    assert_eq!(path.path, CleanupPath::ProductTeardownVerified);
     assert_eq!(GRACEFUL_KILL_CALLS.load(Ordering::SeqCst), 0);
     assert_eq!(MANAGED_BROWSER_REAP_CALLS.load(Ordering::SeqCst), 0);
     assert_eq!(REMOVE_DIR_CALLS.load(Ordering::SeqCst), 0);
@@ -211,7 +252,7 @@ fn graceful_cleanup_path_marks_harness_fallback_when_product_lane_leaves_home_re
         },
     );
 
-    assert_eq!(path, CleanupPath::HarnessFallbackVerified);
+    assert_eq!(path.path, CleanupPath::HarnessFallbackVerified);
     assert_eq!(MANAGED_BROWSER_REAP_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(REMOVE_DIR_CALLS.load(Ordering::SeqCst), 1);
 }
@@ -242,7 +283,7 @@ fn graceful_cleanup_path_marks_harness_fallback_when_browser_authority_needs_rea
     );
     set_product_cleanup_home(None);
 
-    assert_eq!(path, CleanupPath::HarnessFallbackVerified);
+    assert_eq!(path.path, CleanupPath::HarnessFallbackVerified);
     assert_eq!(MANAGED_BROWSER_REAP_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(REMOVE_DIR_CALLS.load(Ordering::SeqCst), 1);
 }
@@ -273,7 +314,7 @@ fn fallback_cleanup_path_marks_harness_fallback_after_explicit_kill_lane() {
         },
     );
 
-    assert_eq!(path, CleanupPath::HarnessFallbackVerified);
+    assert_eq!(path.path, CleanupPath::HarnessFallbackVerified);
     assert_eq!(FALLBACK_KILL_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(FALLBACK_WAIT_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(MANAGED_BROWSER_REAP_CALLS.load(Ordering::SeqCst), 1);
@@ -335,6 +376,150 @@ fn daemon_command_matches_home_authority_requires_exact_session_metadata() {
         "/tmp/rub-home",
         &authority,
     ));
+}
+
+#[test]
+fn home_artifact_daemon_authorities_reconstruct_non_default_runtime_socket_from_pid_files() {
+    let _serial = cleanup_test_serial().lock().expect("cleanup test serial");
+    let home = unique_cleanup_home();
+    let runtime = RubPaths::new(&home).session_runtime("work", "sess-work");
+    let expected_socket = runtime.socket_path();
+    let session_pid = session_pid_path(&home, "work");
+    std::fs::create_dir_all(runtime.session_dir()).expect("create non-default runtime dir");
+    std::fs::create_dir_all(
+        session_pid
+            .parent()
+            .expect("session pid path should have a parent"),
+    )
+    .expect("create non-default session dir");
+    std::fs::write(runtime.pid_path(), "818181\n").expect("write by-id pid");
+    std::fs::write(&session_pid, "818181\n").expect("write session pid");
+
+    let authorities = home_artifact_daemon_authorities(&home);
+    let authority = authorities
+        .iter()
+        .find(|authority| authority.pid == 818181)
+        .expect("non-default authority should be recovered from pid artifacts");
+    assert_eq!(authority.session_name.as_deref(), Some("work"));
+    assert_eq!(authority.session_id.as_deref(), Some("sess-work"));
+    assert_eq!(authority.socket_path.as_ref(), Some(&expected_socket));
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn cleanup_authority_does_not_fallback_to_weak_command_match_when_artifact_socket_mismatches() {
+    let _serial = cleanup_test_serial().lock().expect("cleanup test serial");
+    let home = unique_cleanup_home();
+    let runtime = RubPaths::new(&home).session_runtime("work", "sess-stale");
+    let session_pid = session_pid_path(&home, "work");
+    std::fs::create_dir_all(runtime.session_dir()).expect("create non-default runtime dir");
+    std::fs::create_dir_all(
+        session_pid
+            .parent()
+            .expect("session pid path should have a parent"),
+    )
+    .expect("create non-default session dir");
+    std::fs::write(runtime.pid_path(), "929292\n").expect("write by-id pid");
+    std::fs::write(&session_pid, "929292\n").expect("write session pid");
+    let snapshot = format!(
+        "929292 /tmp/target/debug/rub __daemon --session work --session-id sess-stale --rub-home {}",
+        home
+    );
+
+    let roots = proven_home_daemon_root_pids_with_snapshot(&home, &snapshot);
+
+    assert!(
+        roots.is_empty(),
+        "artifact-backed daemon cleanup must fail closed instead of authorizing a weak ps match"
+    );
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+#[cfg(unix)]
+fn cleanup_authority_rejects_live_socket_session_mismatch_for_non_default_artifact() {
+    let _serial = cleanup_test_serial().lock().expect("cleanup test serial");
+    let home = unique_cleanup_home();
+    let runtime = RubPaths::new(&home).session_runtime("work", "sess-stale");
+    let session_pid = session_pid_path(&home, "work");
+    std::fs::create_dir_all(runtime.session_dir()).expect("create non-default runtime dir");
+    std::fs::create_dir_all(
+        session_pid
+            .parent()
+            .expect("session pid path should have a parent"),
+    )
+    .expect("create non-default session dir");
+    std::fs::write(runtime.pid_path(), "949494\n").expect("write by-id pid");
+    std::fs::write(&session_pid, "949494\n").expect("write session pid");
+    let server = spawn_handshake_server(&runtime.socket_path(), "sess-other");
+    let snapshot = format!(
+        "949494 /tmp/target/debug/rub __daemon --session work --session-id sess-stale --rub-home {}",
+        home
+    );
+
+    let roots = proven_home_daemon_root_pids_with_snapshot(&home, &snapshot);
+
+    server.join().expect("handshake server should join");
+    assert!(
+        roots.is_empty(),
+        "non-default artifact cleanup must reject live socket identity mismatch instead of falling back to ps"
+    );
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn cleanup_weak_fallback_is_only_available_without_artifact_authority() {
+    let _serial = cleanup_test_serial().lock().expect("cleanup test serial");
+    let home = unique_cleanup_home();
+    let snapshot = format!(
+        "939393 /tmp/target/debug/rub __daemon --session default --rub-home {}",
+        home
+    );
+
+    assert_eq!(
+        daemon_root_pids_for_home_in_snapshot(&home, &snapshot),
+        vec![939393]
+    );
+    assert_eq!(
+        proven_home_daemon_root_pids_with_snapshot(&home, &snapshot),
+        vec![939393]
+    );
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+#[cfg(unix)]
+fn cleanup_verifier_matches_non_default_pid_file_authority_through_real_runtime_socket() {
+    let _serial = cleanup_test_serial().lock().expect("cleanup test serial");
+    let home = unique_cleanup_home();
+    let runtime = RubPaths::new(&home).session_runtime("work", "sess-work");
+    let socket_path = runtime.socket_path();
+    let session_pid = session_pid_path(&home, "work");
+    std::fs::create_dir_all(runtime.session_dir()).expect("create non-default runtime dir");
+    std::fs::create_dir_all(
+        session_pid
+            .parent()
+            .expect("session pid path should have a parent"),
+    )
+    .expect("create non-default session dir");
+    std::fs::write(runtime.pid_path(), "919191\n").expect("write by-id pid");
+    std::fs::write(&session_pid, "919191\n").expect("write session pid");
+    let server = spawn_handshake_server(&socket_path, "sess-work");
+    let snapshot = format!(
+        "919191 /tmp/target/debug/rub __daemon --session work --session-id sess-work --rub-home {}",
+        home
+    );
+
+    let roots = proven_home_daemon_root_pids_with_snapshot(&home, &snapshot);
+
+    server
+        .join()
+        .expect("cleanup verifier handshake server should join");
+    assert_eq!(roots, vec![919191]);
+
+    let _ = std::fs::remove_file(socket_path);
+    let _ = std::fs::remove_dir_all(home);
 }
 
 #[test]
@@ -433,10 +618,14 @@ fn spawn_handshake_server(
     socket_path: &std::path::Path,
     daemon_session_id: &str,
 ) -> std::thread::JoinHandle<()> {
+    use rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID;
     use std::io::Write;
     use std::os::unix::net::UnixListener;
 
     let _ = std::fs::remove_file(socket_path);
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent).expect("create handshake socket parent");
+    }
     let listener = UnixListener::bind(socket_path).expect("bind handshake socket");
     let daemon_session_id = daemon_session_id.to_string();
     std::thread::spawn(move || {
@@ -446,15 +635,24 @@ fn spawn_handshake_server(
                 .try_clone()
                 .expect("clone accepted stream for reading"),
         );
-        let _request = NdJsonCodec::read_blocking::<rub_ipc::protocol::IpcRequest, _>(&mut reader)
+        let request = NdJsonCodec::read_blocking::<rub_ipc::protocol::IpcRequest, _>(&mut reader)
             .expect("read handshake request")
             .expect("handshake request");
-        let response = IpcResponse::success(
-            "req-1",
-            serde_json::json!({
-                "daemon_session_id": daemon_session_id,
-            }),
+        assert_eq!(request.command, "_handshake");
+        assert_eq!(
+            request.command_id.as_deref(),
+            Some(HANDSHAKE_PROBE_COMMAND_ID)
         );
+        let response = IpcResponse::success(
+            "handshake-probe",
+            serde_json::json!({
+                "daemon_session_id": daemon_session_id.clone(),
+            }),
+        )
+        .with_command_id(HANDSHAKE_PROBE_COMMAND_ID)
+        .expect("handshake probe command_id must be valid")
+        .with_daemon_session_id(daemon_session_id)
+        .expect("daemon_session_id must be valid");
         let encoded = NdJsonCodec::encode(&response).expect("encode handshake response");
         stream
             .write_all(&encoded)
@@ -481,4 +679,23 @@ fn socket_identity_confirmation_rejects_mismatched_session() {
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_dir_all(socket_dir);
     assert_eq!(confirmation, SocketIdentityConfirmation::ConfirmedMismatch);
+}
+
+#[test]
+fn only_confirmed_socket_identity_authorizes_home_cleanup() {
+    assert!(socket_identity_confirms_expected_authority(
+        SocketIdentityConfirmation::ConfirmedMatch
+    ));
+    assert!(!socket_identity_confirms_expected_authority(
+        SocketIdentityConfirmation::ConfirmedMismatch
+    ));
+    assert!(!socket_identity_confirms_expected_authority(
+        SocketIdentityConfirmation::ProtocolVersionMismatch
+    ));
+    assert!(!socket_identity_confirms_expected_authority(
+        SocketIdentityConfirmation::ProbeContractFailure
+    ));
+    assert!(!socket_identity_confirms_expected_authority(
+        SocketIdentityConfirmation::Inconclusive
+    ));
 }

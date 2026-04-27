@@ -20,13 +20,18 @@ use crate::scheduler_policy::{
 
 use super::dispatch::execute_named_command_with_fence;
 use super::runtime;
+use super::timeout_projection::{ExecutionTimeoutProjectionRecorder, scope_timeout_projection};
+#[cfg(test)]
+use super::transaction::prepare_replay_fence;
 use super::transaction::{
     DispatchPreparation, PendingResponseCommit, PreparedCommandDispatch, execution_timeout_error,
-    execution_timeout_response, preflight_rejection_response, prepare_command_dispatch,
-    prepare_request_preflight, queue_timeout_response,
+    execution_timeout_response, handoff_blocked_error_for_command,
+    handoff_blocked_response_for_command, preflight_rejection_response, prepare_command_dispatch,
+    prepare_request_preflight_with_inherited_deadline, queue_timeout_response,
 };
 use super::{
-    DaemonRouter, OwnedRouterTransactionGuard, RouterTransactionGuard, TransactionDeadline,
+    DaemonRouter, OwnedRouterTransactionGuard, RouterFenceDisposition, RouterTransactionGuard,
+    TransactionDeadline,
 };
 
 impl DaemonRouter {
@@ -43,7 +48,7 @@ impl DaemonRouter {
         state: &Arc<SessionState>,
     ) -> PendingResponseCommit {
         let prepared = match self
-            .prepare_dispatch(request.clone(), state, true, false)
+            .prepare_dispatch(request.clone(), state, true, false, None)
             .await
         {
             DispatchPreparation::Final(response) => return *response,
@@ -54,6 +59,7 @@ impl DaemonRouter {
             .await
     }
 
+    #[cfg(test)]
     async fn acquire_fifo_permit<'a>(
         &'a self,
         command: &str,
@@ -78,6 +84,7 @@ impl DaemonRouter {
         }
     }
 
+    #[cfg(test)]
     async fn begin_request_transaction<'a>(
         &'a self,
         command: &str,
@@ -104,12 +111,80 @@ impl DaemonRouter {
                 })),
             ));
         }
+        if let Some(response) =
+            handoff_blocked_response_for_command(command, state, request_id).await
+        {
+            drop(permit);
+            return Err(response);
+        }
         let in_flight_count = state
             .in_flight_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .saturating_add(1);
         state.record_in_flight_count_observation(in_flight_count);
         Ok(RouterTransactionGuard {
+            _permit: permit,
+            state: state.clone(),
+        })
+    }
+
+    async fn begin_request_transaction_owned(
+        &self,
+        command: &str,
+        request_id: &str,
+        deadline: TransactionDeadline,
+        state: &Arc<SessionState>,
+    ) -> Result<OwnedRouterTransactionGuard, IpcResponse> {
+        let Some(timeout) = deadline.remaining_duration() else {
+            state.record_queue_pressure_timeout();
+            return Err(queue_timeout_response(command, request_id, deadline));
+        };
+        let permit = match tokio::time::timeout(
+            timeout,
+            self.exec_semaphore.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return Err(IpcResponse::error(
+                    request_id,
+                    ErrorEnvelope::new(ErrorCode::IpcTimeout, "Command queue closed"),
+                ));
+            }
+            Err(_) => {
+                state.record_queue_pressure_timeout();
+                return Err(queue_timeout_response(command, request_id, deadline));
+            }
+        };
+        if state.is_shutdown_requested() {
+            return Err(IpcResponse::error(
+                request_id,
+                ErrorEnvelope::new(
+                    ErrorCode::SessionBusy,
+                    format!(
+                        "Session '{}' is draining for shutdown; command '{}' is temporarily rejected",
+                        state.session_name, command
+                    ),
+                )
+                .with_context(serde_json::json!({
+                    "command": command,
+                    "reason": "session_shutting_down_after_queue_wait",
+                })),
+            ));
+        }
+        if let Some(response) =
+            handoff_blocked_response_for_command(command, state, request_id).await
+        {
+            drop(permit);
+            return Err(response);
+        }
+        let in_flight_count = state
+            .in_flight_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        state.record_in_flight_count_observation(in_flight_count);
+        Ok(OwnedRouterTransactionGuard {
             _permit: permit,
             state: state.clone(),
         })
@@ -147,6 +222,10 @@ impl DaemonRouter {
                         drop(permit);
                         return Err(automation_shutdown_rejection(state, command));
                     }
+                    if let Some(error) = handoff_blocked_error_for_command(command, state).await {
+                        drop(permit);
+                        return Err(error);
+                    }
                     let in_flight_count = state
                         .in_flight_count
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -161,8 +240,33 @@ impl DaemonRouter {
                     if state.is_shutdown_requested() {
                         return Err(automation_shutdown_rejection(state, command));
                     }
+                    if let Some(error) = handoff_blocked_error_for_command(command, state).await {
+                        return Err(error);
+                    }
                 }
             }
+        }
+    }
+
+    pub(crate) async fn begin_automation_transaction_if_needed<'a>(
+        &'a self,
+        state: &Arc<SessionState>,
+        command: &str,
+        queue_wait_budget: Duration,
+        shutdown_poll_interval: Duration,
+        disposition: RouterFenceDisposition,
+    ) -> Result<Option<RouterTransactionGuard<'a>>, ErrorEnvelope> {
+        match disposition {
+            RouterFenceDisposition::Acquire => self
+                .begin_automation_transaction_with_wait_budget(
+                    state,
+                    command,
+                    queue_wait_budget,
+                    shutdown_poll_interval,
+                )
+                .await
+                .map(Some),
+            RouterFenceDisposition::ReuseCurrentTransaction => Ok(None),
         }
     }
 
@@ -198,6 +302,10 @@ impl DaemonRouter {
                         drop(permit);
                         return Err(automation_shutdown_rejection(state, command));
                     }
+                    if let Some(error) = handoff_blocked_error_for_command(command, state).await {
+                        drop(permit);
+                        return Err(error);
+                    }
                     let in_flight_count = state
                         .in_flight_count
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -211,6 +319,9 @@ impl DaemonRouter {
                 _ = tokio::time::sleep(shutdown_poll_interval.min(remaining)) => {
                     if state.is_shutdown_requested() {
                         return Err(automation_shutdown_rejection(state, command));
+                    }
+                    if let Some(error) = handoff_blocked_error_for_command(command, state).await {
+                        return Err(error);
                     }
                 }
             }
@@ -236,9 +347,18 @@ impl DaemonRouter {
         request: IpcRequest,
         state: &'a Arc<SessionState>,
     ) -> Pin<Box<dyn Future<Output = IpcResponse> + Send + 'a>> {
+        self.dispatch_within_active_transaction_preserving_replay_until(request, state, None)
+    }
+
+    pub(crate) fn dispatch_within_active_transaction_preserving_replay_until<'a>(
+        &'a self,
+        request: IpcRequest,
+        state: &'a Arc<SessionState>,
+        inherited_deadline: Option<TransactionDeadline>,
+    ) -> Pin<Box<dyn Future<Output = IpcResponse> + Send + 'a>> {
         Box::pin(async move {
             match self
-                .prepare_dispatch(request.clone(), state, false, true)
+                .prepare_dispatch(request.clone(), state, false, true, inherited_deadline)
                 .await
             {
                 DispatchPreparation::Final(response) => (*response).commit_locally(state).await,
@@ -265,20 +385,33 @@ impl DaemonRouter {
         request_id: &str,
         queue_ms: u64,
         deadline: TransactionDeadline,
-    ) -> IpcResponse {
+    ) -> (IpcResponse, bool) {
         let exec_start = Instant::now();
         let exec_budget_ms = deadline.remaining_ms();
         let Some(exec_timeout) = deadline.remaining_duration() else {
-            return execution_timeout_response(request, request_id, queue_ms, 0);
+            return (
+                execution_timeout_response(request, request_id, queue_ms, 0, deadline.timeout_ms),
+                false,
+            );
         };
+        let timeout_projection = Arc::new(ExecutionTimeoutProjectionRecorder::default());
         let result = match tokio::time::timeout(
             exec_timeout,
-            self.execute_command(request, deadline, state),
+            scope_timeout_projection(
+                timeout_projection.clone(),
+                self.execute_command(request, deadline, state),
+            ),
         )
         .await
         {
             Ok(r) => r,
-            Err(_) => Err(execution_timeout_error(request, queue_ms, exec_budget_ms)),
+            Err(_) => Err(execution_timeout_error(
+                request,
+                queue_ms,
+                exec_budget_ms,
+                deadline.timeout_ms,
+                timeout_projection.snapshot(),
+            )),
         };
         let exec_ms = exec_start.elapsed().as_millis() as u64;
         let timing = Timing {
@@ -297,10 +430,11 @@ impl DaemonRouter {
             "command_complete"
         );
 
-        match result {
+        let response = match result {
             Ok(data) => IpcResponse::success(request_id, data).with_timing(timing),
             Err(err) => IpcResponse::error(request_id, err.into_envelope()).with_timing(timing),
-        }
+        };
+        (response, true)
     }
 
     async fn execute_prepared_request(
@@ -310,8 +444,7 @@ impl DaemonRouter {
         mut prepared: PreparedCommandDispatch,
     ) -> IpcResponse {
         let queue_ms = prepared.queue_ms();
-        prepared.mark_execution_started();
-        let response = self
+        let (response, execution_entered) = self
             .execute_request_once(
                 request,
                 state,
@@ -320,6 +453,9 @@ impl DaemonRouter {
                 prepared.deadline(),
             )
             .await;
+        if execution_entered {
+            prepared.mark_execution_started();
+        }
         prepared
             .prepare_response_commit(request, response)
             .commit_locally(state)
@@ -333,8 +469,7 @@ impl DaemonRouter {
         mut prepared: PreparedCommandDispatch,
     ) -> PendingResponseCommit {
         let queue_ms = prepared.queue_ms();
-        prepared.mark_execution_started();
-        let response = self
+        let (response, execution_entered) = self
             .execute_request_once(
                 request,
                 state,
@@ -343,6 +478,9 @@ impl DaemonRouter {
                 prepared.deadline(),
             )
             .await;
+        if execution_entered {
+            prepared.mark_execution_started();
+        }
         prepared.prepare_response_commit(request, response)
     }
 
@@ -353,7 +491,7 @@ impl DaemonRouter {
         prepared: PreparedCommandDispatch,
     ) -> PendingResponseCommit {
         let transaction = match self
-            .begin_request_transaction(
+            .begin_request_transaction_owned(
                 request.command.as_str(),
                 prepared.request_id(),
                 prepared.deadline(),
@@ -370,8 +508,7 @@ impl DaemonRouter {
         let response = self
             .execute_prepared_request_for_external(request, state, prepared)
             .await;
-        drop(transaction);
-        response
+        response.with_request_transaction(transaction)
     }
 
     async fn prepare_dispatch(
@@ -380,8 +517,10 @@ impl DaemonRouter {
         state: &Arc<SessionState>,
         allow_handshake: bool,
         in_process_dispatch: bool,
+        inherited_deadline: Option<TransactionDeadline>,
     ) -> DispatchPreparation {
-        let preflight = prepare_request_preflight(&request);
+        let preflight =
+            prepare_request_preflight_with_inherited_deadline(&request, inherited_deadline);
         let request_id = preflight.request_id.clone();
 
         if allow_handshake && request.command == "_handshake" {

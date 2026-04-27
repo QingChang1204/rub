@@ -9,6 +9,7 @@ const ERROR_FILE_ENV: &str = "RUB_DAEMON_ERROR_FILE";
 const STDERR_FILE_ENV: &str = "RUB_DAEMON_STDERR_FILE";
 const CLEANUP_FILE_ENV: &str = "RUB_DAEMON_CLEANUP_FILE";
 const SESSION_ID_ENV: &str = "RUB_SESSION_ID";
+pub(super) const STARTUP_INPUTS_ENV: &str = "RUB_STARTUP_INPUTS";
 
 mod readiness;
 
@@ -35,14 +36,23 @@ pub struct StartupSignalFiles {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupCleanupAuthorityKind {
-    ManagedBrowserProfile,
+    ManagedBrowserProfileFallback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartupCleanupProof {
+    /// Recovery-only fallback authority for a startup path that died before the
+    /// owning `rub-cdp` launch transaction could report or clean itself up.
     pub kind: StartupCleanupAuthorityKind,
     pub managed_user_data_dir: String,
+    pub managed_profile_directory: Option<String>,
     pub ephemeral: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoritativeStartupInputs {
+    pub connection_request: crate::session_policy::ConnectionRequest,
+    pub attachment_identity: Option<String>,
 }
 
 pub fn startup_signal_paths() -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
@@ -54,6 +64,24 @@ pub fn startup_signal_paths() -> (Option<std::path::PathBuf>, Option<std::path::
 
 pub(crate) fn startup_cleanup_signal_path() -> Option<std::path::PathBuf> {
     std::env::var_os(CLEANUP_FILE_ENV).map(std::path::PathBuf::from)
+}
+
+pub(crate) fn read_authoritative_startup_inputs()
+-> Result<Option<AuthoritativeStartupInputs>, RubError> {
+    let Some(raw) = std::env::var_os(STARTUP_INPUTS_ENV) else {
+        return Ok(None);
+    };
+    serde_json::from_str(&raw.to_string_lossy())
+        .map(Some)
+        .map_err(|error| {
+            RubError::domain_with_context(
+                ErrorCode::DaemonStartFailed,
+                format!("Failed to parse authoritative startup inputs: {error}"),
+                serde_json::json!({
+                    "reason": "authoritative_startup_inputs_parse_failed",
+                }),
+            )
+        })
 }
 
 pub(crate) fn write_startup_cleanup_proof_at(

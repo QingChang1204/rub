@@ -223,10 +223,13 @@ fn t370_387_listener_and_doctor_projection_grouped_scenario() {
 #[serial]
 fn t388_389c_external_handoff_and_takeover_grouped_scenario() {
     let (_rt, server) = start_standard_site_fixture();
-    let Some((mut chrome, cdp_origin, profile_dir)) = spawn_external_chrome(Some(&server.url()))
-    else {
-        eprintln!("Skipping external takeover test because no Chrome/Chromium binary was found");
-        return;
+    let (mut chrome, cdp_origin, profile_dir) = match spawn_external_chrome(Some(&server.url())) {
+        Ok(Some(spawned)) => spawned,
+        Ok(None) => {
+            eprintln!("Skipping external takeover test because no Chrome/Chromium binary was found");
+            return;
+        }
+        Err(error) => panic!("external takeover helper launch/readiness failed: {error}"),
     };
     let session = ManagedBrowserSession::new();
     let _home = session.home();
@@ -1917,17 +1920,7 @@ fn t416_417_424_425_frame_runtime_inventory_and_stale_grouped_scenario() {
     );
     assert_eq!(switched_stale["success"], true, "{switched_stale}");
 
-    let waited = parse_json(
-        &session
-            .cmd()
-            .args([
-                "exec",
-                "new Promise((resolve) => setTimeout(() => resolve('done'), 750))",
-            ])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(waited["success"], true, "{waited}");
+    std::thread::sleep(Duration::from_millis(750));
 
     let stale_runtime = parse_json(&session.cmd().args(["runtime", "frame"]).output().unwrap());
     assert_eq!(stale_runtime["success"], true, "{stale_runtime}");
@@ -2316,9 +2309,29 @@ fn t421_423_selected_same_origin_frame_grouped_context_scenario() {
     );
     assert_eq!(top_input_value["success"], true, "{top_input_value}");
     assert_eq!(
-        top_input_value["data"]["result"], "top",
+        top_input_value["data"]["result"], "child hello",
         "{top_input_value}"
     );
+
+    let reset_top = parse_json(&session.cmd().args(["frame", "--top"]).output().unwrap());
+    assert_eq!(reset_top["success"], true, "{reset_top}");
+    let top_input_value = parse_json(
+        &session
+            .cmd()
+            .args(["exec", "document.getElementById('shared-input').value"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(top_input_value["success"], true, "{top_input_value}");
+    assert_eq!(top_input_value["data"]["result"], "top", "{top_input_value}");
+    let switched = parse_json(
+        &session
+            .cmd()
+            .args(["frame", "--name", "child-frame"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(switched["success"], true, "{switched}");
 
     let selected = parse_json(
         &session
@@ -2356,9 +2369,32 @@ fn t421_423_selected_same_origin_frame_grouped_context_scenario() {
     );
     assert_eq!(top_select_value["success"], true, "{top_select_value}");
     assert_eq!(
+        top_select_value["data"]["result"], "child_b",
+        "{top_select_value}"
+    );
+
+    let reset_top = parse_json(&session.cmd().args(["frame", "--top"]).output().unwrap());
+    assert_eq!(reset_top["success"], true, "{reset_top}");
+    let top_select_value = parse_json(
+        &session
+            .cmd()
+            .args(["exec", "document.getElementById('shared-select').value"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(top_select_value["success"], true, "{top_select_value}");
+    assert_eq!(
         top_select_value["data"]["result"], "top_a",
         "{top_select_value}"
     );
+    let switched = parse_json(
+        &session
+            .cmd()
+            .args(["frame", "--name", "child-frame"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(switched["success"], true, "{switched}");
 
     let uploaded = parse_json(
         &session
@@ -2410,6 +2446,14 @@ fn t421_423_selected_same_origin_frame_grouped_context_scenario() {
         "{extracted}"
     );
 
+    let top_filename = parse_json(
+        &session
+            .cmd()
+            .args(["frame", "--top"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(top_filename["success"], true, "{top_filename}");
     let top_filename = parse_json(
         &session
             .cmd()
@@ -2940,7 +2984,18 @@ fn t400_402_interference_grouped_scenario() {
             .output()
             .unwrap(),
     );
-    assert_eq!(clicked["success"], true, "{clicked}");
+    assert_eq!(clicked["success"], false, "{clicked}");
+    assert_eq!(
+        clicked["error"]["code"],
+        "INTERACTION_NOT_CONFIRMED",
+        "{clicked}"
+    );
+    assert_eq!(
+        clicked["error"]["context"]["committed_response_projection"]["interaction"]
+            ["interference"]["after"]["current_interference"]["kind"],
+        "popup_hijack",
+        "{clicked}"
+    );
 
     let tabs_json = (0..30)
         .find_map(|_| {
@@ -2966,6 +3021,16 @@ fn t400_402_interference_grouped_scenario() {
         .find(|tab| tab["title"].as_str() == Some("Popup Target"))
         .and_then(|tab| tab["index"].as_u64())
         .expect("popup tab index") as u32;
+    let active_tab = tabs_json["data"]["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tab| tab["active"] == true)
+        .expect("tabs projection should mark one active tab");
+    assert!(matches!(
+        active_tab["active_authority"].as_str(),
+        Some("browser_truth" | "local_fallback")
+    ));
 
     let switched = parse_json(
         &session

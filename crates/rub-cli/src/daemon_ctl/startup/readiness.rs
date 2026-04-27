@@ -1,13 +1,15 @@
 #[cfg(test)]
 use super::super::FORCE_SETSID_FAILURE;
 use super::super::{
-    authority_bound_deferred_client, connect_ipc_once, daemon_ctl_path_error,
-    daemon_ctl_path_state, daemon_ctl_socket_error, fetch_handshake_info_with_timeout,
-    handshake_attempt_error, remaining_budget_duration, remaining_budget_ms,
+    AuthorityBoundConnectSpec, authority_bound_connected_client, connect_ipc_once,
+    daemon_ctl_path_error, daemon_ctl_path_state, daemon_ctl_socket_error,
+    fetch_handshake_info_with_timeout, handshake_attempt_error, remaining_budget_duration,
+    remaining_budget_ms,
 };
 use super::{
-    CLEANUP_FILE_ENV, DaemonCtlPathContext, ERROR_FILE_ENV, READY_FILE_ENV, SESSION_ID_ENV,
-    STDERR_FILE_ENV, StartupSignalFiles, startup_lock_scope_keys, try_lock_exclusive, unlock,
+    AuthoritativeStartupInputs, CLEANUP_FILE_ENV, DaemonCtlPathContext, ERROR_FILE_ENV,
+    READY_FILE_ENV, SESSION_ID_ENV, STARTUP_INPUTS_ENV, STDERR_FILE_ENV, StartupSignalFiles,
+    startup_lock_scope_keys, try_lock_exclusive, unlock,
 };
 use crate::connection_hardening::{
     AttemptError, ConnectionFailureClass, RetryAttribution, RetryFailure, RetryPolicy,
@@ -106,6 +108,7 @@ pub fn start_daemon(
     session_name: &str,
     session_id: &str,
     extra_args: &[String],
+    authoritative_startup_inputs: Option<&AuthoritativeStartupInputs>,
 ) -> Result<StartupSignalFiles, RubError> {
     let exe = std::env::current_exe().map_err(|e| {
         RubError::domain(
@@ -140,6 +143,7 @@ pub fn start_daemon(
         .env(CLEANUP_FILE_ENV, &cleanup_file);
     cmd.env(STDERR_FILE_ENV, &stderr_file);
     cmd.env(SESSION_ID_ENV, session_id);
+    apply_authoritative_startup_inputs_env(&mut cmd, authoritative_startup_inputs)?;
 
     for arg in extra_args {
         cmd.arg(arg);
@@ -194,6 +198,24 @@ pub fn start_daemon(
     })
 }
 
+fn apply_authoritative_startup_inputs_env(
+    cmd: &mut Command,
+    authoritative_startup_inputs: Option<&AuthoritativeStartupInputs>,
+) -> Result<(), RubError> {
+    if let Some(authoritative_startup_inputs) = authoritative_startup_inputs {
+        let raw = serde_json::to_string(authoritative_startup_inputs).map_err(|error| {
+            RubError::domain(
+                ErrorCode::DaemonStartFailed,
+                format!("Failed to serialize authoritative startup inputs: {error}"),
+            )
+        })?;
+        cmd.env(STARTUP_INPUTS_ENV, raw);
+    } else {
+        cmd.env_remove(STARTUP_INPUTS_ENV);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub async fn acquire_startup_lock(
     rub_home: &Path,
@@ -230,11 +252,11 @@ pub async fn upgrade_startup_lock_to_canonical_attachment_until(
     rub_home: &Path,
     attachment_identity: Option<&str>,
     deadline: Instant,
-) -> Result<(), RubError> {
+) -> Result<Option<String>, RubError> {
     let Some(canonical_identity) =
-        canonical_startup_attachment_identity(attachment_identity).await?
+        canonical_startup_attachment_identity(attachment_identity, deadline).await?
     else {
-        return Ok(());
+        return Ok(None);
     };
     guard
         .acquire_scope_until(
@@ -242,7 +264,8 @@ pub async fn upgrade_startup_lock_to_canonical_attachment_until(
             format!("attachment-{canonical_identity}"),
             deadline,
         )
-        .await
+        .await?;
+    Ok(Some(canonical_identity))
 }
 
 async fn acquire_startup_lock_file_until(
@@ -315,6 +338,7 @@ async fn acquire_startup_lock_file_until(
 
 async fn canonical_startup_attachment_identity(
     attachment_identity: Option<&str>,
+    deadline: Instant,
 ) -> Result<Option<String>, RubError> {
     let Some(identity) = attachment_identity else {
         return Ok(None);
@@ -325,13 +349,20 @@ async fn canonical_startup_attachment_identity(
     match kind {
         "cdp" => Ok(Some(format!(
             "cdp:{}",
-            rub_cdp::attachment::canonical_external_browser_identity(value).await?
+            rub_cdp::attachment::canonical_external_browser_identity_until(value, deadline.into())
+                .await?
         ))),
         "auto_discover" if value == "local_cdp" => {
-            let candidate = rub_cdp::attachment::resolve_unique_local_cdp_candidate().await?;
+            let candidate =
+                rub_cdp::attachment::resolve_unique_local_cdp_candidate_until(deadline.into())
+                    .await?;
             Ok(Some(format!(
                 "cdp:{}",
-                rub_cdp::attachment::canonical_external_browser_identity(&candidate.ws_url).await?
+                rub_cdp::attachment::canonical_external_browser_identity_until(
+                    &candidate.ws_url,
+                    deadline.into(),
+                )
+                .await?
             )))
         }
         _ => Ok(Some(identity.to_string())),
@@ -346,7 +377,7 @@ pub async fn wait_for_ready(
     timeout_ms: u64,
 ) -> Result<(IpcClient, String), RubError> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
-    wait_for_ready_until(rub_home, session_name, signals, deadline).await
+    wait_for_ready_until(rub_home, session_name, signals, deadline, None).await
 }
 
 pub async fn wait_for_ready_until(
@@ -354,6 +385,7 @@ pub async fn wait_for_ready_until(
     session_name: &str,
     signals: &StartupSignalFiles,
     deadline: Instant,
+    expected_attachment_identity: Option<&str>,
 ) -> Result<(IpcClient, String), RubError> {
     let monitor = StartupReadyMonitor::new(rub_home, session_name, &signals.session_id);
     let _signal_cleanup = StartupSignalCleanup { signals };
@@ -403,8 +435,13 @@ pub async fn wait_for_ready_until(
                 ));
             }
             StartupReadinessObservation::ReadyToHandshake => {
-                match connect_ready_client(&monitor.socket_path, &signals.session_id, deadline)
-                    .await
+                match connect_ready_client(
+                    &monitor.socket_path,
+                    &signals.session_id,
+                    expected_attachment_identity,
+                    deadline,
+                )
+                .await
                 {
                     Ok((client, daemon_session_id, _attribution)) => {
                         return Ok((client, daemon_session_id));
@@ -522,6 +559,7 @@ impl StartupReadyMonitor {
 async fn connect_ready_client(
     socket_path: &Path,
     expected_session_id: &str,
+    expected_attachment_identity: Option<&str>,
     deadline: Instant,
 ) -> Result<(IpcClient, String, RetryAttribution), RetryFailure> {
     let socket_path = socket_path.to_path_buf();
@@ -536,6 +574,22 @@ async fn connect_ready_client(
                 &socket_path,
             ));
         };
+        let handshake_socket_identity = match super::super::current_socket_path_identity(
+            &socket_path,
+            "daemon_ctl.startup.handshake.socket_path",
+            "startup_ready_monitor.socket_path",
+            ErrorCode::DaemonStartFailed,
+            "verified_daemon_authority_socket_identity_read_failed",
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Err(RetryFailure {
+                    error,
+                    attribution,
+                    final_failure_class: ConnectionFailureClass::ProtocolMismatch,
+                });
+            }
+        };
         let attempt = tokio::time::timeout(remaining, async {
             let mut handshake_client = connect_ipc_once(
                 &socket_path,
@@ -545,6 +599,21 @@ async fn connect_ready_client(
                 "startup_ready_monitor.socket_path",
             )
             .await?;
+            super::super::verify_socket_path_identity(
+                &socket_path,
+                handshake_socket_identity,
+                &AuthorityBoundConnectSpec {
+                    phase: "startup_handshake",
+                    error_code: ErrorCode::DaemonStartFailed,
+                    message_prefix:
+                        "Failed to connect to the daemon socket while confirming startup readiness",
+                    path_authority: "daemon_ctl.startup.handshake.socket_path",
+                    upstream_truth: "startup_ready_monitor.socket_path",
+                },
+            )
+            .map_err(|error| {
+                AttemptError::terminal(error, ConnectionFailureClass::ProtocolMismatch)
+            })?;
 
             let handshake = fetch_handshake_info_with_timeout(
                 &mut handshake_client,
@@ -569,26 +638,39 @@ async fn connect_ready_client(
                             ),
                         }),
                     ),
-                    ConnectionFailureClass::ProtocolMismatch,
-                ));
-            }
-
-            let client = authority_bound_deferred_client(&socket_path, &handshake.daemon_session_id)
-                .map_err(|error| {
-                    AttemptError::terminal(
-                        daemon_ctl_socket_error(
-                            ErrorCode::DaemonStartFailed,
-                            format!(
-                                "Failed to bind startup daemon authority after handshake: {error}"
-                            ),
-                            &socket_path,
-                            "daemon_ctl.startup.handshake.socket_path",
-                            "startup_ready_monitor.socket_path",
-                            "startup_handshake_bind_failed",
-                        ),
                         ConnectionFailureClass::ProtocolMismatch,
-                    )
-                })?;
+                    ));
+            }
+            super::super::validate_handshake_attachment_identity(
+                "startup",
+                expected_attachment_identity,
+                handshake.attachment_identity.as_deref(),
+                &socket_path,
+                "daemon_ctl.startup.handshake.socket_path",
+                "startup_ready_monitor.socket_path",
+            )
+            .map_err(|error| AttemptError::terminal(error, ConnectionFailureClass::ProtocolMismatch))?;
+
+            let client = authority_bound_connected_client(
+                &socket_path,
+                &handshake.daemon_session_id,
+                handshake_socket_identity,
+                Some(super::super::AttachBudget {
+                    deadline,
+                    timeout_ms: remaining_budget_ms(deadline).max(1),
+                }),
+                AuthorityBoundConnectSpec {
+                    phase: "startup_handshake_bound_authority_connect",
+                    error_code: ErrorCode::DaemonStartFailed,
+                    message_prefix: "Failed to connect the verified startup daemon authority",
+                    path_authority: "daemon_ctl.startup.handshake.socket_path",
+                    upstream_truth: "startup_ready_monitor.socket_path",
+                },
+            )
+            .await
+            .map_err(|error| {
+                AttemptError::terminal(error, ConnectionFailureClass::ProtocolMismatch)
+            })?;
 
             Ok((client, handshake.daemon_session_id))
         })
@@ -671,4 +753,49 @@ pub(crate) fn read_startup_error(path: &Path) -> Result<rub_core::error::ErrorEn
         rub_core::error::ErrorEnvelope::new(ErrorCode::DaemonStartFailed, contents)
     });
     Ok(envelope)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{STARTUP_INPUTS_ENV, apply_authoritative_startup_inputs_env};
+    use crate::daemon_ctl::AuthoritativeStartupInputs;
+    use crate::session_policy::ConnectionRequest;
+    use std::process::Command;
+
+    #[test]
+    fn startup_inputs_env_is_explicitly_removed_when_parent_has_no_authority() {
+        let mut cmd = Command::new("rub");
+        cmd.env(STARTUP_INPUTS_ENV, "stale-parent-authority");
+
+        apply_authoritative_startup_inputs_env(&mut cmd, None)
+            .expect("env removal should not fail");
+
+        let (_, value) = cmd
+            .get_envs()
+            .find(|(key, _)| *key == STARTUP_INPUTS_ENV)
+            .expect("env_remove should be recorded on command");
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn startup_inputs_env_is_set_only_from_authoritative_parent_payload() {
+        let mut cmd = Command::new("rub");
+        let inputs = AuthoritativeStartupInputs {
+            connection_request: ConnectionRequest::None,
+            attachment_identity: None,
+        };
+
+        apply_authoritative_startup_inputs_env(&mut cmd, Some(&inputs))
+            .expect("env serialization should succeed");
+
+        let (_, value) = cmd
+            .get_envs()
+            .find(|(key, _)| *key == STARTUP_INPUTS_ENV)
+            .expect("startup inputs env should be set");
+        assert!(
+            value
+                .and_then(|value| value.to_str())
+                .is_some_and(|raw| raw.contains("\"connection_request\""))
+        );
+    }
 }

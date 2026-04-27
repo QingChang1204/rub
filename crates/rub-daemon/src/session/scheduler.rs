@@ -112,10 +112,15 @@ impl SessionState {
                 "trigger_worker_pre_queue_gate": "none",
                 "orchestration_worker_pre_queue_gate": "none",
                 "automation_reservation_fence": "router.begin_automation_reservation_transaction_owned",
-                "orchestration_source_materialization_reservation_fence": "router.begin_automation_transaction_with_wait_budget",
+                "orchestration_source_materialization_reservation_fence": "router.current_transaction_or_begin_automation_transaction",
                 "shutdown_drain_fence": "daemon.shutdown.wait_for_transaction_drain",
             },
             "reservation_wait_policy": {
+                "response_delivery": {
+                    "mode": "transport_delivery_holds_fifo_until_write_or_fallback_commit",
+                    "transport_timeout_authority": "daemon.IPC_WRITE_TIMEOUT",
+                    "fallback_commit_authority": "router.transaction.commit_after_delivery_failure",
+                },
                 "worker_cycle": {
                     "mode": "bounded_worker_cycle_budget",
                     "wait_budget_ms": AUTOMATION_QUEUE_WAIT_BUDGET_MS,

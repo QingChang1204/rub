@@ -94,7 +94,9 @@ pub(crate) fn project_batch_close_result(
         "result": {
             "closed": result.closed,
             "cleaned_stale": result.cleaned_stale,
+            "compatibility_degraded_owned_sessions": result.compatibility_degraded_owned_sessions,
             "failed": result.failed,
+            "session_error_details": result.session_error_details,
         }
     })
 }

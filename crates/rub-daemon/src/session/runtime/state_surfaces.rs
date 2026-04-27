@@ -24,13 +24,12 @@ impl SessionState {
         &self,
         kind: StorageMutationKind,
         origin: String,
-        area: Option<StorageArea>,
-        key: Option<String>,
+        context: StorageMutationRuntimeContext,
     ) -> StorageRuntimeInfo {
         self.storage_runtime
             .write()
             .await
-            .record_mutation(kind, origin, area, key)
+            .record_mutation(kind, origin, context)
     }
 
     /// Mark the storage runtime surface as degraded when the live probe cannot run reliably.
@@ -96,7 +95,24 @@ impl SessionState {
         sequence: u64,
         snapshot: RuntimeStateSnapshot,
     ) {
-        self.runtime_state.write().await.replace(sequence, snapshot);
+        let _published = self
+            .publish_runtime_state_snapshot_if(sequence, snapshot, || true)
+            .await;
+    }
+
+    /// Replace the current runtime-state projection only if the caller's
+    /// authority fence still holds after waiting for this store's write lock.
+    pub async fn publish_runtime_state_snapshot_if(
+        &self,
+        sequence: u64,
+        snapshot: RuntimeStateSnapshot,
+        publish_allowed: impl FnOnce() -> bool + Send,
+    ) -> bool {
+        let mut runtime_state = self.runtime_state.write().await;
+        if !publish_allowed() {
+            return false;
+        }
+        runtime_state.replace(sequence, snapshot)
     }
 
     /// Mark both runtime-state surfaces as degraded from a shared live-probe failure.

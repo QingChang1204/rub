@@ -19,7 +19,7 @@ pub(super) fn history_capture_window_json(
         "newest_retained_sequence": projection.capture_newest_retained_sequence,
         "dropped_before_retention": projection.capture_dropped_before_retention,
         "dropped_before_projection": projection.capture_dropped_before_projection,
-        "truncated": !projection.complete,
+        "truncated": projection.selection_truncated_by_retention,
     })
 }
 
@@ -27,10 +27,10 @@ pub(super) fn command_history_projection_state_json(
     projection: &crate::history::CommandHistoryProjection,
 ) -> serde_json::Value {
     let mut lossy_reasons = Vec::new();
-    if projection.dropped_before_projection > 0 {
+    if projection.selection_dropped_before_projection {
         lossy_reasons.push("dropped_before_projection");
     }
-    if projection.dropped_before_retention > 0 {
+    if projection.selection_truncated_by_retention {
         lossy_reasons.push("dropped_before_retention");
     }
 
@@ -61,13 +61,10 @@ pub(super) fn workflow_export_projection_state_json(
     projection: &WorkflowExportProjection,
 ) -> serde_json::Value {
     let mut lossy_reasons = Vec::new();
-    if projection.capture_dropped_before_projection > 0 {
+    if projection.selection_dropped_before_projection {
         lossy_reasons.push("dropped_before_projection");
     }
-    if projection.capture_dropped_before_retention > 0 {
-        lossy_reasons.push("dropped_before_retention");
-    }
-    if !projection.complete {
+    if projection.selection_truncated_by_retention {
         lossy_reasons.push("retention_truncated");
     }
 
@@ -81,6 +78,7 @@ pub(super) fn workflow_export_projection_state_json(
         "durability": "best_effort",
         "lossy": !lossy_reasons.is_empty(),
         "lossy_reasons": lossy_reasons,
+        "global_projection_drop_count": projection.capture_dropped_before_projection,
     })
 }
 

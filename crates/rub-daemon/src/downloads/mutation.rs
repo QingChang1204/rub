@@ -44,6 +44,8 @@ impl DownloadRuntimeState {
             self.current_generation = generation;
             self.next_sequence = 0;
             self.runtime_event_sequence = 0;
+            self.dropped_event_count = 0;
+            self.last_evicted_sequence = 0;
             self.projection = DownloadRuntimeInfo::default();
             self.entries.clear();
             self.entry_event_sequence.clear();
@@ -100,6 +102,85 @@ impl DownloadRuntimeState {
             download_dir,
             degraded_reason,
         )
+    }
+
+    pub fn apply_runtime_projection_sequenced(
+        &mut self,
+        generation: u64,
+        browser_sequence: u64,
+        runtime: DownloadRuntimeInfo,
+    ) -> DownloadRuntimeMutationOutcome {
+        let outcome = self.apply_runtime_event(
+            generation,
+            Some(browser_sequence),
+            runtime.status,
+            runtime.mode,
+            runtime.download_dir.clone(),
+            runtime.degraded_reason.clone(),
+        );
+        if !outcome.applied {
+            return outcome;
+        }
+
+        let previous_entries = self.entries.clone();
+        self.entries.clear();
+        self.entry_event_sequence.clear();
+        self.active_order.clear();
+        self.completed_order.clear();
+
+        let mut recovered_entries = Vec::new();
+
+        for download in &runtime.active_downloads {
+            self.entries.insert(download.guid.clone(), download.clone());
+            self.active_order.push_back(download.guid.clone());
+            recovered_entries.push(download.clone());
+        }
+        for download in &runtime.completed_downloads {
+            self.entries.insert(download.guid.clone(), download.clone());
+            if !self
+                .completed_order
+                .iter()
+                .any(|guid| guid == &download.guid)
+            {
+                self.completed_order.push_back(download.guid.clone());
+            }
+            if !recovered_entries
+                .iter()
+                .any(|entry: &DownloadEntry| entry.guid == download.guid)
+            {
+                recovered_entries.push(download.clone());
+            }
+        }
+        if let Some(download) = &runtime.last_download {
+            self.entries
+                .entry(download.guid.clone())
+                .or_insert_with(|| download.clone());
+            if !recovered_entries
+                .iter()
+                .any(|entry: &DownloadEntry| entry.guid == download.guid)
+            {
+                recovered_entries.push(download.clone());
+            }
+        }
+
+        self.projection.active_downloads = runtime.active_downloads.clone();
+        self.projection.completed_downloads = runtime.completed_downloads.clone();
+        self.projection.last_download = runtime
+            .last_download
+            .clone()
+            .or_else(|| runtime.active_downloads.last().cloned())
+            .or_else(|| runtime.completed_downloads.last().cloned());
+
+        for download in recovered_entries {
+            if previous_entries.get(&download.guid) != Some(&download) {
+                self.record_event(event_kind_for_state(download.state), download);
+            }
+        }
+
+        DownloadRuntimeMutationOutcome {
+            projection: self.projection(),
+            applied: true,
+        }
     }
 
     fn apply_runtime_event(

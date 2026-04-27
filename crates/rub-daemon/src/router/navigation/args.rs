@@ -10,6 +10,8 @@ pub(super) struct OpenArgs {
     pub(super) _wait_after: Option<serde_json::Value>,
     #[serde(default, rename = "_trigger")]
     pub(super) _trigger: Option<serde_json::Value>,
+    #[serde(default, rename = "_orchestration")]
+    pub(super) _orchestration: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -58,6 +60,8 @@ pub(super) struct ScrollArgs {
     pub(super) direction: Option<String>,
     #[serde(default)]
     pub(super) amount: Option<u32>,
+    #[serde(default, rename = "_orchestration")]
+    pub(super) _orchestration: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -69,6 +73,8 @@ pub(super) struct ReloadArgs {
     pub(super) _wait_after: Option<serde_json::Value>,
     #[serde(default, rename = "_trigger")]
     pub(super) _trigger: Option<serde_json::Value>,
+    #[serde(default, rename = "_orchestration")]
+    pub(super) _orchestration: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -82,6 +88,8 @@ pub(super) struct ScreenshotArgs {
     pub(super) path: Option<String>,
     #[serde(default, rename = "path_state")]
     pub(super) _path_state: Option<serde_json::Value>,
+    #[serde(default, rename = "_orchestration")]
+    pub(super) _orchestration: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -92,6 +100,8 @@ pub(super) struct SwitchArgs {
     pub(super) _wait_after: Option<serde_json::Value>,
     #[serde(default, rename = "_trigger")]
     pub(super) _trigger: Option<serde_json::Value>,
+    #[serde(default, rename = "_orchestration")]
+    pub(super) _orchestration: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -99,6 +109,8 @@ pub(super) struct SwitchArgs {
 pub(super) struct CloseTabArgs {
     #[serde(default)]
     pub(super) index: Option<u32>,
+    #[serde(default, rename = "_orchestration")]
+    pub(super) _orchestration: Option<serde_json::Value>,
 }
 
 pub(super) fn parse_optional_load_strategy(

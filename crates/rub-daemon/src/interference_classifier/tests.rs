@@ -13,6 +13,8 @@ fn active_tab(target_id: &str, url: &str, title: &str) -> TabInfo {
         url: url.to_string(),
         title: title.to_string(),
         active: true,
+        active_authority: None,
+        degraded_reason: None,
     }
 }
 
@@ -161,6 +163,36 @@ fn classifier_detects_interstitial_navigation_from_url_pattern() {
             .map(|obs| obs.kind),
         Some(InterferenceKind::InterstitialNavigation)
     );
+}
+
+#[test]
+fn classifier_does_not_treat_degraded_active_tab_url_as_navigation_truth() {
+    let classified = classify(
+        &InterferenceRuntimeInfo::default(),
+        &InterferenceBaseline {
+            primary_target_id: Some("target-1".to_string()),
+            primary_url: Some("https://app.example.com/home".to_string()),
+            last_tab_count: 1,
+        },
+        &[TabInfo {
+            index: 0,
+            target_id: "target-1".to_string(),
+            url: String::new(),
+            title: String::new(),
+            active: true,
+            active_authority: None,
+            degraded_reason: Some("tab_url_and_title_probe_failed".to_string()),
+        }],
+        &RuntimeObservatoryInfo::default(),
+        &ReadinessInfo::default(),
+        &HumanVerificationHandoffInfo::default(),
+    );
+
+    assert_eq!(
+        classified.projection.status,
+        InterferenceRuntimeStatus::Inactive
+    );
+    assert!(classified.projection.current_interference.is_none());
 }
 
 #[test]

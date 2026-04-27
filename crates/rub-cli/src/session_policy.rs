@@ -1,4 +1,5 @@
 use crate::commands::EffectiveCli;
+use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 use std::path::PathBuf;
@@ -19,7 +20,7 @@ pub(crate) use self::request::{
 };
 pub(crate) use self::validation::{
     compatibility_launch_policy, requires_existing_session_validation,
-    validate_existing_session_connection_request_with_deadline,
+    validate_existing_session_connection_request_via_authority_probe_with_deadline,
 };
 
 #[cfg(test)]
@@ -36,7 +37,7 @@ use crate::commands::Commands;
 #[cfg(test)]
 use crate::commands::RequestedLaunchPolicy;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ConnectionRequest {
     None,
     CdpUrl {
@@ -77,6 +78,7 @@ mod tests {
             cdp_url: None,
             connect: false,
             profile: None,
+            profile_resolved_path: None,
             use_alias: None,
             no_stealth: false,
             humanize: false,

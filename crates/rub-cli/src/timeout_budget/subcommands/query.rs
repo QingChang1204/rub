@@ -8,6 +8,7 @@ use super::super::{
     observation_projection_args, observation_scope_args, resolve_cli_path,
     resolve_inspect_list_spec_source,
 };
+use super::checked_request;
 
 pub(crate) fn build_get_request(
     timeout: u64,
@@ -212,7 +213,7 @@ pub(crate) fn build_inspect_request(
             "id": id,
         }),
     };
-    Ok(IpcRequest::new(
+    checked_request(IpcRequest::new(
         "inspect",
         args,
         inspect_request_timeout(timeout, subcommand),

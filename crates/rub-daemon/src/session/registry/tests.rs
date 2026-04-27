@@ -1,23 +1,53 @@
 use super::{
-    RegistryData, RegistryEntry, authoritative_entry_by_session_name, cleanup_projections,
+    RegistryData, RegistryEntry, RegistryEntryLiveness, authoritative_entry_by_session_name,
+    check_profile_in_use, cleanup_projections, force_busy_registry_socket_probe_once_for_test,
+    force_dead_registry_socket_probe_once_for_test, force_live_registry_socket_probe_once_for_test,
+    force_probe_contract_failure_registry_socket_probe_once_for_test,
+    force_protocol_incompatible_registry_socket_probe_once_for_test,
     is_matching_rub_daemon_command, latest_entry_by_session_name, new_session_id,
     promote_session_authority, read_registry, register_pending_session, register_session,
     registry_authority_snapshot, registry_entry_is_live_for_home,
-    registry_entry_is_pending_startup_for_home, write_registry,
+    registry_entry_is_pending_startup_for_home, write_hard_cut_release_pending_proof,
+    write_registry,
 };
 use crate::rub_paths::RubPaths;
-use rub_ipc::codec::NdJsonCodec;
-use rub_ipc::protocol::{IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse};
-use std::io::{BufRead, BufReader, Write};
+use rub_ipc::protocol::IPC_PROTOCOL_VERSION;
 #[cfg(unix)]
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 #[cfg(unix)]
-use std::os::unix::net::UnixListener;
-use std::time::Duration;
+use std::process::Command;
 use uuid::Uuid;
 
 fn temp_home() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("rub-registry-test-{}", Uuid::now_v7()))
+}
+
+#[cfg(unix)]
+fn spawn_synthetic_chrome_profile_holder(
+    home: &std::path::Path,
+    profile_dir: &std::path::Path,
+) -> std::process::Child {
+    let bin_dir = home.join("fake-browser-bin");
+    std::fs::create_dir_all(&bin_dir).expect("create fake browser bin dir");
+    let browser_path = bin_dir.join("Google Chrome");
+    std::fs::write(&browser_path, b"#!/bin/sh\nsleep 30\n").expect("write fake browser");
+    let mut permissions = std::fs::metadata(&browser_path)
+        .expect("fake browser metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&browser_path, permissions).expect("chmod fake browser");
+
+    Command::new(&browser_path)
+        .arg("--user-data-dir")
+        .arg(profile_dir)
+        .spawn()
+        .expect("spawn synthetic Chrome profile holder")
+}
+
+fn ensure_socket_path_parent(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
 }
 
 #[test]
@@ -172,6 +202,65 @@ fn read_registry_rejects_entries_with_noncanonical_socket_path() {
     .unwrap();
 
     let error = read_registry(&home).expect_err("noncanonical socket_path should be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn read_registry_accepts_legacy_runtime_socket_path_for_upgrade_compatibility() {
+    let home = temp_home();
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let legacy_socket_path = "/tmp/rub-sock-olduser/0123456789abcdef.sock";
+    std::fs::write(
+        home.join("registry.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "sessions": [{
+                "session_id": "sess-default",
+                "session_name": "default",
+                "pid": 1234,
+                "socket_path": legacy_socket_path,
+                "created_at": "2026-03-31T00:00:00Z",
+                "ipc_protocol_version": "1.0",
+                "user_data_dir": null
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let registry = read_registry(&home).expect("legacy runtime socket path should load");
+    assert_eq!(registry.sessions[0].socket_path, legacy_socket_path);
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn read_registry_rejects_lookalike_legacy_socket_path_outside_legacy_tmp_root() {
+    let home = temp_home();
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let lookalike_socket_path = home.join("rub-sock-olduser/0123456789abcdef.sock");
+    std::fs::write(
+        home.join("registry.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "sessions": [{
+                "session_id": "sess-default",
+                "session_name": "default",
+                "pid": 1234,
+                "socket_path": lookalike_socket_path,
+                "created_at": "2026-03-31T00:00:00Z",
+                "ipc_protocol_version": "1.0",
+                "user_data_dir": null
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = read_registry(&home)
+        .expect_err("lookalike legacy socket outside /tmp/rub-sock-<tag> should be rejected");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 
     let _ = std::fs::remove_dir_all(home);
@@ -362,26 +451,10 @@ fn live_registry_identity_requires_socket_handshake() {
     )
     .unwrap();
     std::fs::write(projection.startup_committed_path(), session_id).unwrap();
+    ensure_socket_path_parent(&runtime.socket_path());
+    std::fs::write(runtime.socket_path(), b"socket").unwrap();
     symlink(runtime.socket_path(), projection.canonical_socket_path()).unwrap();
-
-    let listener = UnixListener::bind(runtime.socket_path()).unwrap();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut request)
-            .unwrap();
-        let decoded: IpcRequest = serde_json::from_str(request.trim_end()).unwrap();
-        assert_eq!(decoded.command, "_handshake");
-        let response = IpcResponse::success(
-            "req-1",
-            serde_json::json!({
-                "daemon_session_id": "sess-default",
-            }),
-        );
-        serde_json::to_writer(&mut stream, &response).unwrap();
-        stream.write_all(b"\n").unwrap();
-    });
+    force_live_registry_socket_probe_once_for_test(&runtime.socket_path());
 
     let entry = RegistryEntry {
         session_id: session_id.to_string(),
@@ -396,7 +469,6 @@ fn live_registry_identity_requires_socket_handshake() {
     };
 
     assert!(registry_entry_is_live_for_home(&home, &entry));
-    server.join().unwrap();
     let _ = std::fs::remove_dir_all(home);
 }
 
@@ -418,26 +490,10 @@ fn live_registry_identity_requires_matching_handshake_session_id() {
     )
     .unwrap();
     std::fs::write(projection.startup_committed_path(), session_id).unwrap();
+    ensure_socket_path_parent(&runtime.socket_path());
+    std::fs::write(runtime.socket_path(), b"socket").unwrap();
     symlink(runtime.socket_path(), projection.canonical_socket_path()).unwrap();
-
-    let listener = UnixListener::bind(runtime.socket_path()).unwrap();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut request)
-            .unwrap();
-        let decoded: IpcRequest = serde_json::from_str(request.trim_end()).unwrap();
-        assert_eq!(decoded.command, "_handshake");
-        let response = IpcResponse::success(
-            "req-1",
-            serde_json::json!({
-                "daemon_session_id": "other-session",
-            }),
-        );
-        serde_json::to_writer(&mut stream, &response).unwrap();
-        stream.write_all(b"\n").unwrap();
-    });
+    force_dead_registry_socket_probe_once_for_test(&runtime.socket_path());
 
     let entry = RegistryEntry {
         session_id: session_id.to_string(),
@@ -452,7 +508,6 @@ fn live_registry_identity_requires_matching_handshake_session_id() {
     };
 
     assert!(!registry_entry_is_live_for_home(&home, &entry));
-    server.join().unwrap();
     let _ = std::fs::remove_dir_all(home);
 }
 
@@ -474,27 +529,68 @@ fn live_registry_identity_requires_matching_protocol_version() {
     )
     .unwrap();
     std::fs::write(projection.startup_committed_path(), session_id).unwrap();
+    ensure_socket_path_parent(&runtime.socket_path());
+    std::fs::write(runtime.socket_path(), b"socket").unwrap();
     symlink(runtime.socket_path(), projection.canonical_socket_path()).unwrap();
+    force_protocol_incompatible_registry_socket_probe_once_for_test(&runtime.socket_path());
 
-    let listener = UnixListener::bind(runtime.socket_path()).unwrap();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut request)
-            .unwrap();
-        let decoded: IpcRequest = serde_json::from_str(request.trim_end()).unwrap();
-        assert_eq!(decoded.command, "_handshake");
-        let mut response = IpcResponse::success(
-            "req-1",
-            serde_json::json!({
-                "daemon_session_id": "sess-default",
-            }),
-        );
-        response.ipc_protocol_version = "0.9".to_string();
-        serde_json::to_writer(&mut stream, &response).unwrap();
-        stream.write_all(b"\n").unwrap();
-    });
+    write_registry(
+        &home,
+        &RegistryData {
+            sessions: vec![RegistryEntry {
+                session_id: session_id.to_string(),
+                session_name: session_name.to_string(),
+                pid: std::process::id(),
+                socket_path: runtime.socket_path().display().to_string(),
+                created_at: "2026-04-02T00:00:00Z".to_string(),
+                ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
+                user_data_dir: None,
+                attachment_identity: None,
+                connection_target: None,
+            }],
+        },
+    )
+    .unwrap();
+
+    let snapshot = registry_authority_snapshot(&home).unwrap();
+    let session_snapshot = snapshot.session(session_name).expect("session snapshot");
+    let latest_entry = session_snapshot.latest_entry().expect("latest entry");
+    assert!(latest_entry.is_protocol_incompatible_authority());
+    let entry_snapshot = session_snapshot
+        .authoritative_entry()
+        .expect("protocol-incompatible entry should remain authoritative");
+    assert!(entry_snapshot.is_protocol_incompatible_authority());
+    let active = snapshot.active_entry_snapshots();
+    assert_eq!(active.len(), 1);
+    assert_eq!(
+        active[0].liveness,
+        RegistryEntryLiveness::ProtocolIncompatible
+    );
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+#[cfg(unix)]
+fn live_registry_identity_rejects_payload_and_protocol_echo_divergence() {
+    let home = temp_home();
+    let _ = std::fs::remove_dir_all(&home);
+    let session_name = "default";
+    let session_id = "sess-default";
+    let runtime = RubPaths::new(&home).session_runtime(session_name, session_id);
+    let projection = RubPaths::new(&home).session(session_name);
+    std::fs::create_dir_all(runtime.session_dir()).unwrap();
+    std::fs::create_dir_all(projection.projection_dir()).unwrap();
+    std::fs::write(runtime.pid_path(), std::process::id().to_string()).unwrap();
+    std::fs::write(
+        projection.canonical_pid_path(),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+    std::fs::write(projection.startup_committed_path(), session_id).unwrap();
+    ensure_socket_path_parent(&runtime.socket_path());
+    std::fs::write(runtime.socket_path(), b"socket").unwrap();
+    symlink(runtime.socket_path(), projection.canonical_socket_path()).unwrap();
+    force_probe_contract_failure_registry_socket_probe_once_for_test(&runtime.socket_path());
 
     let entry = RegistryEntry {
         session_id: session_id.to_string(),
@@ -508,8 +604,76 @@ fn live_registry_identity_requires_matching_protocol_version() {
         connection_target: None,
     };
 
-    assert!(!registry_entry_is_live_for_home(&home, &entry));
-    server.join().unwrap();
+    write_registry(
+        &home,
+        &RegistryData {
+            sessions: vec![entry.clone()],
+        },
+    )
+    .unwrap();
+    let snapshot = registry_authority_snapshot(&home).unwrap();
+    let session_snapshot = snapshot.session(session_name).expect("session snapshot");
+    let entry_snapshot = session_snapshot
+        .authoritative_entry()
+        .expect("probe-contract-failure entry should remain authoritative");
+    assert!(entry_snapshot.is_probe_contract_failure_authority());
+    let active = snapshot.active_entry_snapshots();
+    assert_eq!(active.len(), 1);
+    assert_eq!(
+        active[0].liveness,
+        RegistryEntryLiveness::ProbeContractFailure
+    );
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+#[cfg(unix)]
+fn live_registry_identity_requires_matching_handshake_command_id() {
+    let home = temp_home();
+    let _ = std::fs::remove_dir_all(&home);
+    let session_name = "default";
+    let session_id = "sess-default";
+    let runtime = RubPaths::new(&home).session_runtime(session_name, session_id);
+    let projection = RubPaths::new(&home).session(session_name);
+    std::fs::create_dir_all(runtime.session_dir()).unwrap();
+    std::fs::create_dir_all(projection.projection_dir()).unwrap();
+    std::fs::write(runtime.pid_path(), std::process::id().to_string()).unwrap();
+    std::fs::write(
+        projection.canonical_pid_path(),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+    std::fs::write(projection.startup_committed_path(), session_id).unwrap();
+    ensure_socket_path_parent(&runtime.socket_path());
+    std::fs::write(runtime.socket_path(), b"socket").unwrap();
+    symlink(runtime.socket_path(), projection.canonical_socket_path()).unwrap();
+    force_probe_contract_failure_registry_socket_probe_once_for_test(&runtime.socket_path());
+
+    let entry = RegistryEntry {
+        session_id: session_id.to_string(),
+        session_name: session_name.to_string(),
+        pid: std::process::id(),
+        socket_path: runtime.socket_path().display().to_string(),
+        created_at: "2026-04-02T00:00:00Z".to_string(),
+        ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
+        user_data_dir: None,
+        attachment_identity: None,
+        connection_target: None,
+    };
+
+    write_registry(
+        &home,
+        &RegistryData {
+            sessions: vec![entry.clone()],
+        },
+    )
+    .unwrap();
+    let snapshot = registry_authority_snapshot(&home).unwrap();
+    let session_snapshot = snapshot.session(session_name).expect("session snapshot");
+    let entry_snapshot = session_snapshot
+        .authoritative_entry()
+        .expect("probe-contract-failure entry should remain authoritative");
+    assert!(entry_snapshot.is_probe_contract_failure_authority());
     let _ = std::fs::remove_dir_all(home);
 }
 
@@ -531,13 +695,10 @@ fn slow_handshake_is_treated_as_busy_not_dead() {
     )
     .unwrap();
     std::fs::write(projection.startup_committed_path(), session_id).unwrap();
+    ensure_socket_path_parent(&runtime.socket_path());
+    std::fs::write(runtime.socket_path(), b"socket").unwrap();
     symlink(runtime.socket_path(), projection.canonical_socket_path()).unwrap();
-
-    let listener = UnixListener::bind(runtime.socket_path()).unwrap();
-    let server = std::thread::spawn(move || {
-        let (_stream, _) = listener.accept().unwrap();
-        std::thread::sleep(Duration::from_millis(900));
-    });
+    force_busy_registry_socket_probe_once_for_test(&runtime.socket_path());
 
     let entry = RegistryEntry {
         session_id: session_id.to_string(),
@@ -552,7 +713,6 @@ fn slow_handshake_is_treated_as_busy_not_dead() {
     };
 
     assert!(registry_entry_is_live_for_home(&home, &entry));
-    server.join().unwrap();
     let _ = std::fs::remove_dir_all(home);
 }
 
@@ -565,6 +725,7 @@ fn pending_startup_is_not_live_but_is_explicitly_detectable() {
     let runtime = RubPaths::new(&home).session_runtime(session_name, session_id);
     std::fs::create_dir_all(runtime.session_dir()).unwrap();
     std::fs::write(runtime.pid_path(), std::process::id().to_string()).unwrap();
+    ensure_socket_path_parent(&runtime.socket_path());
     std::fs::write(runtime.socket_path(), b"socket").unwrap();
 
     let entry = RegistryEntry {
@@ -582,6 +743,173 @@ fn pending_startup_is_not_live_but_is_explicitly_detectable() {
     assert!(!registry_entry_is_live_for_home(&home, &entry));
     assert!(registry_entry_is_pending_startup_for_home(&home, &entry));
     let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+#[cfg(unix)]
+fn hard_cut_release_pending_remains_authoritative_and_blocks_profile_reuse() {
+    let home = temp_home();
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let session_name = "default";
+    let session_id = "sess-hard-cut";
+    let runtime = RubPaths::new(&home).session_runtime(session_name, session_id);
+    let profile_dir = rub_cdp::projected_managed_profile_path_for_session(session_id);
+    std::fs::create_dir_all(&profile_dir).unwrap();
+
+    let mut child = spawn_synthetic_chrome_profile_holder(&home, &profile_dir);
+
+    let attachment_identity = format!("user_data_dir:{}", profile_dir.display());
+
+    write_registry(
+        &home,
+        &RegistryData {
+            sessions: vec![RegistryEntry {
+                session_id: session_id.to_string(),
+                session_name: session_name.to_string(),
+                pid: 999_999,
+                socket_path: runtime.socket_path().display().to_string(),
+                created_at: "2026-04-19T00:00:00Z".to_string(),
+                ipc_protocol_version: "0.9".to_string(),
+                user_data_dir: Some(profile_dir.display().to_string()),
+                attachment_identity: Some(attachment_identity.clone()),
+                connection_target: None,
+            }],
+        },
+    )
+    .unwrap();
+    write_hard_cut_release_pending_proof(
+        &home,
+        session_name,
+        &super::HardCutReleasePendingProof {
+            session_id: session_id.to_string(),
+        },
+    )
+    .unwrap();
+
+    let snapshot = registry_authority_snapshot(&home).unwrap();
+    let session = snapshot.session(session_name).expect("session snapshot");
+    let authority = session
+        .authoritative_entry()
+        .expect("hard-cut release pending must remain authoritative");
+    assert!(authority.is_hard_cut_release_pending_authority());
+    assert_eq!(authority.entry.session_id, session_id);
+
+    assert_eq!(
+        check_profile_in_use(&home, &attachment_identity, None).unwrap(),
+        Some(session_name.to_string())
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(home);
+    let _ = std::fs::remove_dir_all(profile_dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn malformed_hard_cut_release_pending_proof_still_blocks_profile_reuse() {
+    let home = temp_home();
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let session_name = "default";
+    let session_id = "sess-hard-cut-malformed";
+    let runtime = RubPaths::new(&home).session_runtime(session_name, session_id);
+    let projection = RubPaths::new(&home).session(session_name);
+    let profile_dir = rub_cdp::projected_managed_profile_path_for_session(session_id);
+    std::fs::create_dir_all(runtime.session_dir()).unwrap();
+    std::fs::create_dir_all(projection.projection_dir()).unwrap();
+    std::fs::create_dir_all(&profile_dir).unwrap();
+
+    let mut child = spawn_synthetic_chrome_profile_holder(&home, &profile_dir);
+
+    let attachment_identity = format!("user_data_dir:{}", profile_dir.display());
+    write_registry(
+        &home,
+        &RegistryData {
+            sessions: vec![RegistryEntry {
+                session_id: session_id.to_string(),
+                session_name: session_name.to_string(),
+                pid: 999_999,
+                socket_path: runtime.socket_path().display().to_string(),
+                created_at: "2026-04-21T00:00:00Z".to_string(),
+                ipc_protocol_version: "0.9".to_string(),
+                user_data_dir: Some(profile_dir.display().to_string()),
+                attachment_identity: Some(attachment_identity.clone()),
+                connection_target: None,
+            }],
+        },
+    )
+    .unwrap();
+    std::fs::write(projection.hard_cut_release_pending_path(), b"{not-json").unwrap();
+
+    let snapshot = registry_authority_snapshot(&home).unwrap();
+    let session = snapshot.session(session_name).expect("session snapshot");
+    let authority = session
+        .authoritative_entry()
+        .expect("malformed hard-cut fallback proof must still remain authoritative");
+    assert!(authority.is_hard_cut_release_pending_authority());
+
+    assert_eq!(
+        check_profile_in_use(&home, &attachment_identity, None).unwrap(),
+        Some(session_name.to_string())
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(home);
+    let _ = std::fs::remove_dir_all(profile_dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn hard_cut_release_pending_profile_observation_failure_still_blocks_authority() {
+    let home = temp_home();
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let session_name = "default";
+    let session_id = "sess-hard-cut-observe";
+    let runtime = RubPaths::new(&home).session_runtime(session_name, session_id);
+    let profile_dir = rub_cdp::projected_managed_profile_path_for_session(session_id);
+    std::fs::create_dir_all(runtime.session_dir()).unwrap();
+    std::fs::create_dir_all(&profile_dir).unwrap();
+
+    write_registry(
+        &home,
+        &RegistryData {
+            sessions: vec![RegistryEntry {
+                session_id: session_id.to_string(),
+                session_name: session_name.to_string(),
+                pid: 999_999,
+                socket_path: runtime.socket_path().display().to_string(),
+                created_at: "2026-04-21T00:00:00Z".to_string(),
+                ipc_protocol_version: "0.9".to_string(),
+                user_data_dir: Some(profile_dir.display().to_string()),
+                attachment_identity: Some(format!("user_data_dir:{}", profile_dir.display())),
+                connection_target: None,
+            }],
+        },
+    )
+    .unwrap();
+    write_hard_cut_release_pending_proof(
+        &home,
+        session_name,
+        &super::HardCutReleasePendingProof {
+            session_id: session_id.to_string(),
+        },
+    )
+    .unwrap();
+
+    super::force_hard_cut_release_pending_profile_observation_failure_for_test();
+    let snapshot = registry_authority_snapshot(&home).unwrap();
+    let session = snapshot.session(session_name).expect("session snapshot");
+    let authority = session
+        .authoritative_entry()
+        .expect("profile observation failure must fail closed onto hard-cut fallback authority");
+    assert!(authority.is_hard_cut_release_pending_authority());
+
+    let _ = std::fs::remove_dir_all(home);
+    let _ = std::fs::remove_dir_all(profile_dir);
 }
 
 #[test]
@@ -698,23 +1026,9 @@ fn registry_authority_snapshot_classifies_stale_and_uncertain_entries_once() {
     )
     .unwrap();
     std::fs::write(live_runtime.startup_committed_path(), "sess-live").unwrap();
-    let listener = UnixListener::bind(live_runtime.socket_path()).unwrap();
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        let request: IpcRequest = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(request.command, "_handshake");
-        let response = IpcResponse::success(
-            request.command.clone(),
-            serde_json::json!({
-                "daemon_session_id": "sess-live",
-            }),
-        );
-        let encoded = NdJsonCodec::encode(&response).unwrap();
-        reader.get_mut().write_all(&encoded).unwrap();
-    });
+    ensure_socket_path_parent(&live_runtime.socket_path());
+    std::fs::write(live_runtime.socket_path(), b"socket").unwrap();
+    force_live_registry_socket_probe_once_for_test(&live_runtime.socket_path());
 
     let dead_runtime = RubPaths::new(&home).session_runtime("default", "sess-dead");
     let uncertain_runtime = RubPaths::new(&home).session_runtime("default", "sess-uncertain");
@@ -778,7 +1092,6 @@ fn registry_authority_snapshot_classifies_stale_and_uncertain_entries_once() {
     );
     assert!(session.has_uncertain_entries());
 
-    server.join().unwrap();
     let _ = std::fs::remove_dir_all(home);
 }
 

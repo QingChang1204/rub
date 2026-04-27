@@ -1,10 +1,12 @@
 use super::{
     commit_asset_writes, list_orchestrations, pending_asset_write,
-    persist_orchestration_export_asset, remove_newly_created_asset_if_matches,
+    persist_orchestration_export_asset, persist_orchestration_export_asset_until,
+    remove_newly_created_asset_if_matches,
 };
 use crate::commands::{Commands, EffectiveCli, OrchestrationSubcommand, RequestedLaunchPolicy};
 use rub_core::error::ErrorCode;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 fn cli_with(command: Commands, rub_home: PathBuf) -> EffectiveCli {
     EffectiveCli {
@@ -23,6 +25,7 @@ fn cli_with(command: Commands, rub_home: PathBuf) -> EffectiveCli {
         cdp_url: None,
         connect: false,
         profile: None,
+        profile_resolved_path: None,
         use_alias: None,
         no_stealth: false,
         humanize: false,
@@ -236,6 +239,60 @@ fn persist_orchestration_export_asset_rolls_back_prior_write_on_second_failure()
     persist_orchestration_export_asset(&cli, &mut data)
         .expect_err("second write should fail and roll back the first");
     assert!(!saved.exists(), "first output should be rolled back");
+
+    let _ = std::fs::remove_dir_all(rub_home);
+}
+
+#[test]
+fn persist_orchestration_export_asset_until_fails_closed_after_deadline_without_publishing() {
+    let rub_home = std::env::temp_dir().join(format!(
+        "rub-cli-orchestration-export-deadline-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let _ = std::fs::remove_dir_all(&rub_home);
+    let output_path = rub_home.join("exports/rule.json");
+    let cli = cli_with(
+        Commands::Orchestration {
+            subcommand: OrchestrationSubcommand::Export {
+                id: 7,
+                save_as: None,
+                output: Some(output_path.display().to_string()),
+            },
+        },
+        rub_home.clone(),
+    );
+    let mut data = serde_json::json!({
+        "subject": { "kind": "orchestration_rule", "id": 7 },
+        "result": {
+            "format": "orchestration",
+            "spec": {
+                "source": { "session_id": "source" },
+                "target": { "session_id": "target" },
+                "condition": { "kind": "url_match", "url": "https://example.com" },
+                "actions": [{ "kind": "browser_command", "command": "reload" }]
+            }
+        }
+    });
+
+    let error = persist_orchestration_export_asset_until(
+        &cli,
+        &mut data,
+        Instant::now() - Duration::from_millis(1),
+        30_000,
+    )
+    .expect_err("expired deadline should fail closed");
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::IpcTimeout);
+    let context = envelope.context.expect("deadline error context");
+    assert_eq!(context["reason"], "command_deadline_exhausted");
+    assert_eq!(
+        context["phase"],
+        "post_commit_orchestration_export_persistence"
+    );
+    assert!(
+        !output_path.exists(),
+        "orchestration export artifact must not publish after deadline"
+    );
 
     let _ = std::fs::remove_dir_all(rub_home);
 }

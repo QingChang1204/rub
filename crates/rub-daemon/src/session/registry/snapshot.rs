@@ -1,9 +1,11 @@
 use super::{
-    RegistryData, RegistryEntry, liveness::registry_entry_snapshot_for_home, read_registry,
+    RegistryData, RegistryEntry,
+    liveness::{registry_entry_snapshot_async_for_home, registry_entry_snapshot_for_home},
+    read_registry,
 };
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -11,6 +13,9 @@ use time::format_description::well_known::Rfc3339;
 pub enum RegistryEntryLiveness {
     Live,
     BusyOrUnknown,
+    ProbeContractFailure,
+    ProtocolIncompatible,
+    HardCutReleasePending,
     PendingStartup,
     Dead,
 }
@@ -26,8 +31,24 @@ impl RegistryEntrySnapshot {
     pub fn is_live_authority(&self) -> bool {
         matches!(
             self.liveness,
-            RegistryEntryLiveness::Live | RegistryEntryLiveness::BusyOrUnknown
+            RegistryEntryLiveness::Live
+                | RegistryEntryLiveness::BusyOrUnknown
+                | RegistryEntryLiveness::ProbeContractFailure
+                | RegistryEntryLiveness::ProtocolIncompatible
+                | RegistryEntryLiveness::HardCutReleasePending
         )
+    }
+
+    pub fn is_protocol_incompatible_authority(&self) -> bool {
+        self.liveness == RegistryEntryLiveness::ProtocolIncompatible
+    }
+
+    pub fn is_hard_cut_release_pending_authority(&self) -> bool {
+        self.liveness == RegistryEntryLiveness::HardCutReleasePending
+    }
+
+    pub fn is_probe_contract_failure_authority(&self) -> bool {
+        self.liveness == RegistryEntryLiveness::ProbeContractFailure
     }
 
     pub fn is_pending_startup(&self) -> bool {
@@ -109,6 +130,16 @@ impl RegistryAuthoritySnapshot {
         entries.sort_by(compare_registry_entry_created_at);
         entries
     }
+
+    pub fn active_entry_snapshots(&self) -> Vec<RegistryEntrySnapshot> {
+        let mut entries = self
+            .sessions
+            .iter()
+            .filter_map(|session| session.authoritative_entry().cloned())
+            .collect::<Vec<_>>();
+        entries.sort_by(compare_registry_entry_snapshot_created_at);
+        entries
+    }
 }
 
 pub fn authoritative_entry_by_session_name(
@@ -137,9 +168,24 @@ pub fn active_registry_entries(home: &Path) -> std::io::Result<Vec<RegistryEntry
     Ok(registry_authority_snapshot(home)?.active_entries())
 }
 
+pub fn active_registry_entry_snapshots(home: &Path) -> std::io::Result<Vec<RegistryEntrySnapshot>> {
+    Ok(registry_authority_snapshot(home)?.active_entry_snapshots())
+}
+
 pub fn registry_authority_snapshot(home: &Path) -> std::io::Result<RegistryAuthoritySnapshot> {
     let data = read_registry(home)?;
     Ok(build_registry_authority_snapshot(home, &data))
+}
+
+pub(crate) async fn registry_authority_snapshot_async(
+    home: PathBuf,
+    prioritized_session_id: Option<String>,
+) -> std::io::Result<RegistryAuthoritySnapshot> {
+    let read_home = home.clone();
+    let data = tokio::task::spawn_blocking(move || read_registry(&read_home))
+        .await
+        .map_err(|error| std::io::Error::other(format!("join registry read: {error}")))??;
+    Ok(build_registry_authority_snapshot_async(home, data, prioritized_session_id).await)
 }
 
 fn build_registry_authority_snapshot(
@@ -168,7 +214,55 @@ fn build_registry_authority_snapshot(
     RegistryAuthoritySnapshot { sessions }
 }
 
-pub(super) fn compare_registry_entry_created_at(
+async fn build_registry_authority_snapshot_async(
+    home: PathBuf,
+    mut data: RegistryData,
+    prioritized_session_id: Option<String>,
+) -> RegistryAuthoritySnapshot {
+    if let Some(prioritized_session_id) = prioritized_session_id.as_deref() {
+        data.sessions.sort_by_key(|entry| {
+            if entry.session_id == prioritized_session_id {
+                0
+            } else {
+                1
+            }
+        });
+    }
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for entry in data.sessions {
+        let home = home.clone();
+        join_set
+            .spawn(async move { registry_entry_snapshot_async_for_home(home, entry, true).await });
+    }
+
+    let mut sessions = BTreeMap::<String, Vec<RegistryEntrySnapshot>>::new();
+    while let Some(snapshot) = join_set
+        .join_next()
+        .await
+        .transpose()
+        .expect("registry authority snapshot task should not panic")
+    {
+        sessions
+            .entry(snapshot.entry.session_name.clone())
+            .or_default()
+            .push(snapshot);
+    }
+
+    let sessions = sessions
+        .into_iter()
+        .map(|(session_name, mut entries)| {
+            entries.sort_by(compare_registry_entry_snapshot_created_at);
+            RegistrySessionSnapshot {
+                session_name,
+                entries,
+            }
+        })
+        .collect();
+    RegistryAuthoritySnapshot { sessions }
+}
+
+pub(crate) fn compare_registry_entry_created_at(
     left: &RegistryEntry,
     right: &RegistryEntry,
 ) -> Ordering {

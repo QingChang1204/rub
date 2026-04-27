@@ -37,14 +37,14 @@ impl SessionState {
         observatory: &crate::observatory::RuntimeObservatoryState,
         cursor: u64,
         end_cursor: u64,
-        last_observed_drop_count: u64,
-        observed_drop_count: u64,
+        last_observed_ingress_drop_count: u64,
+        observed_ingress_drop_count: u64,
     ) -> crate::observatory::ObservatoryEventWindow {
         observatory.event_window_between(
             cursor,
             end_cursor,
-            observed_drop_count,
-            last_observed_drop_count,
+            observed_ingress_drop_count,
+            last_observed_ingress_drop_count,
         )
     }
 
@@ -52,12 +52,12 @@ impl SessionState {
         &self,
         observatory: &crate::observatory::RuntimeObservatoryState,
         cursor: u64,
-        last_observed_drop_count: u64,
+        last_observed_ingress_drop_count: u64,
     ) -> crate::observatory::NetworkRequestWindow {
         observatory.request_window_after(
             cursor,
-            self.observatory_drop_counts(observatory).request,
-            last_observed_drop_count,
+            self.network_request_ingress_drop_count(),
+            last_observed_ingress_drop_count,
         )
     }
 
@@ -66,14 +66,14 @@ impl SessionState {
         observatory: &crate::observatory::RuntimeObservatoryState,
         cursor: u64,
         end_cursor: u64,
-        last_observed_drop_count: u64,
-        observed_drop_count: u64,
+        last_observed_ingress_drop_count: u64,
+        observed_ingress_drop_count: u64,
     ) -> crate::observatory::NetworkRequestWindow {
         observatory.request_window_between(
             cursor,
             end_cursor,
-            observed_drop_count,
-            last_observed_drop_count,
+            observed_ingress_drop_count,
+            last_observed_ingress_drop_count,
         )
     }
 
@@ -93,6 +93,16 @@ impl SessionState {
         self.observatory.read().await.request_cursor()
     }
 
+    pub(crate) async fn current_network_request_baseline(
+        &self,
+    ) -> crate::session::NetworkRequestBaseline {
+        crate::session::NetworkRequestBaseline {
+            cursor: self.network_request_cursor().await,
+            observed_ingress_drop_count: self.network_request_ingress_drop_count(),
+            primed: true,
+        }
+    }
+
     /// Return sequenced observatory events recorded after the given cursor.
     pub async fn observatory_events_after(&self, cursor: u64) -> Vec<RuntimeObservatoryEvent> {
         self.observatory.read().await.events_after(cursor)
@@ -102,16 +112,16 @@ impl SessionState {
         &self,
         cursor: u64,
         end_cursor: u64,
-        last_observed_drop_count: u64,
-        observed_drop_count: u64,
+        last_observed_ingress_drop_count: u64,
+        observed_ingress_drop_count: u64,
     ) -> crate::observatory::ObservatoryEventWindow {
         let observatory = self.observatory.read().await;
         self.observatory_event_window_between_from_state(
             &observatory,
             cursor,
             end_cursor,
-            last_observed_drop_count,
-            observed_drop_count,
+            last_observed_ingress_drop_count,
+            observed_ingress_drop_count,
         )
     }
 
@@ -187,26 +197,30 @@ impl SessionState {
     pub(crate) async fn network_request_window_after(
         &self,
         cursor: u64,
-        last_observed_drop_count: u64,
+        last_observed_ingress_drop_count: u64,
     ) -> crate::observatory::NetworkRequestWindow {
         let observatory = self.observatory.read().await;
-        self.observatory_request_window_from_state(&observatory, cursor, last_observed_drop_count)
+        self.observatory_request_window_from_state(
+            &observatory,
+            cursor,
+            last_observed_ingress_drop_count,
+        )
     }
 
     pub(crate) async fn network_request_window_between(
         &self,
         cursor: u64,
         end_cursor: u64,
-        last_observed_drop_count: u64,
-        observed_drop_count: u64,
+        last_observed_ingress_drop_count: u64,
+        observed_ingress_drop_count: u64,
     ) -> crate::observatory::NetworkRequestWindow {
         let observatory = self.observatory.read().await;
         self.observatory_request_window_between_from_state(
             &observatory,
             cursor,
             end_cursor,
-            last_observed_drop_count,
-            observed_drop_count,
+            last_observed_ingress_drop_count,
+            observed_ingress_drop_count,
         )
     }
 

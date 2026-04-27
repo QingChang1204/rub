@@ -253,6 +253,10 @@ pub fn workflow_request_allowed(command: &str, args: &serde_json::Value) -> bool
     workflow_request_policy(command, args).workflow_allowed
 }
 
+pub fn trigger_workflow_request_allowed(command: &str, args: &serde_json::Value) -> bool {
+    command != "exec" && workflow_request_allowed(command, args)
+}
+
 pub fn workflow_request_capture_class(
     command: &str,
     args: &serde_json::Value,
@@ -267,6 +271,13 @@ pub fn workflow_allowed_step_descriptions() -> Vec<String> {
         .collect::<Vec<_>>();
     allowed.push("orchestration:add|pause|resume|remove|execute".to_string());
     allowed
+}
+
+pub fn trigger_workflow_allowed_step_descriptions() -> Vec<String> {
+    workflow_allowed_step_descriptions()
+        .into_iter()
+        .filter(|command| command != "exec")
+        .collect()
 }
 
 fn orchestration_request_policy(args: &serde_json::Value) -> WorkflowStepPolicy {
@@ -300,6 +311,7 @@ mod tests {
         workflow_capture_class, workflow_command_allowed, workflow_request_allowed,
         workflow_request_capture_class, workflow_step_policy,
     };
+    use super::{trigger_workflow_allowed_step_descriptions, trigger_workflow_request_allowed};
 
     #[test]
     fn workflow_allowed_commands_match_policy_guard() {
@@ -370,6 +382,24 @@ mod tests {
             allowed
                 .iter()
                 .any(|entry| entry == "orchestration:add|pause|resume|remove|execute")
+        );
+    }
+
+    #[test]
+    fn trigger_workflow_policy_rejects_exec_without_changing_regular_workflows() {
+        assert!(workflow_request_allowed("exec", &serde_json::json!({})));
+        assert!(!trigger_workflow_request_allowed(
+            "exec",
+            &serde_json::json!({})
+        ));
+        assert!(trigger_workflow_request_allowed(
+            "click",
+            &serde_json::json!({})
+        ));
+        assert!(
+            !trigger_workflow_allowed_step_descriptions()
+                .iter()
+                .any(|command| command == "exec")
         );
     }
 }

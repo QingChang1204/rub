@@ -16,7 +16,9 @@ use rub_core::model::{
     ConsoleErrorEvent, NetworkBodyPreview, NetworkFailureEvent, NetworkRequestLifecycle,
     ObservedNetworkRequestRecord, PageErrorEvent, RequestSummaryEvent,
 };
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -34,7 +36,6 @@ use pending_requests::{
 };
 pub(crate) use pending_requests::{
     SharedPendingRequestRegistry, new_shared_pending_request_registry,
-    prune_stale_pending_request_registries,
 };
 
 type ConsoleCallback = Arc<dyn Fn(ConsoleErrorEvent) + Send + Sync>;
@@ -43,6 +44,7 @@ type NetworkFailureCallback = Arc<dyn Fn(NetworkFailureEvent) + Send + Sync>;
 type RequestSummaryCallback = Arc<dyn Fn(RequestSummaryEvent) + Send + Sync>;
 type RequestRecordCallback = Arc<dyn Fn(ObservedNetworkRequestRecord) + Send + Sync>;
 type ObservatoryDegradedCallback = Arc<dyn Fn(String) + Send + Sync>;
+pub(crate) type ObservatoryListenerEndedCallback = Arc<dyn Fn(&'static str) + Send + Sync>;
 
 const PENDING_REQUEST_RETENTION_LIMIT: usize = 1_024;
 
@@ -115,6 +117,7 @@ pub struct ObservatoryCallbacks {
     pub on_request_summary: Option<RequestSummaryCallback>,
     pub on_request_record: Option<RequestRecordCallback>,
     pub on_runtime_degraded: Option<ObservatoryDegradedCallback>,
+    pub on_listener_ended: Option<ObservatoryListenerEndedCallback>,
 }
 
 impl ObservatoryCallbacks {
@@ -125,6 +128,7 @@ impl ObservatoryCallbacks {
             && self.on_request_summary.is_none()
             && self.on_request_record.is_none()
             && self.on_runtime_degraded.is_none()
+            && self.on_listener_ended.is_none()
     }
 }
 
@@ -140,27 +144,127 @@ pub(crate) async fn ensure_page_observatory(
         return Ok(());
     }
 
-    page.execute(EnableParams::default())
-        .await
-        .map_err(|error| {
+    let needs_runtime_events =
+        callbacks.on_console_error.is_some() || callbacks.on_page_error.is_some();
+    let needs_network_events = callbacks.on_network_failure.is_some()
+        || callbacks.on_request_summary.is_some()
+        || callbacks.on_request_record.is_some();
+    let needs_response_received =
+        callbacks.on_request_summary.is_some() || callbacks.on_request_record.is_some();
+    let needs_loading_finished = needs_loading_finished_listener(&callbacks);
+    let needs_loading_failed = needs_loading_failed_listener(&callbacks);
+
+    let console_listener = if callbacks.on_console_error.is_some() {
+        Some(
+            page.event_listener::<EventConsoleApiCalled>()
+                .await
+                .map_err(|_| {
+                    RubError::domain(
+                        ErrorCode::BrowserCrashed,
+                        "Runtime observatory failed to subscribe to console events",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let page_error_listener = if callbacks.on_page_error.is_some() {
+        Some(
+            page.event_listener::<EventExceptionThrown>()
+                .await
+                .map_err(|_| {
+                    RubError::domain(
+                        ErrorCode::BrowserCrashed,
+                        "Runtime observatory failed to subscribe to page exception events",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let request_will_be_sent_listener = if needs_network_events {
+        Some(
+            page.event_listener::<EventRequestWillBeSent>()
+                .await
+                .map_err(|_| {
+                    RubError::domain(
+                        ErrorCode::BrowserCrashed,
+                        "Runtime observatory failed to subscribe to requestWillBeSent events",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let response_received_listener = if needs_response_received {
+        Some(
+            page.event_listener::<EventResponseReceived>()
+                .await
+                .map_err(|_| {
+                    RubError::domain(
+                        ErrorCode::BrowserCrashed,
+                        "Runtime observatory failed to subscribe to responseReceived events",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let loading_finished_listener = if needs_loading_finished {
+        Some(
+            page.event_listener::<EventLoadingFinished>()
+                .await
+                .map_err(|_| {
+                    RubError::domain(
+                        ErrorCode::BrowserCrashed,
+                        "Runtime observatory failed to subscribe to loadingFinished events",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let loading_failed_listener = if needs_loading_failed {
+        Some(
+            page.event_listener::<EventLoadingFailed>()
+                .await
+                .map_err(|_| {
+                    RubError::domain(
+                        ErrorCode::BrowserCrashed,
+                        "Runtime observatory failed to subscribe to loadingFailed events",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+
+    if needs_network_events {
+        page.execute(EnableParams::default())
+            .await
+            .map_err(|error| {
+                RubError::domain(
+                    ErrorCode::BrowserCrashed,
+                    format!("Runtime observatory failed to enable Network domain: {error}"),
+                )
+            })?;
+    }
+
+    if needs_runtime_events {
+        page.enable_runtime().await.map_err(|error| {
             RubError::domain(
                 ErrorCode::BrowserCrashed,
-                format!("Runtime observatory failed to enable Network domain: {error}"),
+                format!("Runtime observatory failed to enable Runtime domain: {error}"),
             )
         })?;
-
-    page.enable_runtime().await.map_err(|error| {
-        RubError::domain(
-            ErrorCode::BrowserCrashed,
-            format!("Runtime observatory failed to enable Runtime domain: {error}"),
-        )
-    })?;
+    }
     let tab_target_id = page.target_id().as_ref().to_string();
 
     if let Some(callback) = callbacks.on_console_error.clone()
-        && let Ok(mut listener) = page.event_listener::<EventConsoleApiCalled>().await
+        && let Some(mut listener) = console_listener
     {
         let generation_rx = listener_generation_rx.clone();
+        let listener_ended = callbacks.on_listener_ended.clone();
         tokio::spawn(async move {
             let mut generation_rx = generation_rx;
             while let Some(event) =
@@ -174,18 +278,17 @@ pub(crate) async fn ensure_page_observatory(
                     });
                 }
             }
+            if let Some(callback) = listener_ended {
+                callback("observatory.console");
+            }
         });
-    } else if callbacks.on_console_error.is_some() {
-        return Err(RubError::domain(
-            ErrorCode::BrowserCrashed,
-            "Runtime observatory failed to subscribe to console events",
-        ));
     }
 
     if let Some(callback) = callbacks.on_page_error.clone()
-        && let Ok(mut listener) = page.event_listener::<EventExceptionThrown>().await
+        && let Some(mut listener) = page_error_listener
     {
         let generation_rx = listener_generation_rx.clone();
+        let listener_ended = callbacks.on_listener_ended.clone();
         tokio::spawn(async move {
             let mut generation_rx = generation_rx;
             while let Some(event) =
@@ -196,19 +299,18 @@ pub(crate) async fn ensure_page_observatory(
                     source: event.exception_details.url.clone(),
                 });
             }
+            if let Some(callback) = listener_ended {
+                callback("observatory.page_error");
+            }
         });
-    } else if callbacks.on_page_error.is_some() {
-        return Err(RubError::domain(
-            ErrorCode::BrowserCrashed,
-            "Runtime observatory failed to subscribe to page exception events",
-        ));
     }
 
-    if let Ok(mut listener) = page.event_listener::<EventRequestWillBeSent>().await {
+    if let Some(mut listener) = request_will_be_sent_listener {
         let pending_registry = pending_registry.clone();
         let request_correlation = request_correlation.clone();
         let on_request_record = callbacks.on_request_record.clone();
         let on_runtime_degraded = callbacks.on_runtime_degraded.clone();
+        let listener_ended = callbacks.on_listener_ended.clone();
         let tab_target_id = tab_target_id.clone();
         let generation_rx = listener_generation_rx.clone();
         tokio::spawn(async move {
@@ -268,22 +370,19 @@ pub(crate) async fn ensure_page_observatory(
                     callback(build_request_record(&current));
                 }
             }
+            if let Some(callback) = listener_ended {
+                callback("observatory.request_will_be_sent");
+            }
         });
-    } else {
-        return Err(RubError::domain(
-            ErrorCode::BrowserCrashed,
-            "Runtime observatory failed to subscribe to requestWillBeSent events",
-        ));
     }
 
-    if (callbacks.on_request_summary.is_some() || callbacks.on_request_record.is_some())
-        && let Ok(mut listener) = page.event_listener::<EventResponseReceived>().await
-    {
+    if let Some(mut listener) = response_received_listener {
         let on_request_summary = callbacks.on_request_summary.clone();
         let pending_registry = pending_registry.clone();
         let request_correlation = request_correlation.clone();
         let on_request_record = callbacks.on_request_record.clone();
         let on_runtime_degraded = callbacks.on_runtime_degraded.clone();
+        let listener_ended = callbacks.on_listener_ended.clone();
         let tab_target_id = tab_target_id.clone();
         let generation_rx = listener_generation_rx.clone();
         tokio::spawn(async move {
@@ -292,13 +391,26 @@ pub(crate) async fn ensure_page_observatory(
                 next_listener_event(&mut listener, listener_generation, &mut generation_rx).await
             {
                 let request_id = event.request_id.as_ref().to_string();
+                let response_identity = {
+                    pending_registry
+                        .lock()
+                        .await
+                        .peek_terminal_identity(&request_id)
+                };
+                let response_method = response_identity
+                    .as_ref()
+                    .map(|identity| identity.method.clone())
+                    .unwrap_or_else(unknown_request_method);
+                let response_headers = response_identity
+                    .as_ref()
+                    .map(|identity| identity.request_headers.clone());
                 let correlation = if on_request_record.is_some() {
                     peek_request_correlation_with_degraded(
                         &request_correlation,
                         &request_id,
                         &event.response.url,
-                        &unknown_request_method(),
-                        None,
+                        &response_method,
+                        response_headers.as_ref(),
                         Some(&tab_target_id),
                         &on_runtime_degraded,
                     )
@@ -308,8 +420,8 @@ pub(crate) async fn ensure_page_observatory(
                         &request_correlation,
                         &request_id,
                         &event.response.url,
-                        &unknown_request_method(),
-                        None,
+                        &response_method,
+                        response_headers.as_ref(),
                         Some(&tab_target_id),
                         &on_runtime_degraded,
                     )
@@ -345,22 +457,19 @@ pub(crate) async fn ensure_page_observatory(
                     callback(build_request_record(&current));
                 }
             }
+            if let Some(callback) = listener_ended {
+                callback("observatory.response_received");
+            }
         });
-    } else if callbacks.on_request_summary.is_some() || callbacks.on_request_record.is_some() {
-        return Err(RubError::domain(
-            ErrorCode::BrowserCrashed,
-            "Runtime observatory failed to subscribe to responseReceived events",
-        ));
     }
 
-    if (callbacks.on_request_record.is_some() || callbacks.on_request_summary.is_some())
-        && let Ok(mut listener) = page.event_listener::<EventLoadingFinished>().await
-    {
+    if let Some(mut listener) = loading_finished_listener {
         let on_request_record = callbacks.on_request_record.clone();
         let pending_registry = pending_registry.clone();
         let page = page.clone();
         let request_correlation = request_correlation.clone();
         let on_runtime_degraded = callbacks.on_runtime_degraded.clone();
+        let listener_ended = callbacks.on_listener_ended.clone();
         let tab_target_id = tab_target_id.clone();
         let generation_rx = listener_generation_rx.clone();
         tokio::spawn(async move {
@@ -413,24 +522,19 @@ pub(crate) async fn ensure_page_observatory(
                     callback(build_request_record(&pending));
                 }
             }
+            if let Some(callback) = listener_ended {
+                callback("observatory.loading_finished");
+            }
         });
-    } else if callbacks.on_request_record.is_some() || callbacks.on_request_summary.is_some() {
-        return Err(RubError::domain(
-            ErrorCode::BrowserCrashed,
-            "Runtime observatory failed to subscribe to loadingFinished events",
-        ));
     }
 
-    if (callbacks.on_network_failure.is_some()
-        || callbacks.on_request_record.is_some()
-        || callbacks.on_request_summary.is_some())
-        && let Ok(mut listener) = page.event_listener::<EventLoadingFailed>().await
-    {
+    if let Some(mut listener) = loading_failed_listener {
         let on_network_failure = callbacks.on_network_failure.clone();
         let pending_registry = pending_registry.clone();
         let request_correlation = request_correlation.clone();
         let on_request_record = callbacks.on_request_record.clone();
         let on_runtime_degraded = callbacks.on_runtime_degraded.clone();
+        let listener_ended = callbacks.on_listener_ended.clone();
         let tab_target_id = tab_target_id.clone();
         let generation_rx = listener_generation_rx.clone();
         tokio::spawn(async move {
@@ -549,18 +653,21 @@ pub(crate) async fn ensure_page_observatory(
                     callback(build_request_record(&fallback));
                 }
             }
+            if let Some(callback) = listener_ended {
+                callback("observatory.loading_failed");
+            }
         });
-    } else if callbacks.on_network_failure.is_some()
-        || callbacks.on_request_record.is_some()
-        || callbacks.on_request_summary.is_some()
-    {
-        return Err(RubError::domain(
-            ErrorCode::BrowserCrashed,
-            "Runtime observatory failed to subscribe to loadingFailed events",
-        ));
     }
 
     Ok(())
+}
+
+fn needs_loading_finished_listener(callbacks: &ObservatoryCallbacks) -> bool {
+    callbacks.on_request_record.is_some()
+}
+
+fn needs_loading_failed_listener(callbacks: &ObservatoryCallbacks) -> bool {
+    callbacks.on_network_failure.is_some() || callbacks.on_request_record.is_some()
 }
 
 fn console_level(level: &ConsoleApiCalledType) -> Option<&'static str> {

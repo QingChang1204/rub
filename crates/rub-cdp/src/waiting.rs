@@ -13,6 +13,7 @@ const TRANSIENT_RETRY_FLOOR_MS: u64 = 50;
 const TRANSIENT_RETRY_CEILING_MS: u64 = 150;
 const INVALID_SELECTOR_SENTINEL: &str = "__rub_invalid_selector__";
 const AMBIGUOUS_LOCATOR_SENTINEL: &str = "__rub_ambiguous_locator__";
+const GEOMETRY_AUTHORITY_SENTINEL: &str = "__rub_geometry_authority_unavailable__";
 
 #[derive(Debug, Default, Clone)]
 struct WaitFrameContextCache {
@@ -108,6 +109,21 @@ pub(crate) async fn wait_for_condition(
                             &frame_context.frame.frame_id,
                         ));
                     }
+                    if let Some(reason) = serde_json::from_str::<String>(&result)
+                        .ok()
+                        .as_deref()
+                        .and_then(parse_geometry_authority_sentinel)
+                    {
+                        return Err(RubError::domain_with_context(
+                            ErrorCode::InvalidInput,
+                            "Wait interactable probe cannot prove top-level frame geometry authority",
+                            serde_json::json!({
+                                "reason": reason,
+                                "frame_id": frame_context.frame.frame_id,
+                                "authority": "top_level_frame_geometry",
+                            }),
+                        ));
+                    }
                     return Err(RubError::domain_with_context(
                         ErrorCode::BrowserCrashed,
                         format!("Wait probe returned malformed result: {error}"),
@@ -180,7 +196,19 @@ fn classify_terminal_wait_error(message: String) -> Option<RubError> {
 }
 
 fn frame_context_error_is_deterministic(error: &RubError) -> bool {
-    matches!(error, RubError::Domain(envelope) if envelope.code == ErrorCode::InvalidInput)
+    matches!(
+        error,
+        RubError::Domain(envelope)
+            if envelope.code == ErrorCode::InvalidInput
+                && matches!(
+                    envelope
+                        .context
+                        .as_ref()
+                        .and_then(|context| context.get("reason"))
+                        .and_then(|value| value.as_str()),
+                    Some("frame_inventory_missing" | "frame_not_same_origin_accessible")
+                )
+    )
 }
 
 fn parse_ambiguous_locator_sentinel(value: &str) -> Option<usize> {
@@ -188,6 +216,12 @@ fn parse_ambiguous_locator_sentinel(value: &str) -> Option<usize> {
         .strip_prefix(AMBIGUOUS_LOCATOR_SENTINEL)
         .and_then(|suffix| suffix.strip_prefix(':'))
         .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn parse_geometry_authority_sentinel(value: &str) -> Option<&str> {
+    value
+        .strip_prefix(GEOMETRY_AUTHORITY_SENTINEL)
+        .and_then(|suffix| suffix.strip_prefix(':'))
 }
 
 fn wait_locator_ambiguity_error(
@@ -269,6 +303,13 @@ fn locator_wait_script(locator: &CanonicalLocator, state: WaitState) -> Result<S
             format!("Failed to serialize wait ambiguity sentinel: {error}"),
         )
     })?;
+    let geometry_authority =
+        serde_json::to_string(GEOMETRY_AUTHORITY_SENTINEL).map_err(|error| {
+            RubError::domain(
+                ErrorCode::InvalidInput,
+                format!("Failed to serialize wait geometry authority sentinel: {error}"),
+            )
+        })?;
     Ok(format!(
         r#"(() =>{{
             const locator = {locator};
@@ -325,13 +366,20 @@ fn locator_wait_script(locator: &CanonicalLocator, state: WaitState) -> Result<S
                 case 'visible':
                     return JSON.stringify(selected !== null && isVisible(selected));
                 case 'interactable':
-                    return JSON.stringify(selected !== null && isInteractable(selected));
+                    if (selected === null) return JSON.stringify(false);
+                    try {{
+                        return JSON.stringify(isInteractable(selected));
+                    }} catch (error) {{
+                        const reason = String(error && error.message ? error.message : error);
+                        return JSON.stringify({geometry_authority} + ":" + reason);
+                    }}
                 default:
                     return JSON.stringify(selected !== null && isVisible(selected));
             }}
         }})()"#,
         invalid_selector = invalid_selector,
         ambiguous_locator = ambiguous_locator,
+        geometry_authority = geometry_authority,
         top_level_hit_test_helpers = crate::targeting::TOP_LEVEL_HIT_TEST_HELPERS
     ))
 }
@@ -497,6 +545,7 @@ mod cache_tests {
             lineage: vec![frame_id.to_string()],
             execution_context_id: execution_context_id
                 .map(chromiumoxide::cdp::js_protocol::runtime::ExecutionContextId::new),
+            frame_scoped: execution_context_id.is_some(),
         }
     }
 }
@@ -506,8 +555,8 @@ mod tests {
     use super::{
         AMBIGUOUS_LOCATOR_SENTINEL, INVALID_SELECTOR_SENTINEL, classify_terminal_wait_error,
         frame_context_error_is_deterministic, locator_description_wait_script, locator_wait_script,
-        parse_ambiguous_locator_sentinel, text_wait_script, title_wait_script,
-        transient_retry_delay, url_wait_script,
+        parse_ambiguous_locator_sentinel, parse_geometry_authority_sentinel, text_wait_script,
+        title_wait_script, transient_retry_delay, url_wait_script,
     };
     use rub_core::error::{ErrorCode, RubError};
     use rub_core::locator::{CanonicalLocator, LocatorSelection};
@@ -638,6 +687,20 @@ mod tests {
             "{script}"
         );
         assert!(script.contains("current.frameElement"), "{script}");
+        assert!(
+            script.contains("__rub_geometry_authority_unavailable__"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn geometry_authority_sentinel_round_trips_reason() {
+        assert_eq!(
+            parse_geometry_authority_sentinel(
+                "__rub_geometry_authority_unavailable__:top_level_hit_test_parent_chain_unavailable"
+            ),
+            Some("top_level_hit_test_parent_chain_unavailable")
+        );
     }
 
     #[test]
@@ -676,12 +739,26 @@ mod tests {
     }
 
     #[test]
-    fn frame_context_invalid_input_is_not_retried() {
-        let error = RubError::domain(
+    fn frame_inventory_missing_is_deterministic_but_context_churn_is_retryable() {
+        let error = RubError::domain_with_context(
             ErrorCode::InvalidInput,
             "Frame 'child' is not present in the current frame inventory",
+            serde_json::json!({
+                "reason": "frame_inventory_missing",
+                "frame_id": "child",
+            }),
         );
         assert!(frame_context_error_is_deterministic(&error));
+        assert!(!frame_context_error_is_deterministic(
+            &RubError::domain_with_context(
+                ErrorCode::InvalidInput,
+                "Frame 'child' has no live execution context",
+                serde_json::json!({
+                    "reason": "frame_execution_context_missing",
+                    "frame_id": "child",
+                }),
+            )
+        ));
         assert!(!frame_context_error_is_deterministic(&RubError::domain(
             ErrorCode::BrowserCrashed,
             "transient context replacement",

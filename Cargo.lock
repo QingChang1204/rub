@@ -1262,7 +1262,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "uuid",
 ]
 
 [[package]]
@@ -1279,10 +1278,10 @@ dependencies = [
  "rub-ipc",
  "serde",
  "serde_json",
+ "sha1",
  "time",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 

@@ -31,7 +31,6 @@ impl RuntimeObservatoryState {
                 }
                 self.dropped_request_record_count =
                     self.dropped_request_record_count.saturating_add(1);
-                self.mark_degraded("network_request_ring_overflow");
             }
         }
     }
@@ -63,7 +62,6 @@ impl RuntimeObservatoryState {
                 }
                 self.dropped_request_record_count =
                     self.dropped_request_record_count.saturating_add(1);
-                self.mark_degraded("network_request_ring_overflow");
             }
         }
     }
@@ -134,8 +132,8 @@ impl RuntimeObservatoryState {
     pub(crate) fn request_window_after(
         &self,
         cursor: u64,
-        total_drop_count: u64,
-        last_observed_drop_count: u64,
+        ingress_drop_count: u64,
+        last_observed_ingress_drop_count: u64,
     ) -> NetworkRequestWindow {
         let records = self.request_records_after(cursor);
         let next_cursor = records
@@ -143,11 +141,12 @@ impl RuntimeObservatoryState {
             .map(|record| record.sequence)
             .max()
             .unwrap_or_else(|| self.request_cursor());
-        let dropped_since_last_poll = total_drop_count > last_observed_drop_count;
-        let cursor_lost_to_eviction =
-            dropped_since_last_poll && cursor < self.last_evicted_request_sequence;
+        let cursor_lost_to_eviction = cursor < self.last_evicted_request_sequence;
+        let ingress_loss_moved = ingress_drop_count > last_observed_ingress_drop_count;
         let degraded_reason = if cursor_lost_to_eviction {
             Some("network_request_ring_overflow".to_string())
+        } else if ingress_loss_moved {
+            Some("network_request_ingress_overflow".to_string())
         } else if self
             .degraded_reason
             .as_deref()
@@ -169,8 +168,8 @@ impl RuntimeObservatoryState {
         &self,
         cursor: u64,
         end_cursor: u64,
-        total_drop_count: u64,
-        last_observed_drop_count: u64,
+        ingress_drop_count: u64,
+        last_observed_ingress_drop_count: u64,
     ) -> NetworkRequestWindow {
         let records = self.request_records_between(cursor, end_cursor);
         let next_cursor = records
@@ -178,11 +177,12 @@ impl RuntimeObservatoryState {
             .map(|record| record.sequence)
             .max()
             .unwrap_or(end_cursor);
-        let dropped_since_last_poll = total_drop_count > last_observed_drop_count;
-        let cursor_lost_to_eviction =
-            dropped_since_last_poll && cursor < self.last_evicted_request_sequence;
+        let cursor_lost_to_eviction = cursor < self.last_evicted_request_sequence;
+        let ingress_loss_moved = ingress_drop_count > last_observed_ingress_drop_count;
         let degraded_reason = if cursor_lost_to_eviction {
             Some("network_request_ring_overflow".to_string())
+        } else if ingress_loss_moved {
+            Some("network_request_ingress_overflow".to_string())
         } else if self
             .degraded_reason
             .as_deref()

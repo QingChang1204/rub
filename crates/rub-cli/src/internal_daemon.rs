@@ -20,19 +20,28 @@ use self::startup_reporting::{
     exit_startup_error, exit_startup_error_with_browser_cleanup, init_tracing, rotate_logs,
 };
 
-fn startup_cleanup_proof_for_request(
+fn startup_cleanup_fallback_proof_for_request(
     connection_request: &ConnectionRequest,
     effective_user_data_dir: Option<&str>,
 ) -> Option<crate::daemon_ctl::StartupCleanupProof> {
     match connection_request {
         ConnectionRequest::CdpUrl { .. } | ConnectionRequest::AutoDiscover => None,
-        ConnectionRequest::Profile { .. }
-        | ConnectionRequest::UserDataDir { .. }
-        | ConnectionRequest::None => Some(crate::daemon_ctl::StartupCleanupProof {
-            kind: crate::daemon_ctl::StartupCleanupAuthorityKind::ManagedBrowserProfile,
-            managed_user_data_dir: effective_user_data_dir?.to_string(),
-            ephemeral: matches!(connection_request, ConnectionRequest::None),
-        }),
+        ConnectionRequest::Profile { dir_name, .. } => {
+            Some(crate::daemon_ctl::StartupCleanupProof {
+                kind: crate::daemon_ctl::StartupCleanupAuthorityKind::ManagedBrowserProfileFallback,
+                managed_user_data_dir: effective_user_data_dir?.to_string(),
+                managed_profile_directory: Some(dir_name.clone()),
+                ephemeral: false,
+            })
+        }
+        ConnectionRequest::UserDataDir { .. } | ConnectionRequest::None => {
+            Some(crate::daemon_ctl::StartupCleanupProof {
+                kind: crate::daemon_ctl::StartupCleanupAuthorityKind::ManagedBrowserProfileFallback,
+                managed_user_data_dir: effective_user_data_dir?.to_string(),
+                managed_profile_directory: None,
+                ephemeral: matches!(connection_request, ConnectionRequest::None),
+            })
+        }
     }
 }
 
@@ -175,7 +184,7 @@ pub async fn run(cli: EffectiveCli) {
         session_paths.download_dir(),
     );
 
-    if let Some(cleanup_proof) = startup_cleanup_proof_for_request(
+    if let Some(cleanup_proof) = startup_cleanup_fallback_proof_for_request(
         &startup_inputs.connection_request,
         startup_inputs.effective_user_data_dir.as_deref(),
     ) && let Some(cleanup_path) = crate::daemon_ctl::startup_cleanup_signal_path()
@@ -236,7 +245,7 @@ mod tests {
     use super::{
         InternalDaemonPathContext, rub_home_startup_error, startup_bootstrap::SESSION_ID_ENV,
         startup_bootstrap::internal_daemon_local_io_error,
-        startup_bootstrap::resolve_startup_session_id, startup_cleanup_proof_for_request,
+        startup_bootstrap::resolve_startup_session_id, startup_cleanup_fallback_proof_for_request,
         startup_reporting::annotate_startup_error_with_browser_cleanup,
     };
     use crate::internal_daemon::startup_bootstrap::internal_daemon_path_state;
@@ -348,21 +357,47 @@ mod tests {
     }
 
     #[test]
-    fn startup_cleanup_proof_is_published_for_managed_launches_only() {
-        let managed = startup_cleanup_proof_for_request(
+    fn startup_cleanup_fallback_proof_is_published_for_managed_launches_only() {
+        let managed = startup_cleanup_fallback_proof_for_request(
             &ConnectionRequest::None,
             Some("/tmp/rub-managed-profile"),
         )
         .expect("managed startup should publish cleanup proof");
         assert_eq!(managed.managed_user_data_dir, "/tmp/rub-managed-profile");
+        assert_eq!(managed.managed_profile_directory, None);
         assert!(managed.ephemeral);
+        assert_eq!(
+            managed.kind,
+            crate::daemon_ctl::StartupCleanupAuthorityKind::ManagedBrowserProfileFallback
+        );
 
-        let external = startup_cleanup_proof_for_request(
+        let external = startup_cleanup_fallback_proof_for_request(
             &ConnectionRequest::CdpUrl {
                 url: "http://127.0.0.1:9222/json/version".to_string(),
             },
             Some("/tmp/unused"),
         );
         assert!(external.is_none());
+    }
+
+    #[test]
+    fn startup_cleanup_fallback_proof_preserves_profile_scoped_authority() {
+        let proof = startup_cleanup_fallback_proof_for_request(
+            &ConnectionRequest::Profile {
+                name: "Work".to_string(),
+                dir_name: "Profile 3".to_string(),
+                resolved_path: "/Users/test/Chrome/Profile 3".to_string(),
+                user_data_root: "/Users/test/Chrome".to_string(),
+            },
+            Some("/Users/test/Chrome"),
+        )
+        .expect("profile startup should publish cleanup proof");
+
+        assert_eq!(proof.managed_user_data_dir, "/Users/test/Chrome");
+        assert_eq!(
+            proof.managed_profile_directory.as_deref(),
+            Some("Profile 3")
+        );
+        assert!(!proof.ephemeral);
     }
 }

@@ -11,7 +11,14 @@ use crate::router::request_args::parse_json_args;
 use crate::router::secret_resolution::{
     attach_secret_resolution_projection, redact_json_value, redact_rub_error,
 };
-use crate::workflow_policy::{workflow_allowed_step_descriptions, workflow_request_allowed};
+use crate::router::timeout_projection::{
+    record_workflow_partial_commit_timeout_projection,
+    record_workflow_pending_step_timeout_projection,
+};
+use crate::workflow_policy::{
+    trigger_workflow_allowed_step_descriptions, trigger_workflow_request_allowed,
+    workflow_allowed_step_descriptions, workflow_request_allowed,
+};
 use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
 
 pub(super) async fn cmd_pipe_with_policy(
@@ -28,16 +35,31 @@ pub(super) async fn cmd_pipe_with_policy(
     let metadata = parsed.metadata;
     let mut completed = Vec::with_capacity(steps.len() + orchestrations.len());
     let mut publish_current_dom_epoch = false;
+    let trigger_owned_workflow = matches!(
+        inheritance_policy,
+        OrchestrationMetadataInheritancePolicy::TriggerAuthoritativeFrame
+    );
 
     for (index, step) in steps.into_iter().enumerate() {
         let command = step.command.as_str();
-        if !workflow_request_allowed(command, &step.args) {
+        let allowed = if trigger_owned_workflow {
+            trigger_workflow_request_allowed(command, &step.args)
+        } else {
+            workflow_request_allowed(command, &step.args)
+        };
+        if !allowed {
+            let allowed_commands = if trigger_owned_workflow {
+                trigger_workflow_allowed_step_descriptions()
+            } else {
+                workflow_allowed_step_descriptions()
+            };
             return Err(RubError::domain_with_context(
                 ErrorCode::InvalidInput,
                 format!("pipe step command '{command}' is not allowed"),
                 serde_json::json!({
                     "step_index": index,
-                    "allowed_commands": workflow_allowed_step_descriptions(),
+                    "allowed_commands": allowed_commands,
+                    "trigger_owned_workflow": trigger_owned_workflow,
                 }),
             ));
         }
@@ -59,6 +81,7 @@ pub(super) async fn cmd_pipe_with_policy(
             ));
         }
 
+        record_workflow_pending_step_timeout_projection("pipe", false, &completed, index);
         let data = match execute_named_command_with_fence(
             router,
             command,
@@ -97,6 +120,7 @@ pub(super) async fn cmd_pipe_with_policy(
         completed.push(workflow_step_projection(
             index, command, step.label, None, data,
         ));
+        record_workflow_partial_commit_timeout_projection("pipe", false, &completed);
     }
 
     for orchestration in orchestrations {
@@ -107,6 +131,7 @@ pub(super) async fn cmd_pipe_with_policy(
             &orchestration,
             step_index,
         )?;
+        record_workflow_pending_step_timeout_projection("pipe", false, &completed, step_index);
         let data = match execute_named_command_with_fence(
             router,
             "orchestration",
@@ -128,6 +153,16 @@ pub(super) async fn cmd_pipe_with_policy(
                 ));
             }
         };
+        if let Err(error) = ensure_embedded_orchestration_registration_committed(&data) {
+            return Err(pipe_step_error(
+                redact_rub_error(RubError::Domain(error), &metadata),
+                step_index,
+                "orchestration",
+                label.as_deref(),
+                &completed,
+                "embedded_orchestration_registration_fence_failed",
+            ));
+        }
         publish_current_dom_epoch |= response_carries_dom_epoch(&data);
         let mut data = data;
         redact_json_value(&mut data, &metadata);
@@ -138,6 +173,7 @@ pub(super) async fn cmd_pipe_with_policy(
             None,
             data,
         ));
+        record_workflow_partial_commit_timeout_projection("pipe", false, &completed);
     }
 
     let mut data = serde_json::json!({
@@ -155,6 +191,76 @@ fn response_carries_dom_epoch(data: &serde_json::Value) -> bool {
     data.get("dom_epoch")
         .and_then(serde_json::Value::as_u64)
         .is_some()
+}
+
+fn ensure_embedded_orchestration_registration_committed(
+    data: &serde_json::Value,
+) -> Result<(), ErrorEnvelope> {
+    let result = data.get("result").ok_or_else(|| {
+        ErrorEnvelope::new(
+            ErrorCode::IpcProtocolError,
+            "Embedded orchestration response did not include result payload",
+        )
+        .with_context(serde_json::json!({
+            "reason": "embedded_orchestration_result_missing",
+        }))
+    })?;
+
+    let rule = result.get("rule").ok_or_else(|| {
+        ErrorEnvelope::new(
+            ErrorCode::IpcProtocolError,
+            "Embedded orchestration response did not include registered rule truth",
+        )
+        .with_context(serde_json::json!({
+            "reason": "embedded_orchestration_rule_missing",
+            "result": result,
+        }))
+    })?;
+
+    let rule_id = rule
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            ErrorEnvelope::new(
+                ErrorCode::IpcProtocolError,
+                "Embedded orchestration response did not include rule.id",
+            )
+            .with_context(serde_json::json!({
+                "reason": "embedded_orchestration_rule_id_missing",
+                "rule": rule,
+            }))
+        })?;
+
+    let status = rule
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            ErrorEnvelope::new(
+                ErrorCode::IpcProtocolError,
+                "Embedded orchestration response did not include rule.status",
+            )
+            .with_context(serde_json::json!({
+                "reason": "embedded_orchestration_rule_status_missing",
+                "rule": rule,
+            }))
+        })?;
+
+    if matches!(status, "armed" | "paused") {
+        return Ok(());
+    }
+
+    Err(ErrorEnvelope::new(
+        ErrorCode::IpcProtocolError,
+        format!(
+            "Embedded orchestration step returned unexpected rule status '{status}' after registration"
+        ),
+    )
+    .with_context(serde_json::json!({
+        "reason": "embedded_orchestration_rule_status_invalid",
+        "rule_id": rule_id,
+        "rule_status": status,
+        "rule": rule,
+    })))
 }
 
 fn pipe_step_error(
@@ -314,5 +420,45 @@ mod tests {
             "dom_epoch": 7,
             "result": { "status": "clicked" }
         })));
+    }
+
+    #[test]
+    fn embedded_orchestration_registration_requires_registered_rule_truth() {
+        ensure_embedded_orchestration_registration_committed(&json!({
+            "result": {
+                "rule": {
+                    "id": 7,
+                    "status": "armed"
+                }
+            }
+        }))
+        .expect("registered embedded orchestration should count as committed");
+
+        let error = ensure_embedded_orchestration_registration_committed(&json!({
+            "result": {
+                "rule": {
+                    "id": 7,
+                    "status": "blocked"
+                }
+            }
+        }))
+        .expect_err("embedded orchestration must fail closed on non-registration rule status");
+        assert_eq!(error.code, ErrorCode::IpcProtocolError);
+        assert_eq!(
+            error
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("embedded_orchestration_rule_status_invalid")
+        );
+        assert_eq!(
+            error
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("rule_status"))
+                .and_then(|value| value.as_str()),
+            Some("blocked")
+        );
     }
 }

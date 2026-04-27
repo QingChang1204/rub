@@ -400,38 +400,36 @@ fn attach_wait_selection_context(
 }
 
 fn wait_probe_args(args: &serde_json::Value) -> Result<WaitProbeArgs, RubError> {
-    let mut filtered = serde_json::Map::new();
-    for key in [
-        "text",
-        "description_contains",
-        "url_contains",
-        "title_contains",
-        "state",
-        "timeout_ms",
-    ] {
-        if let Some(value) = args.get(key) {
-            filtered.insert(key.to_string(), value.clone());
-        }
+    let mut normalized = args
+        .as_object()
+        .cloned()
+        .ok_or_else(|| RubError::domain(ErrorCode::InvalidInput, "wait expects a JSON object"))?;
+    if !normalized.contains_key("element_ref")
+        && let Some(value) = args.get("ref")
+    {
+        normalized.insert("element_ref".to_string(), value.clone());
     }
-    for key in [
-        "index",
-        "selector",
-        "target_text",
-        "role",
-        "label",
-        "testid",
-        "first",
-        "last",
-        "nth",
-    ] {
-        if let Some(value) = args.get(key) {
-            filtered.insert(key.to_string(), value.clone());
-        }
+    parse_json_args(&serde_json::Value::Object(normalized), "wait")
+}
+
+pub(super) fn wait_kind_uses_selected_frame(kind: &WaitKind) -> bool {
+    matches!(
+        kind,
+        WaitKind::Locator { .. } | WaitKind::LocatorDescriptionContains { .. }
+    )
+}
+
+pub(super) async fn effective_wait_frame_id(
+    router: &DaemonRouter,
+    args: &serde_json::Value,
+    state: &Arc<SessionState>,
+    kind: &WaitKind,
+) -> Result<Option<String>, RubError> {
+    if wait_kind_uses_selected_frame(kind) {
+        frame_scope::effective_interaction_frame_id(router, args, state).await
+    } else {
+        Ok(None)
     }
-    if let Some(value) = args.get("element_ref").or_else(|| args.get("ref")) {
-        filtered.insert("element_ref".to_string(), value.clone());
-    }
-    parse_json_args(&serde_json::Value::Object(filtered), "wait")
 }
 
 pub(super) async fn execute_wait_command(
@@ -442,7 +440,7 @@ pub(super) async fn execute_wait_command(
 ) -> Result<serde_json::Value, RubError> {
     let mut parsed = parse_wait_condition(&args, DEFAULT_WAIT_TIMEOUT_MS)?;
     parsed.condition.frame_id =
-        frame_scope::effective_request_frame_id(router, &args, state).await?;
+        effective_wait_frame_id(router, &args, state, &parsed.condition.kind).await?;
     let timeout_ms = parsed.condition.timeout_ms;
     let start = std::time::Instant::now();
     match browser.wait_for(&parsed.condition).await {
@@ -506,7 +504,7 @@ fn wait_outcome_summary(kind_name: &str, condition: &WaitCondition) -> Option<se
             _,
         ) => (
             "confirmed_interactable_target",
-            "The requested target matched the DOM-level interactable wait condition in the current runtime.",
+            "The requested target matched interactable readiness with top-level hit-test geometry authority in the current runtime.",
         ),
         (WaitKind::LocatorDescriptionContains { .. }, _) => (
             "confirmed_target_description",

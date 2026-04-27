@@ -1,4 +1,55 @@
 use super::*;
+use rub_core::model::OrchestrationSessionInfo;
+
+#[derive(Clone, Copy)]
+enum RuleSessionState {
+    Addressable,
+    Missing,
+    NotAddressable,
+}
+
+fn rule_session_state(session: Option<&OrchestrationSessionInfo>) -> RuleSessionState {
+    match session {
+        None => RuleSessionState::Missing,
+        Some(session) if super::orchestration_session_addressability_reason(session).is_some() => {
+            RuleSessionState::NotAddressable
+        }
+        Some(_) => RuleSessionState::Addressable,
+    }
+}
+
+fn unavailable_reason_for_rule_sessions(
+    source: RuleSessionState,
+    target: RuleSessionState,
+) -> Option<String> {
+    match (source, target) {
+        (RuleSessionState::Addressable, RuleSessionState::Addressable) => None,
+        (RuleSessionState::Missing, RuleSessionState::Missing) => {
+            Some("source_and_target_sessions_missing".to_string())
+        }
+        (RuleSessionState::Missing, RuleSessionState::Addressable) => {
+            Some("source_session_missing".to_string())
+        }
+        (RuleSessionState::Addressable, RuleSessionState::Missing) => {
+            Some("target_session_missing".to_string())
+        }
+        (RuleSessionState::NotAddressable, RuleSessionState::Addressable) => {
+            Some("source_session_not_addressable".to_string())
+        }
+        (RuleSessionState::Addressable, RuleSessionState::NotAddressable) => {
+            Some("target_session_not_addressable".to_string())
+        }
+        (RuleSessionState::NotAddressable, RuleSessionState::NotAddressable) => {
+            Some("source_and_target_sessions_not_addressable".to_string())
+        }
+        (RuleSessionState::Missing, RuleSessionState::NotAddressable) => {
+            Some("source_session_missing_target_not_addressable".to_string())
+        }
+        (RuleSessionState::NotAddressable, RuleSessionState::Missing) => {
+            Some("source_session_not_addressable_target_missing".to_string())
+        }
+    }
+}
 
 pub(super) fn orchestration_outcome_event_kind(
     status: OrchestrationRuleStatus,
@@ -36,12 +87,10 @@ impl OrchestrationRuntimeState {
                 rule.target.session_name = session.session_name.clone();
             }
 
-            rule.unavailable_reason = match (source.is_some(), target.is_some()) {
-                (true, true) => None,
-                (false, false) => Some("source_and_target_sessions_missing".to_string()),
-                (false, true) => Some("source_session_missing".to_string()),
-                (true, false) => Some("target_session_missing".to_string()),
-            };
+            rule.unavailable_reason = unavailable_reason_for_rule_sessions(
+                rule_session_state(source),
+                rule_session_state(target),
+            );
 
             if previous_unavailable_reason != rule.unavailable_reason {
                 match (&previous_unavailable_reason, &rule.unavailable_reason) {
@@ -59,6 +108,7 @@ impl OrchestrationRuntimeState {
                         idempotency_key: Some(rule.idempotency_key.clone()),
                         error_code: None,
                         reason: None,
+                        error_context: None,
                         committed_steps: None,
                         total_steps: None,
                     }),
@@ -76,6 +126,7 @@ impl OrchestrationRuntimeState {
                         idempotency_key: Some(rule.idempotency_key.clone()),
                         error_code: None,
                         reason: None,
+                        error_context: None,
                         committed_steps: None,
                         total_steps: None,
                     }),

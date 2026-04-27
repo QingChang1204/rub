@@ -6,7 +6,7 @@ use tokio::net::UnixStream;
 use tokio::time::{Duration, timeout};
 
 use crate::codec::{NdJsonCodec, is_oversized_frame_io_error};
-use crate::protocol::{IPC_PROTOCOL_VERSION, IpcProtocolDecodeError, IpcRequest, IpcResponse};
+use crate::protocol::{IpcProtocolDecodeError, IpcRequest, IpcResponse, MAX_IPC_TIMEOUT_MS};
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 use std::time::Instant;
 
@@ -56,6 +56,41 @@ impl IpcClientError {
         )
     }
 
+    fn replay_sensitive_timeout_suggestion(request: &IpcRequest) -> &'static str {
+        if request.command_id.is_some() {
+            "Retry only through the same command_id or replay-recovery lane; do not send a fresh command."
+        } else {
+            "Treat this request as possibly executed. Do not blindly retry without a command_id."
+        }
+    }
+
+    fn possible_request_write_timeout(request: &IpcRequest, timeout_budget: Duration) -> Self {
+        let mut context = serde_json::json!({
+            "phase": "ipc_request_write",
+            "reason": "ipc_request_write_timeout_after_possible_commit",
+            "command": request.command,
+            "timeout_ms": timeout_budget.as_millis() as u64,
+            "request_commit_state": "possible",
+            "command_id_present": request.command_id.is_some(),
+        });
+        if let Some(context_object) = context.as_object_mut()
+            && let Some(command_id) = request.command_id.as_ref()
+        {
+            context_object.insert("command_id".to_string(), serde_json::json!(command_id));
+        }
+        Self::Protocol(
+            ErrorEnvelope::new(
+                ErrorCode::IpcTimeout,
+                format!(
+                    "IPC request '{}' exceeded local write timeout after the request frame may already have been committed",
+                    request.command
+                ),
+            )
+            .with_context(context)
+            .with_suggestion(Self::replay_sensitive_timeout_suggestion(request)),
+        )
+    }
+
     fn committed_request_timeout(request: &IpcRequest, timeout_budget: Duration) -> Self {
         let mut context = serde_json::json!({
             "phase": "ipc_response_read",
@@ -70,11 +105,6 @@ impl IpcClientError {
         {
             context_object.insert("command_id".to_string(), serde_json::json!(command_id));
         }
-        let suggestion = if request.command_id.is_some() {
-            "Retry only through the same command_id or replay-recovery lane; do not send a fresh command."
-        } else {
-            "Treat this request as possibly executed. Do not blindly retry without a command_id."
-        };
         Self::Protocol(
             ErrorEnvelope::new(
                 ErrorCode::IpcTimeout,
@@ -84,7 +114,40 @@ impl IpcClientError {
                 ),
             )
             .with_context(context)
-            .with_suggestion(suggestion),
+            .with_suggestion(Self::replay_sensitive_timeout_suggestion(request)),
+        )
+    }
+
+    fn committed_response_transport_failure(
+        request: &IpcRequest,
+        timeout_budget: Duration,
+        reason: &'static str,
+        detail: impl fmt::Display,
+    ) -> Self {
+        let mut context = serde_json::json!({
+            "phase": "ipc_response_read",
+            "reason": "ipc_response_transport_failure_after_request_commit",
+            "transport_reason": reason,
+            "command": request.command,
+            "timeout_ms": timeout_budget.as_millis() as u64,
+            "request_committed": true,
+            "command_id_present": request.command_id.is_some(),
+        });
+        if let Some(context_object) = context.as_object_mut()
+            && let Some(command_id) = request.command_id.as_ref()
+        {
+            context_object.insert("command_id".to_string(), serde_json::json!(command_id));
+        }
+        Self::Protocol(
+            ErrorEnvelope::new(
+                ErrorCode::IpcProtocolError,
+                format!(
+                    "IPC response transport failed after request '{}' was committed: {detail}",
+                    request.command
+                ),
+            )
+            .with_context(context)
+            .with_suggestion(Self::replay_sensitive_timeout_suggestion(request)),
         )
     }
 
@@ -95,7 +158,11 @@ impl IpcClientError {
         }
     }
 
-    fn response_read_error(error: Box<dyn Error + Send + Sync>) -> Self {
+    fn response_read_error(
+        request: &IpcRequest,
+        timeout_budget: Duration,
+        error: Box<dyn Error + Send + Sync>,
+    ) -> Self {
         match error.downcast::<IpcProtocolDecodeError>() {
             Ok(protocol_error) => Self::Protocol(protocol_error.into_envelope()),
             Err(error) => match error.downcast::<std::io::Error>() {
@@ -108,7 +175,15 @@ impl IpcClientError {
                     | std::io::ErrorKind::TimedOut
                     | std::io::ErrorKind::Interrupted
                     | std::io::ErrorKind::WouldBlock
-                    | std::io::ErrorKind::BrokenPipe => Self::Transport(*io_error),
+                    | std::io::ErrorKind::BrokenPipe => {
+                        let reason = response_transport_failure_reason(io_error.kind());
+                        Self::committed_response_transport_failure(
+                            request,
+                            timeout_budget,
+                            reason,
+                            io_error,
+                        )
+                    }
                     std::io::ErrorKind::InvalidData
                         if is_oversized_frame_io_error(io_error.as_ref()) =>
                     {
@@ -192,6 +267,31 @@ impl IpcClient {
         })
     }
 
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn from_connected_stream_for_test(stream: UnixStream) -> Self {
+        Self {
+            stream: Some(stream),
+            deferred_socket_path: None,
+            bound_daemon_session_id: None,
+            used: false,
+        }
+    }
+
+    /// Connect to the daemon socket and immediately bind the client to one
+    /// verified daemon authority. This is the preferred path for attach/startup
+    /// callers that have already completed authority proof and need the real
+    /// execution connection to stay inside the same transaction.
+    pub async fn connect_bound(
+        socket_path: &Path,
+        daemon_session_id: impl Into<String>,
+    ) -> Result<Self, std::io::Error> {
+        Self::connect(socket_path)
+            .await?
+            .bind_daemon_session_id(daemon_session_id)
+            .map_err(std::io::Error::other)
+    }
+
     /// Build a single-use client whose first request will lazily connect to
     /// the provided socket path. This lets bootstrap/attach hand the caller a
     /// client bound to a verified daemon authority without opening a second,
@@ -249,6 +349,9 @@ impl IpcClient {
                 .map_err(|error| IpcClientError::transport(std::io::Error::other(error)))?,
             _ => request.clone(),
         };
+        request
+            .validate_contract()
+            .map_err(IpcClientError::protocol)?;
         let encoded_request =
             NdJsonCodec::encode(&request).map_err(IpcClientError::request_encode_error)?;
 
@@ -268,12 +371,39 @@ impl IpcClient {
         };
         self.used = true;
         let (reader, mut writer) = stream.into_split();
-        let timeout_budget = Duration::from_millis(
-            request
-                .timeout_ms
-                .saturating_add(IPC_CLIENT_TIMEOUT_BUFFER_MS),
-        );
-        let deadline = Instant::now() + timeout_budget;
+        let timeout_budget_ms = request
+            .timeout_ms
+            .checked_add(IPC_CLIENT_TIMEOUT_BUFFER_MS)
+            .filter(|timeout_ms| *timeout_ms <= MAX_IPC_TIMEOUT_MS + IPC_CLIENT_TIMEOUT_BUFFER_MS)
+            .ok_or_else(|| {
+                IpcClientError::protocol(
+                    ErrorEnvelope::new(
+                        ErrorCode::IpcProtocolError,
+                        "IPC request timeout_ms exceeds protocol budget",
+                    )
+                    .with_context(serde_json::json!({
+                        "reason": "invalid_ipc_request_contract",
+                        "field": "timeout_ms",
+                        "max_timeout_ms": MAX_IPC_TIMEOUT_MS,
+                        "actual_timeout_ms": request.timeout_ms,
+                    })),
+                )
+            })?;
+        let timeout_budget = Duration::from_millis(timeout_budget_ms);
+        let deadline = Instant::now().checked_add(timeout_budget).ok_or_else(|| {
+            IpcClientError::protocol(
+                ErrorEnvelope::new(
+                    ErrorCode::IpcProtocolError,
+                    "IPC request timeout_ms cannot be projected onto a client deadline",
+                )
+                .with_context(serde_json::json!({
+                    "reason": "invalid_ipc_request_contract",
+                    "field": "timeout_ms",
+                    "max_timeout_ms": MAX_IPC_TIMEOUT_MS,
+                    "actual_timeout_ms": request.timeout_ms,
+                })),
+            )
+        })?;
 
         timeout(timeout_budget, async {
             writer
@@ -283,16 +413,7 @@ impl IpcClient {
             writer.flush().await.map_err(IpcClientError::transport)
         })
         .await
-        .map_err(|_| {
-            IpcClientError::transport(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!(
-                    "IPC request '{}' exceeded local write timeout after {}ms",
-                    request.command,
-                    timeout_budget.as_millis()
-                ),
-            ))
-        })??;
+        .map_err(|_| IpcClientError::possible_request_write_timeout(&request, timeout_budget))??;
 
         let remaining_budget = deadline
             .checked_duration_since(Instant::now())
@@ -309,22 +430,20 @@ impl IpcClient {
             match timeout(remaining_budget, NdJsonCodec::read(&mut buf_reader)).await {
                 Ok(Ok(Some(value))) => value,
                 Ok(Ok(None)) => {
-                    return Err(IpcClientError::transport(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "Daemon closed connection",
-                    )));
+                    return Err(IpcClientError::committed_response_transport_failure(
+                        &request,
+                        timeout_budget,
+                        "eof_before_response_frame",
+                        "daemon closed connection before response frame",
+                    ));
                 }
-                Ok(Err(error)) => match IpcClientError::response_read_error(error) {
-                    IpcClientError::Transport(io_error)
-                        if io_error.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        return Err(IpcClientError::committed_request_timeout(
-                            &request,
-                            timeout_budget,
-                        ));
-                    }
-                    other => return Err(other),
-                },
+                Ok(Err(error)) => {
+                    return Err(IpcClientError::response_read_error(
+                        &request,
+                        timeout_budget,
+                        error,
+                    ));
+                }
                 Err(_) => {
                     return Err(IpcClientError::committed_request_timeout(
                         &request,
@@ -333,43 +452,23 @@ impl IpcClient {
                 }
             };
 
-        let response =
-            IpcResponse::from_value_strict(response_value).map_err(IpcClientError::protocol)?;
-
-        if response.ipc_protocol_version != IPC_PROTOCOL_VERSION {
-            return Err(IpcClientError::protocol(
-                ErrorEnvelope::new(
-                    ErrorCode::IpcVersionMismatch,
-                    format!(
-                        "IPC protocol version mismatch in response: expected {}, got {}",
-                        IPC_PROTOCOL_VERSION, response.ipc_protocol_version
-                    ),
-                )
-                .with_context(serde_json::json!({
-                    "reason": "ipc_response_protocol_version_mismatch",
-                    "expected_protocol_version": IPC_PROTOCOL_VERSION,
-                    "actual_protocol_version": response.ipc_protocol_version,
-                })),
-            ));
-        }
-        if response.command_id != request.command_id {
-            return Err(IpcClientError::protocol(
-                ErrorEnvelope::new(
-                    ErrorCode::IpcProtocolError,
-                    format!(
-                        "IPC response command_id mismatch: expected {:?}, got {:?}",
-                        request.command_id, response.command_id
-                    ),
-                )
-                .with_context(serde_json::json!({
-                    "reason": "ipc_response_command_id_mismatch",
-                    "expected_command_id": request.command_id,
-                    "actual_command_id": response.command_id,
-                })),
-            ));
-        }
+        let response = IpcResponse::from_value_transport(response_value, &request)
+            .map_err(IpcClientError::protocol)?;
 
         Ok(response)
+    }
+}
+
+fn response_transport_failure_reason(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::UnexpectedEof => "partial_ndjson_frame",
+        std::io::ErrorKind::ConnectionReset => "connection_reset",
+        std::io::ErrorKind::ConnectionAborted => "connection_aborted",
+        std::io::ErrorKind::TimedOut => "response_read_timed_out",
+        std::io::ErrorKind::Interrupted => "response_read_interrupted",
+        std::io::ErrorKind::WouldBlock => "response_read_would_block",
+        std::io::ErrorKind::BrokenPipe => "broken_pipe",
+        _ => "ipc_response_transport_failure",
     }
 }
 

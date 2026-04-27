@@ -50,14 +50,43 @@ pub(super) async fn cmd_observe(
     if observation_scope.is_some() || observation_projection.depth_limit.is_some() {
         apply_projection_limit(&mut snapshot, limit);
     }
-    let snapshot = state.cache_snapshot(snapshot).await;
-
     let highlighted_count = router.browser.highlight_elements(&snapshot).await?;
-    let screenshot_result = capture_screenshot_payload(router, full, path).await;
+    let screenshot_result = capture_screenshot_payload(router, full, path, deadline).await;
     let cleanup_result = router.browser.cleanup_highlights().await;
 
-    let screenshot = screenshot_result?;
-    cleanup_result?;
+    let screenshot = match (screenshot_result, cleanup_result) {
+        (Ok(screenshot), Ok(())) => screenshot,
+        (Ok(screenshot), Err(cleanup_error)) => {
+            state.mark_pending_external_dom_change();
+            return Err(RubError::domain_with_context(
+                ErrorCode::InternalError,
+                format!(
+                    "Observe highlight cleanup failed after overlay injection: {cleanup_error}"
+                ),
+                highlight_cleanup_failure_context(
+                    highlighted_count,
+                    path.map(|_| screenshot),
+                    None,
+                ),
+            ));
+        }
+        (Err(error), Ok(())) => return Err(error),
+        (Err(screenshot_error), Err(cleanup_error)) => {
+            state.mark_pending_external_dom_change();
+            return Err(RubError::domain_with_context(
+                ErrorCode::InternalError,
+                format!(
+                    "Observe screenshot capture failed after overlay injection: {screenshot_error}"
+                ),
+                highlight_cleanup_failure_context(
+                    highlighted_count,
+                    None,
+                    Some(cleanup_error.to_string()),
+                ),
+            ));
+        }
+    };
+    let snapshot = state.cache_snapshot(snapshot).await;
 
     let snapshot_summary = match projection_metadata.mode {
         ObservationProjectionMode::Interactive => summarize_snapshot_a11y(&snapshot),
@@ -163,9 +192,61 @@ pub(super) async fn cmd_observe(
     Ok(response)
 }
 
+pub(crate) fn semantic_replay_args(args: &serde_json::Value) -> Option<serde_json::Value> {
+    let parsed: ObserveArgs = super::request_args::parse_json_args(args, "observe").ok()?;
+    let mut projected = serde_json::Map::new();
+    projected.insert("full".to_string(), serde_json::json!(parsed.full));
+    projected.insert("path".to_string(), serde_json::json!(parsed.path));
+    projected.insert("limit".to_string(), serde_json::json!(parsed.limit));
+    copy_semantic_raw_field(args, "compact", &mut projected);
+    copy_semantic_raw_field(args, "depth", &mut projected);
+    copy_semantic_raw_field(args, "scope", &mut projected);
+    copy_semantic_raw_field(args, "scope_selector", &mut projected);
+    copy_semantic_raw_field(args, "scope_role", &mut projected);
+    copy_semantic_raw_field(args, "scope_label", &mut projected);
+    copy_semantic_raw_field(args, "scope_testid", &mut projected);
+    copy_semantic_raw_field(args, "scope_first", &mut projected);
+    copy_semantic_raw_field(args, "scope_last", &mut projected);
+    copy_semantic_raw_field(args, "scope_nth", &mut projected);
+    if let Some(orchestration) = super::frame_scope::semantic_replay_orchestration_metadata(args) {
+        projected.insert("_orchestration".to_string(), orchestration);
+    }
+    Some(serde_json::Value::Object(projected))
+}
+
+fn highlight_cleanup_failure_context(
+    highlighted_count: u32,
+    committed_screenshot: Option<serde_json::Value>,
+    highlight_cleanup_error: Option<String>,
+) -> serde_json::Value {
+    let mut context = serde_json::json!({
+        "reason": "highlight_cleanup_failed_after_dom_mutation",
+        "highlighted_count": highlighted_count,
+        "fallback_authority": "pending_external_dom_change",
+    });
+    if let Some(committed_screenshot) = committed_screenshot {
+        context["committed_screenshot"] = committed_screenshot;
+    }
+    if let Some(highlight_cleanup_error) = highlight_cleanup_error {
+        context["highlight_cleanup_error"] = serde_json::json!(highlight_cleanup_error);
+    }
+    context
+}
+
+fn copy_semantic_raw_field(
+    args: &serde_json::Value,
+    key: &str,
+    projected: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if let Some(value) = args.get(key) {
+        projected.insert(key.to_string(), value.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::args::{ObserveArgs, parse_observe_limit};
+    use super::highlight_cleanup_failure_context;
     use crate::router::request_args::parse_json_args;
     use rub_core::error::ErrorCode;
 
@@ -205,5 +286,27 @@ mod tests {
         )
         .expect("observe payload should accept display-only path metadata");
         assert_eq!(parsed.path.as_deref(), Some("/tmp/observe.png"));
+    }
+
+    #[test]
+    fn highlight_cleanup_failure_context_preserves_committed_artifact_truth() {
+        let committed_screenshot = serde_json::json!({
+            "kind": "screenshot",
+            "path": "/tmp/observe.png",
+            "path_state": {
+                "path_authority": "router.observe_capture_artifact"
+            }
+        });
+
+        let context =
+            highlight_cleanup_failure_context(3, Some(committed_screenshot.clone()), None);
+
+        assert_eq!(
+            context["reason"],
+            "highlight_cleanup_failed_after_dom_mutation"
+        );
+        assert_eq!(context["fallback_authority"], "pending_external_dom_change");
+        assert_eq!(context["highlighted_count"], 3);
+        assert_eq!(context["committed_screenshot"], committed_screenshot);
     }
 }

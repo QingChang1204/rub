@@ -53,6 +53,7 @@ pub(super) async fn attach_browser(
         ..
     } = connection_request
     {
+        state.set_managed_profile_ephemeral(false).await;
         state
             .set_connection_target(Some(ConnectionTarget::Profile {
                 name: name.clone(),
@@ -72,6 +73,7 @@ pub(super) async fn attach_browser(
             let canonical_url = rub_cdp::attachment::canonical_external_browser_identity(url)
                 .await
                 .map_err(|error| error.into_envelope())?;
+            state.set_managed_profile_ephemeral(false).await;
             state
                 .set_connection_target(Some(ConnectionTarget::CdpUrl {
                     url: canonical_url.clone(),
@@ -93,6 +95,12 @@ pub(super) async fn attach_browser(
                 connection_request,
                 ConnectionRequest::UserDataDir { .. } | ConnectionRequest::None
             ) {
+                state
+                    .set_managed_profile_ephemeral(matches!(
+                        connection_request,
+                        ConnectionRequest::None
+                    ))
+                    .await;
                 state
                     .set_connection_target(Some(ConnectionTarget::Managed))
                     .await;

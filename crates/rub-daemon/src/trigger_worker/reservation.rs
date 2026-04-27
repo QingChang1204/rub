@@ -13,6 +13,7 @@ use super::condition::{
     TriggerConditionState, TriggerNetworkProgress, TriggeredTriggerCondition,
     commit_trigger_network_progress, load_trigger_condition_state,
 };
+use super::outcome::contextualize_trigger_error;
 
 pub(super) struct ReservedTriggerExecution {
     pub(super) trigger: TriggerInfo,
@@ -24,6 +25,7 @@ pub(super) struct ReservedTriggerExecution {
 }
 
 pub(super) struct PendingTriggerConditionPolicy {
+    pub(super) expected_lifecycle_generation: u64,
     pub(super) preserved_triggered: Option<TriggeredTriggerCondition>,
     pub(super) requires_revalidation_after_queue: bool,
     pub(super) rule_semantics_fingerprint: String,
@@ -90,6 +92,10 @@ pub(super) async fn complete_trigger_reservation(
             return Ok(None);
         }
     };
+    if live_trigger.lifecycle_generation != condition_policy.expected_lifecycle_generation {
+        drop(transaction);
+        return Ok(None);
+    }
 
     let live_tabs = match refresh_live_trigger_runtime(browser, state).await {
         Ok(tabs) => tabs,
@@ -121,15 +127,19 @@ pub(super) async fn complete_trigger_reservation(
                 Ok(condition) => condition,
                 Err(error) => {
                     drop(transaction);
-                    return Err(ErrorEnvelope::new(
-                        ErrorCode::BrowserCrashed,
-                        format!("trigger condition evaluation failed after queue: {error}"),
+                    return Err(contextualize_trigger_error(
+                        error,
+                        "trigger condition evaluation failed after queue",
                     ));
                 }
             };
         let TriggerConditionState::Triggered(triggered_after_queue) = live_condition else {
             let _ = state
-                .set_trigger_condition_evidence(live_trigger.id, None)
+                .set_trigger_condition_evidence(
+                    live_trigger.id,
+                    live_trigger.lifecycle_generation,
+                    None,
+                )
                 .await;
             commit_trigger_network_progress(worker, fallback_network_progress);
             drop(transaction);
@@ -153,6 +163,7 @@ pub(super) async fn complete_trigger_reservation(
         let _ = state
             .set_trigger_condition_evidence(
                 live_trigger.id,
+                live_trigger.lifecycle_generation,
                 Some(triggered_after_queue.evidence.clone()),
             )
             .await;

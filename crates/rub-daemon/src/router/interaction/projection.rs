@@ -18,9 +18,9 @@ const INTERACTION_BROWSER_EVENT_QUIET_PERIOD: Duration = Duration::from_millis(2
 
 pub(super) struct InteractionObservationBaseline {
     pub(super) observatory_cursor: u64,
-    pub(super) observatory_drop_count: u64,
+    pub(super) observatory_ingress_drop_count: u64,
     pub(super) request_cursor: u64,
-    pub(super) network_request_drop_count: u64,
+    pub(super) network_request_ingress_drop_count: u64,
     pub(super) download_cursor: u64,
     pub(super) download_ingress_drop_count: u64,
     pub(super) download_degraded_reason_before: Option<String>,
@@ -31,9 +31,9 @@ pub(super) struct InteractionObservationBaseline {
 
 pub(super) struct InteractionObservationFence {
     pub(super) observatory_cursor: u64,
-    pub(super) observatory_drop_count: u64,
+    pub(super) observatory_ingress_drop_count: u64,
     pub(super) request_cursor: u64,
-    pub(super) network_request_drop_count: u64,
+    pub(super) network_request_ingress_drop_count: u64,
     pub(super) download_cursor: u64,
     pub(super) download_ingress_drop_count: u64,
     pub(super) download_degraded_reason_after: Option<String>,
@@ -73,9 +73,9 @@ pub(super) async fn capture_interaction_baseline(
     let download_runtime = state.download_runtime().await;
     InteractionObservationBaseline {
         observatory_cursor: state.observatory_cursor().await,
-        observatory_drop_count: state.observatory().await.dropped_event_count,
+        observatory_ingress_drop_count: state.observatory_ingress_drop_count(),
         request_cursor: state.network_request_cursor().await,
-        network_request_drop_count: state.network_request_drop_count().await,
+        network_request_ingress_drop_count: state.network_request_ingress_drop_count(),
         download_cursor: state.download_cursor().await,
         download_ingress_drop_count: state.download_event_ingress_drop_count(),
         download_degraded_reason_before: download_runtime.degraded_reason,
@@ -91,9 +91,9 @@ async fn capture_interaction_observation_fence(
     let download_runtime = state.download_runtime().await;
     InteractionObservationFence {
         observatory_cursor: state.observatory_cursor().await,
-        observatory_drop_count: state.observatory().await.dropped_event_count,
+        observatory_ingress_drop_count: state.observatory_ingress_drop_count(),
         request_cursor: state.network_request_cursor().await,
-        network_request_drop_count: state.network_request_drop_count().await,
+        network_request_ingress_drop_count: state.network_request_ingress_drop_count(),
         download_cursor: state.download_cursor().await,
         download_ingress_drop_count: state.download_event_ingress_drop_count(),
         download_degraded_reason_after: download_runtime.degraded_reason,
@@ -110,16 +110,16 @@ pub(super) async fn capture_interaction_trace_windows(
         .observatory_event_window_between(
             baseline.observatory_cursor,
             fence.observatory_cursor,
-            baseline.observatory_drop_count,
-            fence.observatory_drop_count,
+            baseline.observatory_ingress_drop_count,
+            fence.observatory_ingress_drop_count,
         )
         .await;
     let network_window = state
         .network_request_window_between(
             baseline.request_cursor,
             fence.request_cursor,
-            baseline.network_request_drop_count,
-            fence.network_request_drop_count,
+            baseline.network_request_ingress_drop_count,
+            fence.network_request_ingress_drop_count,
         )
         .await;
     let download_window = state

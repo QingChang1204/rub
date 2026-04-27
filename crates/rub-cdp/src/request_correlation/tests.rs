@@ -1,4 +1,5 @@
 use super::{
+    CORRELATION_AMBIGUOUS_FALLBACK_REASON, CORRELATION_BROWSER_AUTHORITY_REBUILD_FAILED_REASON,
     CORRELATION_LIMIT, CORRELATION_REGISTRY_EVICTED_REASON,
     CORRELATION_REGISTRY_TTL_EXPIRED_REASON, CORRELATION_RELAXED_FALLBACK_REASON,
     CORRELATION_STRICT_FALLBACK_REASON, CORRELATION_TTL, CorrelationFallbackMetrics,
@@ -102,6 +103,17 @@ fn correlation_registry_peek_does_not_consume_entry() {
 }
 
 #[test]
+fn correlation_registry_can_surface_browser_authority_rebuild_failure_degradation() {
+    let mut registry = RequestCorrelationRegistry::default();
+    registry.mark_runtime_degraded(CORRELATION_BROWSER_AUTHORITY_REBUILD_FAILED_REASON);
+
+    assert_eq!(
+        registry.take_degraded_reasons(),
+        vec![CORRELATION_BROWSER_AUTHORITY_REBUILD_FAILED_REASON]
+    );
+}
+
+#[test]
 fn network_id_lookup_isolated_from_fetch_request_id_collisions() {
     let mut registry = RequestCorrelationRegistry::default();
     registry.record(
@@ -194,6 +206,180 @@ fn correlation_registry_expires_stale_entries() {
     assert_eq!(
         registry.take_degraded_reasons(),
         vec![CORRELATION_REGISTRY_TTL_EXPIRED_REASON]
+    );
+}
+
+#[test]
+fn correlation_registry_discard_removes_prerecorded_fetch_authority() {
+    let mut registry = RequestCorrelationRegistry::default();
+    registry.record(
+        "req-rollback".to_string(),
+        Some("net-rollback".to_string()),
+        "GET",
+        RequestCorrelation {
+            tab_target_id: Some("tab-1".to_string()),
+            original_url: "https://example.com/original".to_string(),
+            rewritten_url: Some("https://example.com/final".to_string()),
+            effective_request_headers: None,
+            applied_rule_effects: vec![NetworkRuleEffect {
+                rule_id: 7,
+                kind: NetworkRuleEffectKind::Rewrite,
+            }],
+        },
+    );
+
+    assert!(registry.discard_for_fetch_request_id("req-rollback"));
+    assert!(
+        registry
+            .take_for_request(
+                "req-rollback",
+                "https://example.com/final",
+                "GET",
+                None,
+                Some("tab-1"),
+            )
+            .is_none(),
+        "discard should roll back pre-recorded correlation authority when actuation fails"
+    );
+}
+
+#[test]
+fn repeated_fetch_request_id_replaces_old_entry_and_retires_fallback_authority() {
+    let mut registry = RequestCorrelationRegistry::default();
+    registry.record(
+        "fetch-shared".to_string(),
+        Some("network-old".to_string()),
+        "GET",
+        RequestCorrelation {
+            tab_target_id: Some("tab-1".to_string()),
+            original_url: "https://example.com/old".to_string(),
+            rewritten_url: Some("https://cdn.example.com/old".to_string()),
+            effective_request_headers: None,
+            applied_rule_effects: vec![NetworkRuleEffect {
+                rule_id: 21,
+                kind: NetworkRuleEffectKind::Rewrite,
+            }],
+        },
+    );
+    registry.record(
+        "fetch-shared".to_string(),
+        Some("network-new".to_string()),
+        "GET",
+        RequestCorrelation {
+            tab_target_id: Some("tab-1".to_string()),
+            original_url: "https://example.com/new".to_string(),
+            rewritten_url: Some("https://cdn.example.com/new".to_string()),
+            effective_request_headers: None,
+            applied_rule_effects: vec![NetworkRuleEffect {
+                rule_id: 22,
+                kind: NetworkRuleEffectKind::Rewrite,
+            }],
+        },
+    );
+
+    let resolved = registry
+        .take_for_request(
+            "fetch-shared",
+            "https://cdn.example.com/new",
+            "GET",
+            None,
+            Some("tab-1"),
+        )
+        .expect("latest fetch-space authority should win");
+    assert_eq!(resolved.original_url, "https://example.com/new");
+    assert!(
+        registry
+            .take_for_request(
+                "network-old",
+                "https://cdn.example.com/old",
+                "GET",
+                None,
+                Some("tab-1"),
+            )
+            .is_none(),
+        "replacing a fetch-space authority must retire the superseded network-side alias too"
+    );
+    assert!(
+        registry
+            .peek_for_request(
+                "unrelated-request",
+                "https://cdn.example.com/old",
+                "GET",
+                None,
+                Some("tab-1"),
+            )
+            .is_none(),
+        "replacing a fetch-space authority must remove the superseded unresolved fallback entry"
+    );
+}
+
+#[test]
+fn repeated_network_request_id_replaces_old_entry_and_retires_fallback_authority() {
+    let mut registry = RequestCorrelationRegistry::default();
+    registry.record(
+        "fetch-old".to_string(),
+        Some("network-shared".to_string()),
+        "GET",
+        RequestCorrelation {
+            tab_target_id: Some("tab-1".to_string()),
+            original_url: "https://example.com/old".to_string(),
+            rewritten_url: Some("https://cdn.example.com/old".to_string()),
+            effective_request_headers: None,
+            applied_rule_effects: vec![NetworkRuleEffect {
+                rule_id: 23,
+                kind: NetworkRuleEffectKind::Rewrite,
+            }],
+        },
+    );
+    registry.record(
+        "fetch-new".to_string(),
+        Some("network-shared".to_string()),
+        "GET",
+        RequestCorrelation {
+            tab_target_id: Some("tab-1".to_string()),
+            original_url: "https://example.com/new".to_string(),
+            rewritten_url: Some("https://cdn.example.com/new".to_string()),
+            effective_request_headers: None,
+            applied_rule_effects: vec![NetworkRuleEffect {
+                rule_id: 24,
+                kind: NetworkRuleEffectKind::Rewrite,
+            }],
+        },
+    );
+
+    let resolved = registry
+        .take_for_request(
+            "network-shared",
+            "https://cdn.example.com/new",
+            "GET",
+            None,
+            Some("tab-1"),
+        )
+        .expect("latest network-space authority should win");
+    assert_eq!(resolved.original_url, "https://example.com/new");
+    assert!(
+        registry
+            .take_for_request(
+                "fetch-old",
+                "https://cdn.example.com/old",
+                "GET",
+                None,
+                Some("tab-1"),
+            )
+            .is_none(),
+        "replacing a network-space authority must retire the superseded fetch-side alias too"
+    );
+    assert!(
+        registry
+            .peek_for_request(
+                "unrelated-request",
+                "https://cdn.example.com/old",
+                "GET",
+                None,
+                Some("tab-1"),
+            )
+            .is_none(),
+        "replacing a network-space authority must remove the superseded unresolved fallback entry"
     );
 }
 
@@ -513,6 +699,10 @@ fn correlation_registry_fails_closed_when_relaxed_url_method_match_is_ambiguous(
             )
             .is_none(),
         "relaxed fallback must fail closed when multiple unresolved correlations share URL+method",
+    );
+    assert_eq!(
+        registry.take_degraded_reasons(),
+        vec![CORRELATION_AMBIGUOUS_FALLBACK_REASON]
     );
 }
 

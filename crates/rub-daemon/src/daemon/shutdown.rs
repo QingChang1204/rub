@@ -22,7 +22,8 @@ pub(super) async fn wait_for_transaction_drain_with_timeout(
     poll_interval: std::time::Duration,
 ) {
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut timeout_logged = false;
+    let mut live_timeout_logged = false;
+    let mut post_commit_timeout_logged = false;
     loop {
         let now = tokio::time::Instant::now();
         let in_flight = state
@@ -34,22 +35,43 @@ pub(super) async fn wait_for_transaction_drain_with_timeout(
         let pre_request_response_fences = state
             .pre_request_response_fence_count
             .load(std::sync::atomic::Ordering::SeqCst);
-        if in_flight == 0 && connected == 0 && pre_request_response_fences == 0 {
+        let post_commit_followups = state.pending_post_commit_followup_count();
+        if in_flight == 0
+            && connected == 0
+            && pre_request_response_fences == 0
+            && post_commit_followups == 0
+        {
             break;
         }
         state.record_shutdown_drain_wait(in_flight, connected, pre_request_response_fences);
-        if now >= deadline && !timeout_logged {
+        if now >= deadline
+            && !live_timeout_logged
+            && (in_flight != 0 || connected != 0 || pre_request_response_fences != 0)
+        {
             state.record_shutdown_drain_soft_timeout(
                 in_flight,
                 connected,
                 pre_request_response_fences,
             );
-            timeout_logged = true;
+            live_timeout_logged = true;
             info!(
                 in_flight_count = in_flight,
                 connected_client_count = connected,
                 pre_request_response_fence_count = pre_request_response_fences,
                 "Shutdown drain exceeded the soft budget; continuing to wait because active request or response fences are still authoritative"
+            );
+        }
+        if now >= deadline
+            && !post_commit_timeout_logged
+            && in_flight == 0
+            && connected == 0
+            && pre_request_response_fences == 0
+            && post_commit_followups > 0
+        {
+            post_commit_timeout_logged = true;
+            info!(
+                post_commit_followup_count = post_commit_followups,
+                "Shutdown drain exceeded the soft budget; continuing to wait because downstream post-commit recovery followups are still running"
             );
         }
         tokio::time::sleep(poll_interval).await;

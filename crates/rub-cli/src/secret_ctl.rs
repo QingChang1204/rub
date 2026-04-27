@@ -1,15 +1,14 @@
 use crate::binding_ctl::binding_path_state;
 use crate::commands::{EffectiveCli, SecretSubcommand};
+use crate::output::{self, InteractionTraceMode};
 use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
 use rub_core::fs::FileCommitOutcome;
-use rub_core::model::CommandResult;
 use rub_core::secrets_env::{
     SecretEffectiveSource, SecretsEnvPersistOutcome, is_valid_secret_name,
 };
 use rub_daemon::rub_paths::RubPaths;
 use serde_json::{Value, json};
 use std::path::Path;
-use uuid::Uuid;
 
 const SECRET_REGISTRY_SCHEMA_VERSION: u32 = 1;
 
@@ -41,12 +40,14 @@ pub(crate) fn handle_secret_command(
         SecretSubcommand::Remove { name } => remove_secret_value(&cli.rub_home, name)?,
     };
 
-    let result = CommandResult::success("secret", &cli.session, Uuid::now_v7().to_string(), data);
-    let output = if cli.json_pretty {
-        serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
-    } else {
-        serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
-    };
+    let output = output::format_cli_success(
+        "secret",
+        &cli.session,
+        &cli.rub_home,
+        data,
+        cli.json_pretty,
+        InteractionTraceMode::Compact,
+    );
     println!("{output}");
     Ok(())
 }

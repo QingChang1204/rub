@@ -7,6 +7,7 @@ use super::{
 use crate::binding_memory_ctl::remember_binding_alias;
 use crate::commands::BindingCaptureAuthInputArg;
 use crate::commands::RememberedBindingAliasKindArg;
+use rub_core::error::ErrorCode;
 use rub_core::model::{
     AuthState, BindingAuthInputMode, BindingAuthProvenance, BindingCaptureAttachmentInfo,
     BindingCaptureAuthEvidence, BindingCaptureCandidateInfo, BindingCaptureDiagnostics,
@@ -16,6 +17,7 @@ use rub_core::model::{
     BindingRegistryData, BindingResolution, BindingScope, BindingSessionReference,
     BindingSessionReferenceKind, BindingStatus, StateInspectorStatus,
 };
+use rub_daemon::rub_paths::RubPaths;
 use rub_daemon::session::{
     RegistryAuthoritySnapshot, RegistryEntry, RegistryEntryLiveness, RegistryEntrySnapshot,
     RegistrySessionSnapshot,
@@ -97,6 +99,76 @@ fn write_binding_registry_sorts_aliases() {
 }
 
 #[test]
+fn write_binding_registry_surfaces_rub_home_directory_durability_failure() {
+    let root = std::env::temp_dir().join(format!(
+        "rub-binding-ctl-dir-fence-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let home = root.join("home");
+    let _ = std::fs::remove_dir_all(&root);
+    crate::local_registry::force_directory_sync_failure_once_for_test(&home);
+
+    let registry = BindingRegistryData {
+        schema_version: 1,
+        bindings: vec![sample_binding("alpha", &home)],
+    };
+    let envelope = write_binding_registry(&home, &registry)
+        .expect_err("binding registry must reject unconfirmed RUB_HOME directory fence")
+        .into_envelope();
+
+    assert_eq!(envelope.code, ErrorCode::IoError);
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|context| context.get("reason"))
+            .and_then(|reason| reason.as_str()),
+        Some("binding_rub_home_create_failed")
+    );
+    assert!(
+        envelope
+            .message
+            .contains("forced local registry directory sync failure"),
+        "{}",
+        envelope.message
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn write_binding_registry_rejects_published_only_file_commit() {
+    let home = temp_home();
+    let registry_path = RubPaths::new(&home).bindings_path();
+    crate::local_registry::force_published_write_outcome_once_for_test(&registry_path);
+
+    let registry = BindingRegistryData {
+        schema_version: 1,
+        bindings: vec![sample_binding("alpha", &home)],
+    };
+    let envelope = write_binding_registry(&home, &registry)
+        .expect_err("binding registry must reject published-only file commit")
+        .into_envelope();
+
+    assert_eq!(envelope.code, ErrorCode::IoError);
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|context| context.get("reason"))
+            .and_then(|reason| reason.as_str()),
+        Some("binding_registry_write_failed")
+    );
+    assert!(
+        envelope.message.contains("durability was not confirmed"),
+        "{}",
+        envelope.message
+    );
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
 fn binding_list_projects_conservative_verification_required_status() {
     let home = temp_home();
     let registry = BindingRegistryData {
@@ -135,6 +207,43 @@ fn binding_inspect_projects_external_reattachment_requirement() {
         "external_reattachment_required"
     );
     assert_eq!(projection["result"]["resolution"]["kind"], "no_live_match");
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn binding_projections_surface_live_registry_authority_failure_metadata() {
+    let home = temp_home();
+    let registry = BindingRegistryData {
+        schema_version: 1,
+        bindings: vec![sample_binding("old-admin", &home)],
+    };
+    write_binding_registry(&home, &registry).unwrap();
+    std::fs::write(
+        RubPaths::new(&home).registry_path(),
+        "{ invalid live registry json",
+    )
+    .unwrap();
+
+    let list_projection = project_binding_list(&home).expect("list projection");
+    assert_eq!(
+        list_projection["result"]["live_registry_error"]["code"],
+        "DAEMON_START_FAILED"
+    );
+    assert_eq!(
+        list_projection["result"]["items"][0]["resolution"]["kind"],
+        "live_status_unavailable"
+    );
+
+    let inspect_projection = project_binding_inspect(&home, "old-admin").expect("inspect");
+    assert_eq!(
+        inspect_projection["result"]["live_registry_error"]["code"],
+        "DAEMON_START_FAILED"
+    );
+    assert_eq!(
+        inspect_projection["result"]["resolution"]["kind"],
+        "live_status_unavailable"
+    );
+
     let _ = std::fs::remove_dir_all(home);
 }
 
@@ -184,12 +293,130 @@ fn project_live_status_returns_typed_live_match_resolution() {
 }
 
 #[test]
+fn project_live_status_does_not_reuse_degraded_registry_authority() {
+    let home = temp_home();
+    let mut binding = sample_binding("old-admin", &home);
+    binding.session_reference = Some(BindingSessionReference {
+        kind: BindingSessionReferenceKind::LiveSessionHint,
+        session_id: "sess-1".to_string(),
+        session_name: "default".to_string(),
+    });
+    binding.attachment_identity = Some("profile:Work".to_string());
+    let snapshot = RegistryAuthoritySnapshot {
+        sessions: vec![RegistrySessionSnapshot {
+            session_name: "default".to_string(),
+            entries: vec![RegistryEntrySnapshot {
+                entry: RegistryEntry {
+                    session_id: "sess-1".to_string(),
+                    session_name: "default".to_string(),
+                    pid: 4242,
+                    socket_path: "/tmp/rub.sock".to_string(),
+                    created_at: "2026-04-14T00:00:00Z".to_string(),
+                    ipc_protocol_version: "1".to_string(),
+                    user_data_dir: Some("/Users/test/Chrome".to_string()),
+                    attachment_identity: Some("profile:Work".to_string()),
+                    connection_target: None,
+                },
+                liveness: RegistryEntryLiveness::ProtocolIncompatible,
+                pid_live: true,
+            }],
+        }],
+    };
+
+    let (live_status, resolution) = project_live_status(&binding, Some(&snapshot));
+
+    assert_eq!(live_status.status, BindingStatus::VerificationRequired);
+    assert!(!live_status.live_session_present);
+    assert_eq!(resolution, BindingResolution::NoLiveMatch);
+}
+
+#[test]
 fn project_live_status_does_not_fallback_to_user_data_dir_for_profile_bindings() {
     let home = temp_home();
     let mut binding = sample_binding("old-admin", &home);
     binding.attachment_identity = Some("profile:/Users/test/Chrome/Profile 3".to_string());
     binding.profile_directory_reference = Some("/Users/test/Chrome/Profile 3".to_string());
     binding.user_data_dir_reference = Some("/Users/test/Chrome".to_string());
+    let snapshot = RegistryAuthoritySnapshot {
+        sessions: vec![RegistrySessionSnapshot {
+            session_name: "default".to_string(),
+            entries: vec![RegistryEntrySnapshot {
+                entry: RegistryEntry {
+                    session_id: "sess-other".to_string(),
+                    session_name: "default".to_string(),
+                    pid: 4242,
+                    socket_path: "/tmp/rub.sock".to_string(),
+                    created_at: "2026-04-14T00:00:00Z".to_string(),
+                    ipc_protocol_version: "1".to_string(),
+                    user_data_dir: Some("/Users/test/Chrome".to_string()),
+                    attachment_identity: Some("profile:/Users/test/Chrome/Profile 7".to_string()),
+                    connection_target: None,
+                },
+                liveness: RegistryEntryLiveness::Live,
+                pid_live: true,
+            }],
+        }],
+    };
+
+    let (live_status, resolution) = project_live_status(&binding, Some(&snapshot));
+    assert_eq!(live_status.status, BindingStatus::VerificationRequired);
+    assert_eq!(resolution, BindingResolution::NoLiveMatch);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn project_live_status_uses_captured_attachment_identity_fallback_when_binding_field_is_missing() {
+    let home = temp_home();
+    let mut binding = sample_binding("old-admin", &home);
+    binding.attachment_identity = None;
+    binding.profile_directory_reference = Some("/Users/test/Chrome/Profile 3".to_string());
+    binding.user_data_dir_reference = Some("/Users/test/Chrome".to_string());
+    binding.auth_provenance.captured_from_attachment_identity =
+        Some("profile:/Users/test/Chrome/Profile 3".to_string());
+    let snapshot = RegistryAuthoritySnapshot {
+        sessions: vec![RegistrySessionSnapshot {
+            session_name: "default".to_string(),
+            entries: vec![RegistryEntrySnapshot {
+                entry: RegistryEntry {
+                    session_id: "sess-match".to_string(),
+                    session_name: "default".to_string(),
+                    pid: 4242,
+                    socket_path: "/tmp/rub.sock".to_string(),
+                    created_at: "2026-04-14T00:00:00Z".to_string(),
+                    ipc_protocol_version: "1".to_string(),
+                    user_data_dir: Some("/Users/test/Chrome".to_string()),
+                    attachment_identity: Some("profile:/Users/test/Chrome/Profile 3".to_string()),
+                    connection_target: None,
+                },
+                liveness: RegistryEntryLiveness::Live,
+                pid_live: true,
+            }],
+        }],
+    };
+
+    let (live_status, resolution) = project_live_status(&binding, Some(&snapshot));
+    assert_eq!(live_status.status, BindingStatus::LiveSessionPresent);
+    assert_eq!(
+        resolution,
+        BindingResolution::LiveMatch {
+            matched_by: "attachment_identity".to_string(),
+            session_id: "sess-match".to_string(),
+            session_name: "default".to_string(),
+        }
+    );
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn project_live_status_does_not_drift_to_user_data_dir_when_only_captured_attachment_identity_exists()
+ {
+    let home = temp_home();
+    let mut binding = sample_binding("old-admin", &home);
+    binding.attachment_identity = None;
+    binding.profile_directory_reference = Some("/Users/test/Chrome/Profile 3".to_string());
+    binding.user_data_dir_reference = Some("/Users/test/Chrome".to_string());
+    binding.auth_provenance.captured_from_attachment_identity =
+        Some("profile:/Users/test/Chrome/Profile 3".to_string());
     let snapshot = RegistryAuthoritySnapshot {
         sessions: vec![RegistrySessionSnapshot {
             session_name: "default".to_string(),
@@ -518,13 +745,16 @@ fn build_binding_record_from_explicit_cli_capture_uses_operator_cli_fence() {
     );
     assert_eq!(
         binding.auth_provenance.created_via,
-        BindingCreatedVia::BoundExistingRuntime
+        BindingCreatedVia::CliAuthCompleted
     );
     assert_eq!(
         binding.auth_provenance.auth_input_mode,
         BindingAuthInputMode::Cli
     );
-    assert!(binding.auth_provenance.capture_fence.is_none());
+    assert_eq!(
+        binding.auth_provenance.capture_fence.as_deref(),
+        Some("explicit_cli_auth_capture")
+    );
 }
 
 #[test]

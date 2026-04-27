@@ -210,8 +210,6 @@ pub(super) async fn cmd_state(
         apply_projection_limit(&mut snapshot, limit);
     }
 
-    let snapshot = state.cache_snapshot(snapshot).await;
-
     if let Some(base_id) = diff_base_id {
         let old_snapshot = state.get_snapshot(base_id).await.ok_or_else(|| {
             RubError::domain(
@@ -232,6 +230,7 @@ pub(super) async fn cmd_state(
             ));
         }
         let diff = rub_cdp::dom::diff_snapshots(&old_snapshot, &snapshot);
+        let snapshot = state.cache_snapshot(snapshot).await;
         let mut data = serde_json::json!({});
         attach_subject(
             &mut data,
@@ -254,6 +253,7 @@ pub(super) async fn cmd_state(
         return Ok(data);
     }
 
+    let snapshot = state.cache_snapshot(snapshot).await;
     let frame_id = snapshot.frame_context.frame_id.clone();
     let mut projected = project_snapshot(&snapshot, format)?;
     if let Some((scope, scope_total_count, scope_match_count)) = scoped_metadata {
@@ -287,7 +287,8 @@ pub(super) async fn cmd_scroll(
     let parsed: ScrollArgs = parse_json_args(args, "scroll")?;
     let direction = parse_optional_scroll_direction(parsed.direction.as_deref(), "direction")?;
     let amount = parsed.amount;
-    let selected_frame_id = state.selected_frame_id().await;
+    let selected_frame_id =
+        super::frame_scope::effective_request_frame_id(router, args, state).await?;
     let position = router
         .browser
         .scroll(selected_frame_id.as_deref(), direction, amount)
@@ -446,6 +447,94 @@ pub(super) async fn cmd_reload(
     );
     Ok(CommandDispatchOutcome::new(data)
         .with_pending_external_dom_commit(pending_external_dom_commit))
+}
+
+pub(crate) fn semantic_replay_args(
+    command: &str,
+    args: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    match command {
+        "open" => {
+            let parsed: OpenArgs = parse_json_args(args, "open").ok()?;
+            Some(serde_json::json!({
+                "url": parsed.url,
+                "load_strategy": parse_optional_load_strategy(parsed.load_strategy.as_deref(), "load_strategy").ok()?,
+                "wait_after": args.get("wait_after").cloned(),
+            }))
+        }
+        "state" => {
+            let parsed: StateArgs = parse_json_args(args, "state").ok()?;
+            let mut projected = serde_json::Map::new();
+            projected.insert("limit".to_string(), serde_json::json!(parsed.limit));
+            projected.insert("format".to_string(), serde_json::json!(parsed.format));
+            projected.insert("a11y".to_string(), serde_json::json!(parsed.a11y));
+            projected.insert("viewport".to_string(), serde_json::json!(parsed.viewport));
+            projected.insert("diff".to_string(), serde_json::json!(parsed.diff));
+            projected.insert("listeners".to_string(), serde_json::json!(parsed.listeners));
+            copy_semantic_raw_field(args, "compact", &mut projected);
+            copy_semantic_raw_field(args, "depth", &mut projected);
+            copy_semantic_raw_field(args, "scope", &mut projected);
+            copy_semantic_raw_field(args, "scope_selector", &mut projected);
+            copy_semantic_raw_field(args, "scope_role", &mut projected);
+            copy_semantic_raw_field(args, "scope_label", &mut projected);
+            copy_semantic_raw_field(args, "scope_testid", &mut projected);
+            copy_semantic_raw_field(args, "scope_first", &mut projected);
+            copy_semantic_raw_field(args, "scope_last", &mut projected);
+            copy_semantic_raw_field(args, "scope_nth", &mut projected);
+            if let Some(orchestration) =
+                super::frame_scope::semantic_replay_orchestration_metadata(args)
+            {
+                projected.insert("_orchestration".to_string(), orchestration);
+            }
+            Some(serde_json::Value::Object(projected))
+        }
+        "scroll" => {
+            let parsed: ScrollArgs = parse_json_args(args, "scroll").ok()?;
+            Some(serde_json::json!({
+                "direction": parse_optional_scroll_direction(parsed.direction.as_deref(), "direction").ok()?,
+                "amount": parsed.amount,
+            }))
+        }
+        "reload" => {
+            let parsed: ReloadArgs = parse_json_args(args, "reload").ok()?;
+            Some(serde_json::json!({
+                "load_strategy": parse_optional_load_strategy(parsed.load_strategy.as_deref(), "load_strategy").ok()?,
+                "wait_after": args.get("wait_after").cloned(),
+            }))
+        }
+        "screenshot" => {
+            let parsed: self::args::ScreenshotArgs = parse_json_args(args, "screenshot").ok()?;
+            Some(serde_json::json!({
+                "full": parsed.full,
+                "highlight": parsed.highlight,
+                "path": parsed.path,
+            }))
+        }
+        "switch" => {
+            let parsed: self::args::SwitchArgs = parse_json_args(args, "switch").ok()?;
+            Some(serde_json::json!({
+                "index": parsed.index,
+                "wait_after": args.get("wait_after").cloned(),
+            }))
+        }
+        "close-tab" => {
+            let parsed: self::args::CloseTabArgs = parse_json_args(args, "close-tab").ok()?;
+            Some(serde_json::json!({
+                "index": parsed.index,
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn copy_semantic_raw_field(
+    args: &serde_json::Value,
+    key: &str,
+    projected: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if let Some(value) = args.get(key) {
+        projected.insert(key.to_string(), value.clone());
+    }
 }
 
 #[cfg(test)]

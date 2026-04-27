@@ -2,10 +2,10 @@ use super::RegistryData;
 use super::lock::{flock, unlock};
 use super::validation::validate_registry_data_for_home;
 use crate::rub_paths::RubPaths;
+use rub_core::fs::{FileCommitOutcome, atomic_write_bytes};
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use uuid::Uuid;
 
 fn registry_path(home: &Path) -> PathBuf {
     RubPaths::new(home).registry_path()
@@ -30,7 +30,7 @@ pub(super) fn write_registry(home: &Path, data: &RegistryData) -> std::io::Resul
     with_registry_lock(home, true, |path| store_registry_for_home(home, path, data))
 }
 
-pub(super) fn with_registry_lock<T>(
+pub(crate) fn with_registry_lock<T>(
     home: &Path,
     exclusive: bool,
     f: impl FnOnce(&Path) -> std::io::Result<T>,
@@ -56,7 +56,7 @@ pub(super) fn with_registry_lock<T>(
     }
 }
 
-pub(super) fn load_registry_for_home(home: &Path, path: &Path) -> std::io::Result<RegistryData> {
+pub(crate) fn load_registry_for_home(home: &Path, path: &Path) -> std::io::Result<RegistryData> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -75,26 +75,52 @@ pub(super) fn load_registry_for_home(home: &Path, path: &Path) -> std::io::Resul
     Ok(data)
 }
 
-pub(super) fn store_registry_for_home(
+pub(crate) fn store_registry_for_home(
     home: &Path,
     path: &Path,
     data: &RegistryData,
 ) -> std::io::Result<()> {
     validate_registry_data_for_home(home, data)?;
     let json = serde_json::to_string_pretty(&data).map_err(std::io::Error::other)?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let temp_path = parent.join(format!(".registry.{}.tmp", Uuid::now_v7()));
-    {
-        let mut temp = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)?;
-        temp.write_all(json.as_bytes())?;
-        temp.sync_all()?;
+    let outcome = atomic_write_bytes(path, json.as_bytes(), 0o600)?;
+    require_durable_registry_commit(path, outcome)
+}
+
+fn require_durable_registry_commit(path: &Path, outcome: FileCommitOutcome) -> std::io::Result<()> {
+    if outcome.durability_confirmed() {
+        return Ok(());
     }
-    std::fs::rename(&temp_path, path)?;
-    if let Ok(parent_dir) = std::fs::File::open(parent) {
-        let _ = parent_dir.sync_all();
+    Err(std::io::Error::other(format!(
+        "Registry commit for {} was published but durability was not confirmed",
+        path.display()
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_durable_registry_commit;
+    use rub_core::fs::FileCommitOutcome;
+    use std::path::Path;
+
+    #[test]
+    fn durable_registry_commit_accepts_durable_outcome() {
+        require_durable_registry_commit(
+            Path::new("/tmp/registry.json"),
+            FileCommitOutcome::Durable,
+        )
+        .expect("durable registry outcome should remain a valid commit fence");
     }
-    Ok(())
+
+    #[test]
+    fn durable_registry_commit_rejects_published_only_outcome() {
+        let error = require_durable_registry_commit(
+            Path::new("/tmp/registry.json"),
+            FileCommitOutcome::Published,
+        )
+        .expect_err("published-only registry outcome must not count as a durable authority commit");
+        assert!(
+            error.to_string().contains("durability was not confirmed"),
+            "registry durability error should explain the missing hard fence: {error}"
+        );
+    }
 }

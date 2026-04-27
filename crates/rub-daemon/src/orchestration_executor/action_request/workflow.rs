@@ -1,5 +1,6 @@
 use super::protocol::RemoteDispatchContract;
 use super::*;
+use crate::router::TransactionDeadline;
 use crate::trigger_workflow_bridge::{
     resolve_trigger_workflow_source_bindings, trigger_workflow_source_var_keys,
 };
@@ -247,6 +248,7 @@ pub(crate) async fn resolve_orchestration_workflow_parameterization(
     rule: &OrchestrationRuleInfo,
     payload: &serde_json::Map<String, serde_json::Value>,
     raw_spec: &str,
+    outer_deadline: Option<TransactionDeadline>,
 ) -> Result<
     (
         crate::workflow_params::WorkflowParameterization,
@@ -261,9 +263,15 @@ pub(crate) async fn resolve_orchestration_workflow_parameterization(
         .transpose()
         .map_err(|error| error.into_envelope())?;
     let mut bindings = explicit.unwrap_or_default();
-    let source_bindings =
-        resolve_orchestration_workflow_source_bindings(router, state, runtime, rule, payload)
-            .await?;
+    let source_bindings = resolve_orchestration_workflow_source_bindings(
+        router,
+        state,
+        runtime,
+        rule,
+        payload,
+        outer_deadline,
+    )
+    .await?;
     let mut source_var_keys = source_bindings.keys().cloned().collect::<Vec<_>>();
     source_var_keys.sort();
     for (name, value) in source_bindings {
@@ -291,6 +299,7 @@ pub(crate) async fn resolve_orchestration_workflow_source_bindings(
     runtime: &OrchestrationRuntimeInfo,
     rule: &OrchestrationRuleInfo,
     payload: &serde_json::Map<String, serde_json::Value>,
+    outer_deadline: Option<TransactionDeadline>,
 ) -> Result<std::collections::BTreeMap<String, String>, ErrorEnvelope> {
     if payload.get("source_vars").is_none() {
         return Ok(Default::default());
@@ -309,14 +318,26 @@ pub(crate) async fn resolve_orchestration_workflow_source_bindings(
     })?;
 
     if rule.source.session_id == state.session_id {
-        return resolve_trigger_workflow_source_bindings(
-            &router.browser_port(),
-            source_target_id,
-            rule.source.frame_id.as_deref(),
-            payload,
+        return run_orchestration_future_with_outer_deadline(
+            outer_deadline,
+            || {
+                source_var_timeout_budget_exhausted_error(
+                    &rule.source.session_id,
+                    &rule.source.session_name,
+                )
+            },
+            async {
+                resolve_trigger_workflow_source_bindings(
+                    &router.browser_port(),
+                    source_target_id,
+                    rule.source.frame_id.as_deref(),
+                    payload,
+                )
+                .await
+                .map_err(|error| error.into_envelope())
+            },
         )
-        .await
-        .map_err(|error| error.into_envelope());
+        .await;
     }
 
     let source_session = resolve_source_session(runtime, rule)?;
@@ -325,6 +346,7 @@ pub(crate) async fn resolve_orchestration_workflow_source_bindings(
         source_target_id,
         rule.source.frame_id.as_deref(),
         payload,
+        outer_deadline,
     )
     .await
 }
@@ -333,7 +355,7 @@ pub(crate) fn resolve_source_session<'a>(
     runtime: &'a OrchestrationRuntimeInfo,
     rule: &OrchestrationRuleInfo,
 ) -> Result<&'a OrchestrationSessionInfo, ErrorEnvelope> {
-    runtime
+    let session = runtime
         .known_sessions
         .iter()
         .find(|session| session.session_id == rule.source.session_id)
@@ -350,7 +372,24 @@ pub(crate) fn resolve_source_session<'a>(
                 "source_session_id": rule.source.session_id,
                 "source_session_name": rule.source.session_name,
             }))
-        })
+        })?;
+    if crate::orchestration_runtime::orchestration_session_addressability_reason(session).is_some()
+    {
+        return Err(
+            crate::orchestration_runtime::orchestration_session_not_addressable_error(
+                session,
+                ErrorCode::SessionBusy,
+                format!(
+                    "Source session '{}' is still present but not addressable for orchestration workflow parameterization",
+                    rule.source.session_name
+                ),
+                "orchestration_source_session_not_addressable",
+                "source_session_id",
+                "source_session_name",
+            ),
+        );
+    }
+    Ok(session)
 }
 
 pub(crate) async fn dispatch_to_source_session_for_workflow_bindings(
@@ -358,10 +397,17 @@ pub(crate) async fn dispatch_to_source_session_for_workflow_bindings(
     source_target_id: &str,
     source_frame_id: Option<&str>,
     payload: &serde_json::Map<String, serde_json::Value>,
+    outer_deadline: Option<TransactionDeadline>,
 ) -> Result<std::collections::BTreeMap<String, String>, ErrorEnvelope> {
-    let response = dispatch_remote_orchestration_request(
-        session,
-        "source",
+    let timeout_ms =
+        bounded_orchestration_timeout_ms(ORCHESTRATION_ACTION_BASE_TIMEOUT_MS, outer_deadline)
+            .ok_or_else(|| {
+                source_var_timeout_budget_exhausted_error(
+                    &session.session_id,
+                    &session.session_name,
+                )
+            })?;
+    let request = crate::orchestration_executor::bind_live_orchestration_phase_command_id(
         IpcRequest::new(
             "_orchestration_workflow_source_vars",
             serde_json::json!({
@@ -369,8 +415,14 @@ pub(crate) async fn dispatch_to_source_session_for_workflow_bindings(
                 "frame_id": source_frame_id,
                 "payload": payload,
             }),
-            ORCHESTRATION_ACTION_BASE_TIMEOUT_MS,
+            timeout_ms,
         ),
+        "orchestration_source_workflow_source_vars",
+    )?;
+    let response = dispatch_remote_orchestration_request(
+        session,
+        "source",
+        request,
         RemoteDispatchContract {
             dispatch_subject: "workflow source vars",
             unreachable_reason: "orchestration_source_session_unreachable",
@@ -390,6 +442,21 @@ pub(crate) async fn dispatch_to_source_session_for_workflow_bindings(
         "orchestration_source_var_payload_invalid",
         "orchestration workflow source vars payload",
     )
+}
+
+fn source_var_timeout_budget_exhausted_error(
+    session_id: &str,
+    session_name: &str,
+) -> ErrorEnvelope {
+    ErrorEnvelope::new(
+        ErrorCode::IpcTimeout,
+        "Orchestration workflow source_vars exhausted the caller-owned timeout budget before authoritative source reads completed",
+    )
+    .with_context(serde_json::json!({
+        "reason": "orchestration_source_var_timeout_budget_exhausted",
+        "source_session_id": session_id,
+        "source_session_name": session_name,
+    }))
 }
 
 pub(crate) fn resolve_orchestration_workflow_spec(
@@ -463,11 +530,17 @@ pub(crate) fn orchestration_step_command_id(
     execution_id: &str,
     step_index: u32,
 ) -> String {
-    let identity_scope = command_identity_key.unwrap_or(execution_id);
-    format!(
-        "orchestration:{}:{}:{}",
-        rule.idempotency_key, identity_scope, step_index
-    )
+    if let Some(identity_key) = command_identity_key {
+        format!(
+            "orchestration:{}:{}:{}:{}",
+            rule.idempotency_key, identity_key, execution_id, step_index
+        )
+    } else {
+        format!(
+            "orchestration:{}:{}:{}",
+            rule.idempotency_key, execution_id, step_index
+        )
+    }
 }
 
 pub(crate) fn orchestration_request_meta(
@@ -483,7 +556,7 @@ pub(crate) fn orchestration_request_meta(
         "id": rule.id,
         "execution_id": execution_id,
         "command_identity_kind": if command_identity_key.is_some() {
-            "stable_evidence_key"
+            "execution_scoped_evidence_key"
         } else {
             "execution_attempt"
         },

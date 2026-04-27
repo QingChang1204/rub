@@ -4,12 +4,15 @@ use crate::main_support::command_timeout_error;
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{ConnectionTarget, LaunchPolicyInfo};
 use rub_ipc::client::IpcClient;
+use std::path::Path;
 use std::time::Instant;
 
 use super::ConnectionRequest;
+#[cfg(test)]
+use super::identity::resolve_attachment_identity;
 use super::identity::{
     request_needs_live_attachment_resolution, requested_attachment_identity,
-    resolve_attachment_identity, resolve_attachment_identity_with_deadline,
+    resolve_attachment_identity_with_deadline,
 };
 use super::projection::{requested_connection_projection, requested_session_policy_projection};
 
@@ -38,6 +41,7 @@ pub(crate) async fn validate_existing_session_connection_request(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn validate_existing_session_connection_request_with_deadline(
     cli: &EffectiveCli,
     request: &ConnectionRequest,
@@ -104,6 +108,134 @@ pub(crate) async fn validate_existing_session_connection_request_with_deadline(
             "daemon_session_id": authority.daemon_session_id,
         }),
     ))
+}
+
+pub(crate) async fn validate_existing_session_connection_request_via_authority_probe_with_deadline(
+    cli: &EffectiveCli,
+    request: &ConnectionRequest,
+    authority_socket_path: &Path,
+    expected_daemon_session_id: Option<&str>,
+    deadline: Instant,
+    timeout_ms: u64,
+) -> Result<(), rub_core::error::RubError> {
+    if !requires_existing_session_validation(true, request, cli) {
+        return Ok(());
+    }
+
+    let authority = fetch_existing_session_authority_via_probe(
+        authority_socket_path,
+        expected_daemon_session_id,
+        &cli.session,
+        deadline,
+        timeout_ms,
+    )
+    .await?;
+    let requested_attachment_identity = if request_needs_live_attachment_resolution(
+        authority.attachment_identity.as_deref(),
+        request,
+    ) {
+        resolve_attachment_identity_with_deadline(
+            cli,
+            request,
+            None,
+            deadline,
+            timeout_ms,
+            "existing_session_validation_attachment_identity_resolution",
+        )
+        .await?
+    } else {
+        requested_attachment_identity(cli, request)
+    };
+    if attachment_identity_matches_request(
+        &authority.attachment_identity,
+        requested_attachment_identity.as_deref(),
+        authority.launch_policy.connection_target.as_ref(),
+        request,
+    ) && launch_policy_matches_session_policy(&authority.launch_policy, request, cli)
+    {
+        return Ok(());
+    }
+
+    Err(rub_core::error::RubError::domain_with_context(
+        ErrorCode::InvalidInput,
+        format!(
+            "Session '{}' is already running with a different browser attachment policy. Use a different --session or close the existing daemon first.",
+            cli.session
+        ),
+        serde_json::json!({
+            "requested_attachment_identity": requested_attachment_identity,
+            "current_attachment_identity": authority.attachment_identity,
+            "requested_connection": requested_connection_projection(request),
+            "requested_session_policy": requested_session_policy_projection(request, cli),
+            "current_launch_policy": authority.launch_policy,
+            "daemon_session_id": authority.daemon_session_id,
+        }),
+    ))
+}
+
+async fn fetch_existing_session_authority_via_probe(
+    authority_socket_path: &Path,
+    expected_daemon_session_id: Option<&str>,
+    session_name: &str,
+    deadline: Instant,
+    timeout_ms: u64,
+) -> Result<ExistingSessionAuthority, RubError> {
+    if daemon_ctl::remaining_budget_ms(deadline) == 0 {
+        return Err(command_timeout_error(
+            timeout_ms,
+            "existing_session_validation",
+        ));
+    }
+    let socket_identity = daemon_ctl::current_socket_path_identity(
+        authority_socket_path,
+        "daemon_ctl.validation.socket_path",
+        "existing_session_authority_socket",
+        ErrorCode::IpcProtocolError,
+        "existing_session_validation_socket_identity_read_failed",
+    )?;
+    let mut client = if let Some(daemon_session_id) = expected_daemon_session_id {
+        daemon_ctl::authority_bound_connected_client(
+            authority_socket_path,
+            daemon_session_id,
+            socket_identity,
+            Some(daemon_ctl::AttachBudget {
+                deadline,
+                timeout_ms,
+            }),
+            daemon_ctl::AuthorityBoundConnectSpec {
+                phase: "existing_session_validation_connect",
+                error_code: ErrorCode::IpcProtocolError,
+                message_prefix: "Failed to connect to the existing-session authority socket",
+                path_authority: "daemon_ctl.validation.socket_path",
+                upstream_truth: "existing_session_authority_socket",
+            },
+        )
+        .await?
+    } else {
+        daemon_ctl::connect_ipc_with_retry_until(
+            authority_socket_path,
+            daemon_ctl::AttachBudget {
+                deadline,
+                timeout_ms,
+            },
+            "existing_session_validation_connect",
+            ErrorCode::IpcProtocolError,
+            "Failed to connect to the existing-session authority socket",
+            "daemon_ctl.validation.socket_path",
+            "existing_session_authority_socket",
+        )
+        .await
+        .map_err(|failure| failure.into_error())?
+        .0
+    };
+    fetch_existing_session_authority(
+        &mut client,
+        expected_daemon_session_id,
+        session_name,
+        Some(deadline),
+        Some(timeout_ms),
+    )
+    .await
 }
 
 async fn fetch_existing_session_authority(
@@ -227,21 +359,19 @@ mod tests {
     use super::*;
     use crate::commands::{Commands, RequestedLaunchPolicy};
     use rub_ipc::client::IpcClient;
+    use rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID;
     use rub_ipc::protocol::{IpcRequest, IpcResponse};
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::path::PathBuf;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant};
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
     use tokio::net::UnixListener;
+    use uuid::Uuid;
 
     fn temp_home() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock must be after unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("rsv-{nonce:x}"))
+        std::env::temp_dir().join(format!("rsv-{}", Uuid::now_v7()))
     }
 
     fn cli_with(command: Commands, home: &std::path::Path) -> EffectiveCli {
@@ -261,6 +391,7 @@ mod tests {
             cdp_url: None,
             connect: false,
             profile: None,
+            profile_resolved_path: None,
             use_alias: None,
             no_stealth: false,
             humanize: false,
@@ -290,12 +421,16 @@ mod tests {
             let request: IpcRequest =
                 serde_json::from_str(line.trim_end()).expect("decode handshake request");
             assert_eq!(request.command, "_handshake");
+            assert_eq!(
+                request.command_id.as_deref(),
+                Some(HANDSHAKE_PROBE_COMMAND_ID)
+            );
 
             let mut writer = std_stream;
             let response = IpcResponse::success(
                 "req-1",
                 serde_json::json!({
-                    "daemon_session_id": daemon_session_id,
+                    "daemon_session_id": daemon_session_id.clone(),
                     "launch_policy": {
                         "headless": true,
                         "ignore_cert_errors": false,
@@ -311,7 +446,11 @@ mod tests {
                     },
                     "attachment_identity": attachment_identity,
                 }),
-            );
+            )
+            .with_command_id(HANDSHAKE_PROBE_COMMAND_ID)
+            .expect("probe command_id must be valid")
+            .with_daemon_session_id(daemon_session_id)
+            .expect("daemon_session_id must be valid");
             serde_json::to_writer(&mut writer, &response).expect("encode handshake response");
             writer.write_all(b"\n").expect("newline handshake response");
         })

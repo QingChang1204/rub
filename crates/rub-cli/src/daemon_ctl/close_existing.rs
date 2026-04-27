@@ -3,13 +3,14 @@ use crate::timeout_budget::helpers::mutating_request;
 use rub_core::error::{ErrorCode, RubError};
 use rub_daemon::session::RegistrySessionSnapshot;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::{
-    DaemonConnection, ExistingCloseOutcome, TransientSocketPolicy, connect_ipc_with_retry,
-    detect_or_connect_hardened_until, fetch_handshake_info_with_timeout,
-    ipc_budget_exhausted_error, registry_authority_snapshot,
-    send_existing_request_with_replay_recovery,
+    AttachBudget, AuthorityBoundConnectSpec, CompatibilityDegradedOwnedSession, DaemonConnection,
+    ExistingCloseOutcome, TransientSocketPolicy, compatibility_degraded_owned_from_snapshot,
+    connect_ipc_with_retry_until, current_socket_path_identity, detect_or_connect_hardened_until,
+    fetch_handshake_info_until, ipc_budget_exhausted_error, registry_authority_snapshot,
+    send_existing_request_with_replay_recovery, verify_socket_path_identity,
 };
 
 fn augment_close_existing_error(
@@ -81,6 +82,61 @@ fn close_existing_authority_disappeared_error(
     )
 }
 
+fn close_existing_compatibility_degraded_owned_error(
+    session_name: &str,
+    compatibility_degraded_owned: &CompatibilityDegradedOwnedSession,
+    expected_daemon_session_id: Option<&str>,
+) -> RubError {
+    RubError::domain_with_context(
+        ErrorCode::SessionBusy,
+        format!(
+            "Close target for session '{session_name}' is still owned but compatibility-degraded, so dispatch must fail closed"
+        ),
+        serde_json::json!({
+            "reason": "close_existing_compatibility_degraded_but_owned",
+            "session": session_name,
+            "expected_daemon_session_id": expected_daemon_session_id,
+            "compatibility_degraded_owned": compatibility_degraded_owned,
+        }),
+    )
+}
+
+fn should_normalize_close_existing_connect_error(
+    error: &RubError,
+    compatibility_degraded_owned: &CompatibilityDegradedOwnedSession,
+) -> bool {
+    matches!(
+        error,
+        RubError::Domain(envelope)
+            if envelope.code == ErrorCode::IpcVersionMismatch
+                && envelope
+                    .context
+                    .as_ref()
+                    .and_then(|ctx| ctx.get("reason"))
+                    .and_then(|value| value.as_str())
+                    == Some("hard_cut_upgrade_fence_incomplete")
+                && matches!(
+                    compatibility_degraded_owned.reason,
+                    crate::daemon_ctl::compatibility::CompatibilityDegradedOwnedReason::ProtocolIncompatible
+                        | crate::daemon_ctl::compatibility::CompatibilityDegradedOwnedReason::HardCutReleasePending
+                )
+    )
+}
+
+fn should_normalize_close_selector_resolution_error(
+    error: &RubError,
+    compatibility_degraded_owned: &CompatibilityDegradedOwnedSession,
+) -> bool {
+    !matches!(
+        error,
+        RubError::Domain(envelope) if envelope.code == ErrorCode::IpcTimeout
+    ) && matches!(
+        compatibility_degraded_owned.reason,
+        crate::daemon_ctl::compatibility::CompatibilityDegradedOwnedReason::ProtocolIncompatible
+            | crate::daemon_ctl::compatibility::CompatibilityDegradedOwnedReason::HardCutReleasePending
+    )
+}
+
 fn close_selector_authority_resolution_error(
     requested_attachment_identity: &str,
     candidate_entries: &[rub_daemon::session::RegistryEntry],
@@ -105,16 +161,39 @@ fn close_selector_authority_resolution_error(
     )
 }
 
+fn close_selector_compatibility_degraded_owned_error(
+    requested_attachment_identity: &str,
+    compatibility_degraded_owned: &[CompatibilityDegradedOwnedSession],
+) -> RubError {
+    RubError::domain_with_context(
+        ErrorCode::SessionBusy,
+        format!(
+            "Close selector matched owned attachment authority for '{}' but every candidate remained compatibility-degraded",
+            requested_attachment_identity
+        ),
+        serde_json::json!({
+            "reason": "close_selector_compatibility_degraded_but_owned",
+            "requested_attachment_identity": requested_attachment_identity,
+            "compatibility_degraded_owned_sessions": compatibility_degraded_owned,
+        }),
+    )
+}
+
 fn close_selector_handshake_transport_failed(error: &RubError) -> bool {
     matches!(
         error,
         RubError::Domain(envelope)
-            if envelope
-                .context
-                .as_ref()
-                .and_then(|ctx| ctx.get("reason"))
-                .and_then(|value| value.as_str())
-                == Some("handshake_transport_failed")
+            if matches!(
+                envelope
+                    .context
+                    .as_ref()
+                    .and_then(|ctx| ctx.get("reason"))
+                    .and_then(|value| value.as_str()),
+                Some(
+                    "handshake_transport_failed"
+                        | "ipc_response_transport_failure_after_request_commit"
+                )
+            )
     )
 }
 
@@ -124,22 +203,32 @@ pub(crate) struct ExistingCloseTargetAuthority {
     pub(crate) daemon_session_id: String,
 }
 
-pub async fn close_existing_session(
+#[cfg(test)]
+pub(crate) async fn close_existing_session_until(
     rub_home: &Path,
     session_name: &str,
+    deadline: Instant,
     timeout_ms: u64,
 ) -> Result<ExistingCloseOutcome, RubError> {
-    close_existing_session_targeted(rub_home, session_name, None, timeout_ms).await
+    close_existing_session_targeted_until(rub_home, session_name, None, deadline, timeout_ms).await
 }
 
-pub(crate) async fn close_existing_session_targeted(
+pub(crate) async fn close_existing_session_targeted_until(
     rub_home: &Path,
     session_name: &str,
     expected_daemon_session_id: Option<&str>,
+    deadline: Instant,
     timeout_ms: u64,
 ) -> Result<ExistingCloseOutcome, RubError> {
     if !rub_home.exists() {
         return Ok(ExistingCloseOutcome::Noop);
+    }
+    if super::remaining_budget_ms(deadline) == 0 {
+        return Err(ipc_budget_exhausted_error(
+            None,
+            timeout_ms.max(1),
+            "existing_daemon_connect",
+        ));
     }
 
     let snapshot = registry_authority_snapshot(rub_home)?;
@@ -152,28 +241,58 @@ pub(crate) async fn close_existing_session_targeted(
             session_snapshot,
         ));
     };
+    let compatibility_degraded_owned =
+        compatibility_degraded_owned_from_snapshot(authoritative_entry);
 
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
-
-    let (mut client, daemon_session_id) = match detect_or_connect_hardened_until(
+    let connection = match detect_or_connect_hardened_until(
         rub_home,
         session_name,
         TransientSocketPolicy::FailAfterLock,
         deadline,
         timeout_ms.max(1),
     )
-    .await?
+    .await
     {
+        Ok(connection) => connection,
+        Err(error)
+            if compatibility_degraded_owned
+                .as_ref()
+                .is_some_and(|degraded| {
+                    should_normalize_close_existing_connect_error(&error, degraded)
+                }) =>
+        {
+            return Err(close_existing_compatibility_degraded_owned_error(
+                session_name,
+                compatibility_degraded_owned
+                    .as_ref()
+                    .expect("normalization checked degraded compatibility authority"),
+                expected_daemon_session_id,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let (mut client, daemon_session_id) = match connection {
         DaemonConnection::Connected {
             client,
             daemon_session_id,
+            ..
         } => (client, daemon_session_id),
         DaemonConnection::NeedStart => {
-            return Err(close_existing_authority_disappeared_error(
-                session_name,
-                authoritative_entry.entry.session_id.as_str(),
-                expected_daemon_session_id,
-            ));
+            return Err(
+                if let Some(compatibility_degraded_owned) = compatibility_degraded_owned.as_ref() {
+                    close_existing_compatibility_degraded_owned_error(
+                        session_name,
+                        compatibility_degraded_owned,
+                        expected_daemon_session_id,
+                    )
+                } else {
+                    close_existing_authority_disappeared_error(
+                        session_name,
+                        authoritative_entry.entry.session_id.as_str(),
+                        expected_daemon_session_id,
+                    )
+                },
+            );
         }
     };
     if let Some(expected) = expected_daemon_session_id
@@ -212,13 +331,21 @@ pub(crate) async fn close_existing_session_targeted(
     Ok(ExistingCloseOutcome::Closed(Box::new(response)))
 }
 
-pub(crate) async fn resolve_existing_close_target_by_attachment_identity(
+pub(crate) async fn resolve_existing_close_target_by_attachment_identity_until(
     rub_home: &Path,
     requested_attachment_identity: &str,
+    deadline: Instant,
     timeout_ms: u64,
 ) -> Result<Option<ExistingCloseTargetAuthority>, RubError> {
     if !rub_home.exists() {
         return Ok(None);
+    }
+    if super::remaining_budget_ms(deadline) == 0 {
+        return Err(ipc_budget_exhausted_error(
+            None,
+            timeout_ms.max(1),
+            "close_selector_resolution",
+        ));
     }
 
     let snapshot = registry_authority_snapshot(rub_home)?;
@@ -226,23 +353,27 @@ pub(crate) async fn resolve_existing_close_target_by_attachment_identity(
         return Ok(None);
     }
 
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
     let candidate_entries = snapshot
         .sessions
         .iter()
         .filter_map(|session| {
-            session
-                .authoritative_entry()
-                .map(|entry| entry.entry.clone())
+            session.authoritative_entry().map(|entry| {
+                (
+                    entry.entry.clone(),
+                    compatibility_degraded_owned_from_snapshot(entry),
+                )
+            })
         })
-        .filter(|entry| entry.attachment_identity.as_deref() == Some(requested_attachment_identity))
+        .filter(|(entry, _)| {
+            entry.attachment_identity.as_deref() == Some(requested_attachment_identity)
+        })
         .collect::<Vec<_>>();
     if candidate_entries.is_empty() {
         return Ok(None);
     }
 
     let mut matches = Vec::new();
-    for entry in &candidate_entries {
+    for (entry, compatibility_degraded_owned) in &candidate_entries {
         let remaining_timeout_ms = super::remaining_budget_ms(deadline);
         if remaining_timeout_ms == 0 {
             return Err(ipc_budget_exhausted_error(
@@ -251,9 +382,35 @@ pub(crate) async fn resolve_existing_close_target_by_attachment_identity(
                 "close_selector_resolution",
             ));
         }
+        let attach_budget = AttachBudget {
+            deadline,
+            timeout_ms: timeout_ms.max(1),
+        };
         let socket_path = std::path::PathBuf::from(&entry.socket_path);
-        let (mut client, _attribution) = match connect_ipc_with_retry(
+        let socket_identity = match current_socket_path_identity(
             &socket_path,
+            "daemon_ctl.close_selector.socket_path",
+            "registry_authority_entry",
+            ErrorCode::IpcProtocolError,
+            "close_selector_socket_identity_read_failed",
+        ) {
+            Ok(identity) => identity,
+            Err(error) if close_selector_handshake_transport_failed(&error) => continue,
+            Err(error)
+                if compatibility_degraded_owned
+                    .as_ref()
+                    .is_some_and(|degraded| {
+                        should_normalize_close_selector_resolution_error(&error, degraded)
+                    }) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let (mut client, _attribution) = match connect_ipc_with_retry_until(
+            &socket_path,
+            attach_budget,
+            "close_selector_resolution",
             ErrorCode::IpcProtocolError,
             "Failed to connect to existing daemon while resolving close selector authority",
             "daemon_ctl.close_selector.socket_path",
@@ -270,15 +427,47 @@ pub(crate) async fn resolve_existing_close_target_by_attachment_identity(
             {
                 continue;
             }
+            Err(failure)
+                if compatibility_degraded_owned
+                    .as_ref()
+                    .is_some_and(|degraded| {
+                        should_normalize_close_selector_resolution_error(&failure.error, degraded)
+                    }) =>
+            {
+                continue;
+            }
             Err(failure) => return Err(failure.into_error()),
         };
-        let handshake =
-            match fetch_handshake_info_with_timeout(&mut client, remaining_timeout_ms.max(1)).await
+        let identity_spec = AuthorityBoundConnectSpec {
+            phase: "close_selector_resolution",
+            error_code: ErrorCode::IpcProtocolError,
+            message_prefix: "Failed to bind close selector authority",
+            path_authority: "daemon_ctl.close_selector.socket_path",
+            upstream_truth: "registry_authority_entry",
+        };
+        verify_socket_path_identity(&socket_path, socket_identity, &identity_spec)?;
+        let handshake = match fetch_handshake_info_until(
+            &mut client,
+            deadline,
+            timeout_ms.max(1),
+            "close_selector_resolution",
+        )
+        .await
+        {
+            Ok(handshake) => handshake,
+            Err(error) if close_selector_handshake_transport_failed(&error) => continue,
+            Err(error)
+                if compatibility_degraded_owned
+                    .as_ref()
+                    .is_some_and(|degraded| {
+                        should_normalize_close_selector_resolution_error(&error, degraded)
+                    }) =>
             {
-                Ok(handshake) => handshake,
-                Err(error) if close_selector_handshake_transport_failed(&error) => continue,
-                Err(error) => return Err(error),
-            };
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        verify_socket_path_identity(&socket_path, socket_identity, &identity_spec)?;
         if handshake.daemon_session_id != entry.session_id {
             continue;
         }
@@ -312,10 +501,24 @@ pub(crate) async fn resolve_existing_close_target_by_attachment_identity(
     }
 
     if matches.is_empty() {
-        return Err(close_selector_authority_resolution_error(
-            requested_attachment_identity,
-            &candidate_entries,
-        ));
+        let compatibility_degraded_owned = candidate_entries
+            .iter()
+            .filter_map(|(_, compatibility_degraded_owned)| compatibility_degraded_owned.clone())
+            .collect::<Vec<_>>();
+        return Err(if compatibility_degraded_owned.is_empty() {
+            close_selector_authority_resolution_error(
+                requested_attachment_identity,
+                &candidate_entries
+                    .iter()
+                    .map(|(entry, _)| entry.clone())
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            close_selector_compatibility_degraded_owned_error(
+                requested_attachment_identity,
+                &compatibility_degraded_owned,
+            )
+        });
     }
 
     Ok(matches.into_iter().next())
@@ -325,7 +528,11 @@ pub(crate) async fn resolve_existing_close_target_by_attachment_identity(
 mod tests {
     use super::{
         ExistingCloseTargetAuthority, augment_close_existing_error,
-        close_existing_session_targeted, resolve_existing_close_target_by_attachment_identity,
+        close_existing_compatibility_degraded_owned_error, close_existing_session_targeted_until,
+        close_selector_compatibility_degraded_owned_error,
+        resolve_existing_close_target_by_attachment_identity_until,
+        should_normalize_close_existing_connect_error,
+        should_normalize_close_selector_resolution_error,
     };
     use rub_core::error::{ErrorCode, RubError};
     use rub_core::model::LaunchPolicyInfo;
@@ -337,6 +544,8 @@ mod tests {
     use tokio::io::BufReader;
     use tokio::net::UnixListener;
     use uuid::Uuid;
+
+    use crate::daemon_ctl::{CompatibilityDegradedOwnedReason, CompatibilityDegradedOwnedSession};
 
     fn temp_home() -> PathBuf {
         std::env::temp_dir().join(format!("rub-close-existing-{}", Uuid::now_v7()))
@@ -377,6 +586,102 @@ mod tests {
             "{}",
             envelope.message
         );
+    }
+
+    #[test]
+    fn close_existing_compatibility_degraded_owned_error_uses_shared_family() {
+        let envelope = close_existing_compatibility_degraded_owned_error(
+            "default",
+            &CompatibilityDegradedOwnedSession {
+                session: "default".to_string(),
+                daemon_session_id: "sess-default".to_string(),
+                reason: CompatibilityDegradedOwnedReason::ProtocolIncompatible,
+            },
+            Some("sess-default"),
+        )
+        .into_envelope();
+        assert_eq!(envelope.code, ErrorCode::SessionBusy);
+        assert_eq!(
+            envelope.context.as_ref().and_then(|ctx| ctx.get("reason")),
+            Some(&serde_json::json!(
+                "close_existing_compatibility_degraded_but_owned"
+            ))
+        );
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("compatibility_degraded_owned"))
+                .and_then(|value| value.get("reason")),
+            Some(&serde_json::json!("protocol_incompatible"))
+        );
+    }
+
+    #[test]
+    fn close_selector_compatibility_degraded_owned_error_uses_shared_family() {
+        let envelope = close_selector_compatibility_degraded_owned_error(
+            "profile:/tmp/a/Profile 1",
+            &[CompatibilityDegradedOwnedSession {
+                session: "default".to_string(),
+                daemon_session_id: "sess-default".to_string(),
+                reason: CompatibilityDegradedOwnedReason::HardCutReleasePending,
+            }],
+        )
+        .into_envelope();
+        assert_eq!(envelope.code, ErrorCode::SessionBusy);
+        assert_eq!(
+            envelope.context.as_ref().and_then(|ctx| ctx.get("reason")),
+            Some(&serde_json::json!(
+                "close_selector_compatibility_degraded_but_owned"
+            ))
+        );
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("compatibility_degraded_owned_sessions"))
+                .and_then(|value| value.get(0))
+                .and_then(|value| value.get("reason")),
+            Some(&serde_json::json!("hard_cut_release_pending"))
+        );
+    }
+
+    #[test]
+    fn close_existing_normalizes_hard_cut_incomplete_into_shared_family() {
+        let error = RubError::domain_with_context(
+            ErrorCode::IpcVersionMismatch,
+            "hard-cut incomplete",
+            serde_json::json!({
+                "reason": "hard_cut_upgrade_fence_incomplete",
+            }),
+        );
+        assert!(should_normalize_close_existing_connect_error(
+            &error,
+            &CompatibilityDegradedOwnedSession {
+                session: "default".to_string(),
+                daemon_session_id: "sess-default".to_string(),
+                reason: CompatibilityDegradedOwnedReason::ProtocolIncompatible,
+            }
+        ));
+    }
+
+    #[test]
+    fn close_selector_normalizes_ingress_protocol_failures_into_shared_family() {
+        let error = RubError::domain_with_context(
+            ErrorCode::IpcProtocolError,
+            "ingress protocol failed",
+            serde_json::json!({
+                "reason": "ipc_request_protocol_mismatch",
+            }),
+        );
+        assert!(should_normalize_close_selector_resolution_error(
+            &error,
+            &CompatibilityDegradedOwnedSession {
+                session: "default".to_string(),
+                daemon_session_id: "sess-default".to_string(),
+                reason: CompatibilityDegradedOwnedReason::ProtocolIncompatible,
+            }
+        ));
     }
 
     #[tokio::test]
@@ -465,9 +770,16 @@ mod tests {
                 };
                 let (reader, mut writer) = stream.into_split();
                 let mut reader = BufReader::new(reader);
-                let request: serde_json::Value =
-                    NdJsonCodec::read(&mut reader).await.unwrap().unwrap();
+                let Some(request): Option<serde_json::Value> =
+                    NdJsonCodec::read(&mut reader).await.unwrap()
+                else {
+                    continue;
+                };
                 assert_eq!(request["command"], "_handshake");
+                assert_eq!(
+                    request["command_id"],
+                    serde_json::json!(rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID)
+                );
                 let response = IpcResponse::success(
                     "handshake-default",
                     serde_json::json!({
@@ -479,7 +791,11 @@ mod tests {
                         },
                         "attachment_identity": "profile:/tmp/a/Profile 1"
                     }),
-                );
+                )
+                .with_command_id(rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID)
+                .expect("handshake probe command_id must be valid")
+                .with_daemon_session_id("sess-default")
+                .expect("daemon_session_id must be valid");
                 let _ = NdJsonCodec::write(&mut writer, &response).await;
             }
         });
@@ -495,9 +811,16 @@ mod tests {
                 };
                 let (reader, mut writer) = stream.into_split();
                 let mut reader = BufReader::new(reader);
-                let request: serde_json::Value =
-                    NdJsonCodec::read(&mut reader).await.unwrap().unwrap();
+                let Some(request): Option<serde_json::Value> =
+                    NdJsonCodec::read(&mut reader).await.unwrap()
+                else {
+                    continue;
+                };
                 assert_eq!(request["command"], "_handshake");
+                assert_eq!(
+                    request["command_id"],
+                    serde_json::json!(rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID)
+                );
                 let response = IpcResponse::success(
                     "handshake-work",
                     serde_json::json!({
@@ -509,15 +832,20 @@ mod tests {
                         },
                         "attachment_identity": "profile:/tmp/b/Profile 2"
                     }),
-                );
+                )
+                .with_command_id(rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID)
+                .expect("handshake probe command_id must be valid")
+                .with_daemon_session_id("sess-work")
+                .expect("daemon_session_id must be valid");
                 let _ = NdJsonCodec::write(&mut writer, &response).await;
             }
         });
 
-        let resolved = resolve_existing_close_target_by_attachment_identity(
+        let resolved = resolve_existing_close_target_by_attachment_identity_until(
             &home,
             "profile:/tmp/b/Profile 2",
-            1_000,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            2_000,
         )
         .await
         .unwrap();
@@ -585,9 +913,16 @@ mod tests {
                 };
                 let (reader, mut writer) = stream.into_split();
                 let mut reader = BufReader::new(reader);
-                let request: serde_json::Value =
-                    NdJsonCodec::read(&mut reader).await.unwrap().unwrap();
+                let Some(request): Option<serde_json::Value> =
+                    NdJsonCodec::read(&mut reader).await.unwrap()
+                else {
+                    continue;
+                };
                 assert_eq!(request["command"], "_handshake");
+                assert_eq!(
+                    request["command_id"],
+                    serde_json::json!(rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID)
+                );
                 let response = IpcResponse::success(
                     "handshake",
                     serde_json::json!({
@@ -598,15 +933,25 @@ mod tests {
                             "hide_infobars": false
                         }
                     }),
-                );
+                )
+                .with_command_id(rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID)
+                .expect("handshake probe command_id must be valid")
+                .with_daemon_session_id("sess-actual")
+                .expect("daemon_session_id must be valid");
                 let _ = NdJsonCodec::write(&mut writer, &response).await;
             }
         });
 
-        let error = close_existing_session_targeted(&home, "default", Some("sess-other"), 1_000)
-            .await
-            .expect_err("authority mismatch must fail closed")
-            .into_envelope();
+        let error = close_existing_session_targeted_until(
+            &home,
+            "default",
+            Some("sess-other"),
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            2_000,
+        )
+        .await
+        .expect_err("authority mismatch must fail closed")
+        .into_envelope();
         assert_eq!(error.code, ErrorCode::IpcProtocolError);
         assert_eq!(
             error.context.as_ref().and_then(|ctx| ctx.get("reason")),
@@ -650,14 +995,91 @@ mod tests {
         )
         .unwrap();
 
-        let error = close_existing_session_targeted(&home, "default", None, 1_000)
-            .await
-            .expect_err("stale session projection must fail closed")
-            .into_envelope();
+        let error = close_existing_session_targeted_until(
+            &home,
+            "default",
+            None,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            1_000,
+        )
+        .await
+        .expect_err("stale session projection must fail closed")
+        .into_envelope();
         assert_eq!(error.code, ErrorCode::IpcProtocolError);
         assert_eq!(
             error.context.as_ref().and_then(|ctx| ctx.get("reason")),
             Some(&serde_json::json!("close_existing_authority_unavailable"))
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn close_existing_session_targeted_until_respects_callers_shared_deadline() {
+        let home = temp_home();
+        std::fs::create_dir_all(&home).unwrap();
+        let runtime = RubPaths::new(&home).session_runtime("default", "sess-default");
+        std::fs::create_dir_all(runtime.session_dir()).unwrap();
+        std::fs::create_dir_all(
+            runtime
+                .startup_committed_path()
+                .parent()
+                .expect("startup commit parent"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(
+            runtime
+                .socket_path()
+                .parent()
+                .expect("socket path parent should exist"),
+        )
+        .unwrap();
+        let _listener = UnixListener::bind(runtime.socket_path()).unwrap();
+        std::fs::write(runtime.pid_path(), std::process::id().to_string()).unwrap();
+        std::fs::write(runtime.startup_committed_path(), "sess-default").unwrap();
+        write_registry(
+            &home,
+            &RegistryData {
+                sessions: vec![RegistryEntry {
+                    session_id: "sess-default".to_string(),
+                    session_name: "default".to_string(),
+                    pid: std::process::id(),
+                    socket_path: runtime.socket_path().display().to_string(),
+                    created_at: "2026-04-18T00:00:00Z".to_string(),
+                    ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+                    user_data_dir: None,
+                    attachment_identity: None,
+                    connection_target: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let error = close_existing_session_targeted_until(
+            &home,
+            "default",
+            None,
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(1))
+                .unwrap(),
+            1_000,
+        )
+        .await
+        .expect_err("shared close deadline exhaustion must fail closed")
+        .into_envelope();
+        assert_eq!(error.code, ErrorCode::IpcTimeout);
+        assert_eq!(
+            error
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("phase"))
+                .and_then(|value| value.as_str()),
+            Some("existing_daemon_connect")
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "close dispatch must respect the caller-owned deadline instead of restarting timeout"
         );
 
         let _ = std::fs::remove_dir_all(home);
@@ -707,10 +1129,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = BufReader::new(reader);
-            let _request: serde_json::Value =
-                NdJsonCodec::read(&mut reader).await.unwrap().unwrap();
+            let (_reader, mut writer) = stream.into_split();
             let response = IpcResponse::success(
                 "handshake",
                 serde_json::json!({
@@ -730,13 +1149,18 @@ mod tests {
                         stealth_coverage: None,
                     }).unwrap(),
                 }),
-            );
+            )
+            .with_command_id(rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID)
+            .expect("probe command_id must be valid")
+            .with_daemon_session_id("sess-default")
+            .expect("daemon_session_id must be valid");
             let _ = NdJsonCodec::write(&mut writer, &response).await;
         });
 
-        let error = resolve_existing_close_target_by_attachment_identity(
+        let error = resolve_existing_close_target_by_attachment_identity_until(
             &home,
             "user_data_dir:/tmp/profile",
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
             1_000,
         )
         .await
@@ -749,6 +1173,76 @@ mod tests {
         );
 
         server.await.unwrap();
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn resolve_close_target_by_attachment_identity_until_respects_callers_shared_deadline() {
+        let home = temp_home();
+        std::fs::create_dir_all(&home).unwrap();
+        let runtime = RubPaths::new(&home).session_runtime("default", "sess-default");
+        std::fs::create_dir_all(runtime.session_dir()).unwrap();
+        std::fs::create_dir_all(
+            runtime
+                .startup_committed_path()
+                .parent()
+                .expect("startup commit parent"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(
+            runtime
+                .socket_path()
+                .parent()
+                .expect("socket path parent should exist"),
+        )
+        .unwrap();
+        let _listener = UnixListener::bind(runtime.socket_path()).unwrap();
+        std::fs::write(runtime.pid_path(), std::process::id().to_string()).unwrap();
+        std::fs::write(runtime.startup_committed_path(), "sess-default").unwrap();
+        write_registry(
+            &home,
+            &RegistryData {
+                sessions: vec![RegistryEntry {
+                    session_id: "sess-default".to_string(),
+                    session_name: "default".to_string(),
+                    pid: std::process::id(),
+                    socket_path: runtime.socket_path().display().to_string(),
+                    created_at: "2026-04-18T00:00:01Z".to_string(),
+                    ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+                    user_data_dir: Some("/tmp/profile".to_string()),
+                    attachment_identity: Some("user_data_dir:/tmp/profile".to_string()),
+                    connection_target: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let error = resolve_existing_close_target_by_attachment_identity_until(
+            &home,
+            "user_data_dir:/tmp/profile",
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(1))
+                .unwrap(),
+            1_000,
+        )
+        .await
+        .expect_err("shared selector-close deadline exhaustion must fail closed")
+        .into_envelope();
+        assert_eq!(error.code, ErrorCode::IpcTimeout);
+        assert_eq!(
+            error
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("phase"))
+                .and_then(|value| value.as_str()),
+            Some("close_selector_resolution")
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "close target resolution must respect the caller-owned deadline instead of restarting timeout"
+        );
+
         let _ = std::fs::remove_dir_all(home);
     }
 }

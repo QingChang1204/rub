@@ -113,6 +113,8 @@ mod tests {
             state.dropped_request_record_count()
         );
         assert!(projection.dropped_event_count > 0);
+        assert_eq!(projection.status, RuntimeObservatoryStatus::Active);
+        assert_eq!(projection.degraded_reason, None);
     }
 
     #[test]
@@ -493,8 +495,7 @@ mod tests {
             });
         }
 
-        let total_drop_count = state.dropped_request_record_count();
-        let window = state.request_window_after(1, total_drop_count, 0);
+        let window = state.request_window_after(1, 0, 0);
         assert!(!window.authoritative);
         assert_eq!(
             window.degraded_reason.as_deref(),
@@ -529,8 +530,7 @@ mod tests {
             });
         }
 
-        let total_drop_count = state.dropped_request_record_count();
-        let lost_window = state.request_window_after(0, total_drop_count, 0);
+        let lost_window = state.request_window_after(0, 0, 0);
         assert!(!lost_window.authoritative);
         assert_eq!(
             lost_window.degraded_reason.as_deref(),
@@ -538,22 +538,156 @@ mod tests {
         );
 
         let recovered_cursor = state.last_evicted_request_sequence;
-        let window = state.request_window_after(recovered_cursor, total_drop_count, 0);
+        let window = state.request_window_after(recovered_cursor, 0, 0);
         assert!(window.authoritative);
         assert_eq!(window.degraded_reason, None);
+    }
+
+    #[test]
+    fn request_window_keeps_stale_cursor_degraded_after_drop_count_stops_moving() {
+        let mut state = RuntimeObservatoryState::default();
+        for index in 0..1_025 {
+            state.upsert_request_record(NetworkRequestRecord {
+                request_id: format!("req-{index}"),
+                sequence: 0,
+                lifecycle: NetworkRequestLifecycle::Completed,
+                url: format!("https://example.com/api/{index}"),
+                method: "GET".to_string(),
+                tab_target_id: None,
+                status: Some(200),
+                request_headers: BTreeMap::new(),
+                response_headers: BTreeMap::new(),
+                request_body: None,
+                response_body: None,
+                original_url: None,
+                rewritten_url: None,
+                applied_rule_effects: Vec::new(),
+                error_text: None,
+                frame_id: None,
+                resource_type: None,
+                mime_type: None,
+            });
+        }
+
+        let lost_window = state.request_window_after(0, 0, 0);
+        assert!(!lost_window.authoritative);
+        assert_eq!(
+            lost_window.degraded_reason.as_deref(),
+            Some("network_request_ring_overflow")
+        );
+
+        let washed_window = state.request_window_after(0, 0, 0);
+        assert!(
+            !washed_window.authoritative,
+            "the same stale cursor must stay degraded even when drop count has stopped moving"
+        );
+        assert_eq!(
+            washed_window.degraded_reason.as_deref(),
+            Some("network_request_ring_overflow")
+        );
     }
 
     #[test]
     fn request_window_treats_non_overflow_degradation_as_non_authoritative() {
         let mut state = RuntimeObservatoryState::default();
         state.mark_degraded("listener_install_failed");
-        let total_drop_count = state.dropped_request_record_count();
-        let window = state.request_window_after(0, total_drop_count, total_drop_count);
+        let window = state.request_window_after(0, 0, 0);
         assert!(!window.authoritative);
         assert_eq!(
             window.degraded_reason.as_deref(),
             Some("listener_install_failed")
         );
+    }
+
+    #[test]
+    fn request_record_overflow_does_not_overwrite_stronger_top_level_degraded_reason() {
+        let mut state = RuntimeObservatoryState::default();
+        state.mark_degraded("listener_install_failed");
+        for index in 0..1_030 {
+            state.upsert_request_record(NetworkRequestRecord {
+                request_id: format!("req-{index}"),
+                sequence: 0,
+                lifecycle: NetworkRequestLifecycle::Completed,
+                url: format!("https://example.com/api/{index}"),
+                method: "GET".to_string(),
+                tab_target_id: None,
+                status: Some(200),
+                request_headers: BTreeMap::new(),
+                response_headers: BTreeMap::new(),
+                request_body: None,
+                response_body: None,
+                original_url: None,
+                rewritten_url: None,
+                applied_rule_effects: Vec::new(),
+                error_text: None,
+                frame_id: None,
+                resource_type: None,
+                mime_type: None,
+            });
+        }
+
+        let projection = state.projection();
+        assert_eq!(projection.status, RuntimeObservatoryStatus::Degraded);
+        assert_eq!(
+            projection.degraded_reason.as_deref(),
+            Some("listener_install_failed")
+        );
+        assert!(projection.dropped_event_count > 0);
+    }
+
+    #[test]
+    fn request_window_treats_ingress_drop_delta_as_non_authoritative() {
+        let mut state = RuntimeObservatoryState::default();
+        state.upsert_request_record(NetworkRequestRecord {
+            request_id: "req-1".to_string(),
+            sequence: 0,
+            lifecycle: NetworkRequestLifecycle::Completed,
+            url: "https://example.com/api/one".to_string(),
+            method: "GET".to_string(),
+            tab_target_id: None,
+            status: Some(200),
+            request_headers: BTreeMap::new(),
+            response_headers: BTreeMap::new(),
+            request_body: None,
+            response_body: None,
+            original_url: None,
+            rewritten_url: None,
+            applied_rule_effects: Vec::new(),
+            error_text: None,
+            frame_id: None,
+            resource_type: None,
+            mime_type: None,
+        });
+        let cursor = state.request_cursor();
+        state.upsert_request_record(NetworkRequestRecord {
+            request_id: "req-2".to_string(),
+            sequence: 0,
+            lifecycle: NetworkRequestLifecycle::Completed,
+            url: "https://example.com/api/two".to_string(),
+            method: "GET".to_string(),
+            tab_target_id: None,
+            status: Some(200),
+            request_headers: BTreeMap::new(),
+            response_headers: BTreeMap::new(),
+            request_body: None,
+            response_body: None,
+            original_url: None,
+            rewritten_url: None,
+            applied_rule_effects: Vec::new(),
+            error_text: None,
+            frame_id: None,
+            resource_type: None,
+            mime_type: None,
+        });
+
+        let window = state.request_window_after(cursor, 1, 0);
+        assert!(!window.authoritative);
+        assert_eq!(
+            window.degraded_reason.as_deref(),
+            Some("network_request_ingress_overflow")
+        );
+        assert_eq!(window.records.len(), 1);
+        assert_eq!(window.records[0].request_id, "req-2");
     }
 
     #[test]
@@ -567,14 +701,111 @@ mod tests {
             });
         }
 
-        let total_drop_count = state.dropped_timeline_event_count();
-        let window: ObservatoryEventWindow =
-            state.event_window_between(0, state.cursor(), total_drop_count, 0);
+        let window: ObservatoryEventWindow = state.event_window_between(0, state.cursor(), 0, 0);
         assert!(!window.authoritative);
         assert_eq!(
             window.degraded_reason.as_deref(),
             Some("observatory_timeline_overflow")
         );
         assert!(!window.events.is_empty());
+    }
+
+    #[test]
+    fn observatory_event_window_keeps_stale_cursor_degraded_after_drop_count_stops_moving() {
+        let mut state = RuntimeObservatoryState::default();
+        for index in 0..70 {
+            state.push_console_error(ConsoleErrorEvent {
+                level: "error".to_string(),
+                message: format!("console-{index}"),
+                source: None,
+            });
+        }
+
+        let lost_window: ObservatoryEventWindow =
+            state.event_window_between(0, state.cursor(), 0, 0);
+        assert!(!lost_window.authoritative);
+        assert_eq!(
+            lost_window.degraded_reason.as_deref(),
+            Some("observatory_timeline_overflow")
+        );
+
+        let washed_window: ObservatoryEventWindow =
+            state.event_window_between(0, state.cursor(), 0, 0);
+        assert!(
+            !washed_window.authoritative,
+            "the same stale cursor must stay degraded even when no new drops arrive"
+        );
+        assert_eq!(
+            washed_window.degraded_reason.as_deref(),
+            Some("observatory_timeline_overflow")
+        );
+    }
+
+    #[test]
+    fn observatory_event_window_treats_ingress_drop_delta_as_non_authoritative() {
+        let mut state = RuntimeObservatoryState::default();
+        state.push_console_error(ConsoleErrorEvent {
+            level: "error".to_string(),
+            message: "before".to_string(),
+            source: None,
+        });
+        let cursor = state.cursor();
+        state.push_console_error(ConsoleErrorEvent {
+            level: "error".to_string(),
+            message: "after".to_string(),
+            source: None,
+        });
+
+        let window: ObservatoryEventWindow =
+            state.event_window_between(cursor, state.cursor(), 1, 0);
+        assert!(!window.authoritative);
+        assert_eq!(
+            window.degraded_reason.as_deref(),
+            Some("observatory_ingress_overflow")
+        );
+        assert_eq!(window.events.len(), 1);
+    }
+
+    #[test]
+    fn observatory_event_window_ignores_request_ring_overflow_when_timeline_authority_holds() {
+        let mut state = RuntimeObservatoryState::default();
+        for index in 0..1_025 {
+            state.upsert_request_record(NetworkRequestRecord {
+                request_id: format!("req-{index}"),
+                sequence: 0,
+                lifecycle: NetworkRequestLifecycle::Completed,
+                url: format!("https://example.com/api/{index}"),
+                method: "GET".to_string(),
+                tab_target_id: None,
+                status: Some(200),
+                request_headers: BTreeMap::new(),
+                response_headers: BTreeMap::new(),
+                request_body: None,
+                response_body: None,
+                original_url: None,
+                rewritten_url: None,
+                applied_rule_effects: Vec::new(),
+                error_text: None,
+                frame_id: None,
+                resource_type: None,
+                mime_type: None,
+            });
+        }
+
+        let cursor = state.cursor();
+        state.push_console_error(ConsoleErrorEvent {
+            level: "error".to_string(),
+            message: "after-request-overflow".to_string(),
+            source: None,
+        });
+
+        let window: ObservatoryEventWindow =
+            state.event_window_between(cursor, state.cursor(), 0, 0);
+        assert!(
+            window.authoritative,
+            "request-record overflow must not invalidate unrelated event-window authority"
+        );
+        assert_eq!(window.degraded_reason, None);
+        assert_eq!(window.events.len(), 1);
     }
 }

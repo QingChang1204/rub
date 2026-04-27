@@ -83,6 +83,8 @@ mod tests {
                 url: "https://app.example.com/home".to_string(),
                 title: "Home".to_string(),
                 active: true,
+                active_authority: None,
+                degraded_reason: None,
             }],
             &RuntimeObservatoryInfo::default(),
             &ReadinessInfo::default(),
@@ -105,6 +107,8 @@ mod tests {
             url: "https://app.example.com/home".to_string(),
             title: "Home".to_string(),
             active: true,
+            active_authority: None,
+            degraded_reason: None,
         }]);
 
         assert_eq!(
@@ -127,6 +131,8 @@ mod tests {
                 url: "https://app.example.com/interstitial".to_string(),
                 title: "Interstitial".to_string(),
                 active: true,
+                active_authority: None,
+                degraded_reason: None,
             }],
             &RuntimeObservatoryInfo::default(),
             &ReadinessInfo::default(),
@@ -148,6 +154,8 @@ mod tests {
                 url: "https://app.example.com/interstitial".to_string(),
                 title: "Interstitial".to_string(),
                 active: true,
+                active_authority: None,
+                degraded_reason: None,
             }],
             &RuntimeObservatoryInfo::default(),
             &ReadinessInfo::default(),
@@ -161,6 +169,8 @@ mod tests {
                 url: "https://app.example.com/home".to_string(),
                 title: "Home".to_string(),
                 active: true,
+                active_authority: None,
+                degraded_reason: None,
             }],
             &RuntimeObservatoryInfo::default(),
             &ReadinessInfo::default(),
@@ -187,6 +197,8 @@ mod tests {
             url: "https://app.example.com/home".to_string(),
             title: "Home".to_string(),
             active: true,
+            active_authority: None,
+            degraded_reason: None,
         }]);
         state.prime_baseline_from_tabs(&[TabInfo {
             index: 0,
@@ -194,6 +206,8 @@ mod tests {
             url: "https://app.example.com/other".to_string(),
             title: "Other".to_string(),
             active: true,
+            active_authority: None,
+            degraded_reason: None,
         }]);
 
         assert_eq!(
@@ -215,6 +229,8 @@ mod tests {
             url: "https://app.example.com/home".to_string(),
             title: "Home".to_string(),
             active: true,
+            active_authority: None,
+            degraded_reason: None,
         }]);
         state.adopt_primary_context_from_tabs(&[TabInfo {
             index: 0,
@@ -222,6 +238,8 @@ mod tests {
             url: "https://example.org/dashboard".to_string(),
             title: "Dashboard".to_string(),
             active: true,
+            active_authority: None,
+            degraded_reason: None,
         }]);
 
         assert_eq!(

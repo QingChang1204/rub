@@ -14,7 +14,8 @@ mod tests {
         BROWSER_EVENT_CRITICAL_SOFT_LIMIT, DOWNLOAD_PROGRESS_OVERFLOW_REASON,
     };
     use rub_core::model::{
-        DialogKind, DialogRuntimeStatus, DownloadMode, DownloadRuntimeStatus, DownloadState,
+        DialogKind, DialogRuntimeInfo, DialogRuntimeStatus, DownloadMode, DownloadRuntimeStatus,
+        DownloadState, PendingDialogInfo,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -40,10 +41,11 @@ mod tests {
             BrowserSessionEvent::DownloadRuntime {
                 browser_sequence,
                 generation: 7,
-                status: DownloadRuntimeStatus::Active,
-                mode: DownloadMode::Managed,
-                download_dir: None,
-                degraded_reason: None,
+                runtime: Box::new(rub_core::model::DownloadRuntimeInfo {
+                    status: DownloadRuntimeStatus::Active,
+                    mode: DownloadMode::Managed,
+                    ..rub_core::model::DownloadRuntimeInfo::default()
+                }),
             },
         );
         let progress_overflow_latched = Arc::new(AtomicBool::new(true));
@@ -104,10 +106,11 @@ mod tests {
             .apply_download_runtime_event_sequenced(
                 7,
                 11,
-                DownloadRuntimeStatus::Active,
-                DownloadMode::Managed,
-                None,
-                None,
+                rub_core::model::DownloadRuntimeInfo {
+                    status: DownloadRuntimeStatus::Active,
+                    mode: DownloadMode::Managed,
+                    ..rub_core::model::DownloadRuntimeInfo::default()
+                },
             )
             .await;
         assert!(applied.applied);
@@ -122,6 +125,89 @@ mod tests {
         let runtime = state.download_runtime().await;
         assert_eq!(runtime.status, DownloadRuntimeStatus::Active);
         assert!(runtime.degraded_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn download_runtime_event_can_restore_active_download_projection_truth() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-browser-event-download-runtime-replay"),
+            None,
+        ));
+        let browser_sequence = state.allocate_browser_event_sequence();
+        let mut pending = BTreeMap::new();
+        pending.insert(
+            browser_sequence,
+            BrowserSessionEvent::DownloadRuntime {
+                browser_sequence,
+                generation: 11,
+                runtime: Box::new(rub_core::model::DownloadRuntimeInfo {
+                    status: DownloadRuntimeStatus::Active,
+                    mode: DownloadMode::Managed,
+                    download_dir: Some("/tmp/rub-downloads".to_string()),
+                    active_downloads: vec![rub_core::model::DownloadEntry {
+                        guid: "guid-runtime-replay".to_string(),
+                        state: DownloadState::InProgress,
+                        url: Some("https://example.test/report.csv".to_string()),
+                        suggested_filename: Some("report.csv".to_string()),
+                        final_path: None,
+                        mime_hint: None,
+                        received_bytes: 64,
+                        total_bytes: Some(128),
+                        started_at: "2026-04-22T00:00:00Z".to_string(),
+                        completed_at: None,
+                        frame_id: Some("frame-main".to_string()),
+                        trigger_command_id: None,
+                    }],
+                    completed_downloads: Vec::new(),
+                    last_download: Some(rub_core::model::DownloadEntry {
+                        guid: "guid-runtime-replay".to_string(),
+                        state: DownloadState::InProgress,
+                        url: Some("https://example.test/report.csv".to_string()),
+                        suggested_filename: Some("report.csv".to_string()),
+                        final_path: None,
+                        mime_hint: None,
+                        received_bytes: 64,
+                        total_bytes: Some(128),
+                        started_at: "2026-04-22T00:00:00Z".to_string(),
+                        completed_at: None,
+                        frame_id: Some("frame-main".to_string()),
+                        trigger_command_id: None,
+                    }),
+                    degraded_reason: None,
+                }),
+            },
+        );
+        let progress_overflow_latched = Arc::new(AtomicBool::new(false));
+        let progress_overflow_latched_generation = Arc::new(AtomicU64::new(0));
+        let progress_overflow_latched_sequence = Arc::new(AtomicU64::new(0));
+        let progress_overflow_coordination = Arc::new(std::sync::Mutex::new(()));
+        let mut next_sequence = 1;
+
+        drain_ready_browser_events(
+            &state,
+            &mut pending,
+            &mut next_sequence,
+            &progress_overflow_coordination,
+            &progress_overflow_latched,
+            &progress_overflow_latched_generation,
+            &progress_overflow_latched_sequence,
+        )
+        .await;
+
+        let runtime = state.download_runtime().await;
+        assert_eq!(runtime.status, DownloadRuntimeStatus::Active);
+        assert_eq!(runtime.active_downloads.len(), 1);
+        assert_eq!(runtime.active_downloads[0].guid, "guid-runtime-replay");
+        assert_eq!(runtime.active_downloads[0].received_bytes, 64);
+        assert_eq!(
+            state
+                .download_entry("guid-runtime-replay")
+                .await
+                .as_ref()
+                .map(|download| download.state),
+            Some(DownloadState::InProgress)
+        );
     }
 
     #[tokio::test]
@@ -241,10 +327,11 @@ mod tests {
         sink.enqueue(BrowserSessionEvent::DownloadRuntime {
             browser_sequence: clear_sequence,
             generation: 7,
-            status: DownloadRuntimeStatus::Active,
-            mode: DownloadMode::Managed,
-            download_dir: None,
-            degraded_reason: None,
+            runtime: Box::new(rub_core::model::DownloadRuntimeInfo {
+                status: DownloadRuntimeStatus::Active,
+                mode: DownloadMode::Managed,
+                ..rub_core::model::DownloadRuntimeInfo::default()
+            }),
         });
 
         let second_overflow_sequence = state.allocate_browser_event_sequence();
@@ -291,10 +378,11 @@ mod tests {
             BrowserSessionEvent::DownloadRuntime {
                 browser_sequence: clear_sequence,
                 generation: 7,
-                status: DownloadRuntimeStatus::Active,
-                mode: DownloadMode::Managed,
-                download_dir: None,
-                degraded_reason: None,
+                runtime: Box::new(rub_core::model::DownloadRuntimeInfo {
+                    status: DownloadRuntimeStatus::Active,
+                    mode: DownloadMode::Managed,
+                    ..rub_core::model::DownloadRuntimeInfo::default()
+                }),
             },
         );
         let progress_overflow_latched = Arc::new(AtomicBool::new(true));
@@ -417,8 +505,10 @@ mod tests {
         sink.enqueue(BrowserSessionEvent::DialogRuntime {
             browser_sequence: state.allocate_browser_event_sequence(),
             generation: 1,
-            status: DialogRuntimeStatus::Active,
-            degraded_reason: None,
+            runtime: Box::new(DialogRuntimeInfo {
+                status: DialogRuntimeStatus::Active,
+                ..DialogRuntimeInfo::default()
+            }),
         });
 
         let metrics = state.browser_event_ingress_metrics().await;
@@ -479,6 +569,76 @@ mod tests {
         assert_eq!(
             runtime.last_result.as_ref().map(|result| result.accepted),
             Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn dialog_runtime_event_replaces_projection_with_failed_rebuild_fallback_truth() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-browser-event-dialog-runtime"),
+            None,
+        ));
+        let sink = BrowserSessionEventSink::new(&state);
+        let sequence = state.allocate_browser_event_sequence();
+
+        sink.enqueue(BrowserSessionEvent::DialogRuntime {
+            browser_sequence: sequence,
+            generation: 4,
+            runtime: Box::new(DialogRuntimeInfo {
+                status: DialogRuntimeStatus::Degraded,
+                degraded_reason: Some("browser_authority_rebuild_failed".to_string()),
+                pending_dialog: Some(PendingDialogInfo {
+                    kind: DialogKind::Alert,
+                    message: "Pending after failed rebuild".to_string(),
+                    default_prompt: None,
+                    url: "https://example.test/dialog".to_string(),
+                    has_browser_handler: false,
+                    opened_at: "2026-04-15T00:00:00Z".to_string(),
+                    frame_id: Some("frame-1".to_string()),
+                    tab_target_id: Some("tab-1".to_string()),
+                }),
+                last_dialog: Some(PendingDialogInfo {
+                    kind: DialogKind::Alert,
+                    message: "Pending after failed rebuild".to_string(),
+                    default_prompt: None,
+                    url: "https://example.test/dialog".to_string(),
+                    has_browser_handler: false,
+                    opened_at: "2026-04-15T00:00:00Z".to_string(),
+                    frame_id: Some("frame-1".to_string()),
+                    tab_target_id: Some("tab-1".to_string()),
+                }),
+                ..DialogRuntimeInfo::default()
+            }),
+        });
+
+        state
+            .wait_for_browser_event_quiescence_since(
+                sequence.saturating_sub(1),
+                Duration::from_millis(100),
+                Duration::from_millis(5),
+            )
+            .await;
+
+        let runtime = state.dialog_runtime().await;
+        assert_eq!(runtime.status, DialogRuntimeStatus::Degraded);
+        assert_eq!(
+            runtime.degraded_reason.as_deref(),
+            Some("browser_authority_rebuild_failed")
+        );
+        assert_eq!(
+            runtime
+                .pending_dialog
+                .as_ref()
+                .map(|dialog| dialog.message.as_str()),
+            Some("Pending after failed rebuild")
+        );
+        assert_eq!(
+            runtime
+                .last_dialog
+                .as_ref()
+                .map(|dialog| dialog.message.as_str()),
+            Some("Pending after failed rebuild")
         );
     }
 }

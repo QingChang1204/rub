@@ -109,12 +109,17 @@ pub fn extract_flag_value(command: &str, flag: &str) -> Option<String> {
     None
 }
 
-pub fn is_chromium_browser_command(command: &str) -> bool {
+fn chromium_command_prefix(command: &str) -> String {
     let lower = command.to_ascii_lowercase();
-    if lower.contains("helper") {
-        return false;
-    }
-    let prefix = lower.split(" --").next().unwrap_or(&lower).trim();
+    lower
+        .split(" --")
+        .next()
+        .unwrap_or(&lower)
+        .trim()
+        .to_string()
+}
+
+fn is_chromium_browser_prefix(prefix: &str) -> bool {
     prefix.ends_with("google chrome")
         || prefix.ends_with("chrome")
         || prefix.ends_with("google-chrome")
@@ -128,6 +133,31 @@ pub fn is_chromium_browser_command(command: &str) -> bool {
         || prefix.ends_with("/chromium")
         || prefix.ends_with("/chromium-browser")
         || prefix.ends_with("/msedge")
+}
+
+fn is_chromium_helper_prefix(prefix: &str) -> bool {
+    prefix.contains("google chrome helper")
+        || prefix.contains("chrome helper")
+        || prefix.contains("chromium helper")
+        || prefix.contains("microsoft edge helper")
+        || prefix.contains("msedge helper")
+}
+
+pub fn is_chromium_browser_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if lower.contains("helper") {
+        return false;
+    }
+    is_chromium_browser_prefix(&chromium_command_prefix(command))
+}
+
+pub fn is_chromium_process_command(command: &str) -> bool {
+    let prefix = chromium_command_prefix(command);
+    is_chromium_browser_prefix(&prefix) || is_chromium_helper_prefix(&prefix)
+}
+
+pub fn is_browser_helper_process(command: &str) -> bool {
+    is_chromium_helper_prefix(&chromium_command_prefix(command))
 }
 
 pub fn is_browser_root_process(command: &str) -> bool {
@@ -188,7 +218,8 @@ fn next_snapshot_field(input: &str) -> Option<(&str, &str)> {
 mod tests {
     use super::{
         extract_flag_value, is_browser_root_process, is_chromium_browser_command,
-        parse_process_snapshot_line, process_has_ancestor, process_tree, tokenize_command,
+        is_chromium_process_command, parse_process_snapshot_line, process_has_ancestor,
+        process_tree, tokenize_command,
     };
     use std::collections::HashSet;
 
@@ -265,6 +296,9 @@ mod tests {
 
     #[test]
     fn chromium_command_filters_helpers() {
+        assert!(is_chromium_process_command(
+            "Google Chrome Helper --type=renderer --user-data-dir=/tmp/profile"
+        ));
         assert!(is_chromium_browser_command(
             "Google Chrome --user-data-dir=/tmp/profile"
         ));

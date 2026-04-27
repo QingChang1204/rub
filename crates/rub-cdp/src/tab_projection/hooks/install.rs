@@ -11,8 +11,10 @@ use super::runtime::{
     projection_authority_commit_in_progress, projection_generation_current,
     refresh_identity_self_probe,
 };
-use super::{PageHookFlag, PageHookInstallState, PageHookResult, active_page_runtime_commit_ready};
-use crate::listener_generation::next_listener_event;
+use super::{
+    PageHookFlag, PageHookInstallState, PageHookResult, required_runtime_hooks_commit_ready,
+};
+use crate::listener_generation::{is_current_generation, next_listener_event};
 
 mod identity;
 
@@ -23,13 +25,17 @@ const PAGE_HOOK_INSTALL_POLL_CEILING_MS: u64 = 100;
 
 #[derive(Debug, Default)]
 struct PageHookInstallOutcome {
-    critical_failed: bool,
+    required_failure_mask: u16,
     auxiliary_failed: bool,
 }
 
 impl PageHookInstallOutcome {
-    fn mark_critical_failure(&mut self) {
-        self.critical_failed = true;
+    fn mark_critical_failure(&mut self, hook: PageHookFlag, required_runtime_hook_mask: u16) {
+        if required_runtime_hook_mask & hook.bit() != 0 {
+            self.required_failure_mask |= hook.bit();
+        } else {
+            self.auxiliary_failed = true;
+        }
     }
 
     async fn mark_auxiliary_failure(
@@ -48,7 +54,7 @@ impl PageHookInstallOutcome {
     }
 
     fn any_failure(&self) -> bool {
-        self.critical_failed || self.auxiliary_failed
+        self.required_failure_mask != 0 || self.auxiliary_failed
     }
 }
 
@@ -62,7 +68,7 @@ struct AuxiliaryPageHookSpec {
 
 struct PageHookInstallTransaction {
     target_key: String,
-    require_runtime_hooks: bool,
+    required_runtime_hook_mask: u16,
     baseline_hook_state: PageHookInstallState,
     hook_state: PageHookInstallState,
     outcome: PageHookInstallOutcome,
@@ -72,17 +78,18 @@ impl PageHookInstallTransaction {
     async fn begin(
         page: &Arc<Page>,
         context: &ProjectionContext,
-        require_runtime_hooks: bool,
+        required_runtime_hook_mask: u16,
     ) -> Result<Option<Self>, RubError> {
         let target_key = page.target_id().as_ref().to_string();
         let Some((baseline_hook_state, hook_state)) =
-            acquire_page_hook_install_state(&target_key, context, require_runtime_hooks).await?
+            acquire_page_hook_install_state(&target_key, context, required_runtime_hook_mask)
+                .await?
         else {
             return Ok(None);
         };
         Ok(Some(Self {
             target_key,
-            require_runtime_hooks,
+            required_runtime_hook_mask,
             baseline_hook_state,
             hook_state,
             outcome: PageHookInstallOutcome::default(),
@@ -91,7 +98,7 @@ impl PageHookInstallTransaction {
 
     async fn finish(self, context: &ProjectionContext) -> Result<(), RubError> {
         if !projection_generation_current(context) {
-            restore_page_hook_installation_baseline(
+            restore_existing_page_hook_installation_baseline(
                 &self.target_key,
                 self.baseline_hook_state,
                 &context.page_hook_states,
@@ -104,7 +111,7 @@ impl PageHookInstallTransaction {
             self.hook_state,
             context,
             self.outcome,
-            self.require_runtime_hooks,
+            self.required_runtime_hook_mask,
         )
         .await
     }
@@ -120,10 +127,10 @@ impl<'a> PageHookInstaller<'a> {
     pub(super) async fn begin(
         page: Arc<Page>,
         context: &'a ProjectionContext,
-        require_runtime_hooks: bool,
+        required_runtime_hook_mask: u16,
     ) -> Result<Option<Self>, RubError> {
         let Some(transaction) =
-            PageHookInstallTransaction::begin(&page, context, require_runtime_hooks).await?
+            PageHookInstallTransaction::begin(&page, context, required_runtime_hook_mask).await?
         else {
             return Ok(None);
         };
@@ -157,6 +164,7 @@ impl<'a> PageHookInstaller<'a> {
     async fn install_critical_runtime_hooks(&mut self) {
         let page = self.page.clone();
         let context = self.context;
+        let required_runtime_hook_mask = self.transaction.required_runtime_hook_mask;
         let PageHookInstallTransaction {
             hook_state,
             outcome,
@@ -166,6 +174,7 @@ impl<'a> PageHookInstaller<'a> {
         install_critical_page_hook(
             hook_state,
             PageHookFlag::SelfProbe,
+            required_runtime_hook_mask,
             "identity.self_probe",
             None,
             outcome,
@@ -180,6 +189,7 @@ impl<'a> PageHookInstaller<'a> {
         install_critical_page_hook(
             hook_state,
             PageHookFlag::DomEnable,
+            required_runtime_hook_mask,
             "dom.enable",
             None,
             outcome,
@@ -191,6 +201,7 @@ impl<'a> PageHookInstaller<'a> {
         install_critical_page_hook(
             hook_state,
             PageHookFlag::RuntimeProbe,
+            required_runtime_hook_mask,
             "runtime_state.probe",
             None,
             outcome,
@@ -205,27 +216,54 @@ impl<'a> PageHookInstaller<'a> {
     async fn install_navigation_listener_hooks(&mut self) {
         let page = self.page.clone();
         let context = self.context;
+        let required_runtime_hook_mask = self.transaction.required_runtime_hook_mask;
         let PageHookInstallTransaction {
             hook_state,
             outcome,
             ..
         } = &mut self.transaction;
-        install_frame_listener(&page, context, hook_state, outcome).await;
-        install_document_listener(&page, context, hook_state, outcome).await;
+        install_frame_listener(
+            &page,
+            context,
+            hook_state,
+            outcome,
+            required_runtime_hook_mask,
+        )
+        .await;
+        install_document_listener(
+            &page,
+            context,
+            hook_state,
+            outcome,
+            required_runtime_hook_mask,
+        )
+        .await;
     }
 
     async fn install_runtime_callback_hooks(&mut self) {
         let context = self.context;
         let page = self.page.clone();
         let target_key = self.transaction.target_key.clone();
+        let required_runtime_hook_mask = self.transaction.required_runtime_hook_mask;
         let observatory_callbacks = guard_observatory_callbacks_for_commit(
             context.observatory_callbacks.lock().await.clone(),
             context,
         );
-        let dialog_callbacks = guard_dialog_callbacks_for_commit(
+        let mut observatory_callbacks = observatory_callbacks;
+        observatory_callbacks.on_listener_ended = Some(page_hook_listener_ended_callback(
+            context,
+            target_key.clone(),
+            PageHookFlag::Observatory,
+        ));
+        let mut dialog_callbacks = guard_dialog_callbacks_for_commit(
             context.dialog_callbacks.lock().await.clone(),
             context,
         );
+        dialog_callbacks.on_listener_ended = Some(page_hook_listener_ended_callback(
+            context,
+            target_key.clone(),
+            PageHookFlag::Dialogs,
+        ));
         let PageHookInstallTransaction {
             hook_state,
             outcome,
@@ -244,6 +282,7 @@ impl<'a> PageHookInstaller<'a> {
             install_critical_page_hook(
                 hook_state,
                 PageHookFlag::Observatory,
+                required_runtime_hook_mask,
                 "observatory.install",
                 Some("Runtime observatory install failed"),
                 outcome,
@@ -266,6 +305,7 @@ impl<'a> PageHookInstaller<'a> {
         install_critical_page_hook(
             hook_state,
             PageHookFlag::Dialogs,
+            required_runtime_hook_mask,
             "dialogs.install",
             Some("Dialog hook installation failed before commit"),
             outcome,
@@ -277,6 +317,7 @@ impl<'a> PageHookInstaller<'a> {
                     context.dialog_intercept.clone(),
                     context.listener_generation,
                     context.listener_generation_rx.clone(),
+                    context.authority_release_in_progress.clone(),
                 )
                 .await
             },
@@ -286,6 +327,7 @@ impl<'a> PageHookInstaller<'a> {
         install_critical_page_hook(
             hook_state,
             PageHookFlag::NetworkRules,
+            required_runtime_hook_mask,
             "network_rules.install",
             Some("Network rule interception install failed"),
             outcome,
@@ -307,7 +349,7 @@ impl<'a> PageHookInstaller<'a> {
 async fn acquire_page_hook_install_state(
     target_key: &str,
     context: &ProjectionContext,
-    require_runtime_hooks: bool,
+    required_runtime_hook_mask: u16,
 ) -> Result<Option<(PageHookInstallState, PageHookInstallState)>, RubError> {
     loop {
         if !projection_generation_current(context) {
@@ -315,8 +357,14 @@ async fn acquire_page_hook_install_state(
         }
         let maybe_state = {
             let mut hook_states = context.page_hook_states.lock().await;
+            if !projection_generation_current(context) {
+                return Ok(None);
+            }
             let state = hook_states.entry(target_key.to_string()).or_default();
-            if state.complete() {
+            if state.complete()
+                || (required_runtime_hook_mask != 0
+                    && state.contains_all(required_runtime_hook_mask))
+            {
                 return Ok(None);
             }
             if state.installing {
@@ -330,10 +378,15 @@ async fn acquire_page_hook_install_state(
         if let Some(state) = maybe_state {
             return Ok(Some(state));
         }
-        if !require_runtime_hooks {
+        if required_runtime_hook_mask == 0 {
             return Ok(None);
         }
-        wait_for_active_page_hook_installation(target_key, &context.page_hook_states).await?;
+        wait_for_required_page_hook_installation(
+            target_key,
+            required_runtime_hook_mask,
+            &context.page_hook_states,
+        )
+        .await?;
     }
 }
 
@@ -342,10 +395,15 @@ async fn finalize_page_hook_installation(
     hook_state: PageHookInstallState,
     context: &ProjectionContext,
     outcome: PageHookInstallOutcome,
-    require_runtime_hooks: bool,
+    required_runtime_hook_mask: u16,
 ) -> Result<(), RubError> {
     let install_complete = hook_state.complete();
     let mut hook_states = context.page_hook_states.lock().await;
+    if !projection_generation_current(context) {
+        let state = hook_states.entry(target_key.to_string()).or_default();
+        state.installing = false;
+        return Ok(());
+    }
     let state = hook_states.entry(target_key.to_string()).or_default();
     *state = hook_state;
     state.installing = false;
@@ -364,26 +422,35 @@ async fn finalize_page_hook_installation(
             .record_page_hook_failure();
     }
 
-    if require_runtime_hooks && !active_page_runtime_commit_ready(state, outcome.critical_failed) {
-        return Err(active_page_runtime_hooks_incomplete_error(
+    if required_runtime_hook_mask != 0
+        && !required_runtime_hooks_commit_ready(
+            state,
+            required_runtime_hook_mask,
+            outcome.required_failure_mask,
+        )
+    {
+        return Err(required_page_runtime_hooks_incomplete_error(
             target_key,
-            "critical_page_hooks_incomplete",
-            "Active page runtime hooks did not install completely",
+            required_runtime_hook_mask,
         ));
     }
 
     Ok(())
 }
 
-async fn restore_page_hook_installation_baseline(
+async fn restore_existing_page_hook_installation_baseline(
     target_key: &str,
     baseline_hook_state: PageHookInstallState,
     page_hook_states: &tokio::sync::Mutex<std::collections::HashMap<String, PageHookInstallState>>,
 ) {
     let mut hook_states = page_hook_states.lock().await;
-    let state = hook_states.entry(target_key.to_string()).or_default();
-    *state = baseline_hook_state;
-    state.installing = false;
+    let Some(state) = hook_states.get_mut(target_key) else {
+        return;
+    };
+    if state.installing {
+        *state = baseline_hook_state;
+        state.installing = false;
+    }
 }
 
 async fn install_auxiliary_page_hook<F, Fut, T, E>(
@@ -417,6 +484,7 @@ async fn install_auxiliary_page_hook<F, Fut, T, E>(
 async fn install_critical_page_hook<F, Fut, T, E>(
     state: &mut PageHookInstallState,
     hook: PageHookFlag,
+    required_runtime_hook_mask: u16,
     label: &'static str,
     warn_message: Option<&'static str>,
     outcome: &mut PageHookInstallOutcome,
@@ -435,9 +503,9 @@ async fn install_critical_page_hook<F, Fut, T, E>(
             if let Some(message) = warn_message {
                 warn!(?error, "{message}");
             }
-            outcome.mark_critical_failure();
+            outcome.mark_critical_failure(hook, required_runtime_hook_mask);
         }
-        PageHookResult::TimedOut => outcome.mark_critical_failure(),
+        PageHookResult::TimedOut => outcome.mark_critical_failure(hook, required_runtime_hook_mask),
     }
 }
 
@@ -446,6 +514,7 @@ async fn install_frame_listener(
     context: &ProjectionContext,
     state: &mut PageHookInstallState,
     outcome: &mut PageHookInstallOutcome,
+    required_runtime_hook_mask: u16,
 ) {
     if state.contains(PageHookFlag::FrameListener) {
         return;
@@ -459,6 +528,10 @@ async fn install_frame_listener(
         let callback_store = context.epoch_callback.clone();
         let page = page.clone();
         let projection_context = context.clone();
+        let target_key = page.target_id().as_ref().to_string();
+        let page_hook_states = context.page_hook_states.clone();
+        let listener_generation_rx = context.listener_generation_rx.clone();
+        let listener_generation = context.listener_generation;
         tokio::spawn(async move {
             let mut generation_rx = projection_context.listener_generation_rx.clone();
             while let Some(event) = next_listener_event(
@@ -482,10 +555,18 @@ async fn install_frame_listener(
                 refresh_identity_self_probe(&page, &projection_context).await;
                 probe_runtime_state_for_active_page(page.clone(), &projection_context).await;
             }
+            invalidate_page_hook_if_current_generation(
+                page_hook_states,
+                listener_generation_rx,
+                listener_generation,
+                target_key,
+                PageHookFlag::FrameListener,
+            )
+            .await;
         });
         state.mark(PageHookFlag::FrameListener);
     } else {
-        outcome.mark_critical_failure();
+        outcome.mark_critical_failure(PageHookFlag::FrameListener, required_runtime_hook_mask);
     }
 }
 
@@ -494,6 +575,7 @@ async fn install_document_listener(
     context: &ProjectionContext,
     state: &mut PageHookInstallState,
     outcome: &mut PageHookInstallOutcome,
+    required_runtime_hook_mask: u16,
 ) {
     if state.contains(PageHookFlag::DocumentListener) {
         return;
@@ -508,7 +590,10 @@ async fn install_document_listener(
         let page = page.clone();
         let listener_generation = context.listener_generation;
         let listener_generation_rx = context.listener_generation_rx.clone();
+        let listener_generation_rx_for_invalidation = listener_generation_rx.clone();
         let projection_context = context.clone();
+        let target_key = page.target_id().as_ref().to_string();
+        let page_hook_states = context.page_hook_states.clone();
         tokio::spawn(async move {
             let mut generation_rx = listener_generation_rx;
             while let Some(_event) =
@@ -524,10 +609,18 @@ async fn install_document_listener(
                 }
                 probe_runtime_state_for_active_page(page.clone(), &projection_context).await;
             }
+            invalidate_page_hook_if_current_generation(
+                page_hook_states,
+                listener_generation_rx_for_invalidation,
+                listener_generation,
+                target_key,
+                PageHookFlag::DocumentListener,
+            )
+            .await;
         });
         state.mark(PageHookFlag::DocumentListener);
     } else {
-        outcome.mark_critical_failure();
+        outcome.mark_critical_failure(PageHookFlag::DocumentListener, required_runtime_hook_mask);
     }
 }
 
@@ -536,25 +629,52 @@ fn guard_observatory_callbacks_for_commit(
     context: &ProjectionContext,
 ) -> crate::runtime_observatory::ObservatoryCallbacks {
     let authority_commit_in_progress = context.authority_commit_in_progress.clone();
+    let runtime_callback_reconfigure_in_progress =
+        context.runtime_callback_reconfigure_in_progress.clone();
     crate::runtime_observatory::ObservatoryCallbacks {
-        on_console_error: callbacks
-            .on_console_error
-            .map(|callback| guard_callback(callback, authority_commit_in_progress.clone())),
-        on_page_error: callbacks
-            .on_page_error
-            .map(|callback| guard_callback(callback, authority_commit_in_progress.clone())),
-        on_network_failure: callbacks
-            .on_network_failure
-            .map(|callback| guard_callback(callback, authority_commit_in_progress.clone())),
-        on_request_summary: callbacks
-            .on_request_summary
-            .map(|callback| guard_callback(callback, authority_commit_in_progress.clone())),
-        on_request_record: callbacks
-            .on_request_record
-            .map(|callback| guard_callback(callback, authority_commit_in_progress.clone())),
-        on_runtime_degraded: callbacks
-            .on_runtime_degraded
-            .map(|callback| guard_callback(callback, authority_commit_in_progress.clone())),
+        on_console_error: callbacks.on_console_error.map(|callback| {
+            guard_callback(
+                callback,
+                authority_commit_in_progress.clone(),
+                runtime_callback_reconfigure_in_progress.clone(),
+            )
+        }),
+        on_page_error: callbacks.on_page_error.map(|callback| {
+            guard_callback(
+                callback,
+                authority_commit_in_progress.clone(),
+                runtime_callback_reconfigure_in_progress.clone(),
+            )
+        }),
+        on_network_failure: callbacks.on_network_failure.map(|callback| {
+            guard_callback(
+                callback,
+                authority_commit_in_progress.clone(),
+                runtime_callback_reconfigure_in_progress.clone(),
+            )
+        }),
+        on_request_summary: callbacks.on_request_summary.map(|callback| {
+            guard_callback(
+                callback,
+                authority_commit_in_progress.clone(),
+                runtime_callback_reconfigure_in_progress.clone(),
+            )
+        }),
+        on_request_record: callbacks.on_request_record.map(|callback| {
+            guard_callback(
+                callback,
+                authority_commit_in_progress.clone(),
+                runtime_callback_reconfigure_in_progress.clone(),
+            )
+        }),
+        on_runtime_degraded: callbacks.on_runtime_degraded.map(|callback| {
+            guard_callback(
+                callback,
+                authority_commit_in_progress.clone(),
+                runtime_callback_reconfigure_in_progress.clone(),
+            )
+        }),
+        on_listener_ended: callbacks.on_listener_ended,
     }
 }
 
@@ -563,28 +683,93 @@ fn guard_dialog_callbacks_for_commit(
     context: &ProjectionContext,
 ) -> crate::dialogs::DialogCallbacks {
     let authority_commit_in_progress = context.authority_commit_in_progress.clone();
+    let runtime_callback_reconfigure_in_progress =
+        context.runtime_callback_reconfigure_in_progress.clone();
     crate::dialogs::DialogCallbacks {
-        on_runtime: callbacks
-            .on_runtime
-            .map(|callback| guard_callback(callback, authority_commit_in_progress.clone())),
-        on_opened: callbacks
-            .on_opened
-            .map(|callback| guard_callback(callback, authority_commit_in_progress.clone())),
-        on_closed: callbacks
-            .on_closed
-            .map(|callback| guard_callback(callback, authority_commit_in_progress.clone())),
+        on_runtime: callbacks.on_runtime.map(|callback| {
+            guard_callback(
+                callback,
+                authority_commit_in_progress.clone(),
+                runtime_callback_reconfigure_in_progress.clone(),
+            )
+        }),
+        on_opened: callbacks.on_opened.map(|callback| {
+            guard_callback(
+                callback,
+                authority_commit_in_progress.clone(),
+                runtime_callback_reconfigure_in_progress.clone(),
+            )
+        }),
+        on_closed: callbacks.on_closed.map(|callback| {
+            guard_callback(
+                callback,
+                authority_commit_in_progress.clone(),
+                runtime_callback_reconfigure_in_progress.clone(),
+            )
+        }),
+        on_listener_ended: callbacks.on_listener_ended,
+    }
+}
+
+fn page_hook_listener_ended_callback(
+    context: &ProjectionContext,
+    target_key: String,
+    hook: PageHookFlag,
+) -> Arc<dyn Fn(&'static str) + Send + Sync> {
+    let page_hook_states = context.page_hook_states.clone();
+    let listener_generation_rx = context.listener_generation_rx.clone();
+    let listener_generation = context.listener_generation;
+    Arc::new(move |_label| {
+        let page_hook_states = page_hook_states.clone();
+        let listener_generation_rx = listener_generation_rx.clone();
+        let target_key = target_key.clone();
+        tokio::spawn(async move {
+            invalidate_page_hook_if_current_generation(
+                page_hook_states,
+                listener_generation_rx,
+                listener_generation,
+                target_key,
+                hook,
+            )
+            .await;
+        });
+    })
+}
+
+async fn invalidate_page_hook_if_current_generation(
+    page_hook_states: Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, PageHookInstallState>>,
+    >,
+    listener_generation_rx: crate::listener_generation::ListenerGenerationRx,
+    listener_generation: crate::listener_generation::ListenerGeneration,
+    target_key: String,
+    hook: PageHookFlag,
+) {
+    if !is_current_generation(&listener_generation_rx, listener_generation) {
+        return;
+    }
+    let mut hook_states = page_hook_states.lock().await;
+    if !is_current_generation(&listener_generation_rx, listener_generation) {
+        return;
+    }
+    if let Some(state) = hook_states.get_mut(&target_key) {
+        state.clear_all(hook.bit());
+        state.installing = false;
     }
 }
 
 fn guard_callback<T>(
     callback: Arc<dyn Fn(T) + Send + Sync>,
     authority_commit_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    runtime_callback_reconfigure_in_progress: Arc<std::sync::atomic::AtomicBool>,
 ) -> Arc<dyn Fn(T) + Send + Sync>
 where
     T: 'static,
 {
     Arc::new(move |value: T| {
-        if authority_commit_in_progress.load(std::sync::atomic::Ordering::SeqCst) {
+        if authority_commit_in_progress.load(std::sync::atomic::Ordering::SeqCst)
+            || runtime_callback_reconfigure_in_progress.load(std::sync::atomic::Ordering::SeqCst)
+        {
             return;
         }
         callback(value);
@@ -606,8 +791,30 @@ fn active_page_runtime_hooks_incomplete_error(
     )
 }
 
-async fn wait_for_active_page_hook_installation(
+fn required_page_runtime_hooks_incomplete_error(
     target_key: &str,
+    required_runtime_hook_mask: u16,
+) -> RubError {
+    if required_runtime_hook_mask == super::CRITICAL_RUNTIME_HOOKS_MASK {
+        return active_page_runtime_hooks_incomplete_error(
+            target_key,
+            "critical_page_hooks_incomplete",
+            "Active page runtime hooks did not install completely",
+        );
+    }
+    RubError::domain_with_context(
+        ErrorCode::BrowserCrashed,
+        "Background page runtime hooks required for committed authority did not install completely",
+        serde_json::json!({
+            "reason": "background_page_runtime_hooks_incomplete",
+            "target_id": target_key,
+        }),
+    )
+}
+
+async fn wait_for_required_page_hook_installation(
+    target_key: &str,
+    required_runtime_hook_mask: u16,
     page_hook_states: &tokio::sync::Mutex<std::collections::HashMap<String, PageHookInstallState>>,
 ) -> Result<(), RubError> {
     let deadline = tokio::time::Instant::now() + PAGE_HOOK_TIMEOUT;
@@ -616,16 +823,18 @@ async fn wait_for_active_page_hook_installation(
         let (still_installing, install_failed) = {
             let hook_states = page_hook_states.lock().await;
             match hook_states.get(target_key) {
-                Some(state) => (state.installing, !state.critical_runtime_hooks_complete()),
+                Some(state) => (
+                    state.installing,
+                    !state.contains_all(required_runtime_hook_mask),
+                ),
                 None => (false, false),
             }
         };
         if !still_installing {
             return if install_failed {
-                Err(active_page_runtime_hooks_incomplete_error(
+                Err(required_page_runtime_hooks_incomplete_error(
                     target_key,
-                    "critical_page_hooks_incomplete",
-                    "Active page runtime hooks did not install completely",
+                    required_runtime_hook_mask,
                 ))
             } else {
                 Ok(())
@@ -638,15 +847,29 @@ async fn wait_for_active_page_hook_installation(
                 timeout_ms = PAGE_HOOK_TIMEOUT.as_millis(),
                 "Active page runtime hooks exceeded the bounded install fence; failing closed instead of waiting indefinitely"
             );
-            return Err(RubError::domain_with_context(
-                ErrorCode::BrowserLaunchFailed,
-                "Active page runtime hooks did not commit before the install timeout",
-                serde_json::json!({
-                    "reason": "active_page_hook_install_timeout",
-                    "target_id": target_key,
-                    "timeout_ms": PAGE_HOOK_TIMEOUT.as_millis(),
-                }),
-            ));
+            return Err(
+                if required_runtime_hook_mask == super::CRITICAL_RUNTIME_HOOKS_MASK {
+                    RubError::domain_with_context(
+                        ErrorCode::BrowserLaunchFailed,
+                        "Active page runtime hooks did not commit before the install timeout",
+                        serde_json::json!({
+                            "reason": "active_page_hook_install_timeout",
+                            "target_id": target_key,
+                            "timeout_ms": PAGE_HOOK_TIMEOUT.as_millis(),
+                        }),
+                    )
+                } else {
+                    RubError::domain_with_context(
+                        ErrorCode::BrowserCrashed,
+                        "Background page runtime hooks required for committed authority did not commit before the install timeout",
+                        serde_json::json!({
+                            "reason": "background_page_hook_install_timeout",
+                            "target_id": target_key,
+                            "timeout_ms": PAGE_HOOK_TIMEOUT.as_millis(),
+                        }),
+                    )
+                },
+            );
         }
         let remaining = deadline.saturating_duration_since(now);
         sleep(page_hook_install_poll_delay(poll_count).min(remaining)).await;

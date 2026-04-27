@@ -16,7 +16,7 @@ pub(super) async fn fire_trigger(
     command_id: &str,
 ) -> Result<Option<serde_json::Value>, ErrorEnvelope> {
     let target_tab = resolve_bound_tab(tabs, &trigger.target_tab.target_id)
-        .map_err(|error| ErrorEnvelope::new(ErrorCode::TabNotFound, error.to_string()))?;
+        .map_err(|_| trigger_target_tab_missing_error(&trigger.target_tab.target_id))?;
 
     if !target_tab.active {
         let switch_request = IpcRequest::new(
@@ -30,7 +30,7 @@ pub(super) async fn fire_trigger(
         let response = router
             .dispatch_within_active_transaction(switch_request, state)
             .await;
-        ensure_trigger_response_success(response)?;
+        ensure_trigger_response_success(response, trigger, "target_switch")?;
     }
 
     ensure_trigger_target_continuity(router, state, &trigger.target_tab.target_id).await?;
@@ -106,7 +106,7 @@ async fn fire_browser_command_trigger(
             state,
         )
         .await;
-    let data = ensure_trigger_response_success(response)?;
+    let data = ensure_trigger_response_success(response, trigger, "action")?;
     ensure_committed_automation_result(command, data.as_ref())?;
     Ok(data)
 }
@@ -172,7 +172,7 @@ async fn fire_workflow_trigger(
             state,
         )
         .await;
-    ensure_trigger_response_success(response)
+    ensure_trigger_response_success(response, trigger, "action")
 }
 
 pub(super) fn resolve_trigger_workflow_spec(
@@ -234,34 +234,18 @@ async fn ensure_trigger_target_continuity(
     let browser = router.browser_port();
     let tabs = refresh_live_trigger_runtime(&browser, state)
         .await
-        .map_err(|error| {
-            ErrorEnvelope::new(
-                ErrorCode::BrowserCrashed,
-                format!("trigger target continuity refresh failed: {error}"),
-            )
-            .with_context(serde_json::json!({
-                "reason": "continuity_tab_refresh_failed",
-                "target_tab_target_id": target_id,
-            }))
-        })?;
-    let target_tab = resolve_bound_tab(&tabs, target_id).map_err(|error| {
-        ErrorEnvelope::new(ErrorCode::TabNotFound, error.to_string()).with_context(
-            serde_json::json!({
-                "reason": "continuity_target_tab_missing",
-                "target_tab_target_id": target_id,
-            }),
-        )
-    })?;
+        .map_err(|error| trigger_target_refresh_failure_error(target_id, error.into_envelope()))?;
+    let target_tab = resolve_bound_tab(&tabs, target_id)
+        .map_err(|_| trigger_target_tab_missing_error(target_id))?;
     if !target_tab.active {
-        return Err(ErrorEnvelope::new(
-            ErrorCode::BrowserCrashed,
+        return Err(trigger_degraded_authority_error(
             "Trigger target continuity fence failed: target tab is not active after switch",
-        )
-        .with_context(serde_json::json!({
-            "reason": "continuity_target_not_active",
-            "target_tab_target_id": target_id,
-            "target_tab_index": target_tab.index,
-        })));
+            "continuity_target_not_active",
+            serde_json::json!({
+                "target_tab_target_id": target_id,
+                "target_tab_index": target_tab.index,
+            }),
+        ));
     }
 
     refresh_live_runtime_state(&browser, state).await;
@@ -271,33 +255,101 @@ async fn ensure_trigger_target_continuity(
     if let Some((reason, message)) =
         trigger_target_continuity_failure(target_id, &frame_runtime, &readiness)
     {
-        return Err(
-            ErrorEnvelope::new(ErrorCode::BrowserCrashed, message).with_context(
-                serde_json::json!({
-                    "reason": reason,
-                    "target_tab_target_id": target_id,
-                    "frame_runtime": frame_runtime,
-                    "readiness_state": readiness,
-                }),
-            ),
-        );
+        return Err(trigger_degraded_authority_error(
+            message,
+            reason,
+            serde_json::json!({
+                "target_tab_target_id": target_id,
+                "frame_runtime": frame_runtime,
+                "readiness_state": readiness,
+            }),
+        ));
     }
 
     Ok(())
 }
 
+fn trigger_target_tab_missing_error(target_id: &str) -> ErrorEnvelope {
+    trigger_degraded_authority_error(
+        "Trigger target continuity fence failed: bound target tab is no longer present in the current session",
+        "continuity_target_tab_missing",
+        serde_json::json!({
+            "target_tab_target_id": target_id,
+        }),
+    )
+}
+
+fn trigger_target_refresh_failure_error(target_id: &str, upstream: ErrorEnvelope) -> ErrorEnvelope {
+    let upstream_code = upstream.code;
+    let upstream_message = upstream.message.clone();
+    let upstream_context = upstream.context.clone();
+    let upstream_reason = upstream_context
+        .as_ref()
+        .and_then(|value| value.get("reason"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    trigger_degraded_authority_error(
+        "Trigger target continuity fence failed: live target refresh could not re-establish authoritative tab state",
+        "continuity_tab_refresh_failed",
+        serde_json::json!({
+            "target_tab_target_id": target_id,
+            "upstream_error_code": upstream_code,
+            "upstream_error_message": upstream_message,
+            "upstream_error_reason": upstream_reason,
+            "upstream_error_context": upstream_context,
+        }),
+    )
+}
+
 fn ensure_trigger_response_success(
     response: rub_ipc::protocol::IpcResponse,
+    trigger: &TriggerInfo,
+    phase: &'static str,
 ) -> Result<Option<serde_json::Value>, ErrorEnvelope> {
     match response.status {
         ResponseStatus::Success => Ok(response.data),
-        ResponseStatus::Error => Err(response.error.unwrap_or_else(|| {
-            ErrorEnvelope::new(
-                ErrorCode::IpcProtocolError,
-                "trigger action returned an error response without an error envelope",
-            )
-        })),
+        ResponseStatus::Error => Err(augment_trigger_error_context(
+            response.error.unwrap_or_else(missing_error_envelope),
+            trigger,
+            phase,
+        )),
     }
+}
+
+fn augment_trigger_error_context(
+    mut error: ErrorEnvelope,
+    trigger: &TriggerInfo,
+    phase: &'static str,
+) -> ErrorEnvelope {
+    let mut context = error
+        .context
+        .take()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let trigger_context = serde_json::json!({
+        "trigger_id": trigger.id,
+        "phase": phase,
+        "source_tab_target_id": trigger.source_tab.target_id,
+        "source_frame_id": trigger.source_tab.frame_id,
+        "target_tab_target_id": trigger.target_tab.target_id,
+        "target_frame_id": trigger.target_tab.frame_id,
+        "action_kind": trigger.action.kind,
+        "action_command": trigger.action.command,
+    });
+    if let Some(trigger_object) = trigger_context.as_object() {
+        for (key, value) in trigger_object {
+            context.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    error.context = Some(serde_json::Value::Object(context));
+    error
+}
+
+fn missing_error_envelope() -> ErrorEnvelope {
+    ErrorEnvelope::new(
+        ErrorCode::IpcProtocolError,
+        "trigger action returned an error response without an error envelope",
+    )
 }
 
 pub(super) fn resolve_bound_tab<'a>(
@@ -375,6 +427,99 @@ pub(super) fn trigger_action_summary(trigger: &TriggerInfo) -> String {
     }
 }
 
+#[cfg(test)]
+mod continuity_tests {
+    use super::{
+        trigger_target_continuity_failure, trigger_target_refresh_failure_error,
+        trigger_target_tab_missing_error,
+    };
+    use rub_core::error::{ErrorCode, ErrorEnvelope};
+    use rub_core::model::{
+        FrameContextInfo, FrameContextStatus, FrameRuntimeInfo, OverlayState, ReadinessInfo,
+        ReadinessStatus, RouteStability,
+    };
+
+    #[test]
+    fn target_tab_missing_uses_degraded_authority_family() {
+        let envelope = trigger_target_tab_missing_error("tab-target");
+        assert_eq!(envelope.code, ErrorCode::SessionBusy);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("continuity_target_tab_missing")
+        );
+    }
+
+    #[test]
+    fn target_refresh_failure_uses_degraded_authority_family() {
+        let envelope = trigger_target_refresh_failure_error(
+            "tab-target",
+            ErrorEnvelope::new(ErrorCode::BrowserCrashed, "browser died").with_context(
+                serde_json::json!({
+                    "reason": "browser_disconnected",
+                }),
+            ),
+        );
+        assert_eq!(envelope.code, ErrorCode::SessionBusy);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("continuity_tab_refresh_failed")
+        );
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("upstream_error_code"))
+                .and_then(|value| value.as_str()),
+            Some("BROWSER_CRASHED")
+        );
+    }
+
+    #[test]
+    fn target_continuity_fails_when_frame_runtime_is_stale() {
+        let frame_runtime = FrameRuntimeInfo {
+            status: FrameContextStatus::Stale,
+            current_frame: Some(FrameContextInfo {
+                frame_id: "missing-frame".to_string(),
+                name: None,
+                parent_frame_id: None,
+                target_id: None,
+                url: None,
+                depth: 0,
+                same_origin_accessible: None,
+            }),
+            primary_frame: None,
+            frame_lineage: vec!["missing-frame".to_string()],
+            degraded_reason: Some("selected_frame_not_found".to_string()),
+        };
+        let readiness = ReadinessInfo {
+            status: ReadinessStatus::Active,
+            route_stability: RouteStability::Stable,
+            loading_present: false,
+            skeleton_present: false,
+            overlay_state: OverlayState::None,
+            document_ready_state: Some("complete".to_string()),
+            blocking_signals: Vec::new(),
+            degraded_reason: None,
+        };
+
+        assert_eq!(
+            trigger_target_continuity_failure("tab-target", &frame_runtime, &readiness),
+            Some((
+                "continuity_frame_unavailable",
+                "Trigger target continuity fence failed: frame context became unavailable",
+            ))
+        );
+    }
+}
+
 fn trigger_action_timeout_ms(command: &str, args: &serde_json::Value) -> u64 {
     TRIGGER_ACTION_BASE_TIMEOUT_MS.saturating_add(
         rub_core::automation_timeout::command_additional_timeout_ms(command, args),
@@ -404,10 +549,21 @@ pub(super) fn trigger_action_command_id(
     trigger: &TriggerInfo,
     evidence: &TriggerEvidenceInfo,
 ) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    trigger.id.hash(&mut hasher);
-    super::trigger_evidence_consumption_key(evidence).hash(&mut hasher);
-    format!("trigger:{}:{:016x}", trigger.id, hasher.finish())
+    let identity_key = super::trigger_evidence_consumption_key(evidence);
+    format!(
+        "trigger:{}:{}",
+        trigger.id,
+        hex_encode_trigger_command_identity(identity_key.as_bytes())
+    )
+}
+
+fn hex_encode_trigger_command_identity(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String must succeed");
+    }
+    encoded
 }
 
 pub(super) fn trigger_action_execution_info(
@@ -530,8 +686,60 @@ fn trigger_request_meta(
 
 #[cfg(test)]
 mod tests {
-    use super::apply_trigger_frame_override;
+    use super::{
+        apply_trigger_frame_override, ensure_trigger_response_success, trigger_action_command_id,
+    };
+    use rub_core::error::{ErrorCode, ErrorEnvelope};
+    use rub_core::model::{
+        TriggerActionKind, TriggerActionSpec, TriggerConditionKind, TriggerConditionSpec,
+        TriggerInfo, TriggerMode, TriggerStatus, TriggerTabBindingInfo,
+    };
+    use rub_ipc::protocol::IpcResponse;
     use serde_json::json;
+
+    fn trigger() -> TriggerInfo {
+        TriggerInfo {
+            id: 7,
+            status: TriggerStatus::Armed,
+            lifecycle_generation: 1,
+            mode: TriggerMode::Once,
+            source_tab: TriggerTabBindingInfo {
+                index: 0,
+                target_id: "source-tab".to_string(),
+                frame_id: Some("source-frame".to_string()),
+                url: "https://source.example".to_string(),
+                title: "Source".to_string(),
+            },
+            target_tab: TriggerTabBindingInfo {
+                index: 1,
+                target_id: "target-tab".to_string(),
+                frame_id: Some("target-frame".to_string()),
+                url: "https://target.example".to_string(),
+                title: "Target".to_string(),
+            },
+            condition: TriggerConditionSpec {
+                kind: TriggerConditionKind::Readiness,
+                locator: None,
+                text: None,
+                url_pattern: None,
+                readiness_state: Some("ready".to_string()),
+                method: None,
+                status_code: None,
+                storage_area: None,
+                key: None,
+                value: None,
+            },
+            action: TriggerActionSpec {
+                kind: TriggerActionKind::BrowserCommand,
+                command: Some("click".to_string()),
+                payload: Some(json!({ "selector": "#send" })),
+            },
+            last_condition_evidence: None,
+            consumed_evidence_fingerprint: None,
+            last_action_result: None,
+            unavailable_reason: None,
+        }
+    }
 
     #[test]
     fn trigger_frame_override_overwrites_conflicting_frame_id() {
@@ -559,5 +767,57 @@ mod tests {
         apply_trigger_frame_override(&mut args, Some("target-frame"));
 
         assert_eq!(args["_orchestration"]["frame_id"], "target-frame");
+    }
+
+    #[test]
+    fn committed_trigger_error_preserves_remote_reason_and_adds_trigger_phase_context() {
+        let trigger = trigger();
+        let response = IpcResponse::error(
+            "req-1",
+            ErrorEnvelope::new(ErrorCode::InvalidInput, "selector is stale").with_context(json!({
+                "reason": "remote_invalid_selector",
+                "selector": "#send"
+            })),
+        );
+
+        let error =
+            ensure_trigger_response_success(response, &trigger, "action").expect_err("error");
+
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        assert_eq!(
+            error.context.as_ref().and_then(|ctx| ctx.get("reason")),
+            Some(&json!("remote_invalid_selector"))
+        );
+        assert_eq!(
+            error.context.as_ref().and_then(|ctx| ctx.get("phase")),
+            Some(&json!("action"))
+        );
+        assert_eq!(
+            error
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("target_tab_target_id")),
+            Some(&json!("target-tab"))
+        );
+        assert_eq!(
+            error
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("target_frame_id")),
+            Some(&json!("target-frame"))
+        );
+    }
+
+    #[test]
+    fn trigger_action_command_id_uses_explicit_stable_hex_identity() {
+        let trigger = trigger();
+        let evidence = rub_core::model::TriggerEvidenceInfo {
+            summary: "source_tab_text_present:Ready".to_string(),
+            fingerprint: Some("Ready::stable".to_string()),
+        };
+
+        let command_id = trigger_action_command_id(&trigger, &evidence);
+
+        assert_eq!(command_id, "trigger:7:52656164793a3a737461626c65");
     }
 }

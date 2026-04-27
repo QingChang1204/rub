@@ -3,7 +3,10 @@ use super::projection::{
     cookie_artifact, cookie_payload, cookie_subject, cookies_subject, runtime_subject,
     runtime_surface_payload,
 };
-use super::takeover::{takeover_continuity_failure, takeover_resume_repaused_error};
+use super::takeover::{
+    takeover_continuity_failure, takeover_degraded_authority_error, takeover_resume_repaused_error,
+    takeover_runtime_refresh_unavailable_error,
+};
 use super::{
     cmd_close, cmd_cookies, cmd_doctor, cmd_handoff, cmd_handshake, cmd_runtime, cmd_upgrade_check,
     intercept_payload, intercept_registry_subject, intercept_rule_id_subject,
@@ -257,6 +260,14 @@ async fn handshake_and_upgrade_check_expose_automation_scheduler_inventory() {
     assert_eq!(
         upgrade["automation_scheduler"]["authority_inventory"]["shutdown_drain_fence"],
         "daemon.shutdown.wait_for_transaction_drain"
+    );
+    assert_eq!(
+        upgrade["semantic_command_protocol"]["compatible"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        upgrade["semantic_command_protocol"]["daemon_protocol_version"],
+        rub_ipc::protocol::IPC_PROTOCOL_VERSION
     );
     assert_eq!(
         handshake["browser_event_ingress"]["critical"]["mode"],
@@ -616,6 +627,59 @@ fn continuity_failure_degrades_readiness_and_integration_surfaces() {
             &IntegrationRuntimeInfo::default()
         ),
         None
+    );
+}
+
+#[test]
+fn takeover_degraded_authority_error_uses_shared_session_busy_family() {
+    let error = takeover_degraded_authority_error(
+        "Takeover continuity degraded",
+        "continuity_frame_unavailable",
+        serde_json::json!({
+            "frame_id": "child",
+        }),
+    )
+    .into_envelope();
+
+    assert_eq!(error.code, ErrorCode::SessionBusy);
+    assert_eq!(
+        error
+            .context
+            .as_ref()
+            .and_then(|context| context.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("continuity_frame_unavailable")
+    );
+    assert_eq!(
+        error
+            .context
+            .as_ref()
+            .and_then(|context| context.get("frame_id"))
+            .and_then(|value| value.as_str()),
+        Some("child")
+    );
+}
+
+#[test]
+fn takeover_runtime_refresh_unavailable_error_uses_specific_reason() {
+    let error = takeover_runtime_refresh_unavailable_error("cdp socket closed").into_envelope();
+
+    assert_eq!(error.code, ErrorCode::SessionBusy);
+    assert_eq!(
+        error
+            .context
+            .as_ref()
+            .and_then(|context| context.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("continuity_runtime_refresh_unavailable")
+    );
+    assert_eq!(
+        error
+            .context
+            .as_ref()
+            .and_then(|context| context.get("phase"))
+            .and_then(|value| value.as_str()),
+        Some("runtime_refresh")
     );
 }
 

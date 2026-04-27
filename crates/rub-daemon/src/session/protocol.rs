@@ -1,7 +1,6 @@
 use super::SessionState;
 use rub_core::model::{
-    DialogKind, DialogRuntimeStatus, DownloadEvent, DownloadMode, DownloadRuntimeStatus,
-    DownloadState,
+    DialogKind, DialogRuntimeInfo, DownloadEvent, DownloadRuntimeInfo, DownloadState,
 };
 use rub_ipc::codec::MAX_FRAME_BYTES;
 use std::collections::{HashMap, VecDeque};
@@ -10,6 +9,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 
 pub(crate) const REPLAY_CACHE_LIMIT: usize = 1000;
 pub(crate) const REPLAY_CACHE_LIMIT_BYTES: usize = MAX_FRAME_BYTES * 8;
+#[cfg(test)]
+pub(crate) const REPLAY_SPENT_LIMIT: usize = REPLAY_CACHE_LIMIT * 4;
 pub(crate) const POST_COMMIT_PROJECTION_LIMIT: usize = 256;
 pub(crate) const POST_COMMIT_PROJECTION_LIMIT_BYTES: usize = MAX_FRAME_BYTES * 4;
 pub(crate) const BROWSER_EVENT_PROGRESS_INGRESS_LIMIT: usize = 1_024;
@@ -47,6 +48,7 @@ pub(crate) struct ReplayProtocolState {
     pub(crate) order: VecDeque<String>,
     pub(crate) in_flight: HashMap<String, ReplayInFlightEntry>,
     pub(crate) spent: HashMap<String, ReplaySpentEntry>,
+    pub(crate) spent_order: VecDeque<String>,
     pub(crate) total_bytes: usize,
 }
 
@@ -71,8 +73,7 @@ pub enum BrowserSessionEvent {
     DialogRuntime {
         browser_sequence: u64,
         generation: u64,
-        status: DialogRuntimeStatus,
-        degraded_reason: Option<String>,
+        runtime: Box<DialogRuntimeInfo>,
     },
     DialogOpened {
         browser_sequence: u64,
@@ -94,10 +95,7 @@ pub enum BrowserSessionEvent {
     DownloadRuntime {
         browser_sequence: u64,
         generation: u64,
-        status: DownloadRuntimeStatus,
-        mode: DownloadMode,
-        download_dir: Option<String>,
-        degraded_reason: Option<String>,
+        runtime: Box<DownloadRuntimeInfo>,
     },
     DownloadRuntimeDegradedMarker {
         browser_sequence: u64,

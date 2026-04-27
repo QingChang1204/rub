@@ -28,10 +28,12 @@ pub(super) struct WorkflowExportProjection {
     pub(super) skipped_observation: usize,
     pub(super) skipped_ineligible: usize,
     pub(super) complete: bool,
+    pub(super) selection_dropped_before_projection: bool,
     pub(super) capture_oldest_retained_sequence: Option<u64>,
     pub(super) capture_newest_retained_sequence: Option<u64>,
     pub(super) capture_dropped_before_retention: u64,
     pub(super) capture_dropped_before_projection: u64,
+    pub(super) selection_truncated_by_retention: bool,
 }
 
 pub(super) async fn export_pipe_history(
@@ -111,7 +113,11 @@ async fn build_export_projection(
     } else {
         state.workflow_capture(last).await
     };
-    let complete = export_selection_is_complete(last, from, to, &projection);
+    let selection_truncated_by_retention =
+        export_selection_is_truncated_by_retention(last, from, to, &projection);
+    let selection_dropped_before_projection =
+        export_selection_is_affected_by_projection_loss(last, from, to, &projection);
+    let complete = !selection_truncated_by_retention && !selection_dropped_before_projection;
     let source_count = projection.entries.len();
     let mut steps = Vec::new();
     let mut skipped_administrative = 0usize;
@@ -146,33 +152,55 @@ async fn build_export_projection(
         skipped_observation,
         skipped_ineligible,
         complete,
+        selection_dropped_before_projection,
         capture_oldest_retained_sequence: projection.oldest_retained_sequence,
         capture_newest_retained_sequence: projection.newest_retained_sequence,
         capture_dropped_before_retention: projection.dropped_before_retention,
         capture_dropped_before_projection: projection.dropped_before_projection,
+        selection_truncated_by_retention,
     })
 }
 
-fn export_selection_is_complete(
+fn export_selection_is_truncated_by_retention(
     last: usize,
     from: Option<u64>,
     to: Option<u64>,
     projection: &WorkflowCaptureProjection,
 ) -> bool {
     if projection.dropped_before_retention == 0 {
-        return true;
+        return false;
     }
 
     let Some(oldest_retained_sequence) = projection.oldest_retained_sequence else {
-        return true;
+        return false;
     };
 
     if from.is_some() || to.is_some() {
         let requested_start = from.unwrap_or(1);
-        requested_start >= oldest_retained_sequence
+        requested_start < oldest_retained_sequence
     } else {
-        last <= projection.entries.len()
+        last > projection.entries.len()
     }
+}
+
+fn export_selection_is_affected_by_projection_loss(
+    last: usize,
+    from: Option<u64>,
+    to: Option<u64>,
+    projection: &WorkflowCaptureProjection,
+) -> bool {
+    if projection.dropped_before_projection == 0 {
+        return false;
+    }
+
+    if from.is_some() || to.is_some() {
+        // Range selections address recorded workflow-capture sequence space; dropped
+        // pre-projection commands never entered that sequence space and therefore
+        // remain global metadata rather than selection-relative loss.
+        return false;
+    }
+
+    last > projection.entries.len()
 }
 
 fn matches_export_range(sequence: u64, from: Option<u64>, to: Option<u64>) -> bool {

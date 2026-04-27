@@ -8,9 +8,8 @@ use rub_core::managed_profile::{
     managed_profile_paths_equivalent, managed_profile_temp_roots,
 };
 use rub_core::process::{
-    ProcessInfo, extract_flag_value, is_chromium_browser_command, is_process_alive,
-    process_has_ancestor, process_snapshot as collect_process_snapshot, process_tree,
-    tokenize_command,
+    ProcessInfo, extract_flag_value, is_chromium_process_command, process_has_ancestor,
+    process_snapshot as collect_process_snapshot, process_tree, tokenize_command,
 };
 use rub_daemon::rub_paths::RubPaths;
 
@@ -21,6 +20,18 @@ pub(super) struct TempDaemonProcess {
     pub(super) session_id: String,
     pub(super) rub_home: PathBuf,
     pub(super) user_data_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TempDaemonReleaseOutcome {
+    Released,
+    StillLive,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct OrphanBrowserCleanupOutcome {
+    pub(super) terminated_pids: HashSet<u32>,
+    pub(super) surviving_pids: HashSet<u32>,
 }
 
 pub(super) fn process_snapshot() -> Result<Vec<ProcessInfo>, RubError> {
@@ -92,14 +103,30 @@ pub(super) fn revalidated_temp_daemon_tree(
         .map(|process| process_tree(snapshot, process.pid))
 }
 
-pub(super) async fn terminate_revalidated_temp_daemon(daemon: &TempDaemonProcess) {
+pub(super) async fn terminate_revalidated_temp_daemon(
+    daemon: &TempDaemonProcess,
+) -> Result<TempDaemonReleaseOutcome, RubError> {
     let Ok(snapshot) = process_snapshot() else {
-        return;
+        return Ok(TempDaemonReleaseOutcome::StillLive);
     };
     let Some(tree) = revalidated_temp_daemon_tree(&snapshot, daemon) else {
-        return;
+        return Ok(TempDaemonReleaseOutcome::Released);
     };
     terminate_process_tree(&tree).await;
+    let Ok(current_snapshot) = process_snapshot() else {
+        return Ok(TempDaemonReleaseOutcome::StillLive);
+    };
+    let survivors = revalidated_temp_daemon_sigkill_tree(&current_snapshot, daemon);
+    if survivors.is_empty() {
+        return Ok(TempDaemonReleaseOutcome::Released);
+    }
+    signal_processes(&survivors, libc::SIGKILL);
+    let Ok(final_snapshot) = process_snapshot() else {
+        return Ok(TempDaemonReleaseOutcome::StillLive);
+    };
+    Ok(classify_temp_daemon_release(
+        &revalidated_temp_daemon_sigkill_tree(&final_snapshot, daemon),
+    ))
 }
 
 pub(super) fn orphan_temp_browser_pids_for_roots(
@@ -124,6 +151,57 @@ pub(super) fn orphan_temp_browser_pids_for_roots(
         orphan_pids.insert(process.pid);
     }
     orphan_pids
+}
+
+pub(super) async fn terminate_orphan_temp_browser_processes(
+    snapshot: &[ProcessInfo],
+    orphan_roots: &HashSet<PathBuf>,
+) -> Result<OrphanBrowserCleanupOutcome, RubError> {
+    let orphan_pids = orphan_temp_browser_pids_for_roots(snapshot, orphan_roots);
+    if orphan_pids.is_empty() {
+        return Ok(OrphanBrowserCleanupOutcome::default());
+    }
+    terminate_process_tree(&orphan_pids).await;
+    let Ok(current_snapshot) = process_snapshot() else {
+        return Ok(OrphanBrowserCleanupOutcome {
+            terminated_pids: HashSet::new(),
+            surviving_pids: orphan_pids,
+        });
+    };
+    let survivors = orphan_temp_browser_pids_for_roots(&current_snapshot, orphan_roots);
+    if survivors.is_empty() {
+        return Ok(summarize_orphan_browser_cleanup(&orphan_pids, &survivors));
+    }
+    signal_processes(&survivors, libc::SIGKILL);
+    let Ok(final_snapshot) = process_snapshot() else {
+        return Ok(OrphanBrowserCleanupOutcome {
+            terminated_pids: HashSet::new(),
+            surviving_pids: survivors,
+        });
+    };
+    let surviving_pids = orphan_temp_browser_pids_for_roots(&final_snapshot, orphan_roots);
+    Ok(summarize_orphan_browser_cleanup(
+        &orphan_pids,
+        &surviving_pids,
+    ))
+}
+
+fn classify_temp_daemon_release(surviving_pids: &HashSet<u32>) -> TempDaemonReleaseOutcome {
+    if surviving_pids.is_empty() {
+        TempDaemonReleaseOutcome::Released
+    } else {
+        TempDaemonReleaseOutcome::StillLive
+    }
+}
+
+fn summarize_orphan_browser_cleanup(
+    initial_pids: &HashSet<u32>,
+    surviving_pids: &HashSet<u32>,
+) -> OrphanBrowserCleanupOutcome {
+    OrphanBrowserCleanupOutcome {
+        terminated_pids: initial_pids.difference(surviving_pids).copied().collect(),
+        surviving_pids: surviving_pids.clone(),
+    }
 }
 
 pub(super) fn orphan_temp_browser_roots(snapshot: &[ProcessInfo]) -> HashSet<PathBuf> {
@@ -167,28 +245,27 @@ pub(super) fn root_has_live_browser_process(snapshot: &[ProcessInfo], root: &Pat
 }
 
 pub(super) async fn terminate_process_tree(processes: &HashSet<u32>) {
+    signal_processes(processes, libc::SIGTERM);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+fn signal_processes(processes: &HashSet<u32>, signal: i32) {
     if processes.is_empty() {
         return;
     }
 
     for pid in processes {
         unsafe {
-            libc::kill(*pid as i32, libc::SIGTERM);
+            libc::kill(*pid as i32, signal);
         }
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+}
 
-    let mut survivors = Vec::new();
-    for pid in processes {
-        if is_process_alive(*pid) {
-            survivors.push(*pid);
-        }
-    }
-    for pid in survivors {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
-        }
-    }
+pub(super) fn revalidated_temp_daemon_sigkill_tree(
+    snapshot: &[ProcessInfo],
+    daemon: &TempDaemonProcess,
+) -> HashSet<u32> {
+    revalidated_temp_daemon_tree(snapshot, daemon).unwrap_or_default()
 }
 
 pub(super) fn is_rub_daemon_command(command: &str) -> bool {
@@ -209,11 +286,11 @@ pub(super) fn is_rub_daemon_command(command: &str) -> bool {
 }
 
 pub(super) fn is_temp_rub_home(path: &Path) -> bool {
-    rub_daemon::rub_paths::is_temp_owned_home(path)
+    rub_daemon::rub_paths::is_temp_owned_home_cleanup_authoritative(path)
 }
 
 pub(super) fn extract_temp_browser_root(command: &str) -> Option<PathBuf> {
-    if !is_chromium_browser_command(command) {
+    if !is_chromium_process_command(command) {
         return None;
     }
     extract_managed_profile_path_from_command(command)
@@ -260,4 +337,45 @@ pub(super) fn temp_roots() -> Vec<PathBuf> {
         roots.push(explicit_tmp);
     }
     roots
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        OrphanBrowserCleanupOutcome, TempDaemonReleaseOutcome, classify_temp_daemon_release,
+        summarize_orphan_browser_cleanup,
+    };
+    use std::collections::HashSet;
+
+    #[test]
+    fn temp_daemon_release_is_honest_when_authority_is_already_gone() {
+        assert_eq!(
+            classify_temp_daemon_release(&HashSet::new()),
+            TempDaemonReleaseOutcome::Released
+        );
+    }
+
+    #[test]
+    fn temp_daemon_release_is_busy_only_when_processes_still_survive() {
+        assert_eq!(
+            classify_temp_daemon_release(&HashSet::from([42_u32])),
+            TempDaemonReleaseOutcome::StillLive
+        );
+    }
+
+    #[test]
+    fn orphan_browser_cleanup_reports_proven_terminated_pids_not_just_sigkill_survivors() {
+        let outcome = summarize_orphan_browser_cleanup(
+            &HashSet::from([1_u32, 2_u32, 3_u32]),
+            &HashSet::from([3_u32]),
+        );
+
+        assert_eq!(
+            outcome,
+            OrphanBrowserCleanupOutcome {
+                terminated_pids: HashSet::from([1_u32, 2_u32]),
+                surviving_pids: HashSet::from([3_u32]),
+            }
+        );
+    }
 }

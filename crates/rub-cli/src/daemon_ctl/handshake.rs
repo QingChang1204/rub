@@ -3,11 +3,21 @@ use crate::main_support::command_timeout_error;
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::LaunchPolicyInfo;
 use rub_ipc::client::{IpcClient, IpcClientError};
+use rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID;
 use rub_ipc::protocol::{IpcRequest, ResponseStatus};
 use std::time::Instant;
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct HandshakePayload {
     pub(crate) daemon_session_id: String,
+    pub(crate) ipc_protocol_version: String,
+    pub(crate) launch_policy: LaunchPolicyInfo,
+    pub(crate) attachment_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RawHandshakePayload {
+    #[serde(default)]
+    daemon_session_id: Option<String>,
     pub(crate) launch_policy: LaunchPolicyInfo,
     pub(crate) attachment_identity: Option<String>,
 }
@@ -35,7 +45,18 @@ pub(crate) async fn fetch_handshake_info_with_timeout(
     client: &mut IpcClient,
     timeout_ms: u64,
 ) -> Result<HandshakePayload, RubError> {
-    let request = IpcRequest::new("_handshake", serde_json::json!({}), timeout_ms.max(1));
+    let request = IpcRequest::new("_handshake", serde_json::json!({}), timeout_ms.max(1))
+        .with_command_id(HANDSHAKE_PROBE_COMMAND_ID)
+        .map_err(|error| {
+            RubError::domain_with_context(
+                ErrorCode::IpcProtocolError,
+                format!("Failed to construct handshake probe request: {error}"),
+                serde_json::json!({
+                    "reason": "handshake_probe_command_id_bind_failed",
+                    "command_id": HANDSHAKE_PROBE_COMMAND_ID,
+                }),
+            )
+        })?;
     let response = client.send(&request).await.map_err(handshake_send_error)?;
 
     if response.status == ResponseStatus::Error {
@@ -48,12 +69,42 @@ pub(crate) async fn fetch_handshake_info_with_timeout(
         return Err(RubError::Domain(envelope));
     }
 
+    let echoed_daemon_session_id = response.daemon_session_id.clone().ok_or_else(|| {
+        RubError::domain_with_context(
+            ErrorCode::IpcProtocolError,
+            "Handshake response did not carry protocol-level daemon authority",
+            serde_json::json!({
+                "reason": "handshake_missing_protocol_daemon_session_id",
+            }),
+        )
+    })?;
+
+    let ipc_protocol_version = response.ipc_protocol_version.clone();
     let data = response.data.unwrap_or_default();
-    serde_json::from_value(data).map_err(|e| {
+    let payload: RawHandshakePayload = serde_json::from_value(data).map_err(|e| {
         RubError::domain(
             ErrorCode::IpcProtocolError,
             format!("Invalid handshake payload: {e}"),
         )
+    })?;
+    if let Some(payload_daemon_session_id) = payload.daemon_session_id.as_deref()
+        && payload_daemon_session_id != echoed_daemon_session_id
+    {
+        return Err(RubError::domain_with_context(
+            ErrorCode::IpcProtocolError,
+            "Handshake daemon authority diverged between protocol echo and payload metadata",
+            serde_json::json!({
+                "reason": "handshake_daemon_session_id_mismatch",
+                "protocol_daemon_session_id": echoed_daemon_session_id,
+                "payload_daemon_session_id": payload_daemon_session_id,
+            }),
+        ));
+    }
+    Ok(HandshakePayload {
+        daemon_session_id: echoed_daemon_session_id,
+        ipc_protocol_version,
+        launch_policy: payload.launch_policy,
+        attachment_identity: payload.attachment_identity,
     })
 }
 

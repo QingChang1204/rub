@@ -8,7 +8,8 @@ use crate::harvest_ctl;
 use crate::inspect_list_help_ctl;
 use crate::internal_daemon;
 use crate::main_support::{
-    finalize_response_output, handle_sessions, output_trace_mode, use_alias_local_surface_error,
+    FinalizeResponseContext, finalize_response_output, handle_sessions, output_trace_mode,
+    use_alias_local_surface_error,
 };
 use crate::orchestration_assets;
 use crate::output;
@@ -47,19 +48,50 @@ pub(crate) fn close_all_partial_failure_error(
     rub_home: &Path,
     result: &daemon_ctl::BatchCloseResult,
 ) -> RubError {
-    let failed_count = result.failed.len();
+    let affected_count = result.failed.len() + result.compatibility_degraded_owned_sessions.len();
+    let compatibility_degraded_owned = result.has_compatibility_degraded_owned_sessions();
     RubError::Domain(
         ErrorEnvelope::new(
-            ErrorCode::IpcProtocolError,
-            format!("Failed to close {failed_count} session(s) during close --all"),
+            if compatibility_degraded_owned {
+                ErrorCode::SessionBusy
+            } else {
+                ErrorCode::IpcProtocolError
+            },
+            format!("Failed to fully release {affected_count} session(s) during close --all"),
         )
         .with_suggestion(
-            "Inspect result.failed, rerun 'rub close <session>' for those sessions, or use 'rub doctor' before retrying.",
+            "Inspect failed_sessions, session_error_details, and compatibility_degraded_owned_sessions, rerun 'rub close <session>' for those sessions, or use 'rub doctor' before retrying.",
         )
         .with_context(serde_json::json!({
-            "reason": "close_all_partial_failure",
+            "reason": if compatibility_degraded_owned {
+                "close_all_compatibility_degraded_owned_sessions"
+            } else {
+                "close_all_partial_failure"
+            },
             "close_all": daemon_ctl::project_batch_close_result(rub_home, result),
             "failed_sessions": result.failed,
+            "session_error_details": result.session_error_details,
+            "compatibility_degraded_owned_sessions": result.compatibility_degraded_owned_sessions,
+        })),
+    )
+}
+
+pub(crate) fn cleanup_compatibility_degraded_owned_error(
+    rub_home: &Path,
+    result: &cleanup_ctl::CleanupResult,
+) -> RubError {
+    RubError::Domain(
+        ErrorEnvelope::new(
+            ErrorCode::SessionBusy,
+            "Cleanup left owned but compatibility-degraded session authority unreleased",
+        )
+        .with_suggestion(
+            "Inspect compatibility_degraded_owned_sessions, rerun 'rub close <session>' for those sessions, or use 'rub doctor' before retrying cleanup.",
+        )
+        .with_context(serde_json::json!({
+            "reason": "cleanup_compatibility_degraded_owned_sessions",
+            "cleanup": cleanup_ctl::project_cleanup_result(rub_home, result),
+            "compatibility_degraded_owned_sessions": result.compatibility_degraded_owned_sessions,
         })),
     )
 }
@@ -152,7 +184,7 @@ pub(crate) async fn try_handle_local_command_before_binding(
 
     if matches!(&cli.command, Commands::Cleanup) {
         match cleanup_ctl::cleanup_runtime(rub_home, timeout).await {
-            Ok(result) => {
+            Ok(result) if !result.has_compatibility_degraded_owned_sessions() => {
                 println!(
                     "{}",
                     output::format_cli_success(
@@ -165,6 +197,19 @@ pub(crate) async fn try_handle_local_command_before_binding(
                     )
                 );
                 return true;
+            }
+            Ok(result) => {
+                println!(
+                    "{}",
+                    output::format_cli_error(
+                        "cleanup",
+                        session,
+                        cleanup_compatibility_degraded_owned_error(rub_home, &result)
+                            .into_envelope(),
+                        pretty,
+                    )
+                );
+                std::process::exit(1);
             }
             Err(error) => {
                 println!(
@@ -336,7 +381,10 @@ pub(crate) async fn try_handle_prebootstrap_command(
             std::process::exit(1);
         }
         match daemon_ctl::close_all_sessions(rub_home, timeout).await {
-            Ok(result) if result.failed.is_empty() => {
+            Ok(result)
+                if result.failed.is_empty()
+                    && !result.has_compatibility_degraded_owned_sessions() =>
+            {
                 println!(
                     "{}",
                     output::format_cli_success(
@@ -419,18 +467,20 @@ pub(crate) async fn try_handle_prebootstrap_command(
             }
         };
         let close_outcome = if let Some(attachment_identity) = attachment_identity {
-            match daemon_ctl::resolve_existing_close_target_by_attachment_identity(
+            match daemon_ctl::resolve_existing_close_target_by_attachment_identity_until(
                 rub_home,
                 &attachment_identity,
+                close_deadline,
                 timeout,
             )
             .await
             {
                 Ok(Some(target)) => {
-                    daemon_ctl::close_existing_session_targeted(
+                    daemon_ctl::close_existing_session_targeted_until(
                         rub_home,
                         &target.session_name,
                         Some(target.daemon_session_id.as_str()),
+                        close_deadline,
                         timeout,
                     )
                     .await
@@ -439,28 +489,33 @@ pub(crate) async fn try_handle_prebootstrap_command(
                 Err(error) => Err(error),
             }
         } else {
-            daemon_ctl::close_existing_session(rub_home, session, timeout).await
+            daemon_ctl::close_existing_session_targeted_until(
+                rub_home,
+                session,
+                cli.session_id.as_deref(),
+                close_deadline,
+                timeout,
+            )
+            .await
         };
         match close_outcome {
             Ok(daemon_ctl::ExistingCloseOutcome::Closed(response)) => {
                 let mut response = *response;
-                let output = match finalize_response_output(
+                let finalized_output = finalize_response_output(
                     cli,
-                    "close",
-                    session,
-                    rub_home,
-                    pretty,
-                    binding_execution_projection,
+                    FinalizeResponseContext {
+                        command_name: "close",
+                        session,
+                        rub_home,
+                        pretty,
+                        command_deadline: close_deadline,
+                        timeout_ms: timeout,
+                        binding_execution_projection,
+                    },
                     &mut response,
-                ) {
-                    Ok(output) => output,
-                    Err(output) => {
-                        println!("{output}");
-                        std::process::exit(1);
-                    }
-                };
-                println!("{output}");
-                if response.status == rub_ipc::protocol::ResponseStatus::Error {
+                );
+                println!("{}", finalized_output.output);
+                if !finalized_output.success {
                     std::process::exit(1);
                 }
                 return true;

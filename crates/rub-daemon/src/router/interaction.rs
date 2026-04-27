@@ -15,8 +15,9 @@ use super::artifacts::annotate_path_reference_state;
 use super::projection::{
     attach_result, attach_subject, coordinates_subject, element_subject, focused_frame_subject,
 };
-use super::request_args::parse_json_args;
+use super::request_args::{locator_json, parse_json_args};
 use super::*;
+use crate::router::timeout_projection::record_mutating_possible_commit_timeout_projection;
 
 pub(super) async fn cmd_click(
     router: &DaemonRouter,
@@ -38,6 +39,10 @@ async fn cmd_click_with_gesture(
     let gesture = requested_click_gesture(args.gesture.as_deref())?;
     if let Some([x, y]) = args.xy {
         let baseline = capture_interaction_baseline(router, state).await;
+        record_interaction_possible_commit_timeout_projection(
+            click_command_name(gesture),
+            raw_args,
+        );
         let outcome = match gesture {
             ClickGesture::Single => router.browser.click_xy(x, y).await?,
             ClickGesture::Double => router.browser.dblclick_xy(x, y).await?,
@@ -66,6 +71,7 @@ async fn cmd_click_with_gesture(
     .await?;
     let element = resolved.element;
     let baseline = capture_interaction_baseline(router, state).await;
+    record_interaction_possible_commit_timeout_projection(click_command_name(gesture), raw_args);
     let outcome = match match gesture {
         ClickGesture::Single => router.browser.click(&element).await,
         ClickGesture::Double => router.browser.dblclick(&element).await,
@@ -98,6 +104,79 @@ async fn cmd_click_with_gesture(
     Ok(data)
 }
 
+fn record_interaction_possible_commit_timeout_projection(command: &str, args: &serde_json::Value) {
+    record_mutating_possible_commit_timeout_projection(
+        command,
+        interaction_possible_commit_recovery_contract(command, args),
+    );
+}
+
+fn interaction_possible_commit_recovery_contract(
+    command: &str,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    let mut request = serde_json::Map::new();
+    if let Some(locator) = redacted_interaction_locator(args) {
+        request.insert("locator".to_string(), locator);
+    }
+    if let Some(xy) = args.get("xy").and_then(|value| value.as_array())
+        && xy.len() == 2
+    {
+        request.insert("xy".to_string(), serde_json::Value::Array(xy.clone()));
+    }
+    if let Some(snapshot_id) = args.get("snapshot_id").and_then(|value| value.as_str()) {
+        request.insert(
+            "snapshot_id".to_string(),
+            serde_json::Value::String(snapshot_id.to_string()),
+        );
+    }
+    if args.get("wait_after").is_some() {
+        request.insert(
+            "wait_after_requested".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    request.insert(
+        "arguments_redacted".to_string(),
+        serde_json::Value::Bool(true),
+    );
+
+    serde_json::json!({
+        "kind": "interaction_possible_commit",
+        "command": command,
+        "same_command_retry_requires_same_command_id": true,
+        "request": request,
+    })
+}
+
+fn redacted_interaction_locator(args: &serde_json::Value) -> Option<serde_json::Value> {
+    let mut locator = serde_json::Map::new();
+    for key in [
+        "index",
+        "element_ref",
+        "ref",
+        "selector",
+        "role",
+        "testid",
+        "visible",
+        "prefer_enabled",
+        "topmost",
+        "first",
+        "last",
+        "nth",
+    ] {
+        if let Some(value) = args.get(key) {
+            let public_key = if key == "ref" { "element_ref" } else { key };
+            locator.insert(public_key.to_string(), value.clone());
+        }
+    }
+    if locator.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(locator))
+    }
+}
+
 pub(super) async fn cmd_keys(
     router: &DaemonRouter,
     args: &serde_json::Value,
@@ -107,8 +186,12 @@ pub(super) async fn cmd_keys(
     let combo = rub_core::model::KeyCombo::parse(&parsed.keys)?;
     let baseline = capture_interaction_baseline(router, state).await;
     let selected_frame_id =
-        super::frame_scope::effective_request_frame_id(router, args, state).await?;
-    let outcome = router.browser.send_keys(&combo).await?;
+        super::frame_scope::effective_interaction_frame_id(router, args, state).await?;
+    record_interaction_possible_commit_timeout_projection("keys", args);
+    let outcome = router
+        .browser
+        .send_keys_in_frame(selected_frame_id.as_deref(), &combo)
+        .await?;
     let mut data = serde_json::json!({});
     attach_subject(
         &mut data,
@@ -157,6 +240,7 @@ async fn cmd_text_entry(
             &mut data,
             element_subject(&resolved.element, &resolved.snapshot_id),
         );
+        record_interaction_possible_commit_timeout_projection("type", raw_args);
         match router
             .browser
             .type_into(&resolved.element, &text, clear)
@@ -183,11 +267,12 @@ async fn cmd_text_entry(
         ));
     } else {
         let selected_frame_id =
-            super::frame_scope::effective_request_frame_id(router, raw_args, state).await?;
+            super::frame_scope::effective_interaction_frame_id(router, raw_args, state).await?;
         attach_subject(
             &mut data,
             focused_frame_subject(selected_frame_id.as_deref()),
         );
+        record_interaction_possible_commit_timeout_projection("type", raw_args);
         router
             .browser
             .type_text_in_frame(selected_frame_id.as_deref(), &text)
@@ -207,6 +292,7 @@ pub(super) async fn cmd_hover(
     let resolved = resolve_element(router, args, state, deadline, "hover").await?;
     let element = resolved.element;
     let baseline = capture_interaction_baseline(router, state).await;
+    record_interaction_possible_commit_timeout_projection("hover", args);
     let outcome = match router.browser.hover(&element).await {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -240,6 +326,7 @@ pub(super) async fn cmd_upload(
     let element = resolved.element;
     let path = parsed.path;
     let baseline = capture_interaction_baseline(router, state).await;
+    record_interaction_possible_commit_timeout_projection("upload", args);
     let outcome = match router.browser.upload_file(&element, &path).await {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -286,6 +373,7 @@ pub(super) async fn cmd_select(
     let element = resolved.element;
     let value = parsed.value;
     let baseline = capture_interaction_baseline(router, state).await;
+    record_interaction_possible_commit_timeout_projection("select", args);
     let outcome = match router.browser.select_option(&element, &value).await {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -321,6 +409,138 @@ pub(super) async fn cmd_interactability_probe(
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     explain::cmd_interactability_probe(router, args, deadline, state).await
+}
+
+pub(crate) fn semantic_replay_args(
+    command: &str,
+    args: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    match command {
+        "click" => {
+            let parsed: ClickArgs = parse_json_args(args, "click").ok()?;
+            let mut projected = serde_json::Map::new();
+            projected.insert(
+                "gesture".to_string(),
+                serde_json::json!(click_gesture_name(
+                    requested_click_gesture(parsed.gesture.as_deref()).ok()?
+                )),
+            );
+            if let Some(xy) = parsed.xy {
+                projected.insert("xy".to_string(), serde_json::json!(xy));
+            } else {
+                merge_locator_projection(&mut projected, locator_json(parsed._locator));
+                if let Some(snapshot_id) = args.get("snapshot_id") {
+                    projected.insert("snapshot_id".to_string(), snapshot_id.clone());
+                }
+                if let Some(orchestration) =
+                    super::frame_scope::semantic_replay_orchestration_metadata(args)
+                {
+                    projected.insert("_orchestration".to_string(), orchestration);
+                }
+            }
+            if let Some(wait_after) = args.get("wait_after") {
+                projected.insert("wait_after".to_string(), wait_after.clone());
+            }
+            Some(serde_json::Value::Object(projected))
+        }
+        "keys" => {
+            let parsed: KeysArgs = parse_json_args(args, "keys").ok()?;
+            let mut projected = serde_json::Map::new();
+            projected.insert("keys".to_string(), serde_json::json!(parsed.keys));
+            if let Some(wait_after) = args.get("wait_after") {
+                projected.insert("wait_after".to_string(), wait_after.clone());
+            }
+            if let Some(orchestration) =
+                super::frame_scope::semantic_replay_orchestration_metadata(args)
+            {
+                projected.insert("_orchestration".to_string(), orchestration);
+            }
+            Some(serde_json::Value::Object(projected))
+        }
+        "type" => {
+            let parsed: TextEntryArgs = parse_json_args(args, "type").ok()?;
+            let mut projected = serde_json::Map::new();
+            projected.insert("text".to_string(), serde_json::json!(parsed.text));
+            projected.insert("clear".to_string(), serde_json::json!(parsed.clear));
+            merge_locator_projection(&mut projected, locator_json(parsed.locator));
+            if let Some(snapshot_id) = args.get("snapshot_id") {
+                projected.insert("snapshot_id".to_string(), snapshot_id.clone());
+            }
+            if let Some(wait_after) = args.get("wait_after") {
+                projected.insert("wait_after".to_string(), wait_after.clone());
+            }
+            if let Some(orchestration) =
+                super::frame_scope::semantic_replay_orchestration_metadata(args)
+            {
+                projected.insert("_orchestration".to_string(), orchestration);
+            }
+            Some(serde_json::Value::Object(projected))
+        }
+        "hover" => {
+            let parsed: HoverArgs = parse_json_args(args, "hover").ok()?;
+            let mut projected = serde_json::Map::new();
+            merge_locator_projection(&mut projected, locator_json(parsed._locator));
+            if let Some(snapshot_id) = args.get("snapshot_id") {
+                projected.insert("snapshot_id".to_string(), snapshot_id.clone());
+            }
+            if let Some(wait_after) = args.get("wait_after") {
+                projected.insert("wait_after".to_string(), wait_after.clone());
+            }
+            if let Some(orchestration) =
+                super::frame_scope::semantic_replay_orchestration_metadata(args)
+            {
+                projected.insert("_orchestration".to_string(), orchestration);
+            }
+            Some(serde_json::Value::Object(projected))
+        }
+        "upload" => {
+            let parsed: UploadArgs = parse_json_args(args, "upload").ok()?;
+            let mut projected = serde_json::Map::new();
+            projected.insert("path".to_string(), serde_json::json!(parsed.path));
+            merge_locator_projection(&mut projected, locator_json(parsed._locator));
+            if let Some(snapshot_id) = args.get("snapshot_id") {
+                projected.insert("snapshot_id".to_string(), snapshot_id.clone());
+            }
+            if let Some(wait_after) = args.get("wait_after") {
+                projected.insert("wait_after".to_string(), wait_after.clone());
+            }
+            if let Some(orchestration) =
+                super::frame_scope::semantic_replay_orchestration_metadata(args)
+            {
+                projected.insert("_orchestration".to_string(), orchestration);
+            }
+            Some(serde_json::Value::Object(projected))
+        }
+        "select" => {
+            let parsed: SelectArgs = parse_json_args(args, "select").ok()?;
+            let mut projected = serde_json::Map::new();
+            projected.insert("value".to_string(), serde_json::json!(parsed.value));
+            merge_locator_projection(&mut projected, locator_json(parsed._locator));
+            if let Some(snapshot_id) = args.get("snapshot_id") {
+                projected.insert("snapshot_id".to_string(), snapshot_id.clone());
+            }
+            if let Some(wait_after) = args.get("wait_after") {
+                projected.insert("wait_after".to_string(), wait_after.clone());
+            }
+            if let Some(orchestration) =
+                super::frame_scope::semantic_replay_orchestration_metadata(args)
+            {
+                projected.insert("_orchestration".to_string(), orchestration);
+            }
+            Some(serde_json::Value::Object(projected))
+        }
+        _ => None,
+    }
+}
+
+fn merge_locator_projection(
+    projected: &mut serde_json::Map<String, serde_json::Value>,
+    locator: serde_json::Value,
+) {
+    let serde_json::Value::Object(locator) = locator else {
+        return;
+    };
+    projected.extend(locator);
 }
 
 #[cfg(test)]

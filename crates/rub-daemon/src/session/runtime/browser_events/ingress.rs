@@ -166,10 +166,7 @@ impl BrowserSessionEventSink {
     pub fn enqueue_download_runtime(
         &self,
         generation: u64,
-        status: DownloadRuntimeStatus,
-        mode: DownloadMode,
-        download_dir: Option<String>,
-        degraded_reason: Option<String>,
+        runtime: rub_core::model::DownloadRuntimeInfo,
     ) {
         let _coordination_guard = self
             .progress_overflow_coordination
@@ -180,10 +177,7 @@ impl BrowserSessionEventSink {
             BrowserSessionEvent::DownloadRuntime {
                 browser_sequence,
                 generation,
-                status,
-                mode,
-                download_dir,
-                degraded_reason,
+                runtime: Box::new(runtime),
             },
             true,
         );
@@ -261,9 +255,9 @@ impl BrowserSessionEventSink {
             BrowserSessionEvent::DownloadRuntime {
                 browser_sequence,
                 generation,
-                degraded_reason,
+                runtime,
                 ..
-            } if degraded_reason.is_none() => Some((*generation, *browser_sequence)),
+            } if runtime.degraded_reason.is_none() => Some((*generation, *browser_sequence)),
             _ => None,
         };
         let mut critical_enqueue_recorded = false;
@@ -400,8 +394,8 @@ fn requires_download_progress_coordination(event: &BrowserSessionEvent) -> bool 
         || matches!(
             event,
             BrowserSessionEvent::DownloadRuntime {
-                degraded_reason, ..
-            } if degraded_reason.is_none()
+                runtime, ..
+            } if runtime.degraded_reason.is_none()
         )
 }
 

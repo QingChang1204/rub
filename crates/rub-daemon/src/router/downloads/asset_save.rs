@@ -311,11 +311,13 @@ mod tests {
     use super::{DownloadSaveArgs, DownloadSaveBatch, DownloadSaveRequest, MAX_SAVE_CONCURRENCY};
     use reqwest::header::HeaderValue;
     use rub_core::error::ErrorCode;
+    use rub_core::fs::commit_temporary_file;
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use time::OffsetDateTime;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn build_base_filename_uses_source_name_and_url_extension() {
@@ -582,6 +584,35 @@ mod tests {
         cleanup_tracked_temp_path(&slot).await;
         assert!(!temp_path.exists());
         assert!(slot.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[tokio::test]
+    async fn download_save_commit_accepts_readable_async_temp_handle() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "rub-asset-save-commit-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let tmp_path = temp_root.join("alpha.jpg.part");
+        let final_path = temp_root.join("alpha.jpg");
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&tmp_path)
+            .await
+            .unwrap();
+        file.write_all(b"AAA").await.unwrap();
+        file.flush().await.unwrap();
+        let file = file.into_std().await;
+
+        let outcome = commit_temporary_file(&file, &tmp_path, &final_path).unwrap();
+        assert!(outcome.durability_confirmed());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"AAA");
+
         let _ = std::fs::remove_dir_all(&temp_root);
     }
 

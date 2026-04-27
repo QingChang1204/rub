@@ -4,6 +4,7 @@ use rub_core::model::PathReferenceState;
 use rub_daemon::rub_paths::{
     RubPaths, default_rub_home as default_rub_home_path, validate_session_name,
 };
+use rub_ipc::protocol::MAX_IPC_TIMEOUT_MS;
 use serde::Deserialize;
 use std::path::{Component, Path, PathBuf};
 
@@ -143,6 +144,10 @@ pub struct Cli {
     #[arg(long, global = true, help_heading = "Browser connection & launch")]
     pub profile: Option<String>,
 
+    /// Internal exact resolved profile authority (hidden; set by parent relaunch only)
+    #[arg(long = "profile-resolved-path", hide = true, global = true)]
+    pub profile_resolved_path: Option<String>,
+
     /// Reuse one remembered binding/account/workspace alias for this browser-backed command
     #[arg(
         long = "use",
@@ -206,6 +211,7 @@ pub struct EffectiveCli {
     pub cdp_url: Option<String>,
     pub connect: bool,
     pub profile: Option<String>,
+    pub profile_resolved_path: Option<String>,
     pub use_alias: Option<String>,
     pub no_stealth: bool,
     pub humanize: bool,
@@ -280,15 +286,28 @@ impl Cli {
                 || std::env::var_os("RUB_HUMANIZE_SPEED").is_some())
             .then_some(effective_humanize_speed.clone()),
         };
+        let effective_timeout = self
+            .timeout
+            .or(file_config.default_timeout_ms)
+            .unwrap_or(30_000);
+        if effective_timeout == 0 || effective_timeout > MAX_IPC_TIMEOUT_MS {
+            return Err(RubError::domain_with_context(
+                ErrorCode::IpcProtocolError,
+                format!("IPC request timeout_ms must be between 1 and {MAX_IPC_TIMEOUT_MS}"),
+                serde_json::json!({
+                    "reason": "invalid_ipc_request_contract",
+                    "field": "timeout_ms",
+                    "max_timeout_ms": MAX_IPC_TIMEOUT_MS,
+                    "actual_timeout_ms": effective_timeout,
+                }),
+            ));
+        }
 
         Ok(EffectiveCli {
             session: self.session,
             session_id: self.session_id,
             rub_home,
-            timeout: self
-                .timeout
-                .or(file_config.default_timeout_ms)
-                .unwrap_or(30_000),
+            timeout: effective_timeout,
             headed: effective_headed,
             ignore_cert_errors: effective_ignore_cert_errors,
             user_data_dir: effective_user_data_dir,
@@ -300,6 +319,7 @@ impl Cli {
             cdp_url: self.cdp_url,
             connect: self.connect,
             profile: self.profile,
+            profile_resolved_path: self.profile_resolved_path,
             use_alias: self.use_alias,
             no_stealth: effective_no_stealth,
             humanize: effective_humanize,
@@ -421,11 +441,32 @@ mod tests {
         Commands, OrchestrationSubcommand, RuntimeSubcommand, TriggerSubcommand,
     };
     use clap::Parser;
+    use rub_core::error::ErrorCode;
+    use rub_ipc::protocol::MAX_IPC_TIMEOUT_MS;
 
     #[test]
     fn json_alias_enables_pretty_output() {
         let cli = Cli::try_parse_from(["rub", "--json", "doctor"]).expect("cli should parse");
         assert!(cli.json_pretty);
+    }
+
+    #[test]
+    fn effective_cli_rejects_timeout_outside_protocol_budget_for_local_commands() {
+        let timeout = (MAX_IPC_TIMEOUT_MS + 1).to_string();
+        let error = Cli::try_parse_from(["rub", "--timeout", timeout.as_str(), "cleanup"])
+            .expect("cli parse should accept raw integer timeout")
+            .effective()
+            .expect_err("effective cli must reject timeout before local dispatch");
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
+        assert_eq!(
+            envelope.context.as_ref().unwrap()["reason"],
+            "invalid_ipc_request_contract"
+        );
+        assert_eq!(
+            envelope.context.as_ref().unwrap()["field"],
+            serde_json::json!("timeout_ms")
+        );
     }
 
     #[test]

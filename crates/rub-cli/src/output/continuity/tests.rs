@@ -11,8 +11,9 @@ fn rub_home() -> &'static Path {
 #[test]
 fn format_response_adds_same_runtime_continuity_for_context_transition() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-wait".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -64,8 +65,9 @@ fn format_response_adds_same_runtime_continuity_for_context_transition() {
 #[test]
 fn format_response_guides_content_lane_after_find_content() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-find".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -117,8 +119,9 @@ fn format_response_guides_content_lane_after_find_content() {
 #[test]
 fn format_response_guides_interaction_lane_after_find_interactive_candidates() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-find".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -171,8 +174,9 @@ fn format_response_guides_interaction_lane_after_find_interactive_candidates() {
 #[test]
 fn format_response_adds_fresh_home_continuity_for_provider_gate() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-blockers".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -250,8 +254,9 @@ fn format_response_adds_fresh_home_continuity_for_provider_gate() {
 #[test]
 fn format_response_uses_top_level_doctor_for_degraded_runtime_guidance() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-blockers".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -310,8 +315,9 @@ fn format_response_uses_top_level_doctor_for_degraded_runtime_guidance() {
 #[test]
 fn format_response_keeps_active_handoff_in_same_runtime() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-blockers".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -379,8 +385,9 @@ fn format_response_keeps_active_handoff_in_same_runtime() {
 #[test]
 fn format_response_prefers_blocker_guidance_when_present() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-blockers".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -435,8 +442,9 @@ fn format_response_prefers_blocker_guidance_when_present() {
 #[test]
 fn format_response_adds_same_runtime_continuity_for_new_item_observed() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-inspect".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -484,8 +492,9 @@ fn format_response_adds_same_runtime_continuity_for_new_item_observed() {
 #[test]
 fn format_response_prefers_open_hint_when_matched_item_contains_url() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-inspect".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -528,8 +537,9 @@ fn format_response_prefers_open_hint_when_matched_item_contains_url() {
 #[test]
 fn format_response_adds_same_runtime_continuity_for_interactable_target() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-wait".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -573,8 +583,9 @@ fn format_response_adds_same_runtime_continuity_for_interactable_target() {
 #[test]
 fn format_response_adds_same_runtime_continuity_for_confirmed_target_description() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-wait-description".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -618,8 +629,9 @@ fn format_response_adds_same_runtime_continuity_for_confirmed_target_description
 #[test]
 fn format_response_adds_observation_guidance_for_confirmed_follow_up_activity() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-click".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -691,8 +703,9 @@ fn format_response_adds_observation_guidance_for_confirmed_follow_up_activity() 
 #[test]
 fn format_response_falls_back_to_recent_network_hint_without_request_id() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-click".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -739,8 +752,9 @@ fn format_response_falls_back_to_recent_network_hint_without_request_id() {
 #[test]
 fn format_response_prefers_local_runtime_checks_for_same_origin_follow_up_reads() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-click".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -813,8 +827,9 @@ fn format_response_prefers_local_runtime_checks_for_same_origin_follow_up_reads(
 #[test]
 fn format_response_prefers_local_recovery_for_failed_follow_up_activity() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-click".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -874,8 +889,9 @@ fn format_response_prefers_local_recovery_for_failed_follow_up_activity() {
 #[test]
 fn format_response_prefers_local_runtime_checks_for_read_like_network_request_records() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-inspect-network".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -936,8 +952,9 @@ fn format_response_prefers_local_runtime_checks_for_read_like_network_request_re
 #[test]
 fn format_response_prefers_local_runtime_checks_for_read_like_network_request_registries() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-inspect-network".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -1015,8 +1032,9 @@ fn format_response_prefers_local_runtime_checks_for_read_like_network_request_re
 #[test]
 fn format_response_prefers_mixed_guidance_for_mixed_network_request_registries() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-inspect-network".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -1106,8 +1124,9 @@ fn format_response_prefers_mixed_guidance_for_mixed_network_request_registries()
 #[test]
 fn format_response_prefers_local_runtime_checks_for_terminal_read_like_requests() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-inspect-network-wait".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -1174,8 +1193,9 @@ fn format_response_prefers_local_runtime_checks_for_terminal_read_like_requests(
 #[test]
 fn format_response_prefers_downstream_observation_for_write_like_network_request_records() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-inspect-network".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -1228,8 +1248,9 @@ fn format_response_prefers_downstream_observation_for_write_like_network_request
 #[test]
 fn format_response_prefers_downstream_observation_for_terminal_write_like_requests() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-inspect-network-wait".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -1292,8 +1313,9 @@ fn format_response_prefers_downstream_observation_for_terminal_write_like_reques
 #[test]
 fn format_response_prefers_local_recovery_for_failed_network_request_records() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-inspect-network".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -1346,8 +1368,9 @@ fn format_response_prefers_local_recovery_for_failed_network_request_records() {
 #[test]
 fn format_response_prefers_local_rechecks_for_in_flight_write_request_records() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-inspect-network".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -1400,8 +1423,9 @@ fn format_response_prefers_local_rechecks_for_in_flight_write_request_records() 
 #[test]
 fn format_response_summarizes_redirected_navigation_commit() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-open".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -1458,8 +1482,9 @@ fn format_response_summarizes_redirected_navigation_commit() {
 #[test]
 fn format_response_summarizes_new_tab_like_navigation_drift() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-open".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -1516,8 +1541,9 @@ fn format_response_summarizes_new_tab_like_navigation_drift() {
 #[test]
 fn format_response_summarizes_interstitial_runtime_interference() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-runtime".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -1565,8 +1591,9 @@ fn format_response_summarizes_interstitial_runtime_interference() {
 #[test]
 fn format_response_summarizes_stale_frame_runtime_authority() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-runtime-frame".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -1623,8 +1650,9 @@ fn format_response_summarizes_stale_frame_runtime_authority() {
 #[test]
 fn format_response_summarizes_degraded_frame_runtime_authority() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-runtime-frame".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({

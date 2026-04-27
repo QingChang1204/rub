@@ -217,6 +217,7 @@ mod tests {
             text: text.to_string(),
             attributes: HashMap::new(),
             element_ref: Some(format!("main:{index}")),
+            target_id: None,
             bounding_box: Some(BoundingBox {
                 x: 0.0,
                 y: 0.0,

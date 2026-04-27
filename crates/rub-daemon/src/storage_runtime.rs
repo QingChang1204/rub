@@ -15,6 +15,15 @@ pub struct StorageRuntimeState {
     recent_mutations: VecDeque<StorageMutationRecord>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct StorageMutationRuntimeContext {
+    pub tab_target_id: Option<String>,
+    pub frame_id: Option<String>,
+    pub area: Option<StorageArea>,
+    pub key: Option<String>,
+    pub commit_status: Option<String>,
+}
+
 impl StorageRuntimeState {
     pub fn projection(&self) -> StorageRuntimeInfo {
         let mut projection = self.projection.clone();
@@ -25,6 +34,8 @@ impl StorageRuntimeState {
     pub fn replace_snapshot(&mut self, snapshot: StorageSnapshot) -> StorageRuntimeInfo {
         self.projection.status = StorageRuntimeStatus::Active;
         self.projection.current_origin = Some(snapshot.origin);
+        self.projection.current_tab_target_id = snapshot.tab_target_id.clone();
+        self.projection.current_frame_id = snapshot.frame_id.clone();
         self.projection.local_storage_keys = snapshot.local_storage.into_keys().collect();
         self.projection.session_storage_keys = snapshot.session_storage.into_keys().collect();
         self.projection.degraded_reason = None;
@@ -35,8 +46,7 @@ impl StorageRuntimeState {
         &mut self,
         kind: StorageMutationKind,
         origin: String,
-        area: Option<StorageArea>,
-        key: Option<String>,
+        context: StorageMutationRuntimeContext,
     ) -> StorageRuntimeInfo {
         let sequence = self.next_sequence.max(1);
         self.next_sequence = sequence + 1;
@@ -44,8 +54,11 @@ impl StorageRuntimeState {
             sequence,
             kind,
             origin,
-            area,
-            key,
+            tab_target_id: context.tab_target_id,
+            frame_id: context.frame_id,
+            area: context.area,
+            key: context.key,
+            commit_status: context.commit_status,
         });
         while self.recent_mutations.len() > STORAGE_MUTATION_LIMIT {
             self.recent_mutations.pop_front();
@@ -62,7 +75,7 @@ impl StorageRuntimeState {
 
 #[cfg(test)]
 mod tests {
-    use super::StorageRuntimeState;
+    use super::{StorageMutationRuntimeContext, StorageRuntimeState};
     use rub_core::storage::{
         StorageArea, StorageMutationKind, StorageRuntimeStatus, StorageSnapshot,
     };
@@ -73,6 +86,8 @@ mod tests {
         let mut state = StorageRuntimeState::default();
         let snapshot = state.replace_snapshot(StorageSnapshot {
             origin: "https://example.test".to_string(),
+            tab_target_id: Some("tab-1".to_string()),
+            frame_id: Some("frame-1".to_string()),
             local_storage: BTreeMap::from([("token".to_string(), "abc".to_string())]),
             session_storage: BTreeMap::from([("csrf".to_string(), "def".to_string())]),
         });
@@ -82,20 +97,39 @@ mod tests {
             snapshot.current_origin.as_deref(),
             Some("https://example.test")
         );
+        assert_eq!(snapshot.current_tab_target_id.as_deref(), Some("tab-1"));
+        assert_eq!(snapshot.current_frame_id.as_deref(), Some("frame-1"));
         assert_eq!(snapshot.local_storage_keys, vec!["token"]);
         assert_eq!(snapshot.session_storage_keys, vec!["csrf"]);
 
         let projection = state.record_mutation(
             StorageMutationKind::Set,
             "https://example.test".to_string(),
-            Some(StorageArea::Local),
-            Some("token".to_string()),
+            StorageMutationRuntimeContext {
+                tab_target_id: Some("tab-1".to_string()),
+                frame_id: Some("frame-1".to_string()),
+                area: Some(StorageArea::Local),
+                key: Some("token".to_string()),
+                commit_status: Some("snapshot_committed".to_string()),
+            },
         );
         assert_eq!(projection.recent_mutations.len(), 1);
         assert_eq!(projection.recent_mutations[0].sequence, 1);
         assert_eq!(
             projection.recent_mutations[0].area,
             Some(StorageArea::Local)
+        );
+        assert_eq!(
+            projection.recent_mutations[0].tab_target_id.as_deref(),
+            Some("tab-1")
+        );
+        assert_eq!(
+            projection.recent_mutations[0].frame_id.as_deref(),
+            Some("frame-1")
+        );
+        assert_eq!(
+            projection.recent_mutations[0].commit_status.as_deref(),
+            Some("snapshot_committed")
         );
     }
 

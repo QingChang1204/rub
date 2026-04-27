@@ -13,8 +13,8 @@ pub(crate) use self::budget::WAIT_IPC_BUFFER_MS;
 #[cfg(test)]
 pub(crate) use self::budget::humanize_budget_ms_for_command_args;
 pub(crate) use self::budget::{
-    command_timeout_ms, deadline_from_start, ensure_remaining_budget, remaining_budget_duration,
-    run_with_remaining_budget,
+    command_timeout_ms, deadline_from_start, deadline_from_start_checked, ensure_remaining_budget,
+    remaining_budget_duration, run_with_remaining_budget, validate_timeout_budget,
 };
 use self::helpers::{
     WaitProbeArgs, element_address_args, input_path_reference_state, merge_json_objects,
@@ -37,8 +37,8 @@ use self::workflow_budget::{
 
 const ATOMIC_FILL_ROLLBACK_RESERVE_MS_PER_STEP: u64 = 1_000;
 
-pub(crate) fn align_embedded_timeout_authority(request: &mut IpcRequest) {
-    let embedded_timeout_ms = match request.command.as_str() {
+pub(crate) fn embedded_timeout_budget_ms(request: &IpcRequest) -> Option<u64> {
+    match request.command.as_str() {
         "wait" => Some(request.timeout_ms.saturating_sub(WAIT_IPC_BUFFER_MS)),
         "inspect"
             if request
@@ -63,21 +63,38 @@ pub(crate) fn align_embedded_timeout_authority(request: &mut IpcRequest) {
         {
             Some(request.timeout_ms.saturating_sub(WAIT_IPC_BUFFER_MS))
         }
+        "inspect"
+            if request
+                .args
+                .get("sub")
+                .and_then(|value| value.as_str())
+                .is_some_and(|sub| sub == "list")
+                && request.args.get("wait_timeout_ms").is_some() =>
+        {
+            Some(request.timeout_ms.saturating_sub(WAIT_IPC_BUFFER_MS))
+        }
         _ => None,
-    };
+    }
+}
 
-    if let Some(timeout_ms) = embedded_timeout_ms
+pub(crate) fn align_embedded_timeout_authority(request: &mut IpcRequest) {
+    if let Some(timeout_ms) = embedded_timeout_budget_ms(request)
         && let Some(object) = request.args.as_object_mut()
-        && object.contains_key("timeout_ms")
     {
-        object.insert("timeout_ms".to_string(), serde_json::json!(timeout_ms));
+        if object.contains_key("timeout_ms") {
+            object.insert("timeout_ms".to_string(), serde_json::json!(timeout_ms));
+        }
+        if object.contains_key("wait_timeout_ms") {
+            object.insert("wait_timeout_ms".to_string(), serde_json::json!(timeout_ms));
+        }
     }
 }
 
 pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
     let timeout = command_timeout_ms(cli);
+    validate_timeout_budget(timeout)?;
 
-    match &cli.command {
+    let request = match &cli.command {
         Commands::Open {
             url,
             load_strategy,
@@ -233,12 +250,19 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
                 ))
             }
         }
-        Commands::Exec { code, raw } => Ok(mutating_request(
+        Commands::Exec {
+            code,
+            raw,
+            wait_after,
+        } => Ok(mutating_request(
             "exec",
-            serde_json::json!({
-                "code": code,
-                "raw": raw,
-            }),
+            with_wait_after(
+                serde_json::json!({
+                    "code": code,
+                    "raw": raw,
+                }),
+                wait_after,
+            )?,
             timeout,
         )),
         Commands::Explain {
@@ -246,11 +270,17 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
         } => Err(local_only_command_projection_error(&cli.command)),
         Commands::Explain {
             subcommand: ExplainSubcommand::Blockers,
-        } => Ok(IpcRequest::new(
-            "_blocker_diagnose",
-            serde_json::json!({}),
-            timeout,
-        )),
+        } => IpcRequest::new("_blocker_diagnose", serde_json::json!({}), timeout)
+            .with_command_id(format!("explain-blockers-{}", uuid::Uuid::now_v7()))
+            .map_err(|error| {
+                RubError::domain_with_context(
+                    ErrorCode::IpcProtocolError,
+                    format!("Failed to bind explain blockers command_id: {error}"),
+                    serde_json::json!({
+                        "reason": "explain_blockers_command_id_bind_failed",
+                    }),
+                )
+            }),
         Commands::Explain {
             subcommand: ExplainSubcommand::Interactability { target },
         } => Ok(IpcRequest::new(
@@ -679,7 +709,9 @@ pub fn build_request(cli: &EffectiveCli) -> Result<IpcRequest, RubError> {
             ))
         }
         Commands::InternalDaemon => Err(local_only_command_projection_error(&cli.command)),
-    }
+    }?;
+    request.validate_contract().map_err(RubError::Domain)?;
+    Ok(request)
 }
 #[cfg(test)]
 mod tests;

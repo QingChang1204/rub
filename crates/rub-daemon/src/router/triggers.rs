@@ -62,6 +62,8 @@ mod tests {
                 url: "https://example.com/source".to_string(),
                 title: "Source".to_string(),
                 active: true,
+                active_authority: None,
+                degraded_reason: None,
             }],
             4,
             Some("frame-child"),
@@ -133,6 +135,23 @@ mod tests {
         let error = validate_trigger_action(&mut action)
             .expect_err("reserved metadata should be rejected for browser commands");
         assert!(error.to_string().contains("_orchestration"));
+    }
+
+    #[test]
+    fn validate_trigger_action_rejects_exec_without_automation_commit_fence() {
+        let mut action = TriggerActionSpec {
+            kind: TriggerActionKind::BrowserCommand,
+            command: Some("exec".to_string()),
+            payload: Some(json!({ "code": "window.sideEffect = true" })),
+        };
+        let error =
+            validate_trigger_action(&mut action).expect_err("trigger exec should fail closed");
+        assert!(error.to_string().contains("not supported"));
+        assert!(
+            error
+                .to_string()
+                .contains("click, type, fill, open, reload")
+        );
     }
 
     #[test]
@@ -305,6 +324,7 @@ mod tests {
         let existing = TriggerInfo {
             id: 17,
             status: TriggerStatus::Armed,
+            lifecycle_generation: 1,
             mode: TriggerMode::Once,
             source_tab: source_tab.clone(),
             target_tab: target_tab.clone(),
@@ -376,6 +396,7 @@ mod tests {
         let existing = TriggerInfo {
             id: 99,
             status: TriggerStatus::Degraded,
+            lifecycle_generation: 1,
             mode: spec.mode,
             source_tab: source_tab.clone(),
             target_tab: target_tab.clone(),
@@ -448,6 +469,7 @@ mod tests {
         let existing = TriggerInfo {
             id: 18,
             status: TriggerStatus::Armed,
+            lifecycle_generation: 1,
             mode: spec.mode,
             source_tab: existing_source_tab,
             target_tab: target_tab.clone(),

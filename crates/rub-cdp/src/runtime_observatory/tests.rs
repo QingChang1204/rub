@@ -6,7 +6,8 @@ use super::pending_requests::{
 };
 use super::{
     ObservatoryCallbacks, PENDING_REQUEST_RETENTION_LIMIT, RequestCorrelation, console_message,
-    exception_message, remote_object_summary, terminal_failure_method,
+    exception_message, needs_loading_failed_listener, needs_loading_finished_listener,
+    remote_object_summary, terminal_failure_method,
 };
 use chromiumoxide::cdp::js_protocol::runtime::{
     EventExceptionThrown, ExceptionDetails, RemoteObject, RemoteObjectType, Timestamp,
@@ -388,6 +389,29 @@ fn record_request_updates_terminal_identity_from_merged_pending_state() {
 }
 
 #[test]
+fn response_correlation_can_peek_request_method_from_pending_identity() {
+    let mut registry = PendingRequestRegistry::default();
+    let request_id = "req-response";
+    let mut pending = sample_pending_request(request_id);
+    pending.method = "POST".to_string();
+    pending.request_headers = BTreeMap::from([("x-rub-test".to_string(), "1".to_string())]);
+    registry.record_request(request_id, pending);
+
+    let terminal = registry
+        .peek_terminal_identity(request_id)
+        .expect("responseReceived should be able to reuse requestWillBeSent identity");
+
+    assert_eq!(terminal.method, "POST");
+    assert_eq!(
+        terminal
+            .request_headers
+            .get("x-rub-test")
+            .map(String::as_str),
+        Some("1")
+    );
+}
+
+#[test]
 fn degraded_only_callbacks_are_not_empty() {
     let callbacks = ObservatoryCallbacks {
         on_runtime_degraded: Some(Arc::new(|_| {})),
@@ -398,6 +422,34 @@ fn degraded_only_callbacks_are_not_empty() {
         !callbacks.is_empty(),
         "degraded-only observatory installs must still keep listeners alive"
     );
+}
+
+#[test]
+fn summary_only_observatory_does_not_install_terminal_body_listeners() {
+    let callbacks = ObservatoryCallbacks {
+        on_request_summary: Some(Arc::new(|_| {})),
+        ..Default::default()
+    };
+
+    assert!(
+        !needs_loading_finished_listener(&callbacks),
+        "summary-only observatory must not fetch response bodies with no record consumer"
+    );
+    assert!(
+        !needs_loading_failed_listener(&callbacks),
+        "summary-only observatory must not consume terminal failure authority without a consumer"
+    );
+}
+
+#[test]
+fn request_record_observatory_installs_terminal_listeners() {
+    let callbacks = ObservatoryCallbacks {
+        on_request_record: Some(Arc::new(|_| {})),
+        ..Default::default()
+    };
+
+    assert!(needs_loading_finished_listener(&callbacks));
+    assert!(needs_loading_failed_listener(&callbacks));
 }
 
 #[test]

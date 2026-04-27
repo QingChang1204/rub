@@ -5,7 +5,7 @@ use rub_core::error::RubError;
 
 use crate::session::SessionState;
 
-use super::DaemonRouter;
+use super::{DaemonRouter, TransactionDeadline};
 
 mod args;
 mod commit;
@@ -24,6 +24,7 @@ use self::projection::{build_storage_read_result, storage_payload, storage_subje
 pub(super) async fn cmd_storage(
     router: &DaemonRouter,
     args: &serde_json::Value,
+    deadline: TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     match StorageCommand::parse(args)? {
@@ -31,9 +32,49 @@ pub(super) async fn cmd_storage(
         StorageCommand::Set(parsed) => cmd_storage_set(router, args, parsed, state).await,
         StorageCommand::Remove(parsed) => cmd_storage_remove(router, args, parsed, state).await,
         StorageCommand::Clear(parsed) => cmd_storage_clear(router, args, parsed, state).await,
-        StorageCommand::Export(parsed) => cmd_storage_export(router, args, parsed, state).await,
+        StorageCommand::Export(parsed) => {
+            cmd_storage_export(router, args, parsed, deadline, state).await
+        }
         StorageCommand::Import(parsed) => cmd_storage_import(router, args, parsed, state).await,
     }
+}
+
+pub(crate) fn semantic_replay_args(args: &serde_json::Value) -> Option<serde_json::Value> {
+    let mut projected = serde_json::Map::new();
+    match StorageCommand::parse(args).ok()? {
+        StorageCommand::Get(parsed) => {
+            projected.insert("sub".to_string(), serde_json::json!("get"));
+            projected.insert("key".to_string(), serde_json::json!(parsed.key));
+            projected.insert("area".to_string(), serde_json::json!(parsed.area));
+        }
+        StorageCommand::Set(parsed) => {
+            projected.insert("sub".to_string(), serde_json::json!("set"));
+            projected.insert("key".to_string(), serde_json::json!(parsed.key));
+            projected.insert("value".to_string(), serde_json::json!(parsed.value));
+            projected.insert("area".to_string(), serde_json::json!(parsed.area));
+        }
+        StorageCommand::Remove(parsed) => {
+            projected.insert("sub".to_string(), serde_json::json!("remove"));
+            projected.insert("key".to_string(), serde_json::json!(parsed.key));
+            projected.insert("area".to_string(), serde_json::json!(parsed.area));
+        }
+        StorageCommand::Clear(parsed) => {
+            projected.insert("sub".to_string(), serde_json::json!("clear"));
+            projected.insert("area".to_string(), serde_json::json!(parsed.area));
+        }
+        StorageCommand::Export(parsed) => {
+            projected.insert("sub".to_string(), serde_json::json!("export"));
+            projected.insert("path".to_string(), serde_json::json!(parsed.path));
+        }
+        StorageCommand::Import(parsed) => {
+            projected.insert("sub".to_string(), serde_json::json!("import"));
+            projected.insert("path".to_string(), serde_json::json!(parsed.path));
+        }
+    }
+    if let Some(orchestration) = super::frame_scope::semantic_replay_orchestration_metadata(args) {
+        projected.insert("_orchestration".to_string(), orchestration);
+    }
+    Some(serde_json::Value::Object(projected))
 }
 
 pub(super) async fn cmd_inspect_storage(
@@ -84,6 +125,8 @@ mod tests {
     fn snapshot() -> StorageSnapshot {
         StorageSnapshot {
             origin: "https://example.test".to_string(),
+            tab_target_id: Some("tab-1".to_string()),
+            frame_id: Some("frame-1".to_string()),
             local_storage: BTreeMap::from([
                 ("token".to_string(), "abc".to_string()),
                 ("theme".to_string(), "dark".to_string()),

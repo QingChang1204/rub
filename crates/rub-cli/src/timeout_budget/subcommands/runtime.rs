@@ -7,6 +7,7 @@ use rub_core::error::{ErrorCode, RubError};
 use rub_ipc::protocol::IpcRequest;
 
 use super::super::{WAIT_IPC_BUFFER_MS, mutating_request, resolve_cli_path};
+use super::checked_request;
 
 pub(crate) fn build_history_request(
     timeout: u64,
@@ -99,8 +100,8 @@ pub(crate) fn build_download_request(
     timeout: u64,
     subcommand: &DownloadSubcommand,
 ) -> Result<IpcRequest, RubError> {
-    match subcommand {
-        DownloadSubcommand::Wait { id, state } => Ok(IpcRequest::new(
+    let request = match subcommand {
+        DownloadSubcommand::Wait { id, state } => IpcRequest::new(
             "download",
             serde_json::json!({
                 "sub": "wait",
@@ -109,15 +110,15 @@ pub(crate) fn build_download_request(
                 "timeout_ms": timeout,
             }),
             timeout.saturating_add(WAIT_IPC_BUFFER_MS),
-        )),
-        DownloadSubcommand::Cancel { id } => Ok(mutating_request(
+        ),
+        DownloadSubcommand::Cancel { id } => mutating_request(
             "download",
             serde_json::json!({
                 "sub": "cancel",
                 "id": id,
             }),
             timeout,
-        )),
+        ),
         DownloadSubcommand::Save {
             file,
             output_dir,
@@ -132,7 +133,7 @@ pub(crate) fn build_download_request(
         } => {
             let file = resolve_cli_path(file);
             let output_dir = resolve_cli_path(output_dir);
-            Ok(mutating_request(
+            mutating_request(
                 "download",
                 serde_json::json!({
                     "sub": "save",
@@ -159,9 +160,10 @@ pub(crate) fn build_download_request(
                     "timeout_ms": timeout,
                 }),
                 timeout.saturating_add(WAIT_IPC_BUFFER_MS),
-            ))
+            )
         }
-    }
+    };
+    checked_request(request)
 }
 
 pub(crate) fn build_storage_request(

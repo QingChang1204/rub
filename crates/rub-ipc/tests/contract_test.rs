@@ -1,7 +1,10 @@
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 use rub_core::model::Timing;
 use rub_ipc::codec::NdJsonCodec;
-use rub_ipc::protocol::{IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse, ResponseStatus};
+use rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID;
+use rub_ipc::protocol::{
+    IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse, ResponseStatus, UPGRADE_CHECK_PROBE_COMMAND_ID,
+};
 use tokio::io::BufReader;
 
 #[test]
@@ -25,10 +28,118 @@ fn ipc_request_roundtrip_through_json() {
 }
 
 #[test]
+fn new_non_compat_request_autopopulates_command_id() {
+    let request = IpcRequest::new("doctor", serde_json::json!({}), 1_000);
+    assert!(
+        request
+            .command_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+        "non-compatibility requests must auto-populate a stable wire command_id"
+    );
+}
+
+#[test]
+fn strict_request_decode_rejects_missing_command_id_for_non_compat_request() {
+    let error = IpcRequest::from_value_strict(serde_json::json!({
+        "ipc_protocol_version": IPC_PROTOCOL_VERSION,
+        "command": "doctor",
+        "args": {},
+        "timeout_ms": 1000
+    }))
+    .expect_err("strict request decode should reject missing command_id for non-compat requests");
+    assert_eq!(error.code, ErrorCode::IpcProtocolError);
+    assert_eq!(
+        error
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("field"))
+            .and_then(|value| value.as_str()),
+        Some("command_id")
+    );
+}
+
+#[test]
+fn strict_request_decode_allows_missing_command_id_for_handshake_compat_request() {
+    let request = IpcRequest::from_value_strict(serde_json::json!({
+        "ipc_protocol_version": IPC_PROTOCOL_VERSION,
+        "command": "_handshake",
+        "args": {},
+        "timeout_ms": 1000
+    }))
+    .expect("compatibility handshake request may omit command_id");
+
+    assert_eq!(request.command, "_handshake");
+    assert_eq!(request.command_id, None);
+}
+
+#[test]
+fn strict_request_decode_allows_missing_command_id_for_upgrade_check_compat_request() {
+    let request = IpcRequest::from_value_strict(serde_json::json!({
+        "ipc_protocol_version": IPC_PROTOCOL_VERSION,
+        "command": "_upgrade_check",
+        "args": {},
+        "timeout_ms": 1000
+    }))
+    .expect("compatibility upgrade-check request may omit command_id");
+
+    assert_eq!(request.command, "_upgrade_check");
+    assert_eq!(request.command_id, None);
+}
+
+#[test]
+fn strict_request_decode_allows_missing_command_id_for_blocker_diagnose_compat_request() {
+    let request = IpcRequest::from_value_strict(serde_json::json!({
+        "ipc_protocol_version": IPC_PROTOCOL_VERSION,
+        "command": "_blocker_diagnose",
+        "args": {},
+        "timeout_ms": 1000
+    }))
+    .expect("compatibility blocker-diagnose request may omit command_id");
+
+    assert_eq!(request.command, "_blocker_diagnose");
+    assert_eq!(request.command_id, None);
+}
+
+#[test]
+fn handshake_probe_request_roundtrip_preserves_fixed_probe_command_id() {
+    let request = IpcRequest::new("_handshake", serde_json::json!({}), 500)
+        .with_command_id(HANDSHAKE_PROBE_COMMAND_ID)
+        .expect("fixed handshake probe command_id must be valid");
+
+    let decoded =
+        IpcRequest::from_value_strict(serde_json::to_value(&request).expect("encode request"))
+            .expect("strict decode should preserve handshake probe request");
+
+    assert_eq!(decoded.command, "_handshake");
+    assert_eq!(
+        decoded.command_id.as_deref(),
+        Some(HANDSHAKE_PROBE_COMMAND_ID)
+    );
+}
+
+#[test]
+fn upgrade_check_probe_request_roundtrip_preserves_fixed_probe_command_id() {
+    let request = IpcRequest::new("_upgrade_check", serde_json::json!({}), 500)
+        .with_command_id(UPGRADE_CHECK_PROBE_COMMAND_ID)
+        .expect("fixed upgrade-check probe command_id must be valid");
+
+    let decoded =
+        IpcRequest::from_value_strict(serde_json::to_value(&request).expect("encode request"))
+            .expect("strict decode should preserve upgrade-check probe request");
+
+    assert_eq!(decoded.command, "_upgrade_check");
+    assert_eq!(
+        decoded.command_id.as_deref(),
+        Some(UPGRADE_CHECK_PROBE_COMMAND_ID)
+    );
+}
+
+#[test]
 fn ipc_request_rejects_unknown_fields() {
     let error = serde_json::from_str::<IpcRequest>(
         r#"{
-            "ipc_protocol_version":"1.0",
+            "ipc_protocol_version":"1.1",
             "command":"doctor",
             "args":{},
             "timeout_ms":1000,
@@ -42,7 +153,7 @@ fn ipc_request_rejects_unknown_fields() {
 #[test]
 fn strict_request_decode_surfaces_structured_contract_reason() {
     let error = IpcRequest::from_value_strict(serde_json::json!({
-        "ipc_protocol_version": "1.0",
+        "ipc_protocol_version": "1.1",
         "command": "doctor",
         "args": {},
         "timeout_ms": 1000,
@@ -64,7 +175,7 @@ fn strict_request_decode_surfaces_structured_contract_reason() {
 fn ipc_request_rejects_blank_command_id() {
     let error = serde_json::from_str::<IpcRequest>(
         r#"{
-            "ipc_protocol_version":"1.0",
+            "ipc_protocol_version":"1.1",
             "command":"doctor",
             "command_id":"   ",
             "args":{},
@@ -82,7 +193,7 @@ fn ipc_request_rejects_blank_command_id() {
 fn ipc_request_rejects_blank_command() {
     let error = serde_json::from_str::<IpcRequest>(
         r#"{
-            "ipc_protocol_version":"1.0",
+            "ipc_protocol_version":"1.1",
             "command":" ",
             "args":{},
             "timeout_ms":1000
@@ -134,6 +245,58 @@ fn ipc_response_success_roundtrip() {
 }
 
 #[test]
+fn handshake_probe_response_roundtrip_preserves_fixed_probe_echo_and_daemon_authority() {
+    let response = IpcResponse::success(
+        "req-1",
+        serde_json::json!({
+            "daemon_session_id": "sess-live",
+        }),
+    )
+    .with_command_id(HANDSHAKE_PROBE_COMMAND_ID)
+    .expect("fixed handshake probe command_id must be valid")
+    .with_daemon_session_id("sess-live")
+    .expect("daemon_session_id must be valid");
+
+    let decoded: IpcResponse =
+        serde_json::from_str(&serde_json::to_string(&response).expect("encode response"))
+            .expect("decode response");
+
+    assert_eq!(
+        decoded.command_id.as_deref(),
+        Some(HANDSHAKE_PROBE_COMMAND_ID)
+    );
+    assert_eq!(decoded.daemon_session_id.as_deref(), Some("sess-live"));
+    assert_eq!(
+        decoded
+            .data
+            .as_ref()
+            .and_then(|data| data.get("daemon_session_id"))
+            .and_then(|value| value.as_str()),
+        Some("sess-live")
+    );
+}
+
+#[test]
+fn upgrade_check_probe_response_roundtrip_preserves_fixed_probe_echo() {
+    let response = IpcResponse::success("req-2", serde_json::json!({ "idle": true }))
+        .with_command_id(UPGRADE_CHECK_PROBE_COMMAND_ID)
+        .expect("fixed upgrade-check probe command_id must be valid");
+
+    let decoded: IpcResponse =
+        serde_json::from_str(&serde_json::to_string(&response).expect("encode response"))
+            .expect("decode response");
+
+    assert_eq!(
+        decoded.command_id.as_deref(),
+        Some(UPGRADE_CHECK_PROBE_COMMAND_ID)
+    );
+    assert_eq!(
+        decoded.data.as_ref().and_then(|data| data.get("idle")),
+        Some(&serde_json::json!(true))
+    );
+}
+
+#[test]
 fn ipc_response_error_roundtrip() {
     let envelope = ErrorEnvelope::new(ErrorCode::StaleSnapshot, "Snapshot is stale")
         .with_context(serde_json::json!({"snapshot_epoch": 3, "current_epoch": 5}));
@@ -153,7 +316,7 @@ fn ipc_response_error_roundtrip() {
 fn ipc_response_rejects_unknown_fields() {
     let error = serde_json::from_str::<IpcResponse>(
         r#"{
-            "ipc_protocol_version":"1.0",
+            "ipc_protocol_version":"1.1",
             "request_id":"req-1",
             "status":"success",
             "data":{},
@@ -169,7 +332,7 @@ fn ipc_response_rejects_unknown_fields() {
 fn ipc_response_rejects_blank_command_id() {
     let error = serde_json::from_str::<IpcResponse>(
         r#"{
-            "ipc_protocol_version":"1.0",
+            "ipc_protocol_version":"1.1",
             "command_id":" ",
             "request_id":"req-1",
             "status":"success",
@@ -188,7 +351,7 @@ fn ipc_response_rejects_blank_command_id() {
 fn ipc_response_rejects_success_with_error_envelope() {
     let error = serde_json::from_str::<IpcResponse>(
         r#"{
-            "ipc_protocol_version":"1.0",
+            "ipc_protocol_version":"1.1",
             "request_id":"req-1",
             "status":"success",
             "data":{},
@@ -207,7 +370,7 @@ fn ipc_response_rejects_success_with_error_envelope() {
 fn ipc_response_rejects_success_without_data() {
     let error = serde_json::from_str::<IpcResponse>(
         r#"{
-            "ipc_protocol_version":"1.0",
+            "ipc_protocol_version":"1.1",
             "request_id":"req-1",
             "status":"success",
             "timing":{"queue_ms":0,"exec_ms":0,"total_ms":0}
@@ -224,7 +387,7 @@ fn ipc_response_rejects_success_without_data() {
 fn ipc_response_rejects_error_without_error_envelope() {
     let error = serde_json::from_str::<IpcResponse>(
         r#"{
-            "ipc_protocol_version":"1.0",
+            "ipc_protocol_version":"1.1",
             "request_id":"req-1",
             "status":"error",
             "timing":{"queue_ms":0,"exec_ms":0,"total_ms":0}
@@ -241,7 +404,7 @@ fn ipc_response_rejects_error_without_error_envelope() {
 fn ipc_response_rejects_error_with_success_data() {
     let error = serde_json::from_str::<IpcResponse>(
         r#"{
-            "ipc_protocol_version":"1.0",
+            "ipc_protocol_version":"1.1",
             "request_id":"req-1",
             "status":"error",
             "data":{"ok":true},
@@ -259,7 +422,7 @@ fn ipc_response_rejects_error_with_success_data() {
 #[test]
 fn strict_response_decode_surfaces_schema_reason() {
     let error = IpcResponse::from_value_strict(serde_json::json!({
-        "ipc_protocol_version": "1.0",
+        "ipc_protocol_version": "1.1",
         "request_id": "req-1",
         "status": "success",
         "data": {},
@@ -281,7 +444,7 @@ fn strict_response_decode_surfaces_schema_reason() {
 #[test]
 fn strict_response_decode_surfaces_contract_reason() {
     let error = IpcResponse::from_value_strict(serde_json::json!({
-        "ipc_protocol_version": "1.0",
+        "ipc_protocol_version": "1.1",
         "request_id": "req-1",
         "status": "success",
         "data": {},
@@ -297,6 +460,67 @@ fn strict_response_decode_surfaces_contract_reason() {
             .and_then(|ctx| ctx.get("reason"))
             .and_then(|value| value.as_str()),
         Some("invalid_ipc_response_contract")
+    );
+}
+
+#[test]
+fn transport_response_decode_allows_forward_metadata_for_handshake_compat_lane() {
+    let request = IpcRequest::new("_handshake", serde_json::json!({}), 1_000)
+        .with_command_id(HANDSHAKE_PROBE_COMMAND_ID)
+        .expect("probe command_id must be valid");
+    let response = IpcResponse::from_value_transport(
+        serde_json::json!({
+            "ipc_protocol_version": "0.9",
+            "command_id": HANDSHAKE_PROBE_COMMAND_ID,
+            "request_id": "req-1",
+            "status": "success",
+            "daemon_session_id": "sess-live",
+            "data": {
+                "daemon_session_id": "sess-live",
+                "launch_policy": {
+                    "headless": true,
+                    "ignore_cert_errors": false,
+                    "hide_infobars": false
+                }
+            },
+            "timing": {"queue_ms":0,"exec_ms":0,"total_ms":0},
+            "future_metadata": "compat"
+        }),
+        &request,
+    )
+    .expect("compat transport lane should stay open to forward metadata");
+
+    assert_eq!(response.ipc_protocol_version, "0.9");
+    assert_eq!(
+        response.command_id.as_deref(),
+        Some(HANDSHAKE_PROBE_COMMAND_ID)
+    );
+}
+
+#[test]
+fn transport_response_decode_rejects_missing_command_echo_for_non_compat_lane() {
+    let request = IpcRequest::new("doctor", serde_json::json!({}), 1_000);
+    let error = IpcResponse::from_value_transport(
+        serde_json::json!({
+            "ipc_protocol_version": "1.1",
+            "request_id": "req-1",
+            "status": "success",
+            "daemon_session_id": "sess-live",
+            "data": {},
+            "timing": {"queue_ms":0,"exec_ms":0,"total_ms":0}
+        }),
+        &request,
+    )
+    .expect_err("missing command_id echo should fail closed");
+
+    assert_eq!(error.code, ErrorCode::IpcProtocolError);
+    assert_eq!(
+        error
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("ipc_response_missing_command_id")
     );
 }
 

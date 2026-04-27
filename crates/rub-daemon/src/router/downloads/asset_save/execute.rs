@@ -6,7 +6,7 @@ use std::time::Instant;
 use futures::stream::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::CONTENT_TYPE;
-use rub_core::fs::{commit_temporary_file, commit_temporary_file_no_clobber};
+use rub_core::fs::{commit_temporary_file_no_clobber_until, commit_temporary_file_until};
 use rub_core::model::{SavedAssetEntry, SavedAssetStatus};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -88,7 +88,12 @@ pub(super) async fn save_one(
                 .await
                 .map_err(|error| error.to_string())?;
         }
-        let mut file = fs::File::create(&tmp_path)
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&tmp_path)
             .await
             .map_err(|error| error.to_string())?;
         let mut bytes_written = 0u64;
@@ -122,106 +127,16 @@ pub(super) async fn save_one(
             tmp_file,
             bytes_written,
         })) => {
-            if context
-                .deadline
-                .checked_duration_since(Instant::now())
-                .is_none()
-            {
-                let _ = fs::remove_file(&tmp_path).await;
-                set_tracked_temp_path(&temp_path_slot, None);
-                return timeout_entry(
-                    &timeout_source,
-                    Some(output_path),
-                    "asset_commit_deadline_exceeded_before_commit",
-                );
-            }
-            match tokio::task::spawn_blocking({
-                let tmp_path = tmp_path.clone();
-                let output_path = output_path.clone();
-                let tmp_file = tmp_file;
-                move || {
-                    if context.overwrite {
-                        commit_temporary_file(&tmp_file, &tmp_path, &output_path)
-                    } else {
-                        commit_temporary_file_no_clobber(&tmp_file, &tmp_path, &output_path)
-                    }
-                }
-            })
+            finalize_prepared_asset_commit(
+                context,
+                &timeout_source,
+                output_path,
+                tmp_path,
+                tmp_file,
+                bytes_written,
+                &temp_path_slot,
+            )
             .await
-            {
-                Ok(Ok(commit_outcome)) => {
-                    set_tracked_temp_path(&temp_path_slot, None);
-                    SavedAssetEntry {
-                        index: source_index,
-                        url: source_url.clone(),
-                        status: SavedAssetStatus::Saved,
-                        output_path: output_path.display().to_string(),
-                        output_path_state: Some(saved_asset_output_path_state(
-                            SavedAssetStatus::Saved,
-                            Some(commit_outcome.durability_confirmed()),
-                        )),
-                        source_name: source_name.clone(),
-                        bytes_written: Some(bytes_written),
-                        durability_confirmed: Some(commit_outcome.durability_confirmed())
-                            .filter(|confirmed| !confirmed),
-                        error: None,
-                    }
-                }
-                Ok(Err(error)) => {
-                    if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        let _ = fs::remove_file(&tmp_path).await;
-                        set_tracked_temp_path(&temp_path_slot, None);
-                        return SavedAssetEntry {
-                            index: source_index,
-                            url: source_url.clone(),
-                            status: SavedAssetStatus::SkippedExisting,
-                            output_path: output_path.display().to_string(),
-                            output_path_state: Some(saved_asset_output_path_state(
-                                SavedAssetStatus::SkippedExisting,
-                                None,
-                            )),
-                            source_name: source_name.clone(),
-                            bytes_written: None,
-                            durability_confirmed: None,
-                            error: None,
-                        };
-                    }
-                    let _ = fs::remove_file(&tmp_path).await;
-                    set_tracked_temp_path(&temp_path_slot, None);
-                    SavedAssetEntry {
-                        index: source_index,
-                        url: source_url.clone(),
-                        status: SavedAssetStatus::Failed,
-                        output_path: output_path.display().to_string(),
-                        output_path_state: Some(saved_asset_output_path_state(
-                            SavedAssetStatus::Failed,
-                            None,
-                        )),
-                        source_name: source_name.clone(),
-                        bytes_written: None,
-                        durability_confirmed: None,
-                        error: Some(error.to_string()),
-                    }
-                }
-                Err(join_error) => {
-                    let _ = fs::remove_file(&tmp_path).await;
-                    set_tracked_temp_path(&temp_path_slot, None);
-                    SavedAssetEntry {
-                        index: source_index,
-                        url: source_url.clone(),
-                        status: SavedAssetStatus::Failed,
-                        output_path: output_path.display().to_string(),
-                        output_path_state: Some(saved_asset_output_path_state(
-                            SavedAssetStatus::Failed,
-                            None,
-                        )),
-                        source_name: source_name.clone(),
-                        bytes_written: None,
-                        durability_confirmed: None,
-                        error: Some(join_error.to_string()),
-                    }
-                }
-            }
         }
         Ok(Ok(SaveOneOutcome::SkippedExisting { output_path })) => SavedAssetEntry {
             index: source_index,
@@ -279,6 +194,127 @@ enum SaveOneOutcome {
     },
 }
 
+async fn finalize_prepared_asset_commit(
+    context: SaveExecutionContext,
+    source: &AssetSource,
+    output_path: PathBuf,
+    tmp_path: PathBuf,
+    tmp_file: std::fs::File,
+    bytes_written: u64,
+    temp_path_slot: &Arc<Mutex<Option<PathBuf>>>,
+) -> SavedAssetEntry {
+    if context
+        .deadline
+        .checked_duration_since(Instant::now())
+        .is_none()
+    {
+        let _ = fs::remove_file(&tmp_path).await;
+        set_tracked_temp_path(temp_path_slot, None);
+        return timeout_entry(
+            source,
+            Some(output_path),
+            "asset_commit_deadline_exceeded_before_commit",
+        );
+    }
+    match tokio::task::spawn_blocking({
+        let tmp_path = tmp_path.clone();
+        let output_path = output_path.clone();
+        let tmp_file = tmp_file;
+        let deadline = context.deadline;
+        move || {
+            if context.overwrite {
+                commit_temporary_file_until(&tmp_file, &tmp_path, &output_path, deadline)
+            } else {
+                commit_temporary_file_no_clobber_until(&tmp_file, &tmp_path, &output_path, deadline)
+            }
+        }
+    })
+    .await
+    {
+        Ok(Ok(commit_outcome)) => {
+            set_tracked_temp_path(temp_path_slot, None);
+            SavedAssetEntry {
+                index: source.index,
+                url: source.url.clone(),
+                status: SavedAssetStatus::Saved,
+                output_path: output_path.display().to_string(),
+                output_path_state: Some(saved_asset_output_path_state(
+                    SavedAssetStatus::Saved,
+                    Some(commit_outcome.durability_confirmed()),
+                )),
+                source_name: source.source_name.clone(),
+                bytes_written: Some(bytes_written),
+                durability_confirmed: Some(commit_outcome.durability_confirmed())
+                    .filter(|confirmed| !confirmed),
+                error: None,
+            }
+        }
+        Ok(Err(error)) => {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                let _ = fs::remove_file(&tmp_path).await;
+                set_tracked_temp_path(temp_path_slot, None);
+                return timeout_entry(
+                    source,
+                    Some(output_path),
+                    "asset_commit_deadline_exceeded_before_publish",
+                );
+            }
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                let _ = fs::remove_file(&tmp_path).await;
+                set_tracked_temp_path(temp_path_slot, None);
+                return SavedAssetEntry {
+                    index: source.index,
+                    url: source.url.clone(),
+                    status: SavedAssetStatus::SkippedExisting,
+                    output_path: output_path.display().to_string(),
+                    output_path_state: Some(saved_asset_output_path_state(
+                        SavedAssetStatus::SkippedExisting,
+                        None,
+                    )),
+                    source_name: source.source_name.clone(),
+                    bytes_written: None,
+                    durability_confirmed: None,
+                    error: None,
+                };
+            }
+            let _ = fs::remove_file(&tmp_path).await;
+            set_tracked_temp_path(temp_path_slot, None);
+            SavedAssetEntry {
+                index: source.index,
+                url: source.url.clone(),
+                status: SavedAssetStatus::Failed,
+                output_path: output_path.display().to_string(),
+                output_path_state: Some(saved_asset_output_path_state(
+                    SavedAssetStatus::Failed,
+                    None,
+                )),
+                source_name: source.source_name.clone(),
+                bytes_written: None,
+                durability_confirmed: None,
+                error: Some(error.to_string()),
+            }
+        }
+        Err(join_error) => {
+            let _ = fs::remove_file(&tmp_path).await;
+            set_tracked_temp_path(temp_path_slot, None);
+            SavedAssetEntry {
+                index: source.index,
+                url: source.url.clone(),
+                status: SavedAssetStatus::Failed,
+                output_path: output_path.display().to_string(),
+                output_path_state: Some(saved_asset_output_path_state(
+                    SavedAssetStatus::Failed,
+                    None,
+                )),
+                source_name: source.source_name.clone(),
+                bytes_written: None,
+                durability_confirmed: None,
+                error: Some(join_error.to_string()),
+            }
+        }
+    }
+}
+
 pub(super) fn timeout_entry(
     source: &AssetSource,
     output_path: Option<PathBuf>,
@@ -300,5 +336,81 @@ pub(super) fn timeout_entry(
         bytes_written: None,
         durability_confirmed: None,
         error: Some(reason.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::request::AssetSource;
+    use super::SaveExecutionContext;
+    use super::finalize_prepared_asset_commit;
+    use rub_core::model::SavedAssetStatus;
+    use std::collections::BTreeSet;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn prepared_asset_commit_timeout_leaves_no_published_artifact() {
+        let root =
+            std::env::temp_dir().join(format!("rub-asset-commit-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let output_path = root.join("asset.bin");
+        let tmp_path = root.join(".asset.bin.tmp");
+        let mut tmp_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&tmp_path)
+            .expect("create temp file");
+        tmp_file.write_all(b"payload").expect("write temp file");
+        tmp_file.sync_all().expect("sync temp file");
+        let temp_path_slot = Arc::new(Mutex::new(Some(tmp_path.clone())));
+        let source = AssetSource {
+            index: 0,
+            url: "https://example.test/asset.bin".to_string(),
+            source_name: Some("asset".to_string()),
+            output_path: output_path.clone(),
+        };
+        let context = SaveExecutionContext {
+            client: reqwest::Client::new(),
+            deadline: Instant::now() - Duration::from_millis(1),
+            overwrite: true,
+            reserved_output_paths: Arc::new(Mutex::new(BTreeSet::<PathBuf>::new())),
+        };
+
+        let entry = finalize_prepared_asset_commit(
+            context,
+            &source,
+            output_path.clone(),
+            tmp_path.clone(),
+            tmp_file,
+            7,
+            &temp_path_slot,
+        )
+        .await;
+
+        assert_eq!(entry.status, SavedAssetStatus::TimedOut);
+        assert_eq!(
+            entry.error.as_deref(),
+            Some("asset_commit_deadline_exceeded_before_commit")
+        );
+        assert!(
+            !output_path.exists(),
+            "download save must not publish an artifact after commit deadline expiry"
+        );
+        assert!(
+            !tmp_path.exists(),
+            "timed-out prepared commit should clean up temp authority"
+        );
+        assert!(
+            temp_path_slot.lock().expect("temp slot").is_none(),
+            "tracked temp authority should be cleared after timed-out commit"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

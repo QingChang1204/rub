@@ -14,6 +14,7 @@ pub enum ErrorCode {
     // Interaction
     ElementNotFound,
     ElementNotInteractable,
+    InteractionNotConfirmed,
     StaleSnapshot,
     StaleIndex,
 
@@ -79,6 +80,9 @@ impl ErrorCode {
             Self::ElementNotFound => "Run 'rub state' to refresh element indices (range: 0-N)",
             Self::ElementNotInteractable => {
                 "Element may be behind a modal or not visible. Try scrolling or closing overlays"
+            }
+            Self::InteractionNotConfirmed => {
+                "The browser-side effect was not confirmed. Inspect confirmation details before retrying, and add an explicit wait if the effect is expected to land asynchronously"
             }
             Self::StaleSnapshot => "Run 'rub state' to get a fresh snapshot",
             Self::StaleIndex => "Run 'rub state' to get fresh element indices",

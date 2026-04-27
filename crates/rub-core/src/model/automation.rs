@@ -36,6 +36,10 @@ fn default_trigger_mode() -> TriggerMode {
     TriggerMode::Once
 }
 
+fn default_trigger_lifecycle_generation() -> u64 {
+    1
+}
+
 /// Canonical kind of trigger condition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -174,6 +178,8 @@ pub struct TriggerResultInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_context: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub consumed_evidence_fingerprint: Option<String>,
 }
 
@@ -220,6 +226,8 @@ pub struct TriggerTraceProjection {
 pub struct TriggerInfo {
     pub id: u32,
     pub status: TriggerStatus,
+    #[serde(default = "default_trigger_lifecycle_generation", skip_serializing)]
+    pub lifecycle_generation: u64,
     pub mode: TriggerMode,
     pub source_tab: TriggerTabBindingInfo,
     pub target_tab: TriggerTabBindingInfo,
@@ -435,6 +443,8 @@ pub struct OrchestrationStepResultInfo {
     pub error_code: Option<crate::error::ErrorCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_context: Option<serde_json::Value>,
 }
 
 /// Structured result emitted for the most recent orchestration execution attempt.
@@ -454,6 +464,8 @@ pub struct OrchestrationResultInfo {
     pub error_code: Option<crate::error::ErrorCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_context: Option<serde_json::Value>,
 }
 
 /// One recent event published by the session-scoped orchestration trace surface.
@@ -476,6 +488,8 @@ pub struct OrchestrationEventInfo {
     pub error_code: Option<crate::error::ErrorCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_context: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub committed_steps: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -500,6 +514,18 @@ pub struct PathReferenceState {
 }
 
 /// One registry-backed session addressable by future orchestration rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationSessionAvailability {
+    Addressable,
+    BusyOrUnknown,
+    ProtocolIncompatible,
+    HardCutReleasePending,
+    PendingStartup,
+    CurrentFallback,
+}
+
+/// One registry-backed session addressable by future orchestration rules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestrationSessionInfo {
     pub session_id: String,
@@ -510,6 +536,8 @@ pub struct OrchestrationSessionInfo {
     pub socket_path_state: Option<PathReferenceState>,
     pub current: bool,
     pub ipc_protocol_version: String,
+    pub availability: OrchestrationSessionAvailability,
+    pub addressing_supported: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_data_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

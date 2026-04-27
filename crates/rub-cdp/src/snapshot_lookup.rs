@@ -107,6 +107,7 @@ mod tests {
             text: text.to_string(),
             attributes: HashMap::new(),
             element_ref: Some(format!("frame-main:{index}")),
+            target_id: None,
             bounding_box: None,
             ax_info: None,
             listeners: None,

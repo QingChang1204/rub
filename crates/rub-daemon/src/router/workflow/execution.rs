@@ -16,6 +16,10 @@ use crate::router::request_args::parse_json_args;
 use crate::router::secret_resolution::{
     attach_secret_resolution_projection, redact_json_value, redact_rub_error,
 };
+use crate::router::timeout_projection::{
+    record_workflow_partial_commit_timeout_projection,
+    record_workflow_pending_step_timeout_projection,
+};
 use rub_core::error::RubError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +130,7 @@ async fn cmd_fill_with_policy(
         if let Some(wait_after) = &step.wait_after {
             attach_step_wait_after(&mut command_args, wait_after);
         }
+        record_workflow_pending_step_timeout_projection("fill", false, &results, step_index);
         let data =
             match execute_named_command_with_fence(router, command, &command_args, deadline, state)
                 .await
@@ -139,6 +144,7 @@ async fn cmd_fill_with_policy(
         results.push(workflow_step_projection(
             step_index, command, None, None, data,
         ));
+        record_workflow_partial_commit_timeout_projection("fill", false, &results);
     }
 
     if let Some(mut submit_args) = if let Some(plan) = &snapshot_plan {
@@ -151,6 +157,7 @@ async fn cmd_fill_with_policy(
             parsed_args._orchestration.as_ref(),
             inheritance_policy,
         );
+        record_workflow_pending_step_timeout_projection("fill", false, &results, results.len());
         let data =
             match execute_named_command_with_fence(router, "click", &submit_args, deadline, state)
                 .await
@@ -168,6 +175,7 @@ async fn cmd_fill_with_policy(
             Some("submit"),
             data,
         ));
+        record_workflow_partial_commit_timeout_projection("fill", false, &results);
     }
 
     let mut data = serde_json::json!({

@@ -87,11 +87,21 @@ impl NdJsonCodec {
     pub async fn read<T: DeserializeOwned, R: tokio::io::AsyncRead + Unpin>(
         reader: &mut BufReader<R>,
     ) -> Result<Option<T>, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(line) = Self::read_frame(reader).await? else {
+        let Some(frame) = Self::read_frame_bytes(reader).await? else {
             return Ok(None);
         };
-        let value = serde_json::from_str(line.trim())?;
+        let value = serde_json::from_slice(&frame)?;
         Ok(Some(value))
+    }
+
+    /// Read one committed NDJSON frame as raw JSON bytes without attempting to
+    /// decode it into a typed value. This is for owner layers that must retain
+    /// framed request bytes to recover protocol correlation on downstream
+    /// decode failure.
+    pub async fn read_frame_bytes<R: tokio::io::AsyncRead + Unpin>(
+        reader: &mut BufReader<R>,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+        Self::read_committed_frame(reader).await
     }
 
     /// Read one NDJSON message from a blocking reader using the same frame-size
@@ -106,9 +116,9 @@ impl NdJsonCodec {
         Ok(Some(value))
     }
 
-    async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
+    async fn read_committed_frame<R: tokio::io::AsyncRead + Unpin>(
         reader: &mut BufReader<R>,
-    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
         let mut frame = Vec::new();
 
         loop {
@@ -143,7 +153,7 @@ impl NdJsonCodec {
             }
         }
 
-        Ok(Some(String::from_utf8(frame)?))
+        Ok(Some(frame))
     }
 
     fn read_frame_blocking<R: std::io::BufRead>(

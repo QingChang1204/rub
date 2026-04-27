@@ -93,5 +93,32 @@ pub(crate) fn tab_entity(tab: &TabInfo) -> serde_json::Value {
         "url": &tab.url,
         "title": &tab.title,
         "active": tab.active,
+        "active_authority": tab.active_authority,
+        "degraded_reason": tab.degraded_reason,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tab_entity;
+    use rub_core::model::{TabActiveAuthority, TabInfo};
+
+    #[test]
+    fn tab_entity_projects_active_authority_provenance() {
+        let tab = TabInfo {
+            index: 1,
+            target_id: "tab-active".to_string(),
+            url: "https://example.com".to_string(),
+            title: "Example".to_string(),
+            active: true,
+            active_authority: Some(TabActiveAuthority::LocalFallback),
+            degraded_reason: None,
+        };
+
+        let entity = tab_entity(&tab);
+        assert_eq!(
+            entity["active_authority"],
+            serde_json::json!("local_fallback")
+        );
+    }
 }

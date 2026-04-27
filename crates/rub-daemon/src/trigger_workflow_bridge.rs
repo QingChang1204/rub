@@ -19,6 +19,17 @@ pub(crate) enum TriggerWorkflowSourceVarKind {
     Attribute,
 }
 
+impl TriggerWorkflowSourceVarKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Html => "html",
+            Self::Value => "value",
+            Self::Attribute => "attribute",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TriggerWorkflowSourceVarSpec {
     pub(crate) kind: TriggerWorkflowSourceVarKind,
@@ -188,17 +199,17 @@ async fn resolve_source_var_bindings(
             TriggerWorkflowSourceVarKind::Text => {
                 browser
                     .query_text_in_tab(source_target_id, source_frame_id, &spec.locator)
-                    .await?
+                    .await
             }
             TriggerWorkflowSourceVarKind::Html => {
                 browser
                     .query_html_in_tab(source_target_id, source_frame_id, &spec.locator)
-                    .await?
+                    .await
             }
             TriggerWorkflowSourceVarKind::Value => {
                 browser
                     .query_value_in_tab(source_target_id, source_frame_id, &spec.locator)
-                    .await?
+                    .await
             }
             TriggerWorkflowSourceVarKind::Attribute => {
                 let attribute_name = spec.attribute.as_deref().ok_or_else(|| {
@@ -211,8 +222,17 @@ async fn resolve_source_var_bindings(
                 })?;
                 let attributes = browser
                     .query_attributes_in_tab(source_target_id, source_frame_id, &spec.locator)
-                    .await?;
-                attributes.get(attribute_name).cloned().ok_or_else(|| {
+                    .await
+                    .map_err(|error| {
+                        normalize_source_var_frame_continuity_error(
+                            error,
+                            source_target_id,
+                            source_frame_id,
+                            &name,
+                            spec.kind.as_str(),
+                        )
+                    })?;
+                Ok(attributes.get(attribute_name).cloned().ok_or_else(|| {
                     RubError::domain_with_context_and_suggestion(
                         ErrorCode::ElementNotFound,
                         format!(
@@ -228,12 +248,77 @@ async fn resolve_source_var_bindings(
                         }),
                         "Use a locator that resolves to an element carrying the requested attribute, or change payload.source_vars to read text, html, or value instead",
                     )
-                })?
+                })?)
             }
-        };
+        }
+        .map_err(|error| {
+            normalize_source_var_frame_continuity_error(
+                error,
+                source_target_id,
+                source_frame_id,
+                &name,
+                spec.kind.as_str(),
+            )
+        })?;
         resolved.insert(name, value);
     }
     Ok(resolved)
+}
+
+fn normalize_source_var_frame_continuity_error(
+    error: RubError,
+    source_target_id: &str,
+    source_frame_id: Option<&str>,
+    var_name: &str,
+    source_var_kind: &str,
+) -> RubError {
+    let RubError::Domain(envelope) = error else {
+        return error;
+    };
+    let authority_reason = envelope
+        .context
+        .as_ref()
+        .and_then(|context| context.get("reason"))
+        .and_then(|value| value.as_str());
+    let frame_continuity_failed = source_frame_id.is_some()
+        && envelope.code == ErrorCode::InvalidInput
+        && matches!(
+            authority_reason,
+            Some(
+                "frame_inventory_missing"
+                    | "frame_not_same_origin_accessible"
+                    | "frame_execution_context_missing"
+            )
+        );
+    let document_continuity_failed = envelope.code == ErrorCode::StaleSnapshot
+        && matches!(
+            authority_reason,
+            Some("document_changed_during_live_read" | "document_fence_unavailable")
+        );
+    if !frame_continuity_failed && !document_continuity_failed {
+        return RubError::Domain(envelope);
+    }
+    let continuity_reason = if document_continuity_failed {
+        "continuity_document_unavailable"
+    } else {
+        "continuity_frame_unavailable"
+    };
+
+    RubError::domain_with_context(
+        ErrorCode::SessionBusy,
+        "trigger workflow source_vars continuity fence failed before authoritative source materialization could complete",
+        serde_json::json!({
+            "reason": continuity_reason,
+            "source_tab_target_id": source_target_id,
+            "source_frame_id": source_frame_id,
+            "source_var": var_name,
+            "source_var_kind": source_var_kind,
+            "source_authority_reason": authority_reason,
+            "upstream_error_code": envelope.code,
+            "upstream_error_message": envelope.message,
+            "upstream_error_context": envelope.context,
+        }),
+    )
 }
 
 pub(crate) async fn resolve_trigger_workflow_source_bindings(
@@ -275,10 +360,11 @@ fn parse_source_var_kind(
 #[cfg(test)]
 mod tests {
     use super::{
-        TriggerWorkflowSourceVarKind, parse_trigger_workflow_source_vars,
-        trigger_workflow_source_var_keys, validate_trigger_workflow_bindings,
+        TriggerWorkflowSourceVarKind, normalize_source_var_frame_continuity_error,
+        parse_trigger_workflow_source_vars, trigger_workflow_source_var_keys,
+        validate_trigger_workflow_bindings,
     };
-    use rub_core::error::ErrorCode;
+    use rub_core::error::{ErrorCode, RubError};
     use rub_core::locator::{CanonicalLocator, LiveLocator, LocatorSelection};
     use serde_json::json;
 
@@ -338,6 +424,34 @@ mod tests {
         let error = parse_trigger_workflow_source_vars(payload.as_object().unwrap())
             .expect_err("missing attribute should fail");
         assert_eq!(error.into_envelope().code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn source_var_frame_continuity_error_is_retryable_degraded_authority() {
+        let error = normalize_source_var_frame_continuity_error(
+            RubError::domain_with_context(
+                ErrorCode::InvalidInput,
+                "Frame is unavailable",
+                json!({
+                    "reason": "frame_execution_context_missing",
+                }),
+            ),
+            "tab-source",
+            Some("frame-child"),
+            "prompt_text",
+            "text",
+        )
+        .into_envelope();
+
+        assert_eq!(error.code, ErrorCode::SessionBusy);
+        assert_eq!(
+            error
+                .context
+                .as_ref()
+                .and_then(|context| context.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("continuity_frame_unavailable")
+        );
     }
 
     #[test]

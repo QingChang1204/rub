@@ -1,6 +1,7 @@
 use crate::commands::EffectiveCli;
 use crate::timeout_budget::{ensure_remaining_budget, run_with_remaining_budget};
 use rub_core::error::ErrorCode;
+use std::path::Path;
 use std::time::Instant;
 
 use super::ConnectionRequest;
@@ -66,6 +67,35 @@ pub(crate) fn parse_connection_request(
         return Ok(ConnectionRequest::UserDataDir { path });
     }
     if let Some(name) = &cli.profile {
+        if let Some(resolved_path) = &cli.profile_resolved_path {
+            let normalized_resolved_path = normalize_identity_path(resolved_path);
+            let resolved_path = Path::new(&normalized_resolved_path);
+            let Some(dir_name) = resolved_path.file_name().and_then(|value| value.to_str()) else {
+                return Err(rub_core::error::RubError::domain(
+                    ErrorCode::ProfileNotFound,
+                    format!(
+                        "Resolved profile path {} has no terminal profile directory",
+                        resolved_path.display()
+                    ),
+                ));
+            };
+            let user_data_root = resolved_path.parent().ok_or_else(|| {
+                rub_core::error::RubError::domain(
+                    ErrorCode::ProfileNotFound,
+                    format!(
+                        "Resolved profile path {} has no parent user data directory",
+                        resolved_path.display()
+                    ),
+                )
+            })?;
+            let user_data_root = user_data_root.display().to_string();
+            return Ok(ConnectionRequest::Profile {
+                name: name.clone(),
+                dir_name: dir_name.to_string(),
+                resolved_path: normalized_resolved_path,
+                user_data_root,
+            });
+        }
         let profile = rub_cdp::profile::resolve_profile(name)?;
         let user_data_root = profile
             .path
@@ -180,9 +210,37 @@ pub(crate) async fn materialize_connection_request_with_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::{Commands, RequestedLaunchPolicy};
     use rub_core::error::ErrorCode;
     use std::path::Path;
     use std::time::Duration;
+
+    fn cli_with(command: Commands) -> EffectiveCli {
+        EffectiveCli {
+            session: "default".to_string(),
+            session_id: None,
+            rub_home: std::path::PathBuf::from("/tmp/rub-test"),
+            timeout: 30_000,
+            headed: false,
+            ignore_cert_errors: false,
+            user_data_dir: None,
+            hide_infobars: true,
+            json_pretty: false,
+            verbose: false,
+            trace: false,
+            command,
+            cdp_url: None,
+            connect: false,
+            profile: None,
+            profile_resolved_path: None,
+            use_alias: None,
+            no_stealth: false,
+            humanize: false,
+            humanize_speed: "normal".to_string(),
+            requested_launch_policy: RequestedLaunchPolicy::default(),
+            effective_launch_policy: RequestedLaunchPolicy::default(),
+        }
+    }
 
     #[tokio::test]
     async fn materialize_connection_request_times_out_when_deadline_is_exhausted() {
@@ -227,5 +285,24 @@ mod tests {
             }
             other => panic!("unexpected materialized request: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_connection_request_prefers_internal_resolved_profile_authority() {
+        let mut cli = cli_with(Commands::Doctor);
+        cli.profile = Some("Work".to_string());
+        cli.profile_resolved_path = Some("/tmp/bindings/Profile 3".to_string());
+
+        let request = parse_connection_request(&cli)
+            .expect("internal resolved profile authority should parse");
+        assert_eq!(
+            request,
+            ConnectionRequest::Profile {
+                name: "Work".to_string(),
+                dir_name: "Profile 3".to_string(),
+                resolved_path: "/tmp/bindings/Profile 3".to_string(),
+                user_data_root: "/tmp/bindings".to_string(),
+            }
+        );
     }
 }

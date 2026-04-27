@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use rub_core::model::Timing;
+use rub_core::model::projected_interaction_effect_success;
 use rub_ipc::protocol::{IpcRequest, IpcResponse, ResponseStatus};
 
 const HISTORY_LIMIT: usize = 64;
@@ -35,6 +36,10 @@ pub struct CommandHistoryProjection {
     pub dropped_before_retention: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub dropped_before_projection: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub selection_dropped_before_projection: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub selection_truncated_by_retention: bool,
 }
 
 #[derive(Debug, Default)]
@@ -59,7 +64,10 @@ impl CommandHistoryState {
         self.entries.push_back(CommandHistoryEntry {
             sequence,
             command: request.command.clone(),
-            success: matches!(response.status, ResponseStatus::Success),
+            success: projected_interaction_effect_success(
+                matches!(response.status, ResponseStatus::Success),
+                response.data.as_ref(),
+            ),
             request_id: response.request_id.clone(),
             command_id: response.command_id.clone(),
             timing: response.timing,
@@ -122,18 +130,36 @@ impl CommandHistoryState {
         let dropped_before_retention = oldest_retained_sequence
             .map(|sequence| sequence.saturating_sub(1))
             .unwrap_or(0);
+        let selection_truncated_by_retention = if dropped_before_retention == 0 {
+            false
+        } else if from.is_some() || to.is_some() {
+            let requested_start = from.unwrap_or(1);
+            oldest_retained_sequence
+                .map(|oldest| requested_start < oldest)
+                .unwrap_or(false)
+        } else {
+            last > entries.len()
+        };
+        let selection_dropped_before_projection =
+            dropped_before_projection > 0 && from.is_none() && to.is_none() && last > entries.len();
         CommandHistoryProjection {
             entries,
             oldest_retained_sequence,
             newest_retained_sequence,
             dropped_before_retention,
             dropped_before_projection,
+            selection_dropped_before_projection,
+            selection_truncated_by_retention,
         }
     }
 }
 
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn matches_history_range(sequence: u64, from: Option<u64>, to: Option<u64>) -> bool {
@@ -220,6 +246,8 @@ mod tests {
         assert_eq!(projection.newest_retained_sequence, Some(2));
         assert_eq!(projection.dropped_before_retention, 0);
         assert_eq!(projection.dropped_before_projection, 0);
+        assert!(!projection.selection_dropped_before_projection);
+        assert!(!projection.selection_truncated_by_retention);
         assert_eq!(
             projection.entries[0].summary.as_deref(),
             Some("confirmed/page_mutation")
@@ -249,6 +277,62 @@ mod tests {
         assert_eq!(projection.newest_retained_sequence, Some(70));
         assert_eq!(projection.dropped_before_retention, 6);
         assert_eq!(projection.dropped_before_projection, 0);
+        assert!(!projection.selection_dropped_before_projection);
+        assert!(projection.selection_truncated_by_retention);
+    }
+
+    #[test]
+    fn history_marks_unconfirmed_interaction_as_unsuccessful() {
+        let mut history = CommandHistoryState::default();
+        let request = IpcRequest::new("click", serde_json::json!({}), 1_000);
+        let response = rub_ipc::protocol::IpcResponse::success(
+            "req-1",
+            serde_json::json!({
+                "interaction": {
+                    "confirmation_status": "degraded",
+                    "confirmation_kind": "page_mutation"
+                }
+            }),
+        );
+
+        history.record(&request, &response);
+        let projection = history.projection(10, 0);
+
+        assert_eq!(projection.entries.len(), 1);
+        assert!(!projection.entries[0].success);
+        assert_eq!(
+            projection.entries[0].summary.as_deref(),
+            Some("degraded/page_mutation")
+        );
+        assert_eq!(
+            projection.entries[0].confirmation_status.as_deref(),
+            Some("degraded")
+        );
+    }
+
+    #[test]
+    fn history_marks_wait_after_fallback_interaction_as_successful() {
+        let mut history = CommandHistoryState::default();
+        let request = IpcRequest::new("click", serde_json::json!({}), 1_000);
+        let response = rub_ipc::protocol::IpcResponse::success(
+            "req-1",
+            serde_json::json!({
+                "interaction": {
+                    "confirmation_status": "degraded",
+                    "confirmation_kind": "page_mutation"
+                },
+                "wait_after": {
+                    "matched": true,
+                    "text": "Saved"
+                }
+            }),
+        );
+
+        history.record(&request, &response);
+        let projection = history.projection(10, 0);
+
+        assert_eq!(projection.entries.len(), 1);
+        assert!(projection.entries[0].success);
     }
 
     #[test]
@@ -271,5 +355,86 @@ mod tests {
         assert_eq!(projection.entries[2].sequence, 4);
         assert_eq!(projection.oldest_retained_sequence, Some(1));
         assert_eq!(projection.newest_retained_sequence, Some(5));
+        assert!(!projection.selection_dropped_before_projection);
+        assert!(!projection.selection_truncated_by_retention);
+    }
+
+    #[test]
+    fn history_projection_last_selection_can_be_complete_despite_global_retention_loss() {
+        let mut history = CommandHistoryState::default();
+
+        for index in 0..70 {
+            let request = IpcRequest::new("open", serde_json::json!({ "index": index }), 1_000);
+            let response = rub_ipc::protocol::IpcResponse::success(
+                format!("req-{index}"),
+                serde_json::json!({}),
+            );
+            history.record(&request, &response);
+        }
+
+        let projection = history.projection(5, 0);
+        assert_eq!(projection.entries.len(), 5);
+        assert_eq!(projection.dropped_before_retention, 6);
+        assert!(!projection.selection_dropped_before_projection);
+        assert!(!projection.selection_truncated_by_retention);
+    }
+
+    #[test]
+    fn history_projection_last_selection_ignores_global_projection_loss_when_window_is_complete() {
+        let mut history = CommandHistoryState::default();
+
+        for index in 0..5 {
+            let request = IpcRequest::new("open", serde_json::json!({ "index": index }), 1_000);
+            let response = rub_ipc::protocol::IpcResponse::success(
+                format!("req-{index}"),
+                serde_json::json!({}),
+            );
+            history.record(&request, &response);
+        }
+
+        let projection = history.projection(2, 3);
+        assert_eq!(projection.entries.len(), 2);
+        assert_eq!(projection.dropped_before_projection, 3);
+        assert!(!projection.selection_dropped_before_projection);
+        assert!(!projection.selection_truncated_by_retention);
+    }
+
+    #[test]
+    fn history_projection_last_selection_marks_projection_loss_when_requested_window_is_short() {
+        let mut history = CommandHistoryState::default();
+
+        for index in 0..5 {
+            let request = IpcRequest::new("open", serde_json::json!({ "index": index }), 1_000);
+            let response = rub_ipc::protocol::IpcResponse::success(
+                format!("req-{index}"),
+                serde_json::json!({}),
+            );
+            history.record(&request, &response);
+        }
+
+        let projection = history.projection(10, 3);
+        assert_eq!(projection.entries.len(), 5);
+        assert_eq!(projection.dropped_before_projection, 3);
+        assert!(projection.selection_dropped_before_projection);
+    }
+
+    #[test]
+    fn history_projection_range_selection_ignores_global_projection_loss() {
+        let mut history = CommandHistoryState::default();
+
+        for index in 0..5 {
+            let request = IpcRequest::new("open", serde_json::json!({ "index": index }), 1_000);
+            let response = rub_ipc::protocol::IpcResponse::success(
+                format!("req-{index}"),
+                serde_json::json!({}),
+            );
+            history.record(&request, &response);
+        }
+
+        let projection = history.projection_range(Some(2), Some(4), 3);
+        assert_eq!(projection.entries.len(), 3);
+        assert_eq!(projection.dropped_before_projection, 3);
+        assert!(!projection.selection_dropped_before_projection);
+        assert!(!projection.selection_truncated_by_retention);
     }
 }

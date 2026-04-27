@@ -24,7 +24,8 @@ use tracing::{info, warn};
 
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{
-    ConnectionTarget, LaunchPolicyInfo, LoadStrategy, NetworkRule, StealthCoverageInfo, TabInfo,
+    ConnectionTarget, DialogRuntimeInfo, LaunchPolicyInfo, LoadStrategy, NetworkRule,
+    StealthCoverageInfo, TabInfo,
 };
 
 use crate::tab_projection::{EpochCallback, PageHookInstallState, ProjectionContext};
@@ -32,7 +33,9 @@ use crate::{
     dialogs::{
         DialogCallbacks, SharedDialogIntercept, SharedDialogRuntime, new_shared_dialog_runtime,
     },
-    downloads::DownloadCallbacks,
+    downloads::{
+        DownloadCallbacks, SharedDownloadRuntimeProjection, new_shared_download_runtime_projection,
+    },
     identity_coverage::IdentityCoverageRegistry,
     identity_policy::IdentityPolicy,
     listener_generation::{
@@ -72,10 +75,13 @@ pub struct BrowserManager {
     browser: Arc<Mutex<Option<Arc<Browser>>>>,
     launch_lock: Arc<Mutex<()>>,
     authority_commit_in_progress: Arc<AtomicBool>,
+    authority_release_in_progress: Arc<AtomicBool>,
+    runtime_callback_reconfigure_in_progress: Arc<AtomicBool>,
     tab_projection: Arc<Mutex<CommittedTabProjection>>,
     managed_profile: Arc<Mutex<Option<ManagedProfileDir>>>,
     local_active_target_authority: Arc<Mutex<Option<LocalActiveTargetAuthority>>>,
     page_hook_states: Arc<Mutex<HashMap<String, PageHookInstallState>>>,
+    runtime_callback_reconfigure_lock: Arc<Mutex<()>>,
     options: BrowserLaunchOptions,
     headless_mode: StdRwLock<bool>,
     identity_seed: u64,
@@ -88,6 +94,7 @@ pub struct BrowserManager {
     /// One-shot pre-registered intercept policy for the next JavaScript dialog.
     dialog_intercept: SharedDialogIntercept,
     download_callbacks: Arc<Mutex<DownloadCallbacks>>,
+    download_runtime: SharedDownloadRuntimeProjection,
     network_rule_runtime: Arc<tokio::sync::RwLock<NetworkRuleRuntime>>,
     request_correlation: Arc<Mutex<RequestCorrelationRegistry>>,
     observatory_pending_registries:
@@ -99,15 +106,27 @@ pub struct BrowserManager {
     connection_target: Arc<Mutex<Option<ConnectionTarget>>>,
     launch_policy_projection: Arc<StdRwLock<LaunchPolicyProjection>>,
     #[cfg(test)]
+    managed_browser_test_permit: Arc<Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
+    #[cfg(test)]
     force_reconcile_runtime_callbacks_failure: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    pause_runtime_callback_reconfigure_before_reconcile: Arc<AtomicBool>,
+    #[cfg(test)]
+    runtime_callback_reconfigure_paused: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    resume_runtime_callback_reconfigure: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     force_previous_authority_release_failure: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     force_current_authority_release_failure: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
+    runtime_state_replay_attempt_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
     force_generation_bound_runtime_reconcile_failure: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     force_managed_profile_ownership_commit_failure: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    force_required_page_hook_install_failure: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     pause_authority_commit_after_projection: Arc<AtomicBool>,
     #[cfg(test)]
@@ -141,10 +160,13 @@ impl BrowserManager {
             browser: Arc::new(Mutex::new(None)),
             launch_lock: Arc::new(Mutex::new(())),
             authority_commit_in_progress: Arc::new(AtomicBool::new(false)),
+            authority_release_in_progress: Arc::new(AtomicBool::new(false)),
+            runtime_callback_reconfigure_in_progress: Arc::new(AtomicBool::new(false)),
             tab_projection: Arc::new(Mutex::new(CommittedTabProjection::empty())),
             managed_profile: Arc::new(Mutex::new(None)),
             local_active_target_authority: Arc::new(Mutex::new(None)),
             page_hook_states: Arc::new(Mutex::new(HashMap::new())),
+            runtime_callback_reconfigure_lock: Arc::new(Mutex::new(())),
             options,
             headless_mode: StdRwLock::new(initial_headless),
             identity_seed,
@@ -158,6 +180,7 @@ impl BrowserManager {
                 None::<rub_core::model::DialogInterceptPolicy>,
             )),
             download_callbacks: Arc::new(Mutex::new(DownloadCallbacks::default())),
+            download_runtime: new_shared_download_runtime_projection(),
             network_rule_runtime: Arc::new(tokio::sync::RwLock::new(NetworkRuleRuntime::default())),
             request_correlation: Arc::new(Mutex::new(RequestCorrelationRegistry::default())),
             observatory_pending_registries: Arc::new(Mutex::new(HashMap::new())),
@@ -169,9 +192,17 @@ impl BrowserManager {
                 stealth_coverage: Some(initial_stealth_coverage),
             })),
             #[cfg(test)]
+            managed_browser_test_permit: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             force_reconcile_runtime_callbacks_failure: Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
+            #[cfg(test)]
+            pause_runtime_callback_reconfigure_before_reconcile: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            runtime_callback_reconfigure_paused: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            resume_runtime_callback_reconfigure: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             force_previous_authority_release_failure: Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
@@ -181,6 +212,8 @@ impl BrowserManager {
                 false,
             )),
             #[cfg(test)]
+            runtime_state_replay_attempt_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
             force_generation_bound_runtime_reconcile_failure: Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
@@ -188,6 +221,10 @@ impl BrowserManager {
             force_managed_profile_ownership_commit_failure: Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
+            #[cfg(test)]
+            force_required_page_hook_install_failure: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             #[cfg(test)]
             pause_authority_commit_after_projection: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -203,6 +240,17 @@ impl BrowserManager {
 
     fn set_authority_commit_in_progress(&self, in_progress: bool) {
         self.authority_commit_in_progress
+            .store(in_progress, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn runtime_callback_reconfigure_in_progress(&self) -> bool {
+        self.runtime_callback_reconfigure_in_progress
+            .load(Ordering::SeqCst)
+    }
+
+    fn set_runtime_callback_reconfigure_in_progress(&self, in_progress: bool) {
+        self.runtime_callback_reconfigure_in_progress
             .store(in_progress, Ordering::SeqCst);
     }
 
@@ -272,6 +320,67 @@ impl BrowserManager {
         self.listener_generation()
     }
 
+    /// Return whether a deferred runtime-state callback may still publish.
+    ///
+    /// Runtime-state callbacks can hand work to an async queue owned by the
+    /// embedding daemon. The callback invocation itself is guarded in CDP, but
+    /// the queued write must also prove that it still belongs to the same
+    /// listener generation and is not crossing an authority/reconfigure fence.
+    pub fn runtime_state_callback_publish_allowed(
+        &self,
+        listener_generation: ListenerGeneration,
+    ) -> bool {
+        self.listener_generation() == listener_generation
+            && !self.authority_commit_in_progress()
+            && !self
+                .runtime_callback_reconfigure_in_progress
+                .load(Ordering::SeqCst)
+    }
+
+    pub async fn runtime_state_callback_publish_allowed_for_active_target(
+        &self,
+        listener_generation: ListenerGeneration,
+        active_target_id: Option<&str>,
+    ) -> bool {
+        if !self.runtime_state_callback_publish_allowed(listener_generation) {
+            return false;
+        }
+        let Some(active_target_id) = active_target_id else {
+            return true;
+        };
+        self.tab_projection
+            .lock()
+            .await
+            .active_target_id
+            .as_ref()
+            .is_some_and(|target| target.as_ref() == active_target_id)
+    }
+
+    pub async fn publish_runtime_state_callback_if_active_target<F, Fut>(
+        &self,
+        listener_generation: ListenerGeneration,
+        active_target_id: Option<&str>,
+        publish: F,
+    ) -> bool
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = bool> + Send,
+    {
+        if !self.runtime_state_callback_publish_allowed(listener_generation) {
+            return false;
+        }
+        let projection = self.tab_projection.lock().await;
+        if let Some(active_target_id) = active_target_id
+            && projection
+                .active_target_id
+                .as_ref()
+                .is_none_or(|target| target.as_ref() != active_target_id)
+        {
+            return false;
+        }
+        publish().await
+    }
+
     fn listener_generation_receiver(&self) -> ListenerGenerationRx {
         self.listener_generation_tx.subscribe()
     }
@@ -283,10 +392,13 @@ impl BrowserManager {
     }
 
     async fn ensure_browser_locked(&self) -> Result<(), RubError> {
+        let mut degraded_runtime_fallback = None;
+        let mut managed_reconnect_url = None;
         {
             let browser_guard = self.browser.lock().await;
             if let Some(browser) = browser_guard.clone() {
                 drop(browser_guard);
+                let was_external = *self.is_external.lock().await;
                 let browser_live = timeout(
                     Duration::from_secs(2),
                     browser.execute(GetVersionParams::default()),
@@ -301,23 +413,47 @@ impl BrowserManager {
                 warn!(
                     "Existing browser authority became unavailable; clearing stale handle and relaunching"
                 );
+                degraded_runtime_fallback = Some(self.snapshot_browser_runtime_fallback().await);
+                if !was_external {
+                    managed_reconnect_url = Some(browser.websocket_address().clone());
+                }
                 self.bump_listener_generation();
                 self.clear_local_browser_authority().await;
             }
         }
 
         let existing_target = self.connection_target.lock().await.clone();
-        let install = self
-            .resolve_browser_authority_install(existing_target)
-            .await?;
-        self.install_runtime_state_locked(
-            install.browser,
-            install.page,
-            install.is_external,
-            install.connection_target,
-            install.managed_profile,
-        )
-        .await?;
+        let install = match self
+            .resolve_browser_authority_install(existing_target, managed_reconnect_url)
+            .await
+        {
+            Ok(install) => install,
+            Err(error) => {
+                if let Some(snapshot) = degraded_runtime_fallback {
+                    self.restore_degraded_runtime_fallback_after_failed_authority_rebuild(snapshot)
+                        .await;
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = self
+            .install_runtime_state_locked(
+                install.browser,
+                install.page,
+                install.is_external,
+                install.connection_target,
+                install.managed_profile,
+                #[cfg(test)]
+                install.managed_browser_test_permit,
+            )
+            .await
+        {
+            if let Some(snapshot) = degraded_runtime_fallback {
+                self.restore_degraded_runtime_fallback_after_failed_authority_rebuild(snapshot)
+                    .await;
+            }
+            return Err(error);
+        }
 
         info!("Browser launched successfully");
         Ok(())
@@ -363,6 +499,21 @@ impl BrowserManager {
         self.dialog_runtime.clone()
     }
 
+    pub async fn dialog_runtime_snapshot(&self) -> Result<DialogRuntimeInfo, RubError> {
+        let _launch_guard = self.launch_lock.lock().await;
+        if let Err(error) = self.ensure_browser_locked().await {
+            if let Some(runtime) = self
+                .degraded_dialog_runtime_after_failed_authority_rebuild()
+                .await
+            {
+                return Ok(runtime);
+            }
+            return Err(error);
+        }
+        self.sync_tabs_projection().await?;
+        Ok(self.dialog_runtime.read().await.clone())
+    }
+
     /// Arm a one-shot intercept policy for the next JavaScript dialog.
     ///
     /// When a `Page.javascriptDialogOpening` event fires, the CDP listener
@@ -372,6 +523,7 @@ impl BrowserManager {
         &self,
         policy: rub_core::model::DialogInterceptPolicy,
     ) -> Result<(), RubError> {
+        let policy = self.bind_dialog_intercept_policy(policy)?;
         let mut guard = self.dialog_intercept.lock().map_err(|_| {
             RubError::domain_with_context(
                 ErrorCode::InternalError,
@@ -383,6 +535,41 @@ impl BrowserManager {
         })?;
         *guard = Some(policy);
         Ok(())
+    }
+
+    fn bind_dialog_intercept_policy(
+        &self,
+        mut policy: rub_core::model::DialogInterceptPolicy,
+    ) -> Result<rub_core::model::DialogInterceptPolicy, RubError> {
+        if policy.target_tab_id.is_some() {
+            return Ok(policy);
+        }
+        if self.authority_commit_in_progress() {
+            return Err(dialog_intercept_wildcard_authority_error(
+                "dialog_intercept_target_tab_authority_commit_in_progress",
+                None,
+            ));
+        }
+        let projection = self.tab_projection.try_lock().map_err(|_| {
+            dialog_intercept_wildcard_authority_error(
+                "dialog_intercept_target_tab_authority_unavailable",
+                None,
+            )
+        })?;
+        let page_count = projection.pages.len();
+        let Some(page) = (page_count == 1).then(|| projection.pages[0].clone()) else {
+            let reason = if page_count == 0 {
+                "dialog_intercept_target_tab_authority_missing"
+            } else {
+                "dialog_intercept_target_tab_authority_ambiguous"
+            };
+            return Err(dialog_intercept_wildcard_authority_error(
+                reason,
+                Some(page_count),
+            ));
+        };
+        policy.target_tab_id = Some(page.target_id().as_ref().to_string());
+        Ok(policy)
     }
 
     /// Cancel any pending one-shot dialog intercept policy.
@@ -664,9 +851,7 @@ impl BrowserManager {
     ) {
         if let Ok(browser) = self.browser_handle().await {
             let context = self.projection_context(browser, listener_generation).await;
-            if let Err(error) =
-                crate::tab_projection::ensure_page_hooks(page, &context, false).await
-            {
+            if let Err(error) = crate::tab_projection::ensure_page_hooks(page, &context, 0).await {
                 warn!("failed to ensure page hooks for epoch listener page: {error}");
             }
         }
@@ -700,4 +885,18 @@ pub(super) fn active_page_authority_error(projected_page_count: usize) -> RubErr
             }),
         )
     }
+}
+
+fn dialog_intercept_wildcard_authority_error(
+    reason: &str,
+    projected_page_count: Option<usize>,
+) -> RubError {
+    RubError::domain_with_context(
+        ErrorCode::InvalidInput,
+        "Cannot arm wildcard dialog intercept without a single authoritative tab; bind an explicit target tab instead.",
+        serde_json::json!({
+            "reason": reason,
+            "projected_page_count": projected_page_count,
+        }),
+    )
 }

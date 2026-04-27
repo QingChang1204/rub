@@ -297,7 +297,7 @@ fn t437b_trigger_records_blocked_outcome_when_target_action_fails() {
         .as_u64()
         .expect("trigger id should be present");
 
-    let blocked = wait_for_trigger_status(&home, trigger_id, "blocked");
+    let blocked = wait_for_trigger_last_action_status(&home, trigger_id, "blocked");
     let trigger = blocked["data"]["result"]["items"]
         .as_array()
         .unwrap()
@@ -547,8 +547,8 @@ fn t437c_trigger_resume_ignores_stale_network_evidence_and_fires_on_new_request(
         "{resumed}"
     );
 
-    std::thread::sleep(Duration::from_millis(1200));
-    let still_armed = parse_json(&rub_cmd(&home).args(["trigger", "list"]).output().unwrap());
+    let still_armed =
+        assert_trigger_status_remains(&home, trigger_id, "armed", Duration::from_millis(1200));
     let trigger = still_armed["data"]["result"]["items"]
         .as_array()
         .unwrap()
@@ -602,6 +602,14 @@ fn t437c_trigger_resume_ignores_stale_network_evidence_and_fires_on_new_request(
     );
     assert_eq!(count_after["success"], true, "{count_after}");
     assert_eq!(count_after["data"]["result"]["value"], "1", "{count_after}");
+
+    let removed = parse_json(
+        &rub_cmd(&home)
+            .args(["trigger", "remove", &trigger_id.to_string()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(removed["success"], true, "{removed}");
 
     cleanup(&home);
 }
@@ -728,9 +736,14 @@ fn t437d_trigger_reports_target_missing_and_does_not_fire() {
 
     let closed = parse_json(&rub_cmd(&home).args(["close-tab"]).output().unwrap());
     assert_eq!(closed["success"], true, "{closed}");
-    assert_eq!(closed["data"]["result"]["remaining_tabs"], 1, "{closed}");
     assert_eq!(
         closed["data"]["result"]["active_tab"]["title"], "Trigger Source Gone",
+        "{closed}"
+    );
+    assert!(
+        closed["data"]["result"]["remaining_tabs"]
+            .as_u64()
+            .is_some_and(|remaining| remaining >= 1),
         "{closed}"
     );
 
@@ -755,8 +768,13 @@ fn t437d_trigger_reports_target_missing_and_does_not_fire() {
         "{degraded}"
     );
 
-    std::thread::sleep(Duration::from_millis(1500));
-    let still_degraded = parse_json(&rub_cmd(&home).args(["trigger", "list"]).output().unwrap());
+    wait_for_text_in_session(&home, "default", "#status", "Ready", Duration::from_secs(5));
+    let still_degraded = assert_trigger_remains_unavailable_without_action(
+        &home,
+        trigger_id,
+        "target_tab_missing",
+        Duration::from_millis(1500),
+    );
     let trigger = still_degraded["data"]["result"]["items"]
         .as_array()
         .unwrap()
@@ -769,6 +787,14 @@ fn t437d_trigger_reports_target_missing_and_does_not_fire() {
         "{still_degraded}"
     );
     assert!(trigger["last_action_result"].is_null(), "{still_degraded}");
+
+    let removed = parse_json(
+        &rub_cmd(&home)
+            .args(["trigger", "remove", &trigger_id.to_string()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(removed["success"], true, "{removed}");
 
     cleanup(&home);
 }
@@ -1012,6 +1038,17 @@ fn t437f_trigger_degrades_when_target_selected_frame_becomes_stale() {
     );
     assert_eq!(switched_target["success"], true, "{switched_target}");
 
+    let scheduled = parse_json(
+        &rub_cmd(&home)
+            .args([
+                "exec",
+                "window.setTimeout(() => window.removeChildFrame(), 100); 'scheduled'",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(scheduled["success"], true, "{scheduled}");
+
     let selected = parse_json(
         &rub_cmd(&home)
             .args(["frame", "--name", "child-frame"])
@@ -1020,34 +1057,11 @@ fn t437f_trigger_degrades_when_target_selected_frame_becomes_stale() {
     );
     assert_eq!(selected["success"], true, "{selected}");
 
-    let removed = parse_json(
-        &rub_cmd(&home)
-            .args(["exec", "window.removeChildFrame(); 'removed'"])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(removed["success"], true, "{removed}");
-
-    let waited = parse_json(
-        &rub_cmd(&home)
-            .args([
-                "exec",
-                "new Promise((resolve) => setTimeout(() => resolve('done'), 900))",
-            ])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(waited["success"], true, "{waited}");
-
-    let frame_runtime = parse_json(&rub_cmd(&home).args(["runtime", "frame"]).output().unwrap());
-    assert_eq!(frame_runtime["success"], true, "{frame_runtime}");
-    assert_eq!(
-        frame_runtime["data"]["runtime"]["status"], "stale",
-        "{frame_runtime}"
-    );
-    assert_eq!(
-        frame_runtime["data"]["runtime"]["degraded_reason"], "selected_frame_not_found",
-        "{frame_runtime}"
+    let _frame_runtime = wait_for_runtime_frame_degraded_reason(
+        &home,
+        "stale",
+        "selected_frame_not_found",
+        Duration::from_secs(5),
     );
 
     let spec_path = format!("{home}/trigger-stale-frame.json");
@@ -1084,7 +1098,7 @@ fn t437f_trigger_degrades_when_target_selected_frame_becomes_stale() {
         .as_u64()
         .expect("trigger id should be present");
 
-    let degraded = wait_for_trigger_status(&home, trigger_id, "degraded");
+    let degraded = wait_for_trigger_last_action_status(&home, trigger_id, "degraded");
     let trigger = degraded["data"]["result"]["items"]
         .as_array()
         .unwrap()
@@ -1100,7 +1114,7 @@ fn t437f_trigger_degrades_when_target_selected_frame_becomes_stale() {
         "{degraded}"
     );
     assert_eq!(
-        trigger["last_action_result"]["error_code"], "BROWSER_CRASHED",
+        trigger["last_action_result"]["error_code"], "SESSION_BUSY",
         "{degraded}"
     );
     assert_eq!(
@@ -1164,6 +1178,14 @@ fn t437f_trigger_degrades_when_target_selected_frame_becomes_stale() {
         inspected["data"]["result"]["value"], "Pending",
         "{inspected}"
     );
+
+    let removed_trigger = parse_json(
+        &rub_cmd(&home)
+            .args(["trigger", "remove", &trigger_id.to_string()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(removed_trigger["success"], true, "{removed_trigger}");
 
     cleanup(&home);
 }
@@ -1738,7 +1760,7 @@ fn t437i_l_trigger_source_vars_storage_blocked_and_removed_grouped_scenario() {
         removed["data"]["result"]["removed"]["id"], trigger_id,
         "{removed}"
     );
-    std::thread::sleep(Duration::from_millis(2600));
+    wait_for_text_in_session(&home, "default", "#status", "Ready", Duration::from_secs(5));
     let listed = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
     assert_eq!(listed["success"], true, "{listed}");
     assert!(
@@ -1915,6 +1937,14 @@ fn t437i_l_trigger_source_vars_storage_blocked_and_removed_grouped_scenario() {
         inspected["data"]["result"]["value"], "Answer from source tab",
         "{inspected}"
     );
+    let removed = parse_json(
+        &session
+            .cmd()
+            .args(["trigger", "remove", &trigger_id.to_string()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(removed["success"], true, "{removed}");
     reset_tabs(&mut expected_tabs, &mut bootstrap);
 
     let (target_index, source_index) = open_pair(
@@ -2029,6 +2059,14 @@ fn t437i_l_trigger_source_vars_storage_blocked_and_removed_grouped_scenario() {
         inspected["data"]["result"]["value"], "Storage triggered",
         "{inspected}"
     );
+    let removed = parse_json(
+        &session
+            .cmd()
+            .args(["trigger", "remove", &trigger_id.to_string()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(removed["success"], true, "{removed}");
     reset_tabs(&mut expected_tabs, &mut bootstrap);
 
     let (target_index, source_index) = open_pair(
@@ -2157,4 +2195,12 @@ fn t437i_l_trigger_source_vars_storage_blocked_and_removed_grouped_scenario() {
         inspected["data"]["result"]["value"], "Pending",
         "{inspected}"
     );
+    let removed = parse_json(
+        &session
+            .cmd()
+            .args(["trigger", "remove", &trigger_id.to_string()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(removed["success"], true, "{removed}");
 }

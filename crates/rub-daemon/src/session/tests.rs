@@ -3,6 +3,8 @@ use super::{
     SessionState,
 };
 use crate::session::protocol::BROWSER_EVENT_CRITICAL_SOFT_LIMIT;
+use crate::storage_runtime::StorageMutationRuntimeContext;
+use crate::workflow_capture::WorkflowCaptureDeliveryState;
 use rub_core::model::{
     AuthState, ConsoleErrorEvent, DownloadMode, DownloadRuntimeStatus, DownloadState,
     FrameContextStatus, HumanVerificationHandoffInfo, HumanVerificationHandoffStatus,
@@ -204,6 +206,18 @@ async fn automation_scheduler_metrics_track_queue_owned_worker_cycles() {
         metrics["reservation_wait_policy"]["active_orchestration_step"]["timeout_authority"],
         serde_json::json!("orchestration_action_request.timeout_ms")
     );
+    assert_eq!(
+        metrics["reservation_wait_policy"]["response_delivery"]["mode"],
+        serde_json::json!("transport_delivery_holds_fifo_until_write_or_fallback_commit")
+    );
+    assert_eq!(
+        metrics["reservation_wait_policy"]["response_delivery"]["transport_timeout_authority"],
+        serde_json::json!("daemon.IPC_WRITE_TIMEOUT")
+    );
+    assert_eq!(
+        metrics["reservation_wait_policy"]["response_delivery"]["fallback_commit_authority"],
+        serde_json::json!("router.transaction.commit_after_delivery_failure")
+    );
     assert!(
         metrics["trigger_worker"]["last_cycle_uptime_ms"]
             .as_u64()
@@ -284,8 +298,10 @@ async fn browser_event_ingress_metrics_track_metered_critical_pressure() {
         sink.enqueue(BrowserSessionEvent::DialogRuntime {
             browser_sequence: state.allocate_browser_event_sequence(),
             generation: 1,
-            status: rub_core::model::DialogRuntimeStatus::Active,
-            degraded_reason: None,
+            runtime: Box::new(rub_core::model::DialogRuntimeInfo {
+                status: rub_core::model::DialogRuntimeStatus::Active,
+                ..rub_core::model::DialogRuntimeInfo::default()
+            }),
         });
     }
 
@@ -332,6 +348,8 @@ async fn session_records_storage_snapshot_and_mutation_history() {
     state
         .set_storage_snapshot(StorageSnapshot {
             origin: "https://example.test".to_string(),
+            tab_target_id: Some("tab-1".to_string()),
+            frame_id: Some("frame-1".to_string()),
             local_storage: BTreeMap::from([("token".to_string(), "abc".to_string())]),
             session_storage: BTreeMap::from([("csrf".to_string(), "def".to_string())]),
         })
@@ -340,8 +358,13 @@ async fn session_records_storage_snapshot_and_mutation_history() {
         .record_storage_mutation(
             StorageMutationKind::Set,
             "https://example.test".to_string(),
-            Some(StorageArea::Local),
-            Some("token".to_string()),
+            StorageMutationRuntimeContext {
+                tab_target_id: Some("tab-1".to_string()),
+                frame_id: Some("frame-1".to_string()),
+                area: Some(StorageArea::Local),
+                key: Some("token".to_string()),
+                commit_status: Some("snapshot_committed".to_string()),
+            },
         )
         .await;
 
@@ -483,7 +506,11 @@ async fn session_records_redacted_post_commit_journal_entry() {
         .expect("static command_id must be valid");
 
         state
-            .record_post_commit_journal(&request, &response)
+            .record_post_commit_journal(
+                &request,
+                &response,
+                WorkflowCaptureDeliveryState::Delivered,
+            )
             .await
             .expect("journal append succeeds");
         let journal = state
@@ -508,6 +535,10 @@ async fn session_records_redacted_post_commit_journal_entry() {
             serde_json::json!("daemon_response_committed")
         );
         assert_eq!(
+            journal[0]["journal_state"]["delivery_state_contract"],
+            serde_json::json!("sibling_post_commit_delivery_state")
+        );
+        assert_eq!(
             journal[0]["journal_state"]["retention_scope"],
             serde_json::json!("session_runtime_cleanup")
         );
@@ -520,6 +551,7 @@ async fn session_records_redacted_post_commit_journal_entry() {
             serde_json::json!("$RUB_TOKEN")
         );
         assert_eq!(journal[0]["command_id"], serde_json::json!("cmd-1"));
+        assert!(journal[0]["delivery_state"].is_null());
         assert_eq!(
             journal[0]["request_redaction_lossy"],
             serde_json::json!(false)
@@ -564,7 +596,11 @@ async fn session_redacts_post_commit_journal_error_response_context() {
         );
 
         state
-            .record_post_commit_journal(&request, &response)
+            .record_post_commit_journal(
+                &request,
+                &response,
+                WorkflowCaptureDeliveryState::Delivered,
+            )
             .await
             .expect("journal append succeeds");
         let journal = state
@@ -608,7 +644,7 @@ async fn session_tracks_post_commit_journal_append_failures() {
 
     state.force_post_commit_journal_failure_once();
     let error = state
-        .record_post_commit_journal(&request, &response)
+        .record_post_commit_journal(&request, &response, WorkflowCaptureDeliveryState::Delivered)
         .await
         .expect_err("forced failure should surface");
     assert!(
@@ -646,7 +682,11 @@ async fn session_reopens_same_session_id_and_appends_to_existing_journal() {
     let response_one =
         rub_ipc::protocol::IpcResponse::success("req-1", serde_json::json!({"ok": true}));
     first
-        .record_post_commit_journal(&request_one, &response_one)
+        .record_post_commit_journal(
+            &request_one,
+            &response_one,
+            WorkflowCaptureDeliveryState::Delivered,
+        )
         .await
         .expect("first append succeeds");
 
@@ -659,7 +699,11 @@ async fn session_reopens_same_session_id_and_appends_to_existing_journal() {
     let response_two =
         rub_ipc::protocol::IpcResponse::success("req-2", serde_json::json!({"ok": true}));
     second
-        .record_post_commit_journal(&request_two, &response_two)
+        .record_post_commit_journal(
+            &request_two,
+            &response_two,
+            WorkflowCaptureDeliveryState::Delivered,
+        )
         .await
         .expect("second append succeeds");
 
@@ -691,7 +735,7 @@ async fn session_ignores_torn_post_commit_journal_tail() {
     let response =
         rub_ipc::protocol::IpcResponse::success("req-1", serde_json::json!({"ok": true}));
     state
-        .record_post_commit_journal(&request, &response)
+        .record_post_commit_journal(&request, &response, WorkflowCaptureDeliveryState::Delivered)
         .await
         .expect("append succeeds");
 
@@ -731,12 +775,18 @@ async fn repeated_projection_drain_spawns_coalesce_to_one_task() {
     state.spawn_post_commit_projection_drain();
     state.spawn_post_commit_projection_drain();
     state.spawn_post_commit_projection_drain();
+    tokio::task::yield_now().await;
 
     assert_eq!(
         state
             .post_commit_projection_drain_spawn_count
             .load(Ordering::SeqCst),
         1
+    );
+    assert_eq!(
+        state.pending_post_commit_followup_count(),
+        1,
+        "detached projection drain must stay inside downstream post-commit followup authority"
     );
 }
 
@@ -840,6 +890,37 @@ async fn session_spent_replay_claim_survives_cached_response_eviction() {
     assert!(matches!(
         state.claim_replay_command("cmd-1", "fingerprint-2".to_string()),
         ReplayCommandClaim::Conflict
+    ));
+}
+
+#[tokio::test]
+async fn session_spent_replay_authority_survives_capacity_pressure() {
+    let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
+    for index in 0..crate::session::protocol::REPLAY_SPENT_LIMIT {
+        state.mark_replay_command_spent(&format!("cmd-{index}"), &format!("fingerprint-{index}"));
+    }
+
+    state.mark_replay_command_spent(
+        &format!("cmd-{}", crate::session::protocol::REPLAY_SPENT_LIMIT),
+        &format!(
+            "fingerprint-{}",
+            crate::session::protocol::REPLAY_SPENT_LIMIT
+        ),
+    );
+
+    assert!(matches!(
+        state.claim_replay_command("cmd-0", "fingerprint-0".to_string()),
+        ReplayCommandClaim::SpentWithoutCachedResponse
+    ));
+    assert!(matches!(
+        state.claim_replay_command(
+            &format!("cmd-{}", crate::session::protocol::REPLAY_SPENT_LIMIT),
+            format!(
+                "fingerprint-{}",
+                crate::session::protocol::REPLAY_SPENT_LIMIT
+            )
+        ),
+        ReplayCommandClaim::SpentWithoutCachedResponse
     ));
 }
 
@@ -1019,10 +1100,12 @@ async fn browser_event_enqueue_failure_commits_dropped_sequence() {
     sink.enqueue(BrowserSessionEvent::DownloadRuntime {
         browser_sequence: sequence,
         generation: 1,
-        status: DownloadRuntimeStatus::Active,
-        mode: DownloadMode::Managed,
-        download_dir: Some("/tmp/rub-test/downloads".to_string()),
-        degraded_reason: None,
+        runtime: Box::new(rub_core::model::DownloadRuntimeInfo {
+            status: DownloadRuntimeStatus::Active,
+            mode: DownloadMode::Managed,
+            download_dir: Some("/tmp/rub-test/downloads".to_string()),
+            ..rub_core::model::DownloadRuntimeInfo::default()
+        }),
     });
 
     state
@@ -1290,6 +1373,80 @@ async fn bounded_download_window_reports_timeline_eviction_truthfully() {
         Some("download_event_timeline_overflow")
     );
     assert!(!window.events.is_empty());
+}
+
+#[tokio::test]
+async fn bounded_download_window_recovers_authority_after_generation_rollover() {
+    let state = Arc::new(SessionState::new(
+        "default",
+        PathBuf::from("/tmp/rub-test"),
+        None,
+    ));
+    for index in 0..140 {
+        state
+            .record_download_started_sequenced(
+                1,
+                index + 1,
+                format!("guid-{index}"),
+                format!("https://example.test/{index}.csv"),
+                format!("{index}.csv"),
+                None,
+            )
+            .await;
+    }
+
+    let stale_window = state
+        .download_event_window_between(
+            0,
+            state.download_cursor().await,
+            0,
+            state.download_event_ingress_drop_count(),
+            None,
+            None,
+        )
+        .await;
+    assert!(!stale_window.authoritative);
+    assert_eq!(
+        stale_window.degraded_reason.as_deref(),
+        Some("download_event_timeline_overflow")
+    );
+
+    state
+        .set_download_runtime(
+            2,
+            rub_core::model::DownloadRuntimeStatus::Active,
+            rub_core::model::DownloadMode::Managed,
+            Some("/tmp/rub-downloads-next".to_string()),
+        )
+        .await;
+    state
+        .record_download_started_sequenced(
+            2,
+            1,
+            "guid-next".to_string(),
+            "https://example.test/next.csv".to_string(),
+            "next.csv".to_string(),
+            None,
+        )
+        .await;
+
+    let recovered_window = state
+        .download_event_window_between(
+            0,
+            state.download_cursor().await,
+            0,
+            state.download_event_ingress_drop_count(),
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        recovered_window.authoritative,
+        "a fresh generation must not inherit timeline overflow from the previous generation"
+    );
+    assert_eq!(recovered_window.degraded_reason, None);
+    assert_eq!(recovered_window.events.len(), 1);
+    assert_eq!(recovered_window.events[0].download.guid, "guid-next");
 }
 
 #[test]
@@ -1613,6 +1770,48 @@ async fn network_request_authority_is_not_degraded_by_best_effort_observatory_ov
 }
 
 #[tokio::test]
+async fn request_record_overflow_does_not_degrade_top_level_observatory_or_integration() {
+    let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
+    for index in 0..1_030 {
+        state
+            .upsert_network_request_record(NetworkRequestRecord {
+                request_id: format!("req-{index}"),
+                sequence: 0,
+                lifecycle: NetworkRequestLifecycle::Completed,
+                url: format!("https://example.com/api/{index}"),
+                method: "GET".to_string(),
+                tab_target_id: Some("target-1".to_string()),
+                status: Some(200),
+                request_headers: BTreeMap::new(),
+                response_headers: BTreeMap::new(),
+                request_body: None,
+                response_body: None,
+                original_url: None,
+                rewritten_url: None,
+                applied_rule_effects: Vec::new(),
+                error_text: None,
+                frame_id: Some("main".to_string()),
+                resource_type: Some("xhr".to_string()),
+                mime_type: Some("application/json".to_string()),
+            })
+            .await;
+    }
+
+    let observatory = state.observatory().await;
+    assert_eq!(observatory.status, RuntimeObservatoryStatus::Active);
+    assert_eq!(observatory.degraded_reason, None);
+    assert!(observatory.dropped_event_count > 0);
+
+    let integration = state.integration_runtime().await;
+    assert_eq!(integration.status, IntegrationRuntimeStatus::Active);
+    assert!(
+        !integration
+            .degraded_surfaces
+            .contains(&IntegrationSurface::RuntimeObservatory)
+    );
+}
+
+#[tokio::test]
 async fn network_request_ingress_overflow_fails_request_window_closed() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
     assert_eq!(state.record_network_request_ingress_overflow(), 1);
@@ -1766,6 +1965,46 @@ async fn stale_runtime_state_sequence_does_not_override_newer_snapshot() {
 }
 
 #[tokio::test]
+async fn runtime_state_publish_rechecks_callback_fence_after_waiting_for_write_authority() {
+    let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
+    let snapshot = RuntimeStateSnapshot {
+        state_inspector: StateInspectorInfo {
+            status: StateInspectorStatus::Active,
+            auth_state: AuthState::Authenticated,
+            cookie_count: 5,
+            local_storage_keys: vec!["token".to_string()],
+            session_storage_keys: Vec::new(),
+            auth_signals: vec!["cookies_present".to_string()],
+            degraded_reason: None,
+        },
+        readiness_state: ReadinessInfo {
+            status: ReadinessStatus::Active,
+            route_stability: RouteStability::Stable,
+            loading_present: false,
+            skeleton_present: false,
+            overlay_state: OverlayState::None,
+            document_ready_state: Some("complete".to_string()),
+            blocking_signals: Vec::new(),
+            degraded_reason: None,
+        },
+    };
+
+    let published = state
+        .publish_runtime_state_snapshot_if(1, snapshot, || false)
+        .await;
+
+    assert!(!published);
+    assert_eq!(
+        state.runtime_state_snapshot().await,
+        RuntimeStateSnapshot {
+            state_inspector: StateInspectorInfo::default(),
+            readiness_state: ReadinessInfo::default(),
+        },
+        "deferred callback publish must recheck its fence after acquiring write authority"
+    );
+}
+
+#[tokio::test]
 async fn stale_orchestration_runtime_sequence_does_not_override_newer_projection() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
     let current_session_id = state.session_id.clone();
@@ -1778,12 +2017,13 @@ async fn stale_orchestration_runtime_sequence_does_not_override_newer_projection
             "/tmp/rub-current.sock".to_string(),
             true,
             "1.0".to_string(),
+            rub_core::model::OrchestrationSessionAvailability::Addressable,
             None,
         ),
     ];
 
     state
-        .set_orchestration_runtime(2, newer_sessions.clone(), None)
+        .set_orchestration_runtime(2, newer_sessions.clone(), true, true, None)
         .await;
     state
         .mark_orchestration_runtime_degraded(
@@ -1795,6 +2035,7 @@ async fn stale_orchestration_runtime_sequence_does_not_override_newer_projection
                 "/tmp/rub-current.sock".to_string(),
                 true,
                 "1.0".to_string(),
+                rub_core::model::OrchestrationSessionAvailability::Addressable,
                 None,
             ),
             "stale_registry_error",
@@ -1809,7 +2050,11 @@ async fn stale_orchestration_runtime_sequence_does_not_override_newer_projection
 
 #[tokio::test]
 async fn degraded_orchestration_runtime_preserves_current_session_execution_authority() {
-    let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
+    let state = SessionState::new(
+        "default",
+        PathBuf::from("/tmp/rub-test"),
+        Some("/tmp/rub-current-profile".to_string()),
+    );
     let current_session_id = state.session_id.clone();
     let current_session_name = state.session_name.clone();
     let sessions = vec![
@@ -1820,11 +2065,14 @@ async fn degraded_orchestration_runtime_preserves_current_session_execution_auth
             "/tmp/rub-current.sock".to_string(),
             true,
             "1.0".to_string(),
+            rub_core::model::OrchestrationSessionAvailability::Addressable,
             None,
         ),
     ];
 
-    state.set_orchestration_runtime(1, sessions, None).await;
+    state
+        .set_orchestration_runtime(1, sessions, true, true, None)
+        .await;
     state
         .mark_orchestration_runtime_degraded(
             2,
@@ -1835,22 +2083,38 @@ async fn degraded_orchestration_runtime_preserves_current_session_execution_auth
                 "/tmp/rub-current.sock".to_string(),
                 true,
                 "1.0".to_string(),
-                None,
+                rub_core::model::OrchestrationSessionAvailability::CurrentFallback,
+                Some("/tmp/rub-current-profile".to_string()),
             ),
-            "registry_read_failed:test",
+            "registry_read_failed",
         )
         .await;
 
     let runtime = state.orchestration_runtime().await;
     assert_eq!(
         runtime.degraded_reason.as_deref(),
-        Some("registry_read_failed:test")
+        Some("registry_read_failed")
     );
     assert!(!runtime.addressing_supported);
     assert!(runtime.execution_supported);
     assert_eq!(runtime.known_sessions.len(), 1);
     assert!(runtime.known_sessions[0].current);
     assert_eq!(runtime.session_count, 1);
+    assert_eq!(
+        runtime.current_session_id.as_deref(),
+        Some(state.session_id.as_str())
+    );
+    assert_eq!(
+        runtime.current_session_name.as_deref(),
+        Some(state.session_name.as_str())
+    );
+    assert_eq!(
+        runtime.known_sessions[0]
+            .user_data_dir_state
+            .as_ref()
+            .map(|state| state.upstream_truth.as_str()),
+        Some("current_session_runtime_authority")
+    );
 }
 
 #[tokio::test]

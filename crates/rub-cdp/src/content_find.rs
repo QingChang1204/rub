@@ -20,15 +20,31 @@ pub(crate) async fn find_content_matches(
 ) -> Result<Vec<ContentFindMatch>, RubError> {
     let frame_context = crate::frame_runtime::resolve_frame_context(page, frame_id).await?;
     let script = content_find_script(locator)?;
-    let payload: ContentFindPayload = serde_json::from_str(
-        &crate::js::evaluate_returning_string_in_context(
-            page,
-            frame_context.execution_context_id,
-            &script,
-        )
-        .await?,
+    let document_before = crate::runtime_state::probe_live_read_document_fence(
+        page,
+        frame_context.execution_context_id,
     )
-    .map_err(|error| RubError::Internal(format!("Parse content-find payload failed: {error}")))?;
+    .await;
+    let raw = crate::js::evaluate_returning_string_in_context(
+        page,
+        frame_context.execution_context_id,
+        &script,
+    )
+    .await?;
+    let document_after = crate::runtime_state::probe_live_read_document_fence(
+        page,
+        frame_context.execution_context_id,
+    )
+    .await;
+    crate::runtime_state::ensure_live_read_document_fence(
+        "content_find",
+        frame_context.frame.frame_id.as_str(),
+        document_before.as_ref(),
+        document_after.as_ref(),
+    )?;
+    let payload: ContentFindPayload = serde_json::from_str(&raw).map_err(|error| {
+        RubError::Internal(format!("Parse content-find payload failed: {error}"))
+    })?;
 
     if let Some(locator_error) = payload.locator_error {
         return Err(RubError::domain_with_context_and_suggestion(

@@ -29,7 +29,11 @@ macro_rules! unexpected_browser_call {
     };
 }
 
-struct ReadinessProbeBrowser;
+#[derive(Default)]
+struct ReadinessProbeBrowser {
+    tabs: Vec<TabInfo>,
+    degraded_readiness: bool,
+}
 
 fn ready_snapshot() -> RuntimeStateSnapshot {
     RuntimeStateSnapshot {
@@ -43,6 +47,22 @@ fn ready_snapshot() -> RuntimeStateSnapshot {
             document_ready_state: Some("complete".to_string()),
             blocking_signals: Vec::new(),
             degraded_reason: None,
+        },
+    }
+}
+
+fn degraded_ready_snapshot() -> RuntimeStateSnapshot {
+    RuntimeStateSnapshot {
+        state_inspector: StateInspectorInfo::default(),
+        readiness_state: ReadinessInfo {
+            status: ReadinessStatus::Degraded,
+            route_stability: RouteStability::Stable,
+            loading_present: false,
+            skeleton_present: false,
+            overlay_state: OverlayState::None,
+            document_ready_state: Some("complete".to_string()),
+            blocking_signals: Vec::new(),
+            degraded_reason: Some("document_fence_changed".to_string()),
         },
     }
 }
@@ -72,15 +92,6 @@ impl BrowserPort for ReadinessProbeBrowser {
 
     async fn click(&self, _element: &Element) -> Result<InteractionOutcome, RubError> {
         unexpected_browser_call!("click")
-    }
-
-    async fn input(
-        &self,
-        _element: &Element,
-        _text: &str,
-        _clear: bool,
-    ) -> Result<InteractionOutcome, RubError> {
-        unexpected_browser_call!("input")
     }
 
     async fn execute_js(&self, _code: &str) -> Result<serde_json::Value, RubError> {
@@ -160,6 +171,14 @@ impl BrowserPort for ReadinessProbeBrowser {
         unexpected_browser_call!("send_keys")
     }
 
+    async fn send_keys_in_frame(
+        &self,
+        _frame_id: Option<&str>,
+        _combo: &KeyCombo,
+    ) -> Result<InteractionOutcome, RubError> {
+        unexpected_browser_call!("send_keys_in_frame")
+    }
+
     async fn type_text(&self, _text: &str) -> Result<InteractionOutcome, RubError> {
         unexpected_browser_call!("type_text")
     }
@@ -186,7 +205,7 @@ impl BrowserPort for ReadinessProbeBrowser {
     }
 
     async fn list_tabs(&self) -> Result<Vec<TabInfo>, RubError> {
-        unexpected_browser_call!("list_tabs")
+        Ok(self.tabs.clone())
     }
 
     async fn switch_tab(&self, _index: u32) -> Result<TabInfo, RubError> {
@@ -354,7 +373,11 @@ impl BrowserPort for ReadinessProbeBrowser {
                 ErrorCode::InvalidInput,
                 format!("frame '{frame_id}' is unavailable"),
             )),
-            None => Ok(ready_snapshot()),
+            None => Ok(if self.degraded_readiness {
+                degraded_ready_snapshot()
+            } else {
+                ready_snapshot()
+            }),
         }
     }
 
@@ -622,6 +645,30 @@ fn network_condition() -> TriggerConditionSpec {
     }
 }
 
+fn sample_text_input_element() -> Element {
+    Element {
+        index: 1,
+        tag: rub_core::model::ElementTag::Input,
+        text: String::new(),
+        attributes: HashMap::new(),
+        element_ref: Some("frame:1".to_string()),
+        target_id: None,
+        bounding_box: None,
+        ax_info: None,
+        listeners: None,
+        depth: Some(0),
+    }
+}
+
+#[tokio::test]
+#[should_panic(expected = "type_into")]
+async fn browser_port_input_default_delegates_to_type_into_lane() {
+    let browser = ReadinessProbeBrowser::default();
+    let element = sample_text_input_element();
+
+    let _ = BrowserPort::input(&browser, &element, "hello", false).await;
+}
+
 #[test]
 fn orchestration_network_request_matches_require_source_frame_when_present() {
     let condition = network_condition();
@@ -656,7 +703,7 @@ fn orchestration_network_request_matches_allow_tab_scoped_rules_without_frame() 
 
 #[tokio::test]
 async fn orchestration_readiness_probe_fails_closed_for_explicit_frame_errors() {
-    let browser: Arc<dyn BrowserPort> = Arc::new(ReadinessProbeBrowser);
+    let browser: Arc<dyn BrowserPort> = Arc::new(ReadinessProbeBrowser::default());
     let state = Arc::new(SessionState::new(
         "default",
         PathBuf::from("/tmp/rub-orchestration-probe-explicit-frame"),
@@ -688,4 +735,96 @@ async fn orchestration_readiness_probe_fails_closed_for_explicit_frame_errors() 
     .expect_err("explicit frame readiness probe must fail closed");
 
     assert!(error.to_string().contains("missing-frame"), "{error}");
+}
+
+#[tokio::test]
+async fn orchestration_readiness_probe_fails_closed_when_readiness_is_degraded() {
+    let browser: Arc<dyn BrowserPort> = Arc::new(ReadinessProbeBrowser {
+        tabs: Vec::new(),
+        degraded_readiness: true,
+    });
+    let state = Arc::new(SessionState::new(
+        "default",
+        PathBuf::from("/tmp/rub-orchestration-probe-degraded-readiness"),
+        None,
+    ));
+    let condition = TriggerConditionSpec {
+        kind: TriggerConditionKind::Readiness,
+        locator: None,
+        text: None,
+        url_pattern: None,
+        readiness_state: Some("stable".to_string()),
+        method: None,
+        status_code: None,
+        storage_area: None,
+        key: None,
+        value: None,
+    };
+
+    let result = evaluate_orchestration_probe_for_tab(
+        &browser,
+        &state,
+        "tab-source",
+        None,
+        &condition,
+        0,
+        0,
+    )
+    .await
+    .expect("degraded readiness should fail closed as a non-match");
+
+    assert!(!result.matched);
+    assert!(result.evidence.is_none());
+    assert!(result.degraded_reason.is_none());
+}
+
+#[tokio::test]
+async fn orchestration_url_match_fails_closed_when_source_tab_page_identity_is_degraded() {
+    let browser: Arc<dyn BrowserPort> = Arc::new(ReadinessProbeBrowser {
+        tabs: vec![TabInfo {
+            index: 0,
+            target_id: "tab-source".to_string(),
+            url: String::new(),
+            title: String::new(),
+            active: true,
+            active_authority: None,
+            degraded_reason: Some("tab_url_and_title_probe_failed".to_string()),
+        }],
+        degraded_readiness: false,
+    });
+    let state = Arc::new(SessionState::new(
+        "default",
+        PathBuf::from("/tmp/rub-orchestration-probe-degraded-url"),
+        None,
+    ));
+    let condition = TriggerConditionSpec {
+        kind: TriggerConditionKind::UrlMatch,
+        locator: None,
+        text: None,
+        url_pattern: Some("/events".to_string()),
+        readiness_state: None,
+        method: None,
+        status_code: None,
+        storage_area: None,
+        key: None,
+        value: None,
+    };
+
+    let error = evaluate_orchestration_probe_for_tab(
+        &browser,
+        &state,
+        "tab-source",
+        None,
+        &condition,
+        0,
+        0,
+    )
+    .await
+    .expect_err("degraded source tab page identity must fail closed");
+
+    assert!(matches!(
+        error,
+        RubError::Domain(ref envelope) if envelope.code == ErrorCode::SessionBusy
+    ));
+    assert!(error.to_string().contains("not authoritative"), "{error}");
 }

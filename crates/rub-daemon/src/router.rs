@@ -35,6 +35,7 @@ mod snapshot;
 mod state_format;
 mod storage;
 mod timeout;
+pub(crate) mod timeout_projection;
 mod transaction;
 mod transaction_context;
 mod triggers;
@@ -54,11 +55,15 @@ use crate::session::SessionState;
 
 use diagnostics::agent_capabilities;
 use diagnostics::detection_risks;
+pub(crate) use orchestration::orchestration_degraded_authority_error;
 use projection::{attach_interaction_projection, attach_select_projection};
 pub(super) use transaction::attach_response_metadata;
+pub(crate) use transaction::handoff_blocked_error_for_command;
+#[cfg(test)]
+pub(crate) use transaction::replay_request_fingerprint;
 pub(crate) use transaction_context::{
     CommandDispatchOutcome, OwnedRouterTransactionGuard, PendingExternalDomCommit,
-    RouterTransactionGuard, TransactionDeadline,
+    RouterFenceDisposition, RouterTransactionGuard, TransactionDeadline,
 };
 use wait_after::apply_post_wait_if_requested;
 /// The central command router. Owns the FIFO dispatch queue.

@@ -21,6 +21,7 @@ struct BindingCaptureInputs {
     rub_home_temp_owned: bool,
     attachment_identity: Option<String>,
     connection_target: Option<rub_core::model::ConnectionTarget>,
+    managed_profile_ephemeral: bool,
     profile_directory_reference: Option<String>,
     user_data_dir_reference: Option<String>,
     handoff: rub_core::model::HumanVerificationHandoffInfo,
@@ -99,6 +100,7 @@ async fn read_binding_capture_inputs(state: &Arc<SessionState>) -> BindingCaptur
         rub_home_temp_owned,
         attachment_identity: launch_identity.attachment_identity,
         connection_target: launch_identity.connection_target,
+        managed_profile_ephemeral: launch_identity.managed_profile_ephemeral,
         profile_directory_reference,
         user_data_dir_reference: state.user_data_dir.clone(),
         handoff,
@@ -114,27 +116,35 @@ async fn read_binding_capture_inputs(state: &Arc<SessionState>) -> BindingCaptur
 }
 
 fn project_binding_persistence_policy(inputs: &BindingCaptureInputs) -> BindingPersistencePolicy {
-    if matches!(
-        inputs.connection_target.as_ref(),
+    match inputs.connection_target.as_ref() {
         Some(
             rub_core::model::ConnectionTarget::CdpUrl { .. }
-                | rub_core::model::ConnectionTarget::AutoDiscovered { .. }
-        )
-    ) {
-        return BindingPersistencePolicy::ExternalReattachmentRequired;
+            | rub_core::model::ConnectionTarget::AutoDiscovered { .. },
+        ) => BindingPersistencePolicy::ExternalReattachmentRequired,
+        Some(rub_core::model::ConnectionTarget::Profile { .. }) => {
+            BindingPersistencePolicy::RubHomeLocalDurable
+        }
+        Some(rub_core::model::ConnectionTarget::Managed) => {
+            if inputs.managed_profile_ephemeral {
+                BindingPersistencePolicy::RubHomeLocalEphemeral
+            } else {
+                BindingPersistencePolicy::RubHomeLocalDurable
+            }
+        }
+        None => {
+            if inputs.rub_home_temp_owned
+                || inputs
+                    .user_data_dir_reference
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .is_some_and(is_temp_root_path)
+            {
+                BindingPersistencePolicy::RubHomeLocalEphemeral
+            } else {
+                BindingPersistencePolicy::RubHomeLocalDurable
+            }
+        }
     }
-
-    if inputs.rub_home_temp_owned
-        || inputs
-            .user_data_dir_reference
-            .as_deref()
-            .map(std::path::Path::new)
-            .is_some_and(is_temp_root_path)
-    {
-        return BindingPersistencePolicy::RubHomeLocalEphemeral;
-    }
-
-    BindingPersistencePolicy::RubHomeLocalDurable
 }
 
 fn project_binding_capture(inputs: &BindingCaptureInputs) -> BindingCaptureProjection {
@@ -183,6 +193,8 @@ fn project_binding_durability(inputs: &BindingCaptureInputs) -> BindingCaptureDu
             reattachment_mode: BindingReattachmentMode::TempHomeEphemeral,
             status_reason: Some(if inputs.rub_home_temp_owned {
                 "temp_owned_rub_home_is_ephemeral".to_string()
+            } else if inputs.managed_profile_ephemeral {
+                "managed_profile_is_ephemeral".to_string()
             } else if inputs
                 .user_data_dir_reference
                 .as_deref()
@@ -510,6 +522,7 @@ mod tests {
     async fn binding_capture_candidate_blocks_capture_while_handoff_is_active() {
         let home = PathBuf::from("/tmp/rub-binding-candidate-active-handoff");
         let state = Arc::new(SessionState::new("default", home, None));
+        state.set_managed_profile_ephemeral(true).await;
         state
             .publish_runtime_state_snapshot(1, sample_runtime_state(AuthState::Authenticated))
             .await;
@@ -528,6 +541,75 @@ mod tests {
         assert_eq!(
             candidate.capture_fence.status_reason.as_deref(),
             Some("automation_paused_for_human_control")
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_capture_candidate_treats_explicit_managed_user_data_dir_as_durable_even_in_temp_root()
+     {
+        let home = PathBuf::from("/tmp/rub-binding-candidate-explicit-managed-temp-root");
+        let explicit_user_data_dir = home.join("remembered-runtime");
+        let state = Arc::new(SessionState::new(
+            "default",
+            home,
+            Some(explicit_user_data_dir.display().to_string()),
+        ));
+        state
+            .publish_runtime_state_snapshot(1, sample_runtime_state(AuthState::Authenticated))
+            .await;
+        state
+            .set_connection_target(Some(ConnectionTarget::Managed))
+            .await;
+        state.set_managed_profile_ephemeral(false).await;
+        state
+            .refresh_takeover_runtime(&managed_launch_policy(
+                false,
+                state.user_data_dir.as_deref(),
+            ))
+            .await;
+
+        let candidate = binding_capture_candidate(&state).await;
+        assert_eq!(
+            candidate.durability.persistence_policy,
+            rub_core::model::BindingPersistencePolicy::RubHomeLocalDurable
+        );
+        assert_eq!(
+            candidate.durability.durability_scope,
+            rub_core::model::BindingDurabilityScope::RubHomeLocalDurable
+        );
+        assert_eq!(candidate.durability.status_reason, None);
+    }
+
+    #[tokio::test]
+    async fn binding_capture_candidate_treats_implicit_managed_profile_as_ephemeral() {
+        let home = PathBuf::from("/tmp/rub-binding-candidate-implicit-managed");
+        let state = Arc::new(SessionState::new(
+            "default",
+            home,
+            Some("/tmp/rub-chrome-session-implicit".to_string()),
+        ));
+        state
+            .publish_runtime_state_snapshot(1, sample_runtime_state(AuthState::Authenticated))
+            .await;
+        state
+            .set_connection_target(Some(ConnectionTarget::Managed))
+            .await;
+        state.set_managed_profile_ephemeral(true).await;
+        state
+            .refresh_takeover_runtime(&managed_launch_policy(
+                false,
+                state.user_data_dir.as_deref(),
+            ))
+            .await;
+
+        let candidate = binding_capture_candidate(&state).await;
+        assert_eq!(
+            candidate.durability.persistence_policy,
+            rub_core::model::BindingPersistencePolicy::RubHomeLocalEphemeral
+        );
+        assert_eq!(
+            candidate.durability.status_reason.as_deref(),
+            Some("managed_profile_is_ephemeral")
         );
     }
 

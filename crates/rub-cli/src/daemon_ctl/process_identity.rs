@@ -5,8 +5,11 @@ use rub_ipc::handshake::{
     SocketSessionIdentityConfirmation as SocketIdentityConfirmation,
     confirm_daemon_session_identity,
 };
+use rub_ipc::protocol::IPC_PROTOCOL_VERSION;
 
-pub(crate) fn process_matches_registry_entry(
+use rub_daemon::rub_paths::RubPaths;
+
+pub(crate) fn process_matches_registry_entry_for_termination(
     rub_home: &Path,
     entry: &rub_daemon::session::RegistryEntry,
 ) -> std::io::Result<bool> {
@@ -18,9 +21,12 @@ pub(crate) fn process_matches_registry_entry(
     )? {
         return Ok(false);
     }
-    Ok(!matches!(
+    let runtime_committed = runtime_commit_matches_registry_entry(rub_home, entry);
+    let compatibility_owned = entry.ipc_protocol_version != IPC_PROTOCOL_VERSION;
+    Ok(socket_identity_authorizes_registry_termination(
         socket_identity_confirmation(Path::new(&entry.socket_path), &entry.session_id)?,
-        SocketIdentityConfirmation::ConfirmedMismatch
+        runtime_committed,
+        compatibility_owned,
     ))
 }
 
@@ -83,10 +89,28 @@ pub(crate) fn process_matches_failed_startup_identity(
     if !process_matches_daemon_identity(rub_home, session_name, Some(session_id), pid)? {
         return Ok(false);
     }
-    Ok(!matches!(
+    Ok(socket_identity_confirms_expected_session(
         socket_identity_confirmation(socket_path, session_id)?,
-        SocketIdentityConfirmation::ConfirmedMismatch
     ))
+}
+
+fn socket_identity_confirms_expected_session(confirmation: SocketIdentityConfirmation) -> bool {
+    matches!(confirmation, SocketIdentityConfirmation::ConfirmedMatch)
+}
+
+fn socket_identity_authorizes_registry_termination(
+    confirmation: SocketIdentityConfirmation,
+    runtime_committed: bool,
+    compatibility_owned: bool,
+) -> bool {
+    matches!(confirmation, SocketIdentityConfirmation::ConfirmedMatch)
+        || (runtime_committed
+            && compatibility_owned
+            && matches!(
+                confirmation,
+                SocketIdentityConfirmation::ProtocolVersionMismatch
+                    | SocketIdentityConfirmation::Inconclusive
+            ))
 }
 
 fn socket_identity_confirmation(
@@ -96,9 +120,29 @@ fn socket_identity_confirmation(
     confirm_daemon_session_identity(socket_path, expected_session_id)
 }
 
+fn runtime_commit_matches_registry_entry(
+    rub_home: &Path,
+    entry: &rub_daemon::session::RegistryEntry,
+) -> bool {
+    let runtime = RubPaths::new(rub_home).session_runtime(&entry.session_name, &entry.session_id);
+    let pid_matches = std::fs::read_to_string(runtime.pid_path())
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        == Some(entry.pid);
+    let committed_matches = std::fs::read_to_string(runtime.startup_committed_path())
+        .ok()
+        .is_some_and(|raw| raw.trim() == entry.session_id);
+    let socket_matches = Path::new(&entry.socket_path) == runtime.socket_path();
+    pid_matches && committed_matches && socket_matches
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SocketIdentityConfirmation, socket_identity_confirmation};
+    use super::{
+        SocketIdentityConfirmation, socket_identity_authorizes_registry_termination,
+        socket_identity_confirmation, socket_identity_confirms_expected_session,
+    };
+    use rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID;
 
     #[cfg(unix)]
     fn spawn_handshake_server(
@@ -106,7 +150,7 @@ mod tests {
         daemon_session_id: &str,
     ) -> std::thread::JoinHandle<()> {
         use rub_ipc::codec::NdJsonCodec;
-        use rub_ipc::protocol::IpcResponse;
+        use rub_ipc::protocol::{IpcRequest, IpcResponse};
         use std::io::Write;
         use std::os::unix::net::UnixListener;
 
@@ -120,15 +164,24 @@ mod tests {
                     .try_clone()
                     .expect("clone accepted stream for reading"),
             );
-            let _: rub_ipc::protocol::IpcRequest = NdJsonCodec::read_blocking(&mut reader)
+            let request: IpcRequest = NdJsonCodec::read_blocking(&mut reader)
                 .expect("read request")
                 .expect("request");
+            assert_eq!(request.command, "_handshake");
+            assert_eq!(
+                request.command_id.as_deref(),
+                Some(HANDSHAKE_PROBE_COMMAND_ID)
+            );
             let response = IpcResponse::success(
                 "req-1",
                 serde_json::json!({
-                    "daemon_session_id": daemon_session_id,
+                    "daemon_session_id": daemon_session_id.clone(),
                 }),
-            );
+            )
+            .with_command_id(HANDSHAKE_PROBE_COMMAND_ID)
+            .expect("probe command_id must be valid")
+            .with_daemon_session_id(daemon_session_id)
+            .expect("daemon_session_id must be valid");
             let encoded = NdJsonCodec::encode(&response).expect("encode response");
             stream
                 .write_all(&encoded)
@@ -171,5 +224,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&socket_dir);
 
         assert_eq!(confirmation, SocketIdentityConfirmation::ConfirmedMismatch);
+    }
+
+    #[test]
+    fn only_confirmed_socket_identity_authorizes_process_match() {
+        assert!(socket_identity_confirms_expected_session(
+            SocketIdentityConfirmation::ConfirmedMatch
+        ));
+        assert!(!socket_identity_confirms_expected_session(
+            SocketIdentityConfirmation::ConfirmedMismatch
+        ));
+        assert!(!socket_identity_confirms_expected_session(
+            SocketIdentityConfirmation::ProtocolVersionMismatch
+        ));
+        assert!(!socket_identity_confirms_expected_session(
+            SocketIdentityConfirmation::ProbeContractFailure
+        ));
+        assert!(!socket_identity_confirms_expected_session(
+            SocketIdentityConfirmation::Inconclusive
+        ));
+    }
+
+    #[test]
+    fn protocol_mismatch_socket_identity_still_authorizes_registry_termination() {
+        assert!(socket_identity_authorizes_registry_termination(
+            SocketIdentityConfirmation::ConfirmedMatch,
+            false,
+            false,
+        ));
+        assert!(socket_identity_authorizes_registry_termination(
+            SocketIdentityConfirmation::ProtocolVersionMismatch,
+            true,
+            true,
+        ));
+        assert!(socket_identity_authorizes_registry_termination(
+            SocketIdentityConfirmation::Inconclusive,
+            true,
+            true,
+        ));
+        assert!(!socket_identity_authorizes_registry_termination(
+            SocketIdentityConfirmation::ProbeContractFailure,
+            true,
+            true,
+        ));
+        assert!(!socket_identity_authorizes_registry_termination(
+            SocketIdentityConfirmation::ProtocolVersionMismatch,
+            false,
+            true,
+        ));
+        assert!(!socket_identity_authorizes_registry_termination(
+            SocketIdentityConfirmation::Inconclusive,
+            true,
+            false,
+        ));
+        assert!(!socket_identity_authorizes_registry_termination(
+            SocketIdentityConfirmation::ConfirmedMismatch,
+            true,
+            true,
+        ));
     }
 }

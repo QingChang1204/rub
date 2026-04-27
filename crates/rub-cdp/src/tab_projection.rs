@@ -7,7 +7,7 @@ mod tests;
 
 pub(crate) use self::hooks::{
     EpochCallback, PageHookInstallState, ProjectionContext, ensure_page_hooks,
-    sync_tabs_projection_with,
+    replay_runtime_state_for_committed_active_page, sync_tabs_projection_with,
 };
 pub(crate) use self::tabs::{
     CommittedTabProjection, LocalActiveTargetAuthority, projected_stealth_patch_names,

@@ -90,6 +90,9 @@ struct A11yProjection<'a> {
     total_count: u32,
     truncated: bool,
     scroll: rub_core::model::ScrollPosition,
+    projection_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projection_warning: Option<&'a str>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -105,6 +108,9 @@ struct CompactProjection<'a> {
     total_count: u32,
     truncated: bool,
     scroll: rub_core::model::ScrollPosition,
+    projection_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projection_warning: Option<&'a str>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -130,6 +136,8 @@ fn build_a11y_projection(snapshot: &Snapshot) -> A11yProjection<'_> {
         total_count: snapshot.total_count,
         truncated: snapshot.truncated,
         scroll: snapshot.scroll,
+        projection_verified: snapshot.projection.verified,
+        projection_warning: snapshot.projection.warning.as_deref(),
     }
 }
 
@@ -146,6 +154,8 @@ fn build_compact_projection(snapshot: &Snapshot) -> CompactProjection<'_> {
         total_count: snapshot.total_count,
         truncated: snapshot.truncated,
         scroll: snapshot.scroll,
+        projection_verified: snapshot.projection.verified,
+        projection_warning: snapshot.projection.warning.as_deref(),
     }
 }
 
@@ -266,6 +276,7 @@ mod tests {
                     text: "Go".to_string(),
                     attributes: button_attrs,
                     element_ref: Some("main:1".to_string()),
+                    target_id: None,
                     bounding_box: Some(BoundingBox {
                         x: 0.0,
                         y: 0.0,
@@ -286,6 +297,7 @@ mod tests {
                     text: "".to_string(),
                     attributes: disabled_attrs,
                     element_ref: Some("main:2".to_string()),
+                    target_id: None,
                     bounding_box: None,
                     ax_info: Some(AXInfo {
                         role: Some("link".to_string()),
@@ -321,6 +333,8 @@ mod tests {
         let snapshot = sample_snapshot();
         let projection = build_a11y_projection(&snapshot);
         assert_eq!(projection.format, "a11y");
+        assert!(projection.projection_verified);
+        assert!(projection.projection_warning.is_none());
         assert!(
             projection
                 .a11y_text
@@ -348,6 +362,8 @@ mod tests {
         let snapshot = sample_snapshot();
         let projection = build_compact_projection(&snapshot);
         assert_eq!(projection.format, "compact");
+        assert!(projection.projection_verified);
+        assert!(projection.projection_warning.is_none());
         assert_eq!(projection.entries.len(), 2);
         assert_eq!(projection.entries[0].depth, 1);
         assert_eq!(projection.entries[1].depth, 2);
@@ -378,5 +394,23 @@ mod tests {
             summarize_snapshot_a11y(&snapshot),
             "No interactive elements matched the current scope/projection"
         );
+    }
+
+    #[test]
+    fn compact_and_a11y_projection_preserve_projection_honesty_metadata() {
+        let mut snapshot = sample_snapshot();
+        snapshot.projection.verified = false;
+        snapshot.projection.warning = Some("projection_count_mismatch".to_string());
+
+        let compact = build_compact_projection(&snapshot);
+        assert!(!compact.projection_verified);
+        assert_eq!(
+            compact.projection_warning,
+            Some("projection_count_mismatch")
+        );
+
+        let a11y = build_a11y_projection(&snapshot);
+        assert!(!a11y.projection_verified);
+        assert_eq!(a11y.projection_warning, Some("projection_count_mismatch"));
     }
 }

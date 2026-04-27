@@ -5,8 +5,8 @@ use rub_core::model::{
 };
 use rub_ipc::protocol::IpcRequest;
 
-use crate::router::RouterTransactionGuard;
 use crate::router::automation_fence::ensure_committed_automation_result;
+use crate::router::{RouterFenceDisposition, RouterTransactionGuard};
 use crate::scheduler_policy::AUTOMATION_QUEUE_SHUTDOWN_POLL_INTERVAL;
 
 use super::action_request::{
@@ -44,7 +44,7 @@ pub(super) async fn dispatch_orchestration_action(
     );
     let retry_policy = orchestration_retry_policy(context.rule);
     let (frozen_request, materialization_attempts) =
-        run_with_orchestration_retry(retry_policy, || async {
+        run_with_orchestration_retry(retry_policy, context.outer_deadline, || async {
             build_dispatchable_orchestration_action_request(
                 context,
                 session,
@@ -60,8 +60,11 @@ pub(super) async fn dispatch_orchestration_action(
             error: failure.error,
             attempts: failure.attempts,
         })?;
+    let dispatch_retry_policy =
+        dispatch_retry_policy_after_materialization(retry_policy, materialization_attempts);
     let (result, attempts) = run_with_frozen_orchestration_request_retry(
-        retry_policy,
+        dispatch_retry_policy,
+        context.outer_deadline,
         frozen_request,
         |request| async move {
             let command = request.command.clone();
@@ -71,6 +74,7 @@ pub(super) async fn dispatch_orchestration_action(
                 session,
                 &context.rule.target,
                 request,
+                context.outer_deadline,
             )
             .await?;
             ensure_committed_automation_result(&command, response.data.as_ref())?;
@@ -97,6 +101,7 @@ pub(super) async fn dispatch_orchestration_action(
         result,
         error_code: None,
         reason: None,
+        error_context: None,
     })
 }
 
@@ -112,12 +117,18 @@ async fn build_dispatchable_orchestration_action_request(
         reserve_source_materialization_authority(context, session, action, step_index).await?;
     let mut request =
         build_orchestration_action_request(context, action, step_index, command_id).await?;
-    trim_action_request_timeout_after_pre_dispatch(&mut request, step_started_at, step_index)?;
+    trim_action_request_timeout_after_pre_dispatch(
+        &mut request,
+        step_started_at,
+        step_index,
+        context.outer_deadline,
+    )?;
     Ok(request)
 }
 
 async fn run_with_frozen_orchestration_request_retry<T, F, Fut>(
     policy: OrchestrationRetryPolicy,
+    outer_deadline: Option<TransactionDeadline>,
     request: IpcRequest,
     mut operation: F,
 ) -> Result<(T, u32), OrchestrationRetryFailure>
@@ -125,11 +136,18 @@ where
     F: FnMut(IpcRequest) -> Fut,
     Fut: std::future::Future<Output = Result<T, ErrorEnvelope>>,
 {
-    run_with_orchestration_retry(policy, || {
+    run_with_orchestration_retry(policy, outer_deadline, || {
         let request = request.clone();
         operation(request)
     })
     .await
+}
+
+fn dispatch_retry_policy_after_materialization(
+    policy: OrchestrationRetryPolicy,
+    materialization_attempts: u32,
+) -> OrchestrationRetryPolicy {
+    policy.remaining_after_attempts(materialization_attempts)
 }
 
 fn total_orchestration_attempts(materialization_attempts: u32, dispatch_attempts: u32) -> u32 {
@@ -147,21 +165,54 @@ async fn reserve_source_materialization_authority<'a>(
     if !requires_remote_source_materialization(context, session, action) {
         return Ok(None);
     }
+    if matches!(
+        context.router_fence_disposition,
+        RouterFenceDisposition::ReuseCurrentTransaction
+    ) {
+        return Ok(None);
+    }
 
     let queue_wait_budget = std::time::Duration::from_millis(
         orchestration_source_materialization_wait_budget_ms(action, context.rub_home)?,
     );
+    let queue_wait_budget = context
+        .outer_deadline
+        .and_then(|deadline| {
+            let remaining_ms = deadline.remaining_ms();
+            (remaining_ms > 0)
+                .then_some(queue_wait_budget.min(std::time::Duration::from_millis(remaining_ms)))
+        })
+        .unwrap_or(queue_wait_budget);
+    if queue_wait_budget.is_zero() {
+        return Err(
+            ErrorEnvelope::new(
+                ErrorCode::IpcTimeout,
+                format!(
+                    "Orchestration step {} exhausted the caller-owned timeout budget before reserving source materialization authority",
+                    step_index + 1,
+                ),
+            )
+            .with_context(serde_json::json!({
+                "reason": "orchestration_source_materialization_timeout_budget_exhausted",
+                "source_session_id": context.rule.source.session_id,
+                "source_session_name": context.rule.source.session_name,
+                "target_session_id": session.session_id,
+                "target_session_name": session.session_name,
+                "step_index": step_index,
+            })),
+        );
+    }
 
     context
         .router
-        .begin_automation_transaction_with_wait_budget(
+        .begin_automation_transaction_if_needed(
             context.state,
             "orchestration_source_materialization",
             queue_wait_budget,
             AUTOMATION_QUEUE_SHUTDOWN_POLL_INTERVAL,
+            context.router_fence_disposition,
         )
         .await
-        .map(Some)
         .map_err(|error| {
             ErrorEnvelope::new(
                 error.code,
@@ -186,10 +237,14 @@ fn trim_action_request_timeout_after_pre_dispatch(
     request: &mut IpcRequest,
     step_started_at: tokio::time::Instant,
     step_index: u32,
+    outer_deadline: Option<crate::router::TransactionDeadline>,
 ) -> Result<(), ErrorEnvelope> {
     let original_timeout_ms = request.timeout_ms;
     let elapsed_ms = step_started_at.elapsed().as_millis() as u64;
-    let remaining_timeout_ms = original_timeout_ms.saturating_sub(elapsed_ms);
+    let mut remaining_timeout_ms = original_timeout_ms.saturating_sub(elapsed_ms);
+    if let Some(outer_deadline) = outer_deadline {
+        remaining_timeout_ms = remaining_timeout_ms.min(outer_deadline.remaining_ms());
+    }
     if remaining_timeout_ms == 0 {
         return Err(
             ErrorEnvelope::new(
@@ -249,22 +304,99 @@ pub(super) fn action_requires_source_materialization(action: &TriggerActionSpec)
 #[cfg(test)]
 mod tests {
     use super::{
-        OrchestrationRetryPolicy, run_with_frozen_orchestration_request_retry,
+        OrchestrationRetryPolicy, dispatch_retry_policy_after_materialization,
+        reserve_source_materialization_authority, run_with_frozen_orchestration_request_retry,
         total_orchestration_attempts, trim_action_request_timeout_after_pre_dispatch,
     };
+    use crate::orchestration_executor::OrchestrationExecutionContext;
+    use crate::router::{DaemonRouter, RouterFenceDisposition, TransactionDeadline};
+    use crate::session::SessionState;
     use rub_core::error::{ErrorCode, ErrorEnvelope};
+    use rub_core::model::{
+        OrchestrationAddressInfo, OrchestrationExecutionPolicyInfo, OrchestrationMode,
+        OrchestrationRuleInfo, OrchestrationRuleStatus, OrchestrationRuntimeInfo,
+        OrchestrationSessionAvailability, TriggerActionKind, TriggerActionSpec,
+        TriggerConditionKind, TriggerConditionSpec,
+    };
     use rub_ipc::protocol::IpcRequest;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
     use tokio::sync::Mutex;
+
+    fn test_router() -> DaemonRouter {
+        let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
+            rub_cdp::browser::BrowserLaunchOptions {
+                headless: true,
+                ignore_cert_errors: false,
+                user_data_dir: None,
+                managed_profile_ephemeral: false,
+                download_dir: None,
+                profile_directory: None,
+                hide_infobars: true,
+                stealth: true,
+            },
+        ));
+        let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
+            manager,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rub_cdp::humanize::HumanizeConfig {
+                enabled: false,
+                speed: rub_cdp::humanize::HumanizeSpeed::Normal,
+            },
+        ));
+        DaemonRouter::new(adapter)
+    }
+
+    fn sample_rule() -> OrchestrationRuleInfo {
+        OrchestrationRuleInfo {
+            id: 7,
+            status: OrchestrationRuleStatus::Armed,
+            lifecycle_generation: 1,
+            source: OrchestrationAddressInfo {
+                session_id: "sess-local".to_string(),
+                session_name: "local".to_string(),
+                tab_index: Some(0),
+                tab_target_id: Some("source-tab".to_string()),
+                frame_id: None,
+            },
+            target: OrchestrationAddressInfo {
+                session_id: "sess-remote".to_string(),
+                session_name: "remote".to_string(),
+                tab_index: Some(0),
+                tab_target_id: Some("target-tab".to_string()),
+                frame_id: None,
+            },
+            mode: OrchestrationMode::Repeat,
+            execution_policy: OrchestrationExecutionPolicyInfo::default(),
+            condition: TriggerConditionSpec {
+                kind: TriggerConditionKind::TextPresent,
+                locator: None,
+                text: Some("ready".to_string()),
+                url_pattern: None,
+                readiness_state: None,
+                method: None,
+                status_code: None,
+                storage_area: None,
+                key: None,
+                value: None,
+            },
+            actions: Vec::new(),
+            correlation_key: "corr".to_string(),
+            idempotency_key: "idem".to_string(),
+            unavailable_reason: None,
+            last_condition_evidence: None,
+            last_result: None,
+        }
+    }
 
     #[test]
     fn trim_action_request_timeout_after_pre_dispatch_projects_remaining_budget() {
         let started_at = tokio::time::Instant::now() - std::time::Duration::from_millis(80);
         let mut request = IpcRequest::new("wait", serde_json::json!({ "timeout_ms": 500 }), 500);
 
-        trim_action_request_timeout_after_pre_dispatch(&mut request, started_at, 0)
+        trim_action_request_timeout_after_pre_dispatch(&mut request, started_at, 0, None)
             .expect("remaining budget should stay positive");
 
         assert!(request.timeout_ms <= 420);
@@ -282,8 +414,9 @@ mod tests {
         let started_at = tokio::time::Instant::now() - std::time::Duration::from_millis(50);
         let mut request = IpcRequest::new("wait", serde_json::json!({ "timeout_ms": 10 }), 10);
 
-        let error = trim_action_request_timeout_after_pre_dispatch(&mut request, started_at, 1)
-            .expect_err("elapsed pre-dispatch budget should fail closed");
+        let error =
+            trim_action_request_timeout_after_pre_dispatch(&mut request, started_at, 1, None)
+                .expect_err("elapsed pre-dispatch budget should fail closed");
 
         assert_eq!(error.code, ErrorCode::IpcTimeout);
         let context = error.context.expect("timeout error should publish context");
@@ -314,6 +447,7 @@ mod tests {
                 max_retries: 1,
                 delay: Duration::from_millis(0),
             },
+            None,
             request,
             {
                 let attempts = attempts.clone();
@@ -359,5 +493,110 @@ mod tests {
         assert_eq!(total_orchestration_attempts(2, 1), 2);
         assert_eq!(total_orchestration_attempts(1, 3), 3);
         assert_eq!(total_orchestration_attempts(2, 2), 3);
+    }
+
+    #[tokio::test]
+    async fn frozen_request_retry_uses_only_remaining_budget_after_materialization() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let request = IpcRequest::new("pipe", serde_json::json!({ "value": "frozen" }), 500)
+            .with_command_id("step-cmd")
+            .expect("command id should validate");
+
+        let failure = run_with_frozen_orchestration_request_retry(
+            dispatch_retry_policy_after_materialization(
+                OrchestrationRetryPolicy {
+                    max_retries: 1,
+                    delay: Duration::from_millis(0),
+                },
+                2,
+            ),
+            None,
+            request,
+            {
+                let attempts = attempts.clone();
+                move |_request| {
+                    let attempts = attempts.clone();
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Err::<(), ErrorEnvelope>(ErrorEnvelope::new(
+                            ErrorCode::IpcProtocolError,
+                            "transient dispatch failure",
+                        )
+                        .with_context(serde_json::json!({
+                            "reason": "orchestration_target_dispatch_transport_failed",
+                        })))
+                    }
+                }
+            },
+        )
+        .await
+        .expect_err("dispatch should not get an extra retry after materialization spent the shared retry budget");
+
+        assert_eq!(failure.attempts, 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn source_materialization_reuses_current_router_transaction() {
+        let router = test_router();
+        let state = Arc::new(SessionState::new_with_id(
+            "default",
+            "sess-local",
+            PathBuf::from("/tmp/rub-orchestration-source-materialization-reuse"),
+            None,
+        ));
+        let runtime = OrchestrationRuntimeInfo {
+            known_sessions: vec![
+                crate::orchestration_runtime::projected_orchestration_session(
+                    "sess-remote".to_string(),
+                    "remote".to_string(),
+                    42,
+                    "/tmp/rub-remote.sock".to_string(),
+                    false,
+                    rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+                    OrchestrationSessionAvailability::Addressable,
+                    None,
+                ),
+            ],
+            session_count: 1,
+            addressing_supported: true,
+            execution_supported: true,
+            ..OrchestrationRuntimeInfo::default()
+        };
+        let rule = sample_rule();
+        let action = TriggerActionSpec {
+            kind: TriggerActionKind::Workflow,
+            command: None,
+            payload: Some(serde_json::json!({
+                "source_vars": {
+                    "greeting": {
+                        "kind": "text",
+                        "selector": "#hero"
+                    }
+                }
+            })),
+        };
+        let context = OrchestrationExecutionContext {
+            router: &router,
+            state: &state,
+            runtime: &runtime,
+            rule: &rule,
+            outer_deadline: Some(TransactionDeadline::new(500)),
+            execution_id: "exec-1",
+            command_identity_key: Some("evidence"),
+            rub_home: &state.rub_home,
+            router_fence_disposition: RouterFenceDisposition::ReuseCurrentTransaction,
+        };
+
+        let reservation = reserve_source_materialization_authority(
+            context,
+            &runtime.known_sessions[0],
+            &action,
+            0,
+        )
+        .await
+        .expect("source materialization should reuse the active router transaction");
+
+        assert!(reservation.is_none());
     }
 }

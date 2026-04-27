@@ -1,5 +1,6 @@
 use super::{
-    ambiguous_locator_error, apply_disambiguation, element_matches_text, parse_locator,
+    ambiguous_locator_error, apply_disambiguation, apply_pre_hit_test_ranking,
+    element_matches_text, parse_locator, resolve_elements_against_snapshot,
     resolve_elements_by_role, resolve_elements_by_testid,
 };
 use crate::locator_memo::LocatorMemoTarget;
@@ -9,8 +10,10 @@ use crate::router::addressing::memo::{
 use crate::router::addressing::semantic::normalize_locator_text;
 use rub_core::error::ErrorCode;
 use rub_core::locator::{CanonicalLocator, LocatorSelection};
-use rub_core::model::{AXInfo, Element, ElementTag};
+use rub_core::model::{AXInfo, BoundingBox, Element, ElementTag};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 #[test]
 fn normalize_locator_text_collapses_whitespace_and_case() {
@@ -480,6 +483,30 @@ fn snapshot(elements: Vec<Element>) -> rub_core::model::Snapshot {
     }
 }
 
+fn test_router() -> crate::router::DaemonRouter {
+    let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
+        rub_cdp::browser::BrowserLaunchOptions {
+            headless: true,
+            ignore_cert_errors: false,
+            user_data_dir: None,
+            managed_profile_ephemeral: false,
+            download_dir: None,
+            profile_directory: None,
+            hide_infobars: true,
+            stealth: true,
+        },
+    ));
+    let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
+        manager,
+        Arc::new(AtomicU64::new(0)),
+        rub_cdp::humanize::HumanizeConfig {
+            enabled: false,
+            speed: rub_cdp::humanize::HumanizeSpeed::Normal,
+        },
+    ));
+    crate::router::DaemonRouter::new(adapter)
+}
+
 fn element(index: u32, text: &str, aria_label: Option<&str>, element_ref: Option<&str>) -> Element {
     let mut attributes = HashMap::new();
     if let Some(label) = aria_label {
@@ -491,6 +518,7 @@ fn element(index: u32, text: &str, aria_label: Option<&str>, element_ref: Option
         text: text.to_string(),
         attributes,
         element_ref: element_ref.map(ToOwned::to_owned),
+        target_id: None,
         bounding_box: None,
         ax_info: None,
         listeners: None,
@@ -520,4 +548,72 @@ fn element_with_testid(index: u32, text: &str, testid: &str) -> Element {
         .attributes
         .insert("data-testid".to_string(), testid.to_string());
     element
+}
+
+#[tokio::test]
+async fn index_locator_resolves_by_element_index_not_scoped_vector_position() {
+    let scoped = snapshot(vec![
+        element(3, "Third", None, Some("main:3")),
+        element(9, "Ninth", None, Some("main:9")),
+    ]);
+    let resolved = resolve_elements_against_snapshot(
+        &test_router(),
+        &scoped,
+        &serde_json::json!({ "index": 9 }),
+        "inspect text",
+    )
+    .await
+    .expect("index lookup should honor element.index");
+
+    assert_eq!(resolved.elements.len(), 1);
+    assert_eq!(resolved.elements[0].index, 9);
+    assert_eq!(resolved.elements[0].text, "Ninth");
+}
+
+#[tokio::test]
+async fn ref_locator_fails_closed_when_snapshot_ref_authority_is_unverified() {
+    let mut scoped = snapshot(vec![element(9, "Ninth", None, None)]);
+    scoped.projection.verified = false;
+    scoped.projection.warning = Some("projection mismatch".to_string());
+
+    let error = resolve_elements_against_snapshot(
+        &test_router(),
+        &scoped,
+        &serde_json::json!({ "element_ref": "main:9" }),
+        "inspect text",
+    )
+    .await
+    .expect_err("ref lookup should fail closed when snapshot ref authority is unavailable");
+
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::StaleSnapshot);
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx["reason"].as_str()),
+        Some("snapshot_ref_authority_unavailable")
+    );
+}
+
+#[test]
+fn visible_ranking_applies_before_live_hit_test() {
+    let locator = parse_locator(&serde_json::json!({
+        "label": "Continue",
+        "visible": true,
+        "topmost": true,
+    }))
+    .expect("visible+topmost locator should parse");
+    let hidden = element(0, "Continue", Some("Continue"), Some("main:10"));
+    let mut visible = element(1, "Continue", Some("Continue"), Some("main:11"));
+    visible.bounding_box = Some(BoundingBox {
+        x: 10.0,
+        y: 20.0,
+        width: 80.0,
+        height: 24.0,
+    });
+
+    let ranked = apply_pre_hit_test_ranking(&locator, vec![hidden, visible.clone()]);
+    assert_eq!(ranked.len(), 1);
+    assert_eq!(ranked[0].index, visible.index);
 }

@@ -1,6 +1,6 @@
 use super::{
-    InteractionTraceMode, POST_COMMIT_LOCAL_FAILURE_STATE, format_cli_error,
-    format_exec_raw_response, format_post_commit_cli_error, format_response,
+    InteractionTraceMode, format_cli_error, format_committed_cli_error, format_exec_raw_response,
+    format_post_commit_cli_error, format_response, format_response_with_success,
 };
 use rub_core::error::ErrorEnvelope;
 use rub_core::model::Timing;
@@ -15,8 +15,9 @@ fn rub_home() -> &'static Path {
 #[test]
 fn format_response_trace_mode_attaches_full_interaction_trace() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-trace".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -161,11 +162,11 @@ fn format_response_trace_mode_attaches_full_interaction_trace() {
         InteractionTraceMode::Trace,
     );
     let json: Value = serde_json::from_str(&output).unwrap();
-    assert_eq!(
-        json["data"]["interaction"]["semantic_class"],
-        "select_choice"
-    );
-    let trace = &json["data"]["interaction_trace"];
+    assert_eq!(json["success"], false, "{json}");
+    assert_eq!(json["error"]["code"], "INTERACTION_NOT_CONFIRMED", "{json}");
+    let committed = &json["error"]["context"]["committed_response_projection"];
+    assert_eq!(committed["interaction"]["semantic_class"], "select_choice");
+    let trace = &committed["interaction_trace"];
     assert_eq!(trace["trace_id"], "019-trace");
     assert_eq!(trace["command"], "select");
     assert_eq!(trace["semantic_class"], "select_choice");
@@ -191,14 +192,98 @@ fn format_response_trace_mode_attaches_full_interaction_trace() {
         trace["observed_effects"]["interference"]["after"]["current_interference"]["kind"],
         "interstitial_navigation"
     );
+    assert_eq!(
+        json["error"]["context"]["effect_state"]["surface"],
+        "cli_interaction_effect_failure"
+    );
 }
 
 #[test]
-fn post_commit_cli_error_preserves_daemon_request_correlation() {
+fn format_response_with_success_fails_closed_on_non_confirmed_interaction() {
+    let response = IpcResponse {
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        command_id: Some("019-click".to_string()),
+        daemon_session_id: None,
+        request_id: "019-request".to_string(),
+        status: ResponseStatus::Success,
+        data: Some(serde_json::json!({
+            "interaction": {
+                "semantic_class": "activate",
+                "interaction_confirmed": false,
+                "confirmation_status": "unconfirmed"
+            }
+        })),
+        error: None,
+        timing: Timing::default(),
+    };
+
+    let formatted = format_response_with_success(
+        &response,
+        "click",
+        "default",
+        rub_home(),
+        false,
+        InteractionTraceMode::Compact,
+    );
+    let json: Value = serde_json::from_str(&formatted.output).unwrap();
+
+    assert!(!formatted.success);
+    assert_eq!(json["success"], false, "{json}");
+    assert_eq!(json["request_id"], "019-request", "{json}");
+    assert_eq!(json["command_id"], "019-click", "{json}");
+    assert_eq!(json["error"]["code"], "INTERACTION_NOT_CONFIRMED", "{json}");
+    assert_eq!(
+        json["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_status"],
+        "unconfirmed",
+        "{json}"
+    );
+}
+
+#[test]
+fn format_response_treats_matched_wait_after_as_interaction_commit_fallback() {
+    let response = IpcResponse {
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        command_id: Some("019-click".to_string()),
+        daemon_session_id: None,
+        request_id: "019-request".to_string(),
+        status: ResponseStatus::Success,
+        data: Some(serde_json::json!({
+            "interaction": {
+                "semantic_class": "activate",
+                "interaction_confirmed": false,
+                "confirmation_status": "degraded"
+            },
+            "wait_after": {
+                "matched": true,
+                "text": "Saved"
+            }
+        })),
+        error: None,
+        timing: Timing::default(),
+    };
+
+    let formatted = format_response_with_success(
+        &response,
+        "click",
+        "default",
+        rub_home(),
+        false,
+        InteractionTraceMode::Compact,
+    );
+    let json: Value = serde_json::from_str(&formatted.output).unwrap();
+
+    assert!(formatted.success);
+    assert_eq!(json["success"], true, "{json}");
+    assert_eq!(json["data"]["wait_after"]["matched"], true, "{json}");
+}
+
+#[test]
+fn legacy_success_shaped_post_commit_cli_error_fails_stdout_contract() {
     let response = IpcResponse {
         ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         request_id: "req-42".to_string(),
         command_id: Some("cmd-42".to_string()),
+        daemon_session_id: None,
         status: ResponseStatus::Success,
         timing: Timing::default(),
         data: Some(serde_json::json!({"result": {"ok": true}})),
@@ -220,54 +305,27 @@ fn post_commit_cli_error_preserves_daemon_request_correlation() {
     assert_eq!(value["command_id"], "cmd-42");
     assert_eq!(value["success"], false);
     assert_eq!(
-        value["data"]["commit_state"],
-        POST_COMMIT_LOCAL_FAILURE_STATE
+        value["error"]["context"]["projection_kind"],
+        "cli_stdout_contract_fallback"
     );
     assert_eq!(
-        value["data"]["post_commit_followup_state"]["surface"],
-        "cli_post_commit_followup_failure"
+        value["error"]["context"]["field"],
+        "data.post_commit_followup_*"
     );
     assert_eq!(
-        value["data"]["post_commit_followup_state"]["truth_level"],
-        "operator_projection"
+        value["error"]["context"]["expected_surface"],
+        "top_level_error"
     );
-    assert_eq!(
-        value["data"]["post_commit_followup_state"]["projection_kind"],
-        "cli_post_commit_followup_failure"
-    );
-    assert_eq!(
-        value["data"]["post_commit_followup_state"]["projection_authority"],
-        "cli.post_commit_followup"
-    );
-    assert_eq!(
-        value["data"]["post_commit_followup_state"]["upstream_commit_truth"],
-        "daemon_response_committed"
-    );
-    assert_eq!(
-        value["data"]["post_commit_followup_state"]["control_role"],
-        "display_only"
-    );
-    assert_eq!(
-        value["data"]["post_commit_followup_state"]["durability"],
-        "best_effort"
-    );
-    assert_eq!(
-        value["data"]["post_commit_followup_state"]["recovery_contract"],
-        "no_public_recovery_contract"
-    );
-    assert_eq!(value["data"]["result"]["ok"], true);
-    assert_eq!(
-        value["error"]["message"],
-        "local export failed after daemon success"
-    );
+    assert!(value.get("data").is_none() || value["data"].is_null());
 }
 
 #[test]
-fn post_commit_cli_error_wraps_non_object_daemon_payload_with_commit_state() {
+fn legacy_success_shaped_post_commit_cli_error_wraps_non_object_payload_but_fails_contract() {
     let response = IpcResponse {
         ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         request_id: "req-99".to_string(),
         command_id: Some("cmd-99".to_string()),
+        daemon_session_id: None,
         status: ResponseStatus::Success,
         timing: Timing::default(),
         data: Some(serde_json::json!("done")),
@@ -286,22 +344,80 @@ fn post_commit_cli_error_wraps_non_object_daemon_payload_with_commit_state() {
     );
     let value: Value = serde_json::from_str(&formatted).expect("valid output JSON");
 
+    assert_eq!(value["success"], false);
     assert_eq!(
-        value["data"]["commit_state"],
-        POST_COMMIT_LOCAL_FAILURE_STATE
+        value["error"]["context"]["projection_kind"],
+        "cli_stdout_contract_fallback"
     );
     assert_eq!(
-        value["data"]["post_commit_followup_state"]["truth_level"],
-        "operator_projection"
+        value["error"]["context"]["expected_surface"],
+        "top_level_error"
     );
-    assert_eq!(value["data"]["daemon_response"], "done");
+}
+
+#[test]
+fn committed_cli_error_preserves_daemon_request_correlation_and_projection() {
+    let response = IpcResponse {
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        request_id: "req-77".to_string(),
+        command_id: Some("cmd-77".to_string()),
+        daemon_session_id: None,
+        status: ResponseStatus::Success,
+        timing: Timing::default(),
+        data: Some(serde_json::json!({
+            "result": {
+                "format": "pipe",
+                "entries": []
+            }
+        })),
+        error: None,
+    };
+
+    let formatted = format_committed_cli_error(
+        &response,
+        "history",
+        "default",
+        ErrorEnvelope::new(
+            rub_core::error::ErrorCode::InvalidInput,
+            "local export failed after daemon success",
+        )
+        .with_context(serde_json::json!({
+            "reason": "post_commit_history_export_failed",
+            "daemon_request_committed": true,
+            "committed_response_projection": {
+                "result": {
+                    "format": "pipe",
+                    "entries": []
+                }
+            }
+        })),
+        false,
+    );
+    let value: Value = serde_json::from_str(&formatted).expect("valid output JSON");
+    assert_eq!(value["request_id"], "req-77");
+    assert_eq!(value["command_id"], "cmd-77");
+    assert_eq!(value["success"], false);
+    assert!(
+        value.get("data").is_none() || value["data"].is_null(),
+        "{value}"
+    );
+    assert_eq!(
+        value["error"]["context"]["reason"],
+        "post_commit_history_export_failed"
+    );
+    assert_eq!(value["error"]["context"]["daemon_request_committed"], true);
+    assert_eq!(
+        value["error"]["context"]["committed_response_projection"]["result"]["format"],
+        "pipe"
+    );
 }
 
 #[test]
 fn format_exec_raw_response_returns_explicit_raw_surface() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-raw".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -332,8 +448,9 @@ fn format_exec_raw_response_returns_explicit_raw_surface() {
 #[test]
 fn format_exec_raw_response_requires_success_with_result_payload() {
     let error_response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-raw".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Error,
         data: None,
@@ -350,8 +467,9 @@ fn format_exec_raw_response_requires_success_with_result_payload() {
     assert!(format_exec_raw_response(&error_response, false).is_none());
 
     let missing_result = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-raw".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({ "ok": true })),
@@ -368,8 +486,9 @@ fn format_exec_raw_response_requires_success_with_result_payload() {
 #[test]
 fn format_response_keeps_exec_success_in_json_envelope_by_default() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-raw".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -399,8 +518,9 @@ fn format_response_keeps_exec_success_in_json_envelope_by_default() {
 #[test]
 fn format_response_compact_mode_omits_interaction_trace() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-request".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -431,8 +551,9 @@ fn format_response_compact_mode_omits_interaction_trace() {
 #[test]
 fn format_response_verbose_mode_attaches_summary_without_observed_effects() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
-        command_id: None,
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        command_id: Some("019-request".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -473,8 +594,9 @@ fn format_response_verbose_mode_attaches_summary_without_observed_effects() {
 #[test]
 fn format_response_trace_mode_picks_up_new_interaction_fields_without_hardcoded_list() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-request".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -519,8 +641,9 @@ fn format_response_trace_mode_picks_up_new_interaction_fields_without_hardcoded_
 #[test]
 fn format_response_attaches_frame_drift_authority_guidance_to_errors() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-frame-drift".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Error,
         data: None,
@@ -584,10 +707,68 @@ fn format_cli_error_attaches_takeover_continuity_guidance() {
 }
 
 #[test]
+fn format_cli_error_attaches_trigger_continuity_guidance_for_session_busy() {
+    let output = format_cli_error(
+        "trigger",
+        "default",
+        ErrorEnvelope::new(
+            rub_core::error::ErrorCode::SessionBusy,
+            "trigger source-frame continuity fence failed",
+        )
+        .with_context(serde_json::json!({
+            "reason": "continuity_frame_unavailable"
+        })),
+        false,
+    );
+    let json: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(json["success"], false);
+    assert_eq!(
+        json["error"]["context"]["authority_guidance"]["source_signal"],
+        "continuity_frame_unavailable"
+    );
+    assert_eq!(
+        json["error"]["context"]["authority_guidance"]["next_command_hints"][0]["command"],
+        "rub frames"
+    );
+}
+
+#[test]
 fn format_response_verbose_uses_request_id_when_command_id_missing() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: None,
+        daemon_session_id: None,
+        request_id: "019-request".to_string(),
+        status: ResponseStatus::Success,
+        data: Some(serde_json::json!({
+            "interaction": {
+                "semantic_class": "hover",
+                "element_verified": true
+            }
+        })),
+        error: None,
+        timing: Timing::default(),
+    };
+
+    let output = format_response(
+        &response,
+        "_handshake",
+        "default",
+        rub_home(),
+        false,
+        InteractionTraceMode::Verbose,
+    );
+    let json: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(json["data"]["interaction_trace"]["trace_id"], "019-request");
+}
+
+#[test]
+fn format_response_rejects_missing_command_id_for_non_compat_command_and_preserves_stdout_contract()
+{
+    let response = IpcResponse {
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        command_id: None,
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -609,14 +790,27 @@ fn format_response_verbose_uses_request_id_when_command_id_missing() {
         InteractionTraceMode::Verbose,
     );
     let json: Value = serde_json::from_str(&output).unwrap();
-    assert_eq!(json["data"]["interaction_trace"]["trace_id"], "019-request");
+    assert_eq!(json["success"], false, "{json}");
+    assert_eq!(json["error"]["code"], "IPC_PROTOCOL_ERROR");
+    assert_eq!(json["error"]["context"]["field"], "command_id");
+    assert_eq!(json["request_id"], "019-request");
+    assert!(json["command_id"].is_null(), "{json}");
+    assert_eq!(
+        json["error"]["context"]["stdout_contract_fallback"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        json["error"]["context"]["projection_kind"],
+        serde_json::json!("cli_stdout_contract_fallback")
+    );
 }
 
 #[test]
 fn format_response_rejects_blank_request_id_before_trace_projection() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
-        command_id: None,
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        command_id: Some("019-request".to_string()),
+        daemon_session_id: None,
         request_id: "   ".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({
@@ -645,8 +839,9 @@ fn format_response_rejects_blank_request_id_before_trace_projection() {
 #[test]
 fn format_response_rejects_success_envelope_with_error_payload() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-invalid".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({"ok": true})),
@@ -674,8 +869,9 @@ fn format_response_rejects_success_envelope_with_error_payload() {
 #[test]
 fn format_response_rejects_success_envelope_without_data() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-invalid".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: None,
@@ -702,6 +898,7 @@ fn format_response_rejects_protocol_version_mismatch() {
     let response = IpcResponse {
         ipc_protocol_version: "0.9".to_string(),
         command_id: Some("019-invalid".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({"ok": true})),
@@ -729,8 +926,9 @@ fn format_response_rejects_protocol_version_mismatch() {
 #[test]
 fn format_response_rejects_error_envelope_with_success_data() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-invalid".to_string()),
+        daemon_session_id: None,
         request_id: "019-request".to_string(),
         status: ResponseStatus::Error,
         data: Some(serde_json::json!({"ok": true})),
@@ -758,8 +956,9 @@ fn format_response_rejects_error_envelope_with_success_data() {
 #[test]
 fn format_response_contract_error_path_sanitizes_blank_stdout_request_id() {
     let response = IpcResponse {
-        ipc_protocol_version: "1.0".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-invalid".to_string()),
+        daemon_session_id: None,
         request_id: "   ".to_string(),
         status: ResponseStatus::Success,
         data: Some(serde_json::json!({"ok": true})),

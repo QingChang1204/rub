@@ -8,7 +8,11 @@ use rub_core::model::{
 };
 use tracing::{info, warn};
 
-use crate::router::DaemonRouter;
+use crate::router::timeout_projection::{
+    record_orchestration_partial_commit_timeout_projection,
+    record_orchestration_pending_step_timeout_projection_with_recovery,
+};
+use crate::router::{DaemonRouter, RouterFenceDisposition, TransactionDeadline};
 use crate::session::SessionState;
 use uuid::Uuid;
 
@@ -22,9 +26,12 @@ pub(crate) mod target;
 #[cfg(test)]
 use action_request::orchestration_action_execution_info;
 #[cfg(test)]
+use action_request::orchestration_request_meta;
 use action_request::orchestration_step_command_id;
 #[cfg(test)]
 use action_request::resolve_orchestration_workflow_spec;
+#[cfg(test)]
+use action_request::resolve_source_session;
 #[cfg(test)]
 use dispatch::action_requires_source_materialization;
 use dispatch::dispatch_orchestration_action;
@@ -32,11 +39,16 @@ pub(crate) use outcome::{
     OrchestrationFailureInput, classify_orchestration_error_status, orchestration_failure_result,
 };
 use outcome::{successful_cooldown_until_ms, successful_next_status};
+#[cfg(test)]
+pub(crate) use protocol::bind_orchestration_daemon_authority;
+#[cfg(test)]
+pub(crate) use protocol::queue_remote_orchestration_connection_for_test;
 pub(crate) use protocol::{
-    RemoteDispatchContract, bind_orchestration_daemon_authority,
-    decode_orchestration_success_payload, decode_orchestration_success_payload_field,
-    decode_orchestration_success_result_items, dispatch_remote_orchestration_request,
-    ensure_orchestration_success_response,
+    RemoteDispatchContract, bind_live_orchestration_phase_command_id,
+    bounded_orchestration_timeout_ms, decode_orchestration_success_payload,
+    decode_orchestration_success_payload_field, decode_orchestration_success_result_items,
+    dispatch_remote_orchestration_request, ensure_orchestration_success_response,
+    run_orchestration_future_with_outer_deadline,
 };
 use target::resolve_target_session;
 
@@ -56,9 +68,11 @@ struct OrchestrationExecutionContext<'a> {
     state: &'a Arc<SessionState>,
     runtime: &'a OrchestrationRuntimeInfo,
     rule: &'a OrchestrationRuleInfo,
+    outer_deadline: Option<TransactionDeadline>,
     execution_id: &'a str,
     command_identity_key: Option<&'a str>,
     rub_home: &'a Path,
+    router_fence_disposition: RouterFenceDisposition,
 }
 
 pub(crate) async fn execute_orchestration_rule(
@@ -67,6 +81,8 @@ pub(crate) async fn execute_orchestration_rule(
     runtime: &OrchestrationRuntimeInfo,
     rule: &OrchestrationRuleInfo,
     command_identity_key: Option<&str>,
+    outer_deadline: Option<TransactionDeadline>,
+    router_fence_disposition: RouterFenceDisposition,
 ) -> OrchestrationResultInfo {
     let total_steps = rule.actions.len() as u32;
     let mut steps = Vec::new();
@@ -82,9 +98,11 @@ pub(crate) async fn execute_orchestration_rule(
         state,
         runtime,
         rule,
+        outer_deadline,
         execution_id: &execution_id,
         command_identity_key,
         rub_home: &state.rub_home,
+        router_fence_disposition,
     };
     let target_session = match resolve_target_session(runtime, rule) {
         Ok(session) => session,
@@ -112,8 +130,40 @@ pub(crate) async fn execute_orchestration_rule(
 
     for (step_index, action) in rule.actions.iter().enumerate() {
         let step_index = step_index as u32;
+        let step_command_id = orchestration_step_command_id(
+            rule,
+            context.command_identity_key,
+            context.execution_id,
+            step_index,
+        );
+        let target_dispatch_command_id = format!(
+            "orchestration_target_dispatch:{}:{step_command_id}",
+            target_session.session_id
+        );
+        record_orchestration_pending_step_timeout_projection_with_recovery(
+            rule.id,
+            total_steps,
+            &steps,
+            step_index,
+            Some(serde_json::json!({
+                "step_index": step_index,
+                "target_session_id": target_session.session_id.as_str(),
+                "target_session_name": target_session.session_name.as_str(),
+                "target_command_id": target_dispatch_command_id,
+                "inner_command_id": step_command_id,
+                "recovery_authority": "target_session_replay",
+                "fallback_authority": "spent_without_cached_response",
+            })),
+        );
         match dispatch_orchestration_action(context, target_session, step_index, action).await {
-            Ok(step) => steps.push(step),
+            Ok(step) => {
+                steps.push(step);
+                record_orchestration_partial_commit_timeout_projection(
+                    rule.id,
+                    total_steps,
+                    &steps,
+                );
+            }
             Err(failure) => {
                 warn!(
                     rule_id = rule.id,
@@ -159,7 +209,26 @@ pub(crate) async fn execute_orchestration_rule(
         cooldown_until_ms: successful_cooldown_until_ms(rule),
         error_code: None,
         reason: None,
+        error_context: None,
     }
+}
+
+pub(crate) fn orchestration_non_authoritative_evidence_error(
+    message: impl Into<String>,
+    degraded_reason: Option<String>,
+    context: serde_json::Value,
+) -> ErrorEnvelope {
+    let mut context = context.as_object().cloned().unwrap_or_default();
+    context.insert(
+        "reason".to_string(),
+        serde_json::json!("runtime_observatory_not_authoritative"),
+    );
+    context.insert(
+        "degraded_reason".to_string(),
+        degraded_reason.map_or(serde_json::Value::Null, serde_json::Value::String),
+    );
+    ErrorEnvelope::new(ErrorCode::SessionBusy, message)
+        .with_context(serde_json::Value::Object(context))
 }
 
 #[cfg(test)]

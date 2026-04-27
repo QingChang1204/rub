@@ -7,24 +7,35 @@ use rub_ipc::codec::{MAX_FRAME_BYTES, encoded_frame_len};
 use rub_ipc::protocol::{IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse};
 
 use crate::router::timeout::{TimeoutPhase, timeout_context};
+use crate::router::timeout_projection::merge_timeout_projection_context;
 use crate::session::SessionState;
 use crate::workflow_capture::WorkflowCaptureDeliveryState;
 
 use super::fingerprint;
 use super::{ReplayFenceOwner, ReplayFinalizeMode, TransactionDeadline};
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum PostCommitProjectionFence {
+    Detached,
+    Synchronous,
+}
+
 pub(crate) async fn finalize_post_commit_followups(
     request: &IpcRequest,
-    response: &IpcResponse,
+    committed_response: &IpcResponse,
     workflow_capture_response: &IpcResponse,
     workflow_capture_delivery_state: WorkflowCaptureDeliveryState,
+    projection_fence: PostCommitProjectionFence,
     state: &Arc<SessionState>,
 ) {
-    if let Err(error) = state.record_post_commit_journal(request, response).await {
+    if let Err(error) = state
+        .record_post_commit_journal(request, committed_response, workflow_capture_delivery_state)
+        .await
+    {
         warn!(
             command = %request.command,
-            command_id = response.command_id.as_deref().unwrap_or(""),
-            request_id = %response.request_id,
+            command_id = committed_response.command_id.as_deref().unwrap_or(""),
+            request_id = %committed_response.request_id,
             journal_failures = state.post_commit_journal_failure_count(),
             error = %error,
             "Post-commit journal append failed after the daemon commit fence"
@@ -32,11 +43,14 @@ pub(crate) async fn finalize_post_commit_followups(
     }
     state.submit_post_commit_projection_with_capture(
         request,
-        response,
+        committed_response,
         workflow_capture_response,
         workflow_capture_delivery_state,
     );
-    state.spawn_post_commit_projection_drain();
+    match projection_fence {
+        PostCommitProjectionFence::Detached => state.spawn_post_commit_projection_drain(),
+        PostCommitProjectionFence::Synchronous => state.drain_post_commit_projections().await,
+    }
 }
 
 pub(crate) async fn finalize_replay_fence(
@@ -63,6 +77,7 @@ pub(crate) async fn finalize_replay_fence(
 pub(crate) fn enforce_response_frame_limit(
     request: &IpcRequest,
     response: IpcResponse,
+    daemon_request_committed: bool,
 ) -> IpcResponse {
     let encoded_len = encoded_frame_len(&response).unwrap_or(usize::MAX);
     if encoded_len <= MAX_FRAME_BYTES {
@@ -83,6 +98,13 @@ pub(crate) fn enforce_response_frame_limit(
             "command": request.command,
             "max_frame_bytes": MAX_FRAME_BYTES,
             "encoded_frame_bytes": encoded_len,
+            "daemon_request_committed": daemon_request_committed,
+            "safe_to_rerun_with_new_command_id": !daemon_request_committed,
+            "recovery_authority": if daemon_request_committed {
+                "replay_same_command_id_or_reduce_response_projection"
+            } else {
+                "request_not_committed"
+            },
         })),
     )
     .with_timing(response.timing);
@@ -91,47 +113,12 @@ pub(crate) fn enforce_response_frame_limit(
             .with_command_id(command_id.clone())
             .expect("validated command_id must remain protocol-valid");
     }
-    overflow
-}
-
-pub(crate) fn response_delivery_failure_response(
-    request: &IpcRequest,
-    response: &IpcResponse,
-    delivery_error: &str,
-) -> IpcResponse {
-    let mut failure = IpcResponse::error(
-        response.request_id.clone(),
-        ErrorEnvelope::new(
-            ErrorCode::IpcProtocolError,
-            format!(
-                "Command '{}' committed in the daemon, but NDJSON response delivery failed: {}",
-                request.command, delivery_error
-            ),
-        )
-        .with_context(serde_json::json!({
-            "command": request.command,
-            "reason": "ipc_response_delivery_failed_after_execution_commit",
-            "phase": "ipc_response_write",
-            "original_status": response.status,
-            "upstream_commit_truth": "daemon_execution_committed",
-            "client_visible_commit": "response_not_delivered",
-            "recovery_contract": if response.command_id.is_some() {
-                "retry_same_command_id_receives_cached_delivery_failure"
-            } else {
-                "no_replay_command_id"
-            },
-        }))
-        .with_suggestion(
-            "Previous execution may already have committed in the daemon. Retry with the same command_id or inspect history/doctor if state is unclear.",
-        ),
-    )
-    .with_timing(response.timing);
-    if let Some(command_id) = response.command_id.as_ref() {
-        failure = failure
-            .with_command_id(command_id.clone())
-            .expect("validated command_id must remain protocol-valid");
+    if let Some(daemon_session_id) = response.daemon_session_id.as_ref() {
+        overflow = overflow
+            .with_daemon_session_id(daemon_session_id.clone())
+            .expect("validated daemon_session_id must remain protocol-valid");
     }
-    failure
+    overflow
 }
 
 pub(crate) fn attach_request_command_id(
@@ -197,7 +184,7 @@ pub(crate) fn queue_timeout_response(
     request_id: &str,
     deadline: TransactionDeadline,
 ) -> IpcResponse {
-    let queue_ms = deadline.elapsed_ms();
+    let queue_ms = deadline.elapsed_ms_bounded_by_timeout();
     IpcResponse::error(
         request_id,
         ErrorEnvelope::new(
@@ -221,6 +208,8 @@ pub(crate) fn execution_timeout_error(
     request: &IpcRequest,
     queue_ms: u64,
     exec_budget_ms: u64,
+    transaction_timeout_ms: u64,
+    partial_commit_projection: Option<serde_json::Value>,
 ) -> RubError {
     let (code, msg) = match request.command.as_str() {
         "open" => (
@@ -231,13 +220,18 @@ pub(crate) fn execution_timeout_error(
         "wait" => (ErrorCode::WaitTimeout, "Wait condition timed out"),
         _ => (ErrorCode::IpcTimeout, "Command execution timed out"),
     };
-    RubError::Domain(ErrorEnvelope::new(code, msg).with_context(timeout_context(
-        request.command.as_str(),
-        TimeoutPhase::Execution,
-        request.timeout_ms,
-        queue_ms,
-        Some(exec_budget_ms),
-    )))
+    let mut envelope = ErrorEnvelope::new(code, msg);
+    envelope.context = merge_timeout_projection_context(
+        Some(timeout_context(
+            request.command.as_str(),
+            TimeoutPhase::Execution,
+            transaction_timeout_ms,
+            queue_ms,
+            Some(exec_budget_ms),
+        )),
+        partial_commit_projection,
+    );
+    RubError::Domain(envelope)
 }
 
 pub(crate) fn execution_timeout_response(
@@ -245,10 +239,18 @@ pub(crate) fn execution_timeout_response(
     request_id: &str,
     queue_ms: u64,
     exec_budget_ms: u64,
+    transaction_timeout_ms: u64,
 ) -> IpcResponse {
     IpcResponse::error(
         request_id,
-        execution_timeout_error(request, queue_ms, exec_budget_ms).into_envelope(),
+        execution_timeout_error(
+            request,
+            queue_ms,
+            exec_budget_ms,
+            transaction_timeout_ms,
+            None,
+        )
+        .into_envelope(),
     )
 }
 
@@ -271,7 +273,7 @@ pub(crate) fn replay_timeout_response(
             "command": request.command,
             "command_id": command_id,
             "phase": "replay_fence",
-            "transaction_timeout_ms": request.timeout_ms,
+            "transaction_timeout_ms": deadline.timeout_ms,
             "elapsed_ms": deadline.elapsed_ms(),
             "reason": "replay_fence_wait_timeout",
         })),

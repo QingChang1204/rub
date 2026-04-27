@@ -1,13 +1,29 @@
 use super::{
-    TOP_LEVEL_BOUNDING_BOX_FUNCTION, TOP_LEVEL_HIT_TEST_HELPERS, allow_global_read_fallback,
-    ambiguous_read_target_error, bounding_box_center_distance, bounding_box_match_score,
-    bounding_box_shape_matches, candidate_points, frame_scoped_read_target_error,
-    parse_backend_node_id, parse_element_ref_frame_id, snapshot_candidate_match_rank, tag_matches,
-    unverified_write_target_error,
+    TOP_LEVEL_BOUNDING_BOX_FUNCTION, TOP_LEVEL_HIT_TEST_HELPERS, bounding_box_center_distance,
+    bounding_box_match_score, bounding_box_shape_matches, candidate_points,
+    filter_snapshot_elements_by_hit_test, finalize_hit_test_ranking, parse_backend_node_id,
+    parse_element_ref_frame_id, snapshot_candidate_match_rank, tag_matches,
+    top_level_geometry_authority_error, top_level_geometry_error_reason,
+    unverified_read_target_error, unverified_write_target_error,
 };
+use crate::browser::{BrowserLaunchOptions, BrowserManager};
 use rub_core::error::ErrorCode;
 use rub_core::model::{BoundingBox, Element, ElementTag};
 use std::collections::HashMap;
+
+fn options() -> BrowserLaunchOptions {
+    let unique = format!("{}-{}", std::process::id(), uuid::Uuid::now_v7());
+    BrowserLaunchOptions {
+        headless: true,
+        ignore_cert_errors: false,
+        user_data_dir: Some(std::env::temp_dir().join(format!("rub-profile-{unique}"))),
+        managed_profile_ephemeral: false,
+        download_dir: Some(std::env::temp_dir().join(format!("rub-downloads-{unique}"))),
+        profile_directory: Some("Default".to_string()),
+        hide_infobars: true,
+        stealth: true,
+    }
+}
 
 #[test]
 fn candidate_points_prioritize_center_and_insets() {
@@ -35,12 +51,6 @@ fn parse_element_ref_frame_id_reads_frame_prefix() {
 }
 
 #[test]
-fn global_read_fallback_is_disabled_for_frame_scoped_reads() {
-    assert!(!allow_global_read_fallback(Some("frame-1")));
-    assert!(allow_global_read_fallback(None));
-}
-
-#[test]
 fn top_level_bounding_box_function_accumulates_frame_offsets() {
     assert!(
         TOP_LEVEL_BOUNDING_BOX_FUNCTION.contains("current.frameElement"),
@@ -61,6 +71,22 @@ fn top_level_hit_test_helpers_descend_through_nested_iframes() {
     assert!(
         TOP_LEVEL_HIT_TEST_HELPERS.contains("topLevelHitPointMatches"),
         "{TOP_LEVEL_HIT_TEST_HELPERS}"
+    );
+    assert!(
+        TOP_LEVEL_HIT_TEST_HELPERS.contains("top_level_hit_test_parent_chain_unavailable"),
+        "{TOP_LEVEL_HIT_TEST_HELPERS}"
+    );
+}
+
+#[test]
+fn top_level_geometry_errors_are_classified_as_authority_failures() {
+    assert_eq!(
+        top_level_geometry_error_reason("Error: top_level_bbox_parent_chain_unavailable"),
+        Some("top_level_bbox_parent_chain_unavailable")
+    );
+    assert_eq!(
+        top_level_geometry_error_reason("Error: top_level_hit_test_parent_chain_unavailable"),
+        Some("top_level_hit_test_parent_chain_unavailable")
     );
 }
 
@@ -161,6 +187,7 @@ fn snapshot_candidate_match_rank_rejects_mismatched_attributes() {
         text: "Read more".to_string(),
         attributes: HashMap::from([("href".to_string(), "/detail".to_string())]),
         element_ref: Some("frame-1:10".to_string()),
+        target_id: Some("target-1".to_string()),
         bounding_box: None,
         ax_info: None,
         listeners: None,
@@ -182,6 +209,7 @@ fn unverified_write_target_error_is_reported_as_stale_snapshot() {
             text: "Save".to_string(),
             attributes: HashMap::new(),
             element_ref: None,
+            target_id: Some("target-1".to_string()),
             bounding_box: None,
             ax_info: None,
             listeners: None,
@@ -209,18 +237,22 @@ fn unverified_write_target_error_is_reported_as_stale_snapshot() {
 }
 
 #[test]
-fn frame_scoped_read_target_error_is_reported_as_stale_snapshot() {
-    let error = frame_scoped_read_target_error(&Element {
-        index: 11,
-        tag: ElementTag::Input,
-        text: String::new(),
-        attributes: HashMap::new(),
-        element_ref: Some("frame-1:42".to_string()),
-        bounding_box: None,
-        ax_info: None,
-        listeners: None,
-        depth: None,
-    });
+fn unverified_read_target_error_is_reported_as_stale_snapshot() {
+    let error = unverified_read_target_error(
+        &Element {
+            index: 11,
+            tag: ElementTag::Input,
+            text: String::new(),
+            attributes: HashMap::new(),
+            element_ref: Some("frame-1:42".to_string()),
+            target_id: Some("target-1".to_string()),
+            bounding_box: None,
+            ax_info: None,
+            listeners: None,
+            depth: None,
+        },
+        "snapshot element backend node id no longer resolves in the live DOM",
+    );
 
     let envelope = error.into_envelope();
     assert_eq!(envelope.code, ErrorCode::StaleSnapshot);
@@ -228,8 +260,8 @@ fn frame_scoped_read_target_error_is_reported_as_stale_snapshot() {
         envelope
             .context
             .as_ref()
-            .and_then(|ctx| ctx["authority_state"].as_str()),
-        Some("frame_scoped_read_target_stale")
+            .and_then(|ctx| ctx["reason"].as_str()),
+        Some("unverified_read_target")
     );
     assert_eq!(
         envelope
@@ -240,22 +272,126 @@ fn frame_scoped_read_target_error_is_reported_as_stale_snapshot() {
     );
 }
 
+#[tokio::test]
+async fn snapshot_bound_read_fails_closed_after_dom_replacement() {
+    let manager = BrowserManager::new(options());
+    manager
+        .ensure_browser()
+        .await
+        .expect("managed browser should launch");
+    let page = manager.page().await.expect("page authority");
+    page.goto("data:text/html,<button id='save'>Save</button>")
+        .await
+        .expect("test page should load");
+
+    let snapshot = crate::dom::build_snapshot(&page, 0, Some(10))
+        .await
+        .expect("snapshot should build");
+    let button = snapshot
+        .elements
+        .iter()
+        .find(|element| element.text == "Save")
+        .cloned()
+        .expect("snapshot should capture save button");
+
+    page.goto("data:text/html,<button id='save'>Save</button>")
+        .await
+        .expect("same-content navigation should replace document authority");
+
+    let error = crate::inspect::get_text(&page, &button)
+        .await
+        .expect_err("snapshot-bound read should fail closed after DOM replacement");
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::StaleSnapshot);
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx["reason"].as_str()),
+        Some("unverified_read_target")
+    );
+
+    manager.close().await.expect("browser should close cleanly");
+}
+
+#[tokio::test]
+async fn topmost_hit_test_preserves_stale_snapshot_authority_when_all_candidates_drift() {
+    let manager = BrowserManager::new(options());
+    manager
+        .ensure_browser()
+        .await
+        .expect("managed browser should launch");
+    let page = manager.page().await.expect("page authority");
+    page.goto("data:text/html,<button id='save'>Save</button>")
+        .await
+        .expect("test page should load");
+
+    let snapshot = crate::dom::build_snapshot(&page, 0, Some(10))
+        .await
+        .expect("snapshot should build");
+    let button = snapshot
+        .elements
+        .iter()
+        .find(|element| element.text == "Save")
+        .cloned()
+        .expect("snapshot should capture save button");
+
+    page.goto("data:text/html,<button id='save'>Save</button>")
+        .await
+        .expect("same-content navigation should replace document authority");
+
+    let error = filter_snapshot_elements_by_hit_test(&page, &snapshot, &[button])
+        .await
+        .expect_err(
+            "topmost hit-test should fail closed when every candidate lost snapshot authority",
+        );
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::StaleSnapshot);
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx["reason"].as_str()),
+        Some("unverified_write_target")
+    );
+
+    manager.close().await.expect("browser should close cleanly");
+}
+
 #[test]
-fn ambiguous_read_target_error_is_reported_as_stale_snapshot() {
-    let error = ambiguous_read_target_error(
-        &Element {
-            index: 13,
-            tag: ElementTag::Link,
-            text: "Read".to_string(),
+fn topmost_hit_test_finalizer_fails_closed_when_any_candidate_loses_snapshot_authority() {
+    let error = finalize_hit_test_ranking(
+        vec![Element {
+            index: 1,
+            tag: ElementTag::Button,
+            text: "Bottom".to_string(),
             attributes: HashMap::new(),
-            element_ref: Some("frame-1:77".to_string()),
+            element_ref: Some("frame-1:7".to_string()),
+            target_id: Some("target-1".to_string()),
             bounding_box: None,
             ax_info: None,
             listeners: None,
             depth: None,
-        },
-        "global_read_fallback_ambiguous",
-        2,
+        }],
+        Some(unverified_write_target_error(
+            &Element {
+                index: 0,
+                tag: ElementTag::Button,
+                text: "Top".to_string(),
+                attributes: HashMap::new(),
+                element_ref: Some("frame-1:6".to_string()),
+                target_id: Some("target-1".to_string()),
+                bounding_box: None,
+                ax_info: None,
+                listeners: None,
+                depth: None,
+            },
+            "snapshot element backend node id no longer resolves in the live DOM",
+        )),
+        true,
+    )
+    .expect_err(
+        "topmost hit-test finalizer should fail closed when any candidate lost snapshot authority",
     );
 
     let envelope = error.into_envelope();
@@ -264,14 +400,81 @@ fn ambiguous_read_target_error_is_reported_as_stale_snapshot() {
         envelope
             .context
             .as_ref()
-            .and_then(|ctx| ctx["authority_state"].as_str()),
-        Some("global_read_fallback_ambiguous")
+            .and_then(|ctx| ctx["reason"].as_str()),
+        Some("unverified_write_target")
     );
+}
+
+#[test]
+fn topmost_hit_test_finalizer_fails_closed_on_geometry_authority_loss() {
+    let error = finalize_hit_test_ranking(
+        vec![Element {
+            index: 1,
+            tag: ElementTag::Button,
+            text: "Bottom".to_string(),
+            attributes: HashMap::new(),
+            element_ref: Some("frame-1:7".to_string()),
+            target_id: Some("target-1".to_string()),
+            bounding_box: None,
+            ax_info: None,
+            listeners: None,
+            depth: None,
+        }],
+        Some(top_level_geometry_authority_error(
+            "top_level_hit_test_parent_chain_unavailable",
+        )),
+        true,
+    )
+    .expect_err("topmost hit-test finalizer should fail closed on geometry authority loss");
+
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::InvalidInput);
     assert_eq!(
         envelope
             .context
             .as_ref()
-            .and_then(|ctx| ctx["candidate_count"].as_u64()),
-        Some(2)
+            .and_then(|ctx| ctx["authority"].as_str()),
+        Some("top_level_frame_geometry")
     );
+}
+
+#[tokio::test]
+async fn snapshot_bound_read_fails_closed_when_element_frame_authority_mismatches() {
+    let manager = BrowserManager::new(options());
+    manager
+        .ensure_browser()
+        .await
+        .expect("managed browser should launch");
+    let page = manager.page().await.expect("page authority");
+    page.goto("data:text/html,<button id='save'>Save</button>")
+        .await
+        .expect("test page should load");
+
+    let snapshot = crate::dom::build_snapshot(&page, 0, Some(10))
+        .await
+        .expect("snapshot should build");
+    let mut button = snapshot
+        .elements
+        .iter()
+        .find(|element| element.text == "Save")
+        .cloned()
+        .expect("snapshot should capture save button");
+    let backend = parse_backend_node_id(button.element_ref.as_deref())
+        .expect("snapshot element should carry backend id");
+    button.element_ref = Some(format!("frame-ghost:{}", backend.inner()));
+
+    let error = crate::inspect::get_text(&page, &button)
+        .await
+        .expect_err("frame-authority mismatch must fail closed");
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::StaleSnapshot);
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx["reason"].as_str()),
+        Some("unverified_read_target")
+    );
+
+    manager.close().await.expect("browser should close cleanly");
 }

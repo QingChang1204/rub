@@ -16,7 +16,7 @@ use rub_core::model::{LoadStrategy, Page as RubPage, ScrollDirection, ScrollPosi
 pub use self::display::{cleanup_highlights, highlight_elements, viewport_dimensions};
 #[cfg(test)]
 pub(super) use self::navigation::{
-    HistoryDirection, NavigateCommitKind, classify_navigate_commit,
+    HistoryDirection, NavigateCommitKind, classify_navigate_commit, committed_navigation_frame,
     history_boundary_from_history_state, history_navigation_deadline, optional_history_budget,
     required_history_budget, wait_for_lifecycle_event_from_listener,
     wait_for_same_document_navigation_from_listener,

@@ -1,24 +1,13 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::{fs, io};
 
-/// Returns a stable, per-OS-user identity string used to scope the runtime
-/// socket directory so that multiple accounts on the same machine never
-/// share a socket directory (which would cause `Permission denied` for
-/// whichever account didn't create it first).
-///
-/// `$USER` is set by the OS for every login session on macOS and Linux and
-/// is the idiomatic way to obtain the current username in safe Rust without
-/// an `unsafe` block or an additional dependency.
-fn current_user_tag() -> String {
-    std::env::var("USER").unwrap_or_else(|_| {
-        // Fallback: if USER is somehow unset (e.g. bare daemon spawn without
-        // a login shell), use the effective UID so we always produce a valid,
-        // non-colliding directory name.
-        std::env::var("UID").unwrap_or_else(|_| "unknown".to_string())
-    })
-}
+use sha1::{Digest, Sha1};
+
+const SOCKET_RUNTIME_HASH_CONTEXT: &str = "rub.socket.runtime.v2";
+const INVALID_SESSION_HASH_CONTEXT: &str = "rub.path.invalid-session.v1";
+const INVALID_SESSION_ID_HASH_CONTEXT: &str = "rub.path.invalid-session-id.v1";
 
 /// Canonical `RUB_HOME` path authority for the current baseline layout.
 #[derive(Debug, Clone)]
@@ -52,13 +41,18 @@ impl RubPaths {
     }
 
     pub fn socket_runtime_dir(&self) -> PathBuf {
-        // Scope the runtime socket directory to the current OS user so that
-        // multiple accounts on the same machine (e.g. liuqingchang and
-        // qingchang) each own their own directory.  Without this, whichever
-        // account runs `rub` first creates /tmp/rub-sock with mode 755, and
-        // all other accounts get `Permission denied` when they try to create
-        // their own sockets inside it.
-        PathBuf::from(format!("/tmp/rub-sock-{}", current_user_tag()))
+        // Keep Unix socket paths short without deriving authority from the
+        // caller's mutable environment. The RUB_HOME authority is canonicalized
+        // first, so cleanup/reconnect/readiness derive the same runtime root.
+        PathBuf::from(format!(
+            "/tmp/rub-sock-{}",
+            stable_hex_digest(
+                SOCKET_RUNTIME_HASH_CONTEXT,
+                canonical_rub_home_authority_path(&self.home)
+                    .to_string_lossy()
+                    .as_ref(),
+            )
+        ))
     }
 
     pub fn workflows_dir(&self) -> PathBuf {
@@ -110,7 +104,7 @@ impl RubPaths {
     }
 
     pub fn mark_temp_home_owner_if_applicable(&self) -> io::Result<bool> {
-        if !is_temp_root_path(&self.home) {
+        if !is_temp_owned_home_candidate(&self.home) {
             return Ok(false);
         }
         fs::create_dir_all(&self.home)?;
@@ -191,6 +185,10 @@ pub fn is_temp_owned_home(path: &Path) -> bool {
     is_temp_root_path(path) && RubPaths::new(path).temp_home_owner_marker_path().exists()
 }
 
+pub fn is_temp_owned_home_cleanup_authoritative(path: &Path) -> bool {
+    is_temp_owned_home_candidate(path) && RubPaths::new(path).temp_home_owner_marker_path().exists()
+}
+
 pub fn read_temp_home_owner_pid(path: &Path) -> Option<u32> {
     let raw = fs::read_to_string(RubPaths::new(path).temp_home_owner_marker_path()).ok()?;
     raw.trim().parse::<u32>().ok()
@@ -205,6 +203,14 @@ fn push_temp_root_variant(roots: &mut Vec<PathBuf>, root: PathBuf) {
     {
         roots.push(alias);
     }
+}
+
+fn is_temp_owned_home_candidate(path: &Path) -> bool {
+    is_temp_root_path(path)
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("rub-temp-owned-"))
 }
 
 fn strip_private_prefix(path: &Path) -> Option<PathBuf> {
@@ -328,6 +334,10 @@ impl SessionPaths {
         self.projection_dir().join("startup.committed")
     }
 
+    pub fn hard_cut_release_pending_path(&self) -> PathBuf {
+        self.projection_dir().join("hard-cut.release-pending.json")
+    }
+
     pub fn post_commit_journal_path(&self) -> PathBuf {
         self.session_dir().join("post-commit.journal.ndjson")
     }
@@ -344,13 +354,23 @@ impl SessionPaths {
     }
 
     fn socket_runtime_key(&self) -> String {
-        let mut hasher = DefaultHasher::new();
-        self.home.hash(&mut hasher);
-        match self.session_id.as_deref() {
-            Some(session_id) => session_id.hash(&mut hasher),
-            None => self.session_name.hash(&mut hasher),
-        }
-        format!("{:016x}", hasher.finish())
+        let home = canonical_rub_home_authority_path(&self.home);
+        let identity = match self.session_id.as_deref() {
+            Some(session_id) => format!(
+                "{}\0home={}\0session_name={}\0session_id={}",
+                SOCKET_RUNTIME_HASH_CONTEXT,
+                home.to_string_lossy(),
+                self.session_name,
+                session_id,
+            ),
+            None => format!(
+                "{}\0home={}\0session_name={}",
+                SOCKET_RUNTIME_HASH_CONTEXT,
+                home.to_string_lossy(),
+                self.session_name,
+            ),
+        };
+        stable_hex_digest(SOCKET_RUNTIME_HASH_CONTEXT, &identity)
     }
 
     fn session_component(&self) -> String {
@@ -415,18 +435,94 @@ fn safe_session_path_component(session_name: &str) -> String {
     if validate_session_name(session_name).is_ok() {
         return session_name.to_string();
     }
-    let mut hasher = DefaultHasher::new();
-    session_name.hash(&mut hasher);
-    format!("invalid-session-{:016x}", hasher.finish())
+    format!(
+        "invalid-session-{}",
+        stable_hex_digest(INVALID_SESSION_HASH_CONTEXT, session_name)
+    )
 }
 
 fn safe_session_id_path_component(session_id: &str) -> String {
     if validate_session_id_component(session_id).is_ok() {
         return session_id.to_string();
     }
-    let mut hasher = DefaultHasher::new();
-    session_id.hash(&mut hasher);
-    format!("invalid-session-id-{:016x}", hasher.finish())
+    format!(
+        "invalid-session-id-{}",
+        stable_hex_digest(INVALID_SESSION_ID_HASH_CONTEXT, session_id)
+    )
+}
+
+fn canonical_rub_home_authority_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    if let Ok(canonical) = absolute.canonicalize() {
+        return public_path_alias(collapse_path_components(&canonical));
+    }
+    if let Some(canonical) = canonicalize_existing_ancestor(&absolute) {
+        return public_path_alias(canonical);
+    }
+    let normalized = collapse_path_components(&absolute);
+    if let Ok(canonical) = normalized.canonicalize() {
+        return public_path_alias(collapse_path_components(&canonical));
+    }
+    if let Some(canonical) = canonicalize_existing_ancestor(&normalized) {
+        return public_path_alias(canonical);
+    }
+    public_path_alias(normalized)
+}
+
+fn canonicalize_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut probe = path;
+    let mut suffix = Vec::<OsString>::new();
+    while !probe.exists() {
+        suffix.push(probe.file_name()?.to_os_string());
+        probe = probe.parent()?;
+    }
+
+    let mut canonical = probe.canonicalize().ok()?;
+    for component in suffix.iter().rev() {
+        canonical.push(component);
+    }
+    Some(collapse_path_components(&canonical))
+}
+
+fn public_path_alias(path: PathBuf) -> PathBuf {
+    strip_private_prefix(&path).unwrap_or(path)
+}
+
+fn collapse_path_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() && normalized.as_os_str().is_empty() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+fn stable_hex_digest(context: &str, value: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(context.as_bytes());
+    hasher.update([0]);
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
 }
 
 fn dedup_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {

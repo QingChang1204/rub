@@ -11,7 +11,9 @@ use self::semantic::{
     resolve_elements_by_label, resolve_elements_by_role, resolve_elements_by_testid,
     resolve_elements_by_text,
 };
-use self::snapshot::load_snapshot as load_addressed_snapshot;
+use self::snapshot::{
+    load_snapshot as load_addressed_snapshot, load_snapshot_deferred as load_deferred_snapshot,
+};
 use super::*;
 use crate::router::element_semantics::{
     has_snapshot_visible_bbox, is_prefer_enabled_blocked_in_snapshot,
@@ -79,7 +81,7 @@ pub(super) async fn resolve_elements(
     command_name: &str,
 ) -> Result<ResolvedElements, RubError> {
     let locator = parse_locator(args)?;
-    let snapshot = load_snapshot(
+    let staged_snapshot = load_deferred_snapshot(
         router,
         args,
         state,
@@ -87,16 +89,14 @@ pub(super) async fn resolve_elements(
         locator.requires_a11y_snapshot(),
     )
     .await?;
+    let snapshot = staged_snapshot.snapshot();
     let candidate_elements =
-        if let Some(elements) = restore_memoized_elements(state, &snapshot, &locator).await? {
+        if let Some(elements) = restore_memoized_elements(state, snapshot, &locator).await? {
             elements
         } else {
-            let elements =
-                resolve_elements_against_locator(router, &snapshot, &locator.locator).await?;
-            record_memoized_elements(state, &snapshot, &locator, &elements).await;
-            elements
+            resolve_elements_against_locator(router, snapshot, &locator.locator).await?
         };
-    let elements = apply_live_ranking(router, &snapshot, &locator, candidate_elements).await?;
+    let elements = apply_live_ranking(router, snapshot, &locator, candidate_elements).await?;
     let elements = apply_disambiguation(elements, &locator, args)?;
 
     if elements.is_empty() {
@@ -105,6 +105,9 @@ pub(super) async fn resolve_elements(
             format!("{command_name} did not resolve to any interactive snapshot element"),
         ));
     }
+
+    let snapshot = staged_snapshot.publish(state).await;
+    record_memoized_elements(state, &snapshot, &locator, &elements).await;
 
     Ok(ResolvedElements {
         elements,
@@ -165,7 +168,8 @@ async fn resolve_elements_against_locator(
         CanonicalLocator::Index { index } => {
             let element = snapshot
                 .elements
-                .get(*index as usize)
+                .iter()
+                .find(|element| element.index == *index)
                 .cloned()
                 .ok_or_else(|| {
                     RubError::domain(
@@ -175,12 +179,15 @@ async fn resolve_elements_against_locator(
                 })?;
             Ok(vec![element])
         }
-        CanonicalLocator::Ref { element_ref } => Ok(snapshot
-            .elements
-            .iter()
-            .filter(|element| element.element_ref.as_deref() == Some(element_ref.as_str()))
-            .cloned()
-            .collect::<Vec<_>>()),
+        CanonicalLocator::Ref { element_ref } => {
+            ensure_snapshot_ref_authority(snapshot, element_ref)?;
+            Ok(snapshot
+                .elements
+                .iter()
+                .filter(|element| element.element_ref.as_deref() == Some(element_ref.as_str()))
+                .cloned()
+                .collect::<Vec<_>>())
+        }
         CanonicalLocator::Selector { css: selector, .. } => {
             // Selector matching is a live, frame-scoped probe against the snapshot's frame.
             // We still project matches back onto snapshot element indices, so this is not a
@@ -205,6 +212,7 @@ async fn apply_live_ranking(
     locator: &ParsedLocator,
     elements: Vec<Element>,
 ) -> Result<Vec<Element>, RubError> {
+    let elements = apply_pre_hit_test_ranking(locator, elements);
     if locator.ranking.topmost {
         return router
             .browser
@@ -212,6 +220,31 @@ async fn apply_live_ranking(
             .await;
     }
     Ok(elements)
+}
+
+fn ensure_snapshot_ref_authority(snapshot: &Snapshot, element_ref: &str) -> Result<(), RubError> {
+    if snapshot.projection.verified {
+        return Ok(());
+    }
+
+    Err(RubError::domain_with_context(
+        ErrorCode::StaleSnapshot,
+        "Snapshot ref addressing requires verified ref authority from the current snapshot projection",
+        serde_json::json!({
+            "reason": "snapshot_ref_authority_unavailable",
+            "snapshot_id": snapshot.snapshot_id,
+            "element_ref": element_ref,
+            "projection_verified": snapshot.projection.verified,
+            "projection_warning": snapshot.projection.warning,
+        }),
+    ))
+}
+
+fn apply_pre_hit_test_ranking(locator: &ParsedLocator, mut elements: Vec<Element>) -> Vec<Element> {
+    if locator.ranking.visible {
+        elements.retain(has_snapshot_visible_bbox);
+    }
+    elements
 }
 
 fn apply_disambiguation(

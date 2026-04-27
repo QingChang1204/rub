@@ -6,9 +6,13 @@ mod workflow;
 
 #[cfg(test)]
 pub(crate) use self::workflow::SOURCE_MATERIALIZATION_TIMEOUT_SENTINEL;
+#[cfg(test)]
+pub(crate) use self::workflow::orchestration_request_meta;
+#[cfg(test)]
+pub(crate) use self::workflow::resolve_source_session;
 use self::workflow::{
     normalized_resolved_workflow_spec_value, orchestration_action_timeout_ms,
-    orchestration_request_meta, resolve_orchestration_workflow_parameterization,
+    resolve_orchestration_workflow_parameterization,
 };
 pub(crate) use self::workflow::{
     orchestration_action_execution_info, orchestration_source_materialization_wait_budget_ms,
@@ -43,7 +47,7 @@ pub(super) async fn build_orchestration_action_request(
             })?;
             object.insert(
                 "_orchestration".to_string(),
-                orchestration_request_meta(
+                self::workflow::orchestration_request_meta(
                     context.rule,
                     context.command_identity_key,
                     context.execution_id,
@@ -87,6 +91,7 @@ pub(super) async fn build_orchestration_action_request(
                 context.rule,
                 object,
                 &raw_spec,
+                context.outer_deadline,
             )
             .await?;
             if let Some(spec_source_object) = spec_source.as_object_mut() {
@@ -106,7 +111,7 @@ pub(super) async fn build_orchestration_action_request(
             let args = serde_json::json!({
                 "spec": resolved_spec,
                 "spec_source": spec_source,
-                "_orchestration": orchestration_request_meta(
+                "_orchestration": self::workflow::orchestration_request_meta(
                     context.rule,
                     context.command_identity_key,
                     context.execution_id,

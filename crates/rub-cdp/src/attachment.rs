@@ -22,12 +22,25 @@ pub fn normalize_external_connect_url(url: &str) -> String {
 }
 
 pub async fn canonical_external_browser_identity(url: &str) -> Result<String, RubError> {
-    let connect_url = resolve_cdp_connect_url_with_timeout(url, DISCOVERY_HTTP_TIMEOUT).await?;
+    canonical_external_browser_identity_until(url, Instant::now() + DISCOVERY_HTTP_TIMEOUT).await
+}
+
+pub async fn canonical_external_browser_identity_until(
+    url: &str,
+    deadline: Instant,
+) -> Result<String, RubError> {
+    let connect_url = resolve_cdp_connect_url_until(url, deadline).await?;
     Ok(normalize_external_connect_url(&connect_url))
 }
 
 pub async fn resolve_unique_local_cdp_candidate() -> Result<CdpCandidate, RubError> {
-    let candidates = discover_local_cdp().await;
+    resolve_unique_local_cdp_candidate_until(Instant::now() + DISCOVERY_HTTP_TIMEOUT).await
+}
+
+pub async fn resolve_unique_local_cdp_candidate_until(
+    deadline: Instant,
+) -> Result<CdpCandidate, RubError> {
+    let candidates = discover_local_cdp_until(deadline).await?;
     match candidates.len() {
         0 => Err(RubError::domain(
             ErrorCode::CdpConnectionFailed,
@@ -133,11 +146,22 @@ pub(crate) async fn connect_external_browser_until(
 /// Returns all discovered candidates. Use with `--connect` (auto-discover)
 /// or to populate `rub doctor` output.
 pub async fn discover_local_cdp() -> Vec<CdpCandidate> {
+    discover_local_cdp_until(Instant::now() + DISCOVERY_HTTP_TIMEOUT)
+        .await
+        .unwrap_or_default()
+}
+
+async fn discover_local_cdp_until(deadline: Instant) -> Result<Vec<CdpCandidate>, RubError> {
     let mut candidates = Vec::new();
 
     for port in 9222..=9229 {
+        let remaining = attach_remaining_budget(deadline)?;
         let url = format!("http://127.0.0.1:{port}/json/version");
-        let timeout_result = http_get_text_with_timeout(&url, Duration::from_millis(200)).await;
+        let timeout_result = http_get_text_until(
+            &url,
+            Instant::now() + remaining.min(Duration::from_millis(200)),
+        )
+        .await;
 
         if let Ok(body) = timeout_result
             && let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
@@ -152,7 +176,7 @@ pub async fn discover_local_cdp() -> Vec<CdpCandidate> {
         }
     }
 
-    candidates
+    Ok(candidates)
 }
 
 async fn http_get_text_with_timeout(
@@ -221,12 +245,11 @@ async fn http_get_text_until(
                 io::Error::new(io::ErrorKind::TimedOut, "HTTP response read timed out")
             })??;
 
-        if read == 0 {
-            break;
+        let eof_reached = read == 0;
+        if !eof_reached {
+            response.extend_from_slice(&chunk[..read]);
         }
-
-        response.extend_from_slice(&chunk[..read]);
-        match parse_http_response_body(&response) {
+        match parse_http_response_body(&response, eof_reached) {
             Ok(body) => return String::from_utf8(body).map_err(Into::into),
             Err(error)
                 if matches!(
@@ -235,9 +258,12 @@ async fn http_get_text_until(
                 ) => {}
             Err(error) => return Err(error),
         }
+        if eof_reached {
+            break;
+        }
     }
 
-    let body = parse_http_response_body(&response)?;
+    let body = parse_http_response_body(&response, true)?;
     String::from_utf8(body).map_err(Into::into)
 }
 
@@ -250,6 +276,10 @@ async fn resolve_cdp_connect_url_with_timeout(
     url: &str,
     timeout_budget: Duration,
 ) -> Result<String, RubError> {
+    resolve_cdp_connect_url_until(url, Instant::now() + timeout_budget).await
+}
+
+async fn resolve_cdp_connect_url_until(url: &str, deadline: Instant) -> Result<String, RubError> {
     if url.starts_with("ws://") || url.starts_with("wss://") {
         return Ok(url.to_string());
     }
@@ -262,7 +292,8 @@ async fn resolve_cdp_connect_url_with_timeout(
     }
 
     let discovery_url = cdp_discovery_endpoint(url);
-    resolve_cdp_connect_url_once(&discovery_url, timeout_budget).await
+    let remaining = attach_remaining_budget(deadline)?;
+    resolve_cdp_connect_url_once(&discovery_url, remaining).await
 }
 
 async fn resolve_cdp_connect_url_once(
@@ -306,6 +337,7 @@ fn cdp_discovery_endpoint(url: &str) -> String {
 
 fn parse_http_response_body(
     response: &[u8],
+    eof_reached: bool,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     use std::io;
 
@@ -363,6 +395,14 @@ fn parse_http_response_body(
             .into());
         }
         return Ok(body[..expected_len].to_vec());
+    }
+
+    if !eof_reached {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Close-delimited HTTP body not committed before EOF",
+        )
+        .into());
     }
 
     Ok(body.to_vec())
@@ -425,15 +465,28 @@ mod tests {
     #[test]
     fn parse_http_response_body_accepts_content_length() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n{\"Browser\":\"x\"}";
-        let body = parse_http_response_body(response).unwrap();
+        let body = parse_http_response_body(response, false).unwrap();
         assert_eq!(body, br#"{"Browser":"x"}"#);
     }
 
     #[test]
     fn parse_http_response_body_rejects_non_200_status() {
         let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}";
-        let error = parse_http_response_body(response).unwrap_err();
+        let error = parse_http_response_body(response, true).unwrap_err();
         assert!(error.to_string().contains("Unexpected HTTP status 404"));
+    }
+
+    #[test]
+    fn parse_http_response_body_requires_eof_for_close_delimited_bodies() {
+        let response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"Browser\":\"x\"}";
+        let error = parse_http_response_body(response, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Close-delimited HTTP body not committed before EOF")
+        );
+        let body = parse_http_response_body(response, true).unwrap();
+        assert_eq!(body, br#"{"Browser":"x"}"#);
     }
 
     #[test]
@@ -507,6 +560,33 @@ mod tests {
         )
         .await
         .expect("complete HTTP response should not require EOF");
+        assert_eq!(body, r#"{"Browser":"x"}"#);
+
+        server.await.expect("server join");
+    }
+
+    #[tokio::test]
+    async fn http_get_text_until_waits_for_eof_for_close_delimited_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 512];
+            let _ = stream.readable().await;
+            let _ = stream.try_read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"Browser\":\"x\"}")
+                .await
+                .expect("write response");
+            tokio::time::sleep(Duration::from_millis(75)).await;
+        });
+
+        let body = http_get_text_until(
+            &format!("http://{address}/json/version"),
+            Instant::now() + Duration::from_millis(250),
+        )
+        .await
+        .expect("close-delimited HTTP response should commit at EOF");
         assert_eq!(body, r#"{"Browser":"x"}"#);
 
         server.await.expect("server join");

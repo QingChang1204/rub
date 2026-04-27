@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::SessionState;
+use crate::workflow_capture::WorkflowCaptureDeliveryState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PostCommitJournalEntry {
@@ -22,6 +23,11 @@ struct PostCommitJournalEntry {
     request_id: String,
     request: serde_json::Value,
     response: serde_json::Value,
+    #[serde(
+        default = "workflow_capture_delivery_delivered",
+        skip_serializing_if = "workflow_capture_delivery_is_delivered"
+    )]
+    delivery_state: WorkflowCaptureDeliveryState,
     request_redaction_lossy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     request_redaction_reason: Option<String>,
@@ -42,6 +48,7 @@ impl PostCommitJournalEntry {
         state: &SessionState,
         request: &IpcRequest,
         response: &IpcResponse,
+        delivery_state: WorkflowCaptureDeliveryState,
     ) -> io::Result<Self> {
         let redacted_request = redacted_post_commit_request_with_status(request, &state.rub_home);
         let request_json = serde_json::to_value(&redacted_request.request)
@@ -59,6 +66,7 @@ impl PostCommitJournalEntry {
             request_id: response.request_id.clone(),
             request: request_json,
             response: response_json.value,
+            delivery_state,
             request_redaction_lossy: redacted_request.lossy,
             request_redaction_reason: redacted_request.reason,
             response_redaction_lossy: response_json.lossy,
@@ -67,12 +75,21 @@ impl PostCommitJournalEntry {
     }
 }
 
+fn workflow_capture_delivery_delivered() -> WorkflowCaptureDeliveryState {
+    WorkflowCaptureDeliveryState::Delivered
+}
+
+fn workflow_capture_delivery_is_delivered(value: &WorkflowCaptureDeliveryState) -> bool {
+    matches!(value, WorkflowCaptureDeliveryState::Delivered)
+}
+
 fn post_commit_journal_state_json() -> Value {
     json!({
         "surface": "post_commit_journal",
         "visibility": "internal_only",
         "recovery_role": "daemon_recovery_writer",
         "upstream_commit_truth": "daemon_response_committed",
+        "delivery_state_contract": "sibling_post_commit_delivery_state",
         "commit_relation": "downstream_of_daemon_commit_fence",
         "durability": "durable",
         "retention_scope": "session_runtime_cleanup",
@@ -204,10 +221,15 @@ impl SessionState {
         &self,
         request: &IpcRequest,
         response: &IpcResponse,
+        delivery_state: WorkflowCaptureDeliveryState,
     ) -> io::Result<()> {
         // This journal is an internal recovery writer downstream of the daemon
         // response commit fence. It must never redefine public commit truth.
         let _append_guard = self.post_commit_journal_append.lock().await;
+        #[cfg(test)]
+        while self.post_commit_journal_blocked.load(Ordering::SeqCst) {
+            self.post_commit_journal_block_notify.notified().await;
+        }
         #[cfg(test)]
         if self
             .post_commit_journal_force_failure_once
@@ -218,7 +240,8 @@ impl SessionState {
             return Err(io::Error::other("forced post-commit journal failure"));
         }
 
-        let entry = PostCommitJournalEntry::from_request_response(self, request, response)?;
+        let entry =
+            PostCommitJournalEntry::from_request_response(self, request, response, delivery_state)?;
         let path = self.post_commit_journal_path();
         match tokio::task::spawn_blocking(move || append_durable_journal_entry(&path, &entry)).await
         {
@@ -242,10 +265,27 @@ impl SessionState {
         self.post_commit_journal_failures.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn pending_post_commit_followup_count(&self) -> u32 {
+        self.post_commit_followup_count.load(Ordering::SeqCst)
+    }
+
     #[cfg(test)]
     pub(crate) fn force_post_commit_journal_failure_once(&self) {
         self.post_commit_journal_force_failure_once
             .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_post_commit_journal_for_tests(&self) {
+        self.post_commit_journal_blocked
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unblock_post_commit_journal_for_tests(&self) {
+        self.post_commit_journal_blocked
+            .store(false, Ordering::SeqCst);
+        self.post_commit_journal_block_notify.notify_waiters();
     }
 
     #[cfg(test)]

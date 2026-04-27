@@ -1,6 +1,9 @@
 use crate::rub_paths::RubPaths;
 use rub_core::model::ConnectionTarget;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::cell::Cell;
+use std::fs;
 use std::path::Path;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -14,6 +17,14 @@ mod snapshot;
 mod storage;
 mod validation;
 
+pub(crate) use self::liveness::registry_entry_has_runtime_authority_for_home;
+#[cfg(test)]
+pub(crate) use self::liveness::{
+    force_busy_registry_socket_probe_once_for_test, force_dead_registry_socket_probe_once_for_test,
+    force_live_registry_socket_probe_once_for_test,
+    force_probe_contract_failure_registry_socket_probe_once_for_test,
+    force_protocol_incompatible_registry_socket_probe_once_for_test,
+};
 pub use self::liveness::{
     registry_entry_is_live_for_home, registry_entry_is_pending_startup_for_home,
 };
@@ -22,11 +33,16 @@ pub use self::mutation::{
     register_session, register_session_with_displaced,
 };
 pub use self::projection_cleanup::cleanup_projections;
+pub(crate) use self::snapshot::registry_authority_snapshot_async;
 pub use self::snapshot::{
     RegistryAuthoritySnapshot, RegistryEntryLiveness, RegistryEntrySnapshot,
-    RegistrySessionSnapshot, active_registry_entries, authoritative_entry_by_session_name,
-    latest_entry_by_session_name, registry_authority_snapshot,
+    RegistrySessionSnapshot, active_registry_entries, active_registry_entry_snapshots,
+    authoritative_entry_by_session_name, latest_entry_by_session_name, registry_authority_snapshot,
 };
+pub(crate) use self::storage::{
+    load_registry_for_home, store_registry_for_home, with_registry_lock,
+};
+pub(crate) use self::validation::validate_registry_entry_for_home;
 
 pub fn ensure_rub_home(home: &Path) -> std::io::Result<()> {
     storage::ensure_rub_home(home)
@@ -59,6 +75,129 @@ pub struct RegistryEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RegistryData {
     pub sessions: Vec<RegistryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HardCutReleasePendingProof {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HardCutReleasePendingAuthority {
+    Absent,
+    Present,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_HARD_CUT_RELEASE_PENDING_PROFILE_OBSERVATION_FAILURE: Cell<bool> =
+        const { Cell::new(false) };
+}
+
+pub fn write_hard_cut_release_pending_proof(
+    home: &Path,
+    session_name: &str,
+    proof: &HardCutReleasePendingProof,
+) -> std::io::Result<rub_core::fs::FileCommitOutcome> {
+    let path = RubPaths::new(home)
+        .session(session_name)
+        .hard_cut_release_pending_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(proof)
+        .map_err(|error| std::io::Error::other(format!("serialize hard-cut proof: {error}")))?;
+    rub_core::fs::atomic_write_bytes(&path, &bytes, 0o600)
+}
+
+pub fn read_hard_cut_release_pending_proof(
+    home: &Path,
+    session_name: &str,
+) -> std::io::Result<Option<HardCutReleasePendingProof>> {
+    let path = RubPaths::new(home)
+        .session(session_name)
+        .hard_cut_release_pending_path();
+    let raw = match fs::read(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let proof = serde_json::from_slice::<HardCutReleasePendingProof>(&raw).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("parse hard-cut proof {}: {error}", path.display()),
+        )
+    })?;
+    Ok(Some(proof))
+}
+
+pub fn clear_hard_cut_release_pending_proof(
+    home: &Path,
+    session_name: &str,
+) -> std::io::Result<()> {
+    let path = RubPaths::new(home)
+        .session(session_name)
+        .hard_cut_release_pending_path();
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn hard_cut_release_pending_blocks_entry(home: &Path, entry: &RegistryEntry) -> bool {
+    matches!(
+        hard_cut_release_pending_authority(home, entry),
+        HardCutReleasePendingAuthority::Present
+    )
+}
+
+fn hard_cut_release_pending_authority(
+    home: &Path,
+    entry: &RegistryEntry,
+) -> HardCutReleasePendingAuthority {
+    let Some(user_data_dir) = entry.user_data_dir.as_deref() else {
+        return HardCutReleasePendingAuthority::Absent;
+    };
+    let path = RubPaths::new(home)
+        .session(&entry.session_name)
+        .hard_cut_release_pending_path();
+    if !path.exists() {
+        return HardCutReleasePendingAuthority::Absent;
+    }
+    let profile_still_held = match hard_cut_release_pending_profile_still_held(user_data_dir) {
+        Ok(profile_still_held) => profile_still_held,
+        Err(_) => return HardCutReleasePendingAuthority::Present,
+    };
+    if !profile_still_held {
+        return HardCutReleasePendingAuthority::Absent;
+    }
+    match read_hard_cut_release_pending_proof(home, &entry.session_name) {
+        Ok(Some(proof)) if proof.session_id == entry.session_id => {
+            HardCutReleasePendingAuthority::Present
+        }
+        Ok(Some(_)) | Ok(None) => HardCutReleasePendingAuthority::Absent,
+        Err(_) => HardCutReleasePendingAuthority::Present,
+    }
+}
+
+fn hard_cut_release_pending_profile_still_held(
+    user_data_dir: &str,
+) -> Result<bool, rub_core::error::RubError> {
+    #[cfg(test)]
+    if FORCE_HARD_CUT_RELEASE_PENDING_PROFILE_OBSERVATION_FAILURE.with(|force| force.replace(false))
+    {
+        return Err(rub_core::error::RubError::domain(
+            rub_core::error::ErrorCode::BrowserLaunchFailed,
+            "forced hard-cut release-pending profile observation failure",
+        ));
+    }
+    rub_cdp::managed_profile_in_use(Path::new(user_data_dir))
+}
+
+#[cfg(test)]
+pub(crate) fn force_hard_cut_release_pending_profile_observation_failure_for_test() {
+    FORCE_HARD_CUT_RELEASE_PENDING_PROFILE_OBSERVATION_FAILURE.with(|force| force.set(true));
 }
 
 pub fn rfc3339_now() -> String {

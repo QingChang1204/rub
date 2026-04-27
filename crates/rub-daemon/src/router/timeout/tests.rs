@@ -1,6 +1,6 @@
 use super::{
-    parse_wait_condition, post_wait_timeout_error, wait_outcome_summary, wait_probe_context,
-    wait_subject_state,
+    parse_wait_condition, post_wait_timeout_error, wait_kind_uses_selected_frame,
+    wait_outcome_summary, wait_probe_context, wait_subject_state,
 };
 use rub_core::error::ErrorCode;
 use rub_core::locator::CanonicalLocator;
@@ -107,6 +107,20 @@ fn title_contains_wait_rejects_locator_selection_flags() {
     .into_envelope();
     assert_eq!(error.code, ErrorCode::InvalidInput);
     assert!(error.message.contains("page-level waits"), "{error}");
+}
+
+#[test]
+fn wait_probe_rejects_unknown_fields_without_prefiltering_them_away() {
+    let error = parse_wait_condition(
+        &serde_json::json!({
+            "selector": "#ready",
+            "mystery": true,
+        }),
+        DEFAULT_WAIT_TIMEOUT_MS,
+    )
+    .expect_err("unknown wait fields must fail closed")
+    .into_envelope();
+    assert_eq!(error.code, ErrorCode::InvalidInput);
 }
 
 #[test]
@@ -266,4 +280,37 @@ fn wait_subject_state_projects_locator_state() {
         frame_id: None,
     });
     assert_eq!(subject_state, Some("interactable"));
+}
+
+#[test]
+fn page_level_wait_kinds_do_not_inherit_selected_frame_authority() {
+    assert!(!wait_kind_uses_selected_frame(&WaitKind::Text {
+        text: "Ready".to_string(),
+    }));
+    assert!(!wait_kind_uses_selected_frame(&WaitKind::UrlContains {
+        value: "/activate".to_string(),
+    }));
+    assert!(!wait_kind_uses_selected_frame(&WaitKind::TitleContains {
+        value: "Confirm your account".to_string(),
+    }));
+}
+
+#[test]
+fn locator_wait_kinds_continue_to_use_selected_frame_authority() {
+    assert!(wait_kind_uses_selected_frame(&WaitKind::Locator {
+        locator: CanonicalLocator::Selector {
+            css: "#ready".to_string(),
+            selection: None,
+        },
+        state: WaitState::Visible,
+    }));
+    assert!(wait_kind_uses_selected_frame(
+        &WaitKind::LocatorDescriptionContains {
+            locator: CanonicalLocator::Label {
+                label: "Email".to_string(),
+                selection: None,
+            },
+            value: "We will email you".to_string(),
+        }
+    ));
 }

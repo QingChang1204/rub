@@ -1,15 +1,15 @@
 use rub_core::command::CommandName;
 
-use super::{command_allowed_during_handoff, command_increments_epoch};
+use super::{
+    command_allowed_during_handoff, command_increments_epoch,
+    command_invalidates_cached_snapshots_without_epoch_bump,
+};
 
 /// Commands that read the current epoch without incrementing it.
 /// These are multi-step commands that need epoch context for
 /// downstream snapshot association but do not themselves mutate the DOM.
 fn command_reads_epoch(command: &str) -> bool {
-    matches!(
-        command,
-        "scroll" | "fill" | "pipe" | "_trigger_fill" | "_trigger_pipe"
-    )
+    matches!(command, "scroll" | "fill" | "_trigger_fill")
 }
 
 /// Commands classified as pure query: no epoch interaction.
@@ -21,7 +21,7 @@ fn command_is_epoch_neutral(command: &str) -> bool {
 /// **Regression guard**: every known CommandName wire string must be
 /// explicitly classified into exactly one epoch category:
 ///   (A) increments epoch  ← `command_increments_epoch`
-///   (B) reads epoch       ← "scroll" | "fill" | "pipe"
+///   (B) reads epoch       ← "scroll" | "fill" | "_trigger_fill"
 ///   (C) epoch-neutral     ← all others
 ///
 /// The three categories are mutually exclusive by construction.
@@ -47,15 +47,22 @@ fn epoch_classification_is_exhaustive_over_all_known_commands() {
         "select",
     ];
 
-    let epoch_reading = ["scroll", "fill", "pipe"];
+    let epoch_reading = ["scroll", "fill", "_trigger_fill"];
 
     let epoch_neutral = [
         "_handshake",
         "_upgrade_check",
+        "_blocker_diagnose",
+        "_interactability_probe",
+        "_fill_validate",
         "_orchestration_probe",
+        "_orchestration_tab_frames",
         "_orchestration_target_dispatch",
         "_orchestration_workflow_source_vars",
         "state",
+        "pipe",
+        "_trigger_pipe",
+        "extract",
         "observe",
         "orchestration",
         "inspect",
@@ -75,12 +82,12 @@ fn epoch_classification_is_exhaustive_over_all_known_commands() {
         "intercept",
         "interference",
         "close",
+        "secret",
         "wait",
         "tabs",
         "trigger",
         "get",
         "cookies",
-        "extract",
     ];
 
     for cmd in epoch_incrementing {
@@ -124,9 +131,15 @@ fn epoch_classification_is_exhaustive_over_all_known_commands() {
     let known_commands = [
         CommandName::Handshake,
         CommandName::UpgradeCheck,
+        CommandName::BlockerDiagnose,
+        CommandName::InteractabilityProbe,
+        CommandName::FillValidate,
         CommandName::OrchestrationProbe,
+        CommandName::OrchestrationTabFrames,
         CommandName::OrchestrationTargetDispatch,
         CommandName::OrchestrationWorkflowSourceVars,
+        CommandName::TriggerFill,
+        CommandName::TriggerPipe,
         CommandName::Open,
         CommandName::State,
         CommandName::Observe,
@@ -154,6 +167,7 @@ fn epoch_classification_is_exhaustive_over_all_known_commands() {
         CommandName::Intercept,
         CommandName::Interference,
         CommandName::Close,
+        CommandName::Secret,
         CommandName::Keys,
         CommandName::Type,
         CommandName::Wait,
@@ -186,6 +200,21 @@ fn epoch_classification_is_exhaustive_over_all_known_commands() {
             "'{wire}' is in both epoch_incrementing and epoch_reading — mutually exclusive invariant violated"
         );
     }
+}
+
+#[test]
+fn extract_cache_invalidation_is_scan_args_aware() {
+    assert!(
+        command_invalidates_cached_snapshots_without_epoch_bump(
+            "extract",
+            &serde_json::json!({"scan": {"limit": 3}})
+        ),
+        "extract scan scrolls the viewport and must clear stale snapshot projections"
+    );
+    assert!(
+        !command_invalidates_cached_snapshots_without_epoch_bump("extract", &serde_json::json!({})),
+        "ordinary extract is read-only and must not clear snapshot projections"
+    );
 }
 
 #[test]

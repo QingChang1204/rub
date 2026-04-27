@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use crate::runtime_refresh::{
     InterferenceRefreshIntent, refresh_live_dialog_runtime, refresh_live_frame_runtime,
-    refresh_live_interference_state, refresh_live_runtime_state, refresh_live_storage_runtime,
-    refresh_live_trigger_runtime, refresh_orchestration_runtime, refresh_takeover_runtime,
+    refresh_live_interference_state, refresh_live_runtime_and_interference,
+    refresh_live_runtime_state, refresh_live_storage_runtime, refresh_live_trigger_runtime,
+    refresh_orchestration_runtime, refresh_takeover_runtime,
 };
 use crate::session::SessionState;
 use rub_core::error::{ErrorCode, RubError};
@@ -132,7 +133,7 @@ impl RuntimeSurface {
                 refresh_live_frame_runtime(&router.browser, state).await;
             }
             Self::Interference => {
-                let _ = refresh_live_interference_state(
+                let _ = refresh_live_runtime_and_interference(
                     &router.browser,
                     state,
                     InterferenceRefreshIntent::ReadOnly,

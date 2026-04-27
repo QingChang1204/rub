@@ -29,10 +29,9 @@ pub(crate) use surfaces::{
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead, BufReader, Write};
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
 
     use super::{
         InterferenceRefreshIntent, apply_policy_driven_handoff, refresh_orchestration_runtime,
@@ -43,9 +42,10 @@ mod tests {
     use rub_core::model::{
         HumanVerificationHandoffStatus, InterferenceKind, InterferenceMode,
         InterferenceObservation, InterferenceRuntimeInfo, InterferenceRuntimeStatus,
-        LaunchPolicyInfo, OrchestrationRuntimeStatus, TakeoverRuntimeStatus,
+        LaunchPolicyInfo, OrchestrationRuntimeStatus, OrchestrationSessionAvailability,
+        TakeoverRuntimeStatus,
     };
-    use rub_ipc::protocol::{IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse};
+    use rub_ipc::protocol::IPC_PROTOCOL_VERSION;
     use uuid::Uuid;
 
     fn temp_home() -> PathBuf {
@@ -54,7 +54,14 @@ mod tests {
 
     struct LiveRegistryFixture {
         socket_path: PathBuf,
-        server: JoinHandle<()>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum RegistryHandshakeBehavior {
+        Live,
+        ProtocolIncompatible,
+        ProbeContractFailure,
+        BusyOrUnknown,
     }
 
     fn headed_launch_policy() -> LaunchPolicyInfo {
@@ -75,12 +82,15 @@ mod tests {
 
     impl LiveRegistryFixture {
         fn join(self) {
-            self.server.join().unwrap();
             let _ = std::fs::remove_file(self.socket_path);
         }
     }
 
-    fn install_live_registry_entry(home: &PathBuf, entry: &RegistryEntry) -> LiveRegistryFixture {
+    fn install_registry_entry_with_handshake(
+        home: &PathBuf,
+        entry: &RegistryEntry,
+        behavior: RegistryHandshakeBehavior,
+    ) -> LiveRegistryFixture {
         let runtime = RubPaths::new(home).session_runtime(&entry.session_name, &entry.session_id);
         let projection = RubPaths::new(home).session(&entry.session_name);
         std::fs::create_dir_all(runtime.session_dir()).unwrap();
@@ -97,31 +107,66 @@ mod tests {
             .unwrap();
 
         let _ = std::fs::remove_file(runtime.socket_path());
-        let listener = std::os::unix::net::UnixListener::bind(runtime.socket_path()).unwrap();
-        listener.set_nonblocking(false).unwrap();
-        let session_id = entry.session_id.clone();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = String::new();
-            BufReader::new(stream.try_clone().unwrap())
-                .read_line(&mut request)
-                .unwrap();
-            let decoded: IpcRequest = serde_json::from_str(request.trim_end()).unwrap();
-            assert_eq!(decoded.command, "_handshake");
-            let response = IpcResponse::success(
-                "req-1",
-                serde_json::json!({
-                    "daemon_session_id": session_id,
-                }),
-            );
-            serde_json::to_writer(&mut stream, &response).unwrap();
-            stream.write_all(b"\n").unwrap();
-        });
+        if let Some(parent) = runtime.socket_path().parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(runtime.socket_path(), b"socket").unwrap();
+        match behavior {
+            RegistryHandshakeBehavior::Live => {
+                crate::session::force_live_registry_socket_probe_once_for_test(
+                    &runtime.socket_path(),
+                );
+            }
+            RegistryHandshakeBehavior::ProtocolIncompatible => {
+                crate::session::force_protocol_incompatible_registry_socket_probe_once_for_test(
+                    &runtime.socket_path(),
+                );
+            }
+            RegistryHandshakeBehavior::ProbeContractFailure => {
+                crate::session::force_probe_contract_failure_registry_socket_probe_once_for_test(
+                    &runtime.socket_path(),
+                );
+            }
+            RegistryHandshakeBehavior::BusyOrUnknown => {
+                crate::session::force_busy_registry_socket_probe_once_for_test(
+                    &runtime.socket_path(),
+                );
+            }
+        }
 
         LiveRegistryFixture {
             socket_path: runtime.socket_path(),
-            server,
         }
+    }
+
+    fn install_live_registry_entry(home: &PathBuf, entry: &RegistryEntry) -> LiveRegistryFixture {
+        install_registry_entry_with_handshake(home, entry, RegistryHandshakeBehavior::Live)
+    }
+
+    fn install_protocol_incompatible_registry_entry(
+        home: &PathBuf,
+        entry: &RegistryEntry,
+    ) -> LiveRegistryFixture {
+        install_registry_entry_with_handshake(
+            home,
+            entry,
+            RegistryHandshakeBehavior::ProtocolIncompatible,
+        )
+    }
+
+    fn install_busy_registry_entry(home: &PathBuf, entry: &RegistryEntry) -> LiveRegistryFixture {
+        install_registry_entry_with_handshake(home, entry, RegistryHandshakeBehavior::BusyOrUnknown)
+    }
+
+    fn install_probe_contract_failure_registry_entry(
+        home: &PathBuf,
+        entry: &RegistryEntry,
+    ) -> LiveRegistryFixture {
+        install_registry_entry_with_handshake(
+            home,
+            entry,
+            RegistryHandshakeBehavior::ProbeContractFailure,
+        )
     }
 
     #[tokio::test]
@@ -314,6 +359,13 @@ mod tests {
                 .map(|state| state.path_kind.as_str()),
             Some("session_socket_reference")
         );
+        assert_eq!(
+            runtime.known_sessions[0]
+                .socket_path_state
+                .as_ref()
+                .map(|state| state.upstream_truth.as_str()),
+            Some("registry_authority_snapshot")
+        );
 
         let _ = std::fs::remove_dir_all(home);
         fixture.join();
@@ -369,9 +421,94 @@ mod tests {
                 .any(|session| session.session_id == state.session_id && session.current)
         );
         assert!(runtime.execution_supported);
+        let current = runtime
+            .known_sessions
+            .iter()
+            .find(|session| session.session_id == state.session_id)
+            .expect("current fallback session should remain visible");
+        assert_eq!(
+            current
+                .socket_path_state
+                .as_ref()
+                .map(|state| state.upstream_truth.as_str()),
+            Some("current_session_runtime_authority")
+        );
 
         let _ = std::fs::remove_dir_all(home);
         fixture.join();
+    }
+
+    #[tokio::test]
+    async fn orchestration_refresh_prioritizes_missing_current_session_over_non_addressable_remote_sessions()
+     {
+        let home = temp_home();
+        let state = Arc::new(SessionState::new("default", home.clone(), None));
+        std::fs::create_dir_all(&home).unwrap();
+
+        let remote_entry = RegistryEntry {
+            session_id: "sess-remote".to_string(),
+            session_name: "remote".to_string(),
+            pid: std::process::id(),
+            socket_path: RubPaths::new(&home)
+                .session_runtime("remote", "sess-remote")
+                .socket_path()
+                .display()
+                .to_string(),
+            created_at: "2026-04-01T00:00:00Z".to_string(),
+            ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
+            user_data_dir: None,
+            attachment_identity: None,
+            connection_target: None,
+        };
+        let remote_fixture = install_protocol_incompatible_registry_entry(&home, &remote_entry);
+        write_registry(
+            &home,
+            &RegistryData {
+                sessions: vec![remote_entry],
+            },
+        )
+        .unwrap();
+
+        refresh_orchestration_runtime(&state).await;
+        let runtime = state.orchestration_runtime().await;
+
+        assert_eq!(runtime.status, OrchestrationRuntimeStatus::Degraded);
+        assert_eq!(
+            runtime.degraded_reason.as_deref(),
+            Some("current_session_missing_from_live_registry")
+        );
+        assert_eq!(
+            runtime.current_session_id.as_deref(),
+            Some(state.session_id.as_str())
+        );
+        assert_eq!(
+            runtime.current_session_name.as_deref(),
+            Some(state.session_name.as_str())
+        );
+        let remote = runtime
+            .known_sessions
+            .iter()
+            .find(|session| session.session_id == "sess-remote")
+            .expect("remote session should remain visible");
+        assert_eq!(
+            remote.availability,
+            OrchestrationSessionAvailability::ProtocolIncompatible
+        );
+        let current = runtime
+            .known_sessions
+            .iter()
+            .find(|session| session.session_id == state.session_id)
+            .expect("current fallback session should remain visible");
+        assert_eq!(
+            current
+                .socket_path_state
+                .as_ref()
+                .map(|state| state.upstream_truth.as_str()),
+            Some("current_session_runtime_authority")
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+        remote_fixture.join();
     }
 
     #[tokio::test]
@@ -417,6 +554,13 @@ mod tests {
                 .map(|state| state.path_authority.as_str()),
             Some("session.orchestration_runtime.known_sessions.socket_path")
         );
+        assert_eq!(
+            runtime.known_sessions[0]
+                .socket_path_state
+                .as_ref()
+                .map(|state| state.upstream_truth.as_str()),
+            Some("registry_authority_snapshot")
+        );
 
         let _ = std::fs::remove_dir_all(home);
         fixture.join();
@@ -425,7 +569,11 @@ mod tests {
     #[tokio::test]
     async fn orchestration_refresh_fails_closed_when_live_registry_is_empty() {
         let home = temp_home();
-        let state = Arc::new(SessionState::new("default", home.clone(), None));
+        let state = Arc::new(SessionState::new(
+            "default",
+            home.clone(),
+            Some("/tmp/rub-current-profile".to_string()),
+        ));
         std::fs::create_dir_all(&home).unwrap();
         write_registry(
             &home,
@@ -444,10 +592,478 @@ mod tests {
         assert!(runtime.known_sessions[0].current);
         assert_eq!(runtime.known_sessions[0].session_id, state.session_id);
         assert_eq!(
+            runtime.known_sessions[0].user_data_dir.as_deref(),
+            Some("/tmp/rub-current-profile")
+        );
+        assert_eq!(
+            runtime.known_sessions[0]
+                .user_data_dir_state
+                .as_ref()
+                .map(|state| state.path_kind.as_str()),
+            Some("managed_user_data_directory")
+        );
+        assert_eq!(
+            runtime.known_sessions[0]
+                .socket_path_state
+                .as_ref()
+                .map(|state| state.upstream_truth.as_str()),
+            Some("current_session_runtime_authority")
+        );
+        assert_eq!(
+            runtime.known_sessions[0]
+                .user_data_dir_state
+                .as_ref()
+                .map(|state| state.upstream_truth.as_str()),
+            Some("current_session_runtime_authority")
+        );
+        assert_eq!(
             runtime.degraded_reason.as_deref(),
             Some("live_registry_empty")
         );
 
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn orchestration_refresh_keeps_protocol_incompatible_sessions_visible_and_non_addressable()
+     {
+        let home = temp_home();
+        let state = Arc::new(SessionState::new("default", home.clone(), None));
+        std::fs::create_dir_all(&home).unwrap();
+
+        let current_entry = RegistryEntry {
+            session_id: state.session_id.clone(),
+            session_name: state.session_name.clone(),
+            pid: std::process::id(),
+            socket_path: RubPaths::new(&home)
+                .session_runtime(&state.session_name, &state.session_id)
+                .socket_path()
+                .display()
+                .to_string(),
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+            ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
+            user_data_dir: None,
+            attachment_identity: None,
+            connection_target: None,
+        };
+        let remote_entry = RegistryEntry {
+            session_id: "sess-remote".to_string(),
+            session_name: "remote".to_string(),
+            pid: std::process::id(),
+            socket_path: RubPaths::new(&home)
+                .session_runtime("remote", "sess-remote")
+                .socket_path()
+                .display()
+                .to_string(),
+            created_at: "2026-04-01T00:00:00Z".to_string(),
+            ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
+            user_data_dir: None,
+            attachment_identity: None,
+            connection_target: None,
+        };
+        let current_fixture = install_live_registry_entry(&home, &current_entry);
+        let remote_fixture = install_protocol_incompatible_registry_entry(&home, &remote_entry);
+        write_registry(
+            &home,
+            &RegistryData {
+                sessions: vec![current_entry, remote_entry],
+            },
+        )
+        .unwrap();
+
+        refresh_orchestration_runtime(&state).await;
+        let runtime = state.orchestration_runtime().await;
+
+        assert_eq!(runtime.status, OrchestrationRuntimeStatus::Degraded);
+        assert!(runtime.addressing_supported);
+        assert!(runtime.execution_supported);
+        assert_eq!(
+            runtime.degraded_reason.as_deref(),
+            Some("registry_contains_non_addressable_sessions")
+        );
+        assert_eq!(runtime.known_sessions.len(), 2);
+        let remote = runtime
+            .known_sessions
+            .iter()
+            .find(|session| session.session_id == "sess-remote")
+            .expect("protocol-incompatible session should remain visible");
+        assert_eq!(
+            remote.availability,
+            OrchestrationSessionAvailability::ProtocolIncompatible
+        );
+        assert!(!remote.addressing_supported);
+
+        let _ = std::fs::remove_dir_all(&home);
+        current_fixture.join();
+        remote_fixture.join();
+    }
+
+    #[tokio::test]
+    async fn orchestration_refresh_keeps_busy_sessions_visible_and_non_addressable() {
+        let home = temp_home();
+        let state = Arc::new(SessionState::new("default", home.clone(), None));
+        std::fs::create_dir_all(&home).unwrap();
+
+        let current_entry = RegistryEntry {
+            session_id: state.session_id.clone(),
+            session_name: state.session_name.clone(),
+            pid: std::process::id(),
+            socket_path: RubPaths::new(&home)
+                .session_runtime(&state.session_name, &state.session_id)
+                .socket_path()
+                .display()
+                .to_string(),
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+            ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
+            user_data_dir: None,
+            attachment_identity: None,
+            connection_target: None,
+        };
+        let remote_entry = RegistryEntry {
+            session_id: "sess-busy".to_string(),
+            session_name: "busy".to_string(),
+            pid: std::process::id(),
+            socket_path: RubPaths::new(&home)
+                .session_runtime("busy", "sess-busy")
+                .socket_path()
+                .display()
+                .to_string(),
+            created_at: "2026-04-01T00:00:00Z".to_string(),
+            ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
+            user_data_dir: None,
+            attachment_identity: None,
+            connection_target: None,
+        };
+        let current_fixture = install_live_registry_entry(&home, &current_entry);
+        let remote_fixture = install_busy_registry_entry(&home, &remote_entry);
+        write_registry(
+            &home,
+            &RegistryData {
+                sessions: vec![current_entry, remote_entry],
+            },
+        )
+        .unwrap();
+
+        refresh_orchestration_runtime(&state).await;
+        let runtime = state.orchestration_runtime().await;
+
+        assert_eq!(runtime.status, OrchestrationRuntimeStatus::Degraded);
+        assert!(runtime.addressing_supported);
+        assert!(runtime.execution_supported);
+        assert_eq!(
+            runtime.degraded_reason.as_deref(),
+            Some("registry_contains_non_addressable_sessions")
+        );
+        let remote = runtime
+            .known_sessions
+            .iter()
+            .find(|session| session.session_id == "sess-busy")
+            .expect("busy session should remain visible");
+        assert_eq!(
+            remote.availability,
+            OrchestrationSessionAvailability::BusyOrUnknown
+        );
+        assert!(!remote.addressing_supported);
+
+        let _ = std::fs::remove_dir_all(&home);
+        current_fixture.join();
+        remote_fixture.join();
+    }
+
+    #[tokio::test]
+    async fn orchestration_refresh_keeps_large_busy_registries_within_one_probe_budget_window() {
+        let home = temp_home();
+        let state = Arc::new(SessionState::new("default", home.clone(), None));
+        std::fs::create_dir_all(&home).unwrap();
+
+        let current_entry = RegistryEntry {
+            session_id: state.session_id.clone(),
+            session_name: state.session_name.clone(),
+            pid: std::process::id(),
+            socket_path: RubPaths::new(&home)
+                .session_runtime(&state.session_name, &state.session_id)
+                .socket_path()
+                .display()
+                .to_string(),
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+            ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
+            user_data_dir: None,
+            attachment_identity: None,
+            connection_target: None,
+        };
+        let busy_entries = (0..9)
+            .map(|index| RegistryEntry {
+                session_id: format!("sess-busy-{index}"),
+                session_name: format!("busy-{index}"),
+                pid: std::process::id(),
+                socket_path: RubPaths::new(&home)
+                    .session_runtime(format!("busy-{index}"), format!("sess-busy-{index}"))
+                    .socket_path()
+                    .display()
+                    .to_string(),
+                created_at: format!("2026-04-01T00:00:{index:02}Z"),
+                ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
+                user_data_dir: None,
+                attachment_identity: None,
+                connection_target: None,
+            })
+            .collect::<Vec<_>>();
+        let current_fixture = install_live_registry_entry(&home, &current_entry);
+        let busy_fixtures = busy_entries
+            .iter()
+            .map(|entry| install_busy_registry_entry(&home, entry))
+            .collect::<Vec<_>>();
+        let mut sessions = vec![current_entry];
+        sessions.extend(busy_entries);
+        write_registry(&home, &RegistryData { sessions }).unwrap();
+
+        let started = Instant::now();
+        refresh_orchestration_runtime(&state).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1_600),
+            "registry liveness probing should stay within a single busy-socket budget window even for larger registries instead of serializing busy sessions inside one refresh: {elapsed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        current_fixture.join();
+        for fixture in busy_fixtures {
+            fixture.join();
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestration_refresh_keeps_late_live_entries_addressable_beyond_old_probe_cap() {
+        let home = temp_home();
+        let state = Arc::new(SessionState::new("default", home.clone(), None));
+        std::fs::create_dir_all(&home).unwrap();
+
+        let current_entry = RegistryEntry {
+            session_id: state.session_id.clone(),
+            session_name: state.session_name.clone(),
+            pid: std::process::id(),
+            socket_path: RubPaths::new(&home)
+                .session_runtime(&state.session_name, &state.session_id)
+                .socket_path()
+                .display()
+                .to_string(),
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+            ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
+            user_data_dir: None,
+            attachment_identity: None,
+            connection_target: None,
+        };
+        let busy_entries = (0..8)
+            .map(|index| RegistryEntry {
+                session_id: format!("sess-busy-{index}"),
+                session_name: format!("busy-{index}"),
+                pid: std::process::id(),
+                socket_path: RubPaths::new(&home)
+                    .session_runtime(format!("busy-{index}"), format!("sess-busy-{index}"))
+                    .socket_path()
+                    .display()
+                    .to_string(),
+                created_at: format!("2026-04-01T00:00:{index:02}Z"),
+                ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
+                user_data_dir: None,
+                attachment_identity: None,
+                connection_target: None,
+            })
+            .collect::<Vec<_>>();
+        let remote_entry = RegistryEntry {
+            session_id: "sess-remote-live".to_string(),
+            session_name: "remote-live".to_string(),
+            pid: std::process::id(),
+            socket_path: RubPaths::new(&home)
+                .session_runtime("remote-live", "sess-remote-live")
+                .socket_path()
+                .display()
+                .to_string(),
+            created_at: "2026-04-01T00:01:00Z".to_string(),
+            ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
+            user_data_dir: None,
+            attachment_identity: None,
+            connection_target: None,
+        };
+
+        let current_fixture = install_live_registry_entry(&home, &current_entry);
+        let busy_fixtures = busy_entries
+            .iter()
+            .map(|entry| install_busy_registry_entry(&home, entry))
+            .collect::<Vec<_>>();
+        let remote_fixture = install_live_registry_entry(&home, &remote_entry);
+
+        let mut sessions = vec![current_entry];
+        sessions.extend(busy_entries);
+        sessions.push(remote_entry);
+        write_registry(&home, &RegistryData { sessions }).unwrap();
+
+        refresh_orchestration_runtime(&state).await;
+        let runtime = state.orchestration_runtime().await;
+        let remote = runtime
+            .known_sessions
+            .iter()
+            .find(|session| session.session_id == "sess-remote-live")
+            .expect("late live session should remain visible");
+        assert_eq!(
+            remote.availability,
+            OrchestrationSessionAvailability::Addressable
+        );
+        assert!(remote.addressing_supported);
+
+        let _ = std::fs::remove_dir_all(&home);
+        current_fixture.join();
+        for fixture in busy_fixtures {
+            fixture.join();
+        }
+        remote_fixture.join();
+    }
+
+    #[tokio::test]
+    async fn orchestration_refresh_keeps_probe_contract_failure_sessions_visible_and_non_addressable()
+     {
+        let home = temp_home();
+        let state = Arc::new(SessionState::new("default", home.clone(), None));
+        std::fs::create_dir_all(&home).unwrap();
+
+        let current_entry = RegistryEntry {
+            session_id: state.session_id.clone(),
+            session_name: state.session_name.clone(),
+            pid: std::process::id(),
+            socket_path: RubPaths::new(&home)
+                .session_runtime(&state.session_name, &state.session_id)
+                .socket_path()
+                .display()
+                .to_string(),
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+            ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
+            user_data_dir: None,
+            attachment_identity: None,
+            connection_target: None,
+        };
+        let remote_entry = RegistryEntry {
+            session_id: "sess-probe-failure".to_string(),
+            session_name: "probe-failure".to_string(),
+            pid: std::process::id(),
+            socket_path: RubPaths::new(&home)
+                .session_runtime("probe-failure", "sess-probe-failure")
+                .socket_path()
+                .display()
+                .to_string(),
+            created_at: "2026-04-01T00:00:00Z".to_string(),
+            ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
+            user_data_dir: None,
+            attachment_identity: None,
+            connection_target: None,
+        };
+        let current_fixture = install_live_registry_entry(&home, &current_entry);
+        let remote_fixture = install_probe_contract_failure_registry_entry(&home, &remote_entry);
+        write_registry(
+            &home,
+            &RegistryData {
+                sessions: vec![current_entry, remote_entry],
+            },
+        )
+        .unwrap();
+
+        refresh_orchestration_runtime(&state).await;
+        let runtime = state.orchestration_runtime().await;
+
+        assert_eq!(runtime.status, OrchestrationRuntimeStatus::Degraded);
+        assert!(runtime.addressing_supported);
+        assert!(runtime.execution_supported);
+        assert_eq!(
+            runtime.degraded_reason.as_deref(),
+            Some("registry_contains_non_addressable_sessions")
+        );
+        let remote = runtime
+            .known_sessions
+            .iter()
+            .find(|session| session.session_id == "sess-probe-failure")
+            .expect("probe-contract-failure session should remain visible");
+        assert_eq!(
+            remote.availability,
+            OrchestrationSessionAvailability::BusyOrUnknown
+        );
+        assert!(!remote.addressing_supported);
+
+        let _ = std::fs::remove_dir_all(&home);
+        current_fixture.join();
+        remote_fixture.join();
+    }
+
+    #[tokio::test]
+    async fn orchestration_refresh_keeps_pending_startup_sessions_visible_and_non_addressable() {
+        let home = temp_home();
+        let state = Arc::new(SessionState::new("default", home.clone(), None));
+        std::fs::create_dir_all(&home).unwrap();
+
+        let current_entry = RegistryEntry {
+            session_id: state.session_id.clone(),
+            session_name: state.session_name.clone(),
+            pid: std::process::id(),
+            socket_path: RubPaths::new(&home)
+                .session_runtime(&state.session_name, &state.session_id)
+                .socket_path()
+                .display()
+                .to_string(),
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+            ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
+            user_data_dir: None,
+            attachment_identity: None,
+            connection_target: None,
+        };
+        let pending_entry = RegistryEntry {
+            session_id: "sess-pending".to_string(),
+            session_name: "pending".to_string(),
+            pid: std::process::id(),
+            socket_path: RubPaths::new(&home)
+                .session_runtime("pending", "sess-pending")
+                .socket_path()
+                .display()
+                .to_string(),
+            created_at: "2026-04-01T00:00:00Z".to_string(),
+            ipc_protocol_version: IPC_PROTOCOL_VERSION.to_string(),
+            user_data_dir: None,
+            attachment_identity: None,
+            connection_target: None,
+        };
+        let current_fixture = install_live_registry_entry(&home, &current_entry);
+        let pending_runtime = RubPaths::new(&home).session_runtime("pending", "sess-pending");
+        std::fs::create_dir_all(pending_runtime.session_dir()).unwrap();
+        std::fs::write(pending_runtime.pid_path(), std::process::id().to_string()).unwrap();
+        std::fs::write(pending_runtime.socket_path(), b"socket").unwrap();
+
+        write_registry(
+            &home,
+            &RegistryData {
+                sessions: vec![current_entry, pending_entry],
+            },
+        )
+        .unwrap();
+
+        refresh_orchestration_runtime(&state).await;
+        let runtime = state.orchestration_runtime().await;
+
+        assert_eq!(runtime.status, OrchestrationRuntimeStatus::Degraded);
+        assert!(runtime.addressing_supported);
+        assert!(runtime.execution_supported);
+        assert_eq!(
+            runtime.degraded_reason.as_deref(),
+            Some("registry_contains_non_addressable_sessions")
+        );
+        let pending = runtime
+            .known_sessions
+            .iter()
+            .find(|session| session.session_id == "sess-pending")
+            .expect("pending-startup session should remain visible");
+        assert_eq!(
+            pending.availability,
+            OrchestrationSessionAvailability::PendingStartup
+        );
+        assert!(!pending.addressing_supported);
+
+        let _ = std::fs::remove_dir_all(&home);
+        current_fixture.join();
     }
 }

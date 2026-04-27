@@ -1,4 +1,5 @@
 use super::*;
+use rub_core::model::Snapshot;
 const SNAPSHOT_SETTLE_DELAY_MS: u64 = 100;
 const SNAPSHOT_SETTLE_RETRIES: usize = 6;
 
@@ -7,6 +8,36 @@ pub(super) enum ExternalDomFenceOutcome {
     Settled,
     IncompleteDueToDeadline,
     Unstable,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum DeferredSnapshotPublication {
+    Cached(Arc<Snapshot>),
+    Fresh(Box<Snapshot>),
+}
+
+impl DeferredSnapshotPublication {
+    pub(super) fn cached(snapshot: Arc<Snapshot>) -> Self {
+        Self::Cached(snapshot)
+    }
+
+    pub(super) fn fresh(snapshot: Snapshot) -> Self {
+        Self::Fresh(Box::new(snapshot))
+    }
+
+    pub(super) fn snapshot(&self) -> &Snapshot {
+        match self {
+            Self::Cached(snapshot) => snapshot.as_ref(),
+            Self::Fresh(snapshot) => snapshot,
+        }
+    }
+
+    pub(super) async fn publish(self, state: &Arc<SessionState>) -> Arc<Snapshot> {
+        match self {
+            Self::Cached(snapshot) => snapshot,
+            Self::Fresh(snapshot) => state.cache_snapshot(*snapshot).await,
+        }
+    }
 }
 
 pub(super) async fn sleep_full_settle_window(
@@ -116,7 +147,7 @@ pub(super) async fn build_stable_snapshot(
     let mut pending_scope = state.take_pending_external_dom_change_scope();
 
     for attempt in 0..SNAPSHOT_SETTLE_RETRIES {
-        let snapshot = if listeners {
+        let mut snapshot = if listeners {
             router
                 .browser
                 .snapshot_with_listeners_for_frame(selected_frame_id.as_deref(), limit, a11y)
@@ -150,6 +181,11 @@ pub(super) async fn build_stable_snapshot(
 
         let observed_scope = state.take_pending_external_dom_change_scope();
         if observed_scope.is_empty() {
+            commit_snapshot_publication_epoch_for_pending_scope(
+                state,
+                &pending_scope,
+                &mut snapshot,
+            );
             return Ok(snapshot);
         }
         pending_scope.merge(observed_scope);
@@ -180,11 +216,30 @@ pub(super) async fn build_stable_snapshot(
     ))
 }
 
+fn commit_snapshot_publication_epoch_for_pending_scope(
+    state: &Arc<SessionState>,
+    pending_scope: &crate::session::PendingExternalDomChangeState,
+    snapshot: &mut Snapshot,
+) -> Option<u64> {
+    if pending_scope.is_empty() {
+        None
+    } else {
+        let epoch = state.increment_epoch();
+        snapshot.dom_epoch = epoch;
+        Some(epoch)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ExternalDomFenceOutcome, settle_external_dom_fence, sleep_full_settle_window};
+    use super::{
+        DeferredSnapshotPublication, ExternalDomFenceOutcome,
+        commit_snapshot_publication_epoch_for_pending_scope, settle_external_dom_fence,
+        sleep_full_settle_window,
+    };
     use crate::router::TransactionDeadline;
     use crate::session::SessionState;
+    use rub_core::model::{FrameContextInfo, ScrollPosition, Snapshot, SnapshotProjection};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
@@ -323,5 +378,110 @@ mod tests {
         let pending_scope = state.take_pending_external_dom_change_scope();
         assert!(pending_scope.affects_target(Some("target-1")));
         assert!(!pending_scope.affects_target(Some("target-2")));
+    }
+
+    fn snapshot(snapshot_id: &str, dom_epoch: u64) -> Snapshot {
+        Snapshot {
+            snapshot_id: snapshot_id.to_string(),
+            dom_epoch,
+            frame_context: FrameContextInfo {
+                frame_id: "frame-main".to_string(),
+                name: Some("main".to_string()),
+                parent_frame_id: None,
+                target_id: Some("target-1".to_string()),
+                url: Some("https://example.test".to_string()),
+                depth: 0,
+                same_origin_accessible: Some(true),
+            },
+            frame_lineage: vec!["frame-main".to_string()],
+            url: "https://example.test".to_string(),
+            title: "Example".to_string(),
+            elements: Vec::new(),
+            total_count: 0,
+            truncated: false,
+            scroll: ScrollPosition {
+                x: 0.0,
+                y: 0.0,
+                at_bottom: false,
+            },
+            timestamp: "2026-04-18T00:00:00Z".to_string(),
+            projection: SnapshotProjection {
+                verified: true,
+                js_traversal_count: 0,
+                backend_traversal_count: 0,
+                resolved_ref_count: 0,
+                warning: None,
+            },
+            viewport_filtered: None,
+            viewport_count: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_dom_drift_commits_new_epoch_at_snapshot_publish_fence() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-router-snapshot-publication-epoch"),
+            None,
+        ));
+        state.mark_pending_external_dom_change();
+        let pending_scope = state.take_pending_external_dom_change_scope();
+        let mut snapshot = snapshot("snap-publication", 0);
+
+        let committed_epoch = commit_snapshot_publication_epoch_for_pending_scope(
+            &state,
+            &pending_scope,
+            &mut snapshot,
+        );
+
+        assert_eq!(committed_epoch, Some(1));
+        assert_eq!(state.current_epoch(), 1);
+        assert_eq!(snapshot.dom_epoch, 1);
+        assert!(
+            !state.has_pending_external_dom_change(),
+            "snapshot publication should consume the preexisting pending authority only when the publish fence commits"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_dom_drift_remerge_preserves_pending_authority_before_publish_commit() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-router-snapshot-publication-epoch-remerge"),
+            None,
+        ));
+        state
+            .in_flight_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        state.observe_external_dom_change(Some("target-1"));
+        let pending_scope = state.take_pending_external_dom_change_scope();
+
+        state.merge_pending_external_dom_change_scope(pending_scope);
+
+        assert_eq!(state.current_epoch(), 0);
+        assert!(
+            state.pending_external_dom_change_affects_target(Some("target-1")),
+            "failed snapshot publication must keep the pending fallback authority until a later publish fence commits a new epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_snapshot_stays_uncached_until_publish() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-router-snapshot-deferred-publish"),
+            None,
+        ));
+        let staged = DeferredSnapshotPublication::fresh(snapshot("snap-deferred", 0));
+
+        assert!(
+            state.get_snapshot("snap-deferred").await.is_none(),
+            "fresh snapshots must not enter cache before the success fence is crossed"
+        );
+
+        let published = staged.publish(&state).await;
+
+        assert_eq!(published.snapshot_id, "snap-deferred");
+        assert!(state.get_snapshot("snap-deferred").await.is_some());
     }
 }

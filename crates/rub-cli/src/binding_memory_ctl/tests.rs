@@ -11,6 +11,7 @@ use rub_core::model::{
     BindingRecord, BindingRegistryData, BindingScope, RememberedBindingAliasKind,
     RememberedBindingAliasRecord, RememberedBindingAliasRegistryData,
 };
+use rub_daemon::rub_paths::RubPaths;
 use std::path::{Path, PathBuf};
 
 fn temp_home() -> PathBuf {
@@ -56,6 +57,88 @@ fn remembered_alias_registry_defaults_to_v1_empty_registry() {
     let registry = read_remembered_alias_registry(&home).unwrap();
     assert_eq!(registry.schema_version, 1);
     assert!(registry.aliases.is_empty());
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn write_remembered_alias_registry_surfaces_rub_home_directory_durability_failure() {
+    let root = std::env::temp_dir().join(format!(
+        "rub-binding-memory-dir-fence-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let home = root.join("home");
+    let _ = std::fs::remove_dir_all(&root);
+    crate::local_registry::force_directory_sync_failure_once_for_test(&home);
+
+    let registry = RememberedBindingAliasRegistryData {
+        schema_version: 1,
+        aliases: vec![RememberedBindingAliasRecord {
+            alias: "finance".to_string(),
+            binding_alias: "old-admin".to_string(),
+            kind: RememberedBindingAliasKind::Workspace,
+            created_at: "2026-04-14T12:00:00Z".to_string(),
+            updated_at: "2026-04-14T12:00:00Z".to_string(),
+        }],
+    };
+    let envelope = write_remembered_alias_registry(&home, &registry)
+        .expect_err("remembered binding registry must reject unconfirmed RUB_HOME directory fence")
+        .into_envelope();
+
+    assert_eq!(envelope.code, ErrorCode::IoError);
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|context| context.get("reason"))
+            .and_then(|reason| reason.as_str()),
+        Some("remembered_binding_rub_home_create_failed")
+    );
+    assert!(
+        envelope
+            .message
+            .contains("forced local registry directory sync failure"),
+        "{}",
+        envelope.message
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn write_remembered_alias_registry_rejects_published_only_file_commit() {
+    let home = temp_home();
+    let registry_path = RubPaths::new(&home).remembered_bindings_path();
+    crate::local_registry::force_published_write_outcome_once_for_test(&registry_path);
+
+    let registry = RememberedBindingAliasRegistryData {
+        schema_version: 1,
+        aliases: vec![RememberedBindingAliasRecord {
+            alias: "finance".to_string(),
+            binding_alias: "old-admin".to_string(),
+            kind: RememberedBindingAliasKind::Workspace,
+            created_at: "2026-04-14T12:00:00Z".to_string(),
+            updated_at: "2026-04-14T12:00:00Z".to_string(),
+        }],
+    };
+    let envelope = write_remembered_alias_registry(&home, &registry)
+        .expect_err("remembered binding registry must reject published-only file commit")
+        .into_envelope();
+
+    assert_eq!(envelope.code, ErrorCode::IoError);
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|context| context.get("reason"))
+            .and_then(|reason| reason.as_str()),
+        Some("remembered_binding_registry_write_failed")
+    );
+    assert!(
+        envelope.message.contains("durability was not confirmed"),
+        "{}",
+        envelope.message
+    );
+
     let _ = std::fs::remove_dir_all(home);
 }
 
@@ -151,5 +234,79 @@ fn remembered_alias_list_surfaces_missing_target_binding() {
         projection["result"]["items"][0]["target"]["kind"],
         "missing_binding"
     );
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn remembered_alias_projections_surface_live_registry_authority_failure_metadata() {
+    let home = temp_home();
+    seed_binding_registry(&home);
+    remember_binding_alias(
+        &home,
+        "finance",
+        "old-admin",
+        RememberedBindingAliasKindArg::Workspace,
+    )
+    .unwrap();
+    std::fs::write(
+        RubPaths::new(&home).registry_path(),
+        "{ invalid live registry json",
+    )
+    .unwrap();
+
+    let list_projection = project_remembered_alias_list(&home).unwrap();
+    assert_eq!(
+        list_projection["result"]["live_registry_error"]["code"],
+        "DAEMON_START_FAILED"
+    );
+
+    let resolved = resolve_remembered_alias(&home, "finance").unwrap();
+    assert_eq!(
+        resolved["result"]["live_registry_error"]["code"],
+        "DAEMON_START_FAILED"
+    );
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn remembered_alias_write_projections_surface_live_registry_authority_failure_metadata() {
+    let home = temp_home();
+    seed_binding_registry(&home);
+    std::fs::write(
+        RubPaths::new(&home).registry_path(),
+        "{ invalid live registry json",
+    )
+    .unwrap();
+
+    let created = remember_binding_alias(
+        &home,
+        "finance",
+        "old-admin",
+        RememberedBindingAliasKindArg::Workspace,
+    )
+    .unwrap();
+    assert_eq!(
+        created["result"]["live_registry_error"]["code"],
+        "DAEMON_START_FAILED"
+    );
+
+    write_binding_registry(
+        &home,
+        &BindingRegistryData {
+            schema_version: 1,
+            bindings: vec![
+                sample_binding("old-admin", &home),
+                sample_binding("ops", &home),
+            ],
+        },
+    )
+    .unwrap();
+    let rebound = rebind_remembered_alias(&home, "finance", "ops", None).unwrap();
+    assert_eq!(
+        rebound["result"]["live_registry_error"]["code"],
+        "DAEMON_START_FAILED"
+    );
+
     let _ = std::fs::remove_dir_all(home);
 }

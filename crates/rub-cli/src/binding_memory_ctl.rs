@@ -1,24 +1,29 @@
 use crate::binding_ctl::{
-    binding_alias_not_found_error, binding_path_state, load_binding_resolution_state,
-    normalize_binding_alias, read_binding_registry, resolve_binding_target,
-    resolve_binding_target_from_state,
+    BindingResolutionState, binding_alias_not_found_error, binding_path_state,
+    load_binding_resolution_state_from_registry, normalize_binding_alias,
+    project_live_registry_error, resolve_binding_target_from_state,
 };
 use crate::commands::RememberedBindingAliasKindArg;
 use rub_core::error::{ErrorCode, RubError};
-use rub_core::model::{RememberedBindingAliasKind, RememberedBindingAliasRecord};
+use rub_core::model::{
+    BindingRegistryData, RememberedBindingAliasKind, RememberedBindingAliasRecord,
+    RememberedBindingAliasRegistryData,
+};
 use rub_daemon::rub_paths::RubPaths;
 use serde_json::{Value, json};
 use std::path::Path;
 
-mod registry;
+pub(crate) mod registry;
 
+pub(crate) use self::registry::mutate_binding_and_remembered_alias_registries;
 use self::registry::{
-    read_remembered_alias_registry, rfc3339_now, write_remembered_alias_registry,
+    mutate_remembered_alias_registry, read_binding_and_remembered_alias_registries, rfc3339_now,
 };
+#[cfg(test)]
+use self::registry::{read_remembered_alias_registry, write_remembered_alias_registry};
 
 pub(crate) fn project_remembered_alias_list(rub_home: &Path) -> Result<Value, RubError> {
-    let registry = read_remembered_alias_registry(rub_home)?;
-    let binding_state = load_binding_resolution_state(rub_home)?;
+    let (registry, binding_state) = load_remembered_alias_resolution_state(rub_home)?;
     let items = registry
         .aliases
         .iter()
@@ -30,13 +35,20 @@ pub(crate) fn project_remembered_alias_list(rub_home: &Path) -> Result<Value, Ru
         })
         .collect::<Result<Vec<_>, RubError>>()?;
 
-    Ok(json!({
+    let mut projection = json!({
         "subject": remembered_alias_registry_subject(rub_home),
         "result": {
             "schema_version": registry.schema_version,
             "items": items,
         }
-    }))
+    });
+    if let Some(error) = binding_state
+        .live_snapshot_error()
+        .map(project_live_registry_error)
+    {
+        projection["result"]["live_registry_error"] = error;
+    }
+    Ok(projection)
 }
 
 pub(crate) fn remember_binding_alias(
@@ -47,19 +59,6 @@ pub(crate) fn remember_binding_alias(
 ) -> Result<Value, RubError> {
     let alias = normalize_binding_alias(alias)?;
     let binding_alias = normalize_binding_alias(binding_alias)?;
-    ensure_binding_target_exists(rub_home, &binding_alias)?;
-
-    let mut registry = read_remembered_alias_registry(rub_home)?;
-    if registry.aliases.iter().any(|record| record.alias == alias) {
-        return Err(RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            format!("Remembered alias already exists: {alias}"),
-            json!({
-                "alias": alias,
-                "reason": "remembered_alias_already_exists",
-            }),
-        ));
-    }
 
     let now = rfc3339_now();
     let record = RememberedBindingAliasRecord {
@@ -69,29 +68,65 @@ pub(crate) fn remember_binding_alias(
         created_at: now.clone(),
         updated_at: now,
     };
-    registry.aliases.push(record.clone());
-    write_remembered_alias_registry(rub_home, &registry)?;
+    mutate_binding_and_remembered_alias_registries(
+        rub_home,
+        |binding_registry, remembered_registry| {
+            ensure_binding_target_exists_in_registry(rub_home, binding_registry, &binding_alias)?;
+            if remembered_registry
+                .aliases
+                .iter()
+                .any(|record| record.alias == alias)
+            {
+                return Err(RubError::domain_with_context(
+                    ErrorCode::InvalidInput,
+                    format!("Remembered alias already exists: {alias}"),
+                    json!({
+                        "alias": alias,
+                        "reason": "remembered_alias_already_exists",
+                    }),
+                ));
+            }
+            remembered_registry.aliases.push(record.clone());
+            Ok(())
+        },
+    )?;
 
-    Ok(json!({
+    let (_, binding_state) = load_remembered_alias_resolution_state(rub_home)?;
+    let target = resolve_binding_target_from_state(&binding_alias, &binding_state)?;
+    let mut projection = json!({
         "subject": remembered_alias_subject(rub_home, &alias),
         "result": {
             "action": "remember",
             "remembered_alias": record,
-            "target": resolve_binding_target(rub_home, &binding_alias)?,
+            "target": target,
         }
-    }))
+    });
+    if let Some(error) = binding_state
+        .live_snapshot_error()
+        .map(project_live_registry_error)
+    {
+        projection["result"]["live_registry_error"] = error;
+    }
+    Ok(projection)
 }
 
 pub(crate) fn resolve_remembered_alias(rub_home: &Path, alias: &str) -> Result<Value, RubError> {
-    let (record, target) = resolve_remembered_alias_target(rub_home, alias)?;
+    let (record, target, binding_state) = resolve_remembered_alias_target(rub_home, alias)?;
 
-    Ok(json!({
+    let mut projection = json!({
         "subject": remembered_alias_subject(rub_home, &record.alias),
         "result": {
             "remembered_alias": record.clone(),
             "target": target,
         }
-    }))
+    });
+    if let Some(error) = binding_state
+        .live_snapshot_error()
+        .map(project_live_registry_error)
+    {
+        projection["result"]["live_registry_error"] = error;
+    }
+    Ok(projection)
 }
 
 pub(crate) fn resolve_remembered_alias_target(
@@ -101,19 +136,40 @@ pub(crate) fn resolve_remembered_alias_target(
     (
         RememberedBindingAliasRecord,
         rub_core::model::RememberedBindingAliasTarget,
+        BindingResolutionState,
     ),
     RubError,
 > {
     let normalized = normalize_binding_alias(alias)?;
-    let registry = read_remembered_alias_registry(rub_home)?;
-    let binding_state = load_binding_resolution_state(rub_home)?;
+    let (registry, binding_state) = load_remembered_alias_resolution_state(rub_home)?;
+    let (record, target) = resolve_remembered_alias_target_from_binding_state(
+        rub_home,
+        &normalized,
+        registry,
+        &binding_state,
+    )?;
+    Ok((record, target, binding_state))
+}
+
+pub(crate) fn resolve_remembered_alias_target_from_binding_state(
+    rub_home: &Path,
+    normalized_alias: &str,
+    registry: RememberedBindingAliasRegistryData,
+    binding_state: &crate::binding_ctl::BindingResolutionState,
+) -> Result<
+    (
+        RememberedBindingAliasRecord,
+        rub_core::model::RememberedBindingAliasTarget,
+    ),
+    RubError,
+> {
     let record = registry
         .aliases
         .iter()
-        .find(|record| record.alias == normalized)
+        .find(|record| record.alias == normalized_alias)
         .cloned()
-        .ok_or_else(|| remembered_alias_not_found_error(rub_home, &normalized))?;
-    let target = resolve_binding_target_from_state(&record.binding_alias, &binding_state)?;
+        .ok_or_else(|| remembered_alias_not_found_error(rub_home, normalized_alias))?;
+    let target = resolve_binding_target_from_state(&record.binding_alias, binding_state)?;
     Ok((record, target))
 }
 
@@ -125,43 +181,55 @@ pub(crate) fn rebind_remembered_alias(
 ) -> Result<Value, RubError> {
     let alias = normalize_binding_alias(alias)?;
     let binding_alias = normalize_binding_alias(binding_alias)?;
-    ensure_binding_target_exists(rub_home, &binding_alias)?;
+    let (previous_binding_alias, updated) = mutate_binding_and_remembered_alias_registries(
+        rub_home,
+        |binding_registry, remembered_registry| {
+            ensure_binding_target_exists_in_registry(rub_home, binding_registry, &binding_alias)?;
+            let record = remembered_registry
+                .aliases
+                .iter_mut()
+                .find(|record| record.alias == alias)
+                .ok_or_else(|| remembered_alias_not_found_error(rub_home, &alias))?;
+            let previous_binding_alias = record.binding_alias.clone();
+            record.binding_alias = binding_alias.clone();
+            if let Some(kind) = kind {
+                record.kind = remembered_alias_kind(kind);
+            }
+            record.updated_at = rfc3339_now();
+            Ok((previous_binding_alias, record.clone()))
+        },
+    )?;
 
-    let mut registry = read_remembered_alias_registry(rub_home)?;
-    let record = registry
-        .aliases
-        .iter_mut()
-        .find(|record| record.alias == alias)
-        .ok_or_else(|| remembered_alias_not_found_error(rub_home, &alias))?;
-    let previous_binding_alias = record.binding_alias.clone();
-    record.binding_alias = binding_alias.clone();
-    if let Some(kind) = kind {
-        record.kind = remembered_alias_kind(kind);
-    }
-    record.updated_at = rfc3339_now();
-    let updated = record.clone();
-    write_remembered_alias_registry(rub_home, &registry)?;
-
-    Ok(json!({
+    let (_, binding_state) = load_remembered_alias_resolution_state(rub_home)?;
+    let target = resolve_binding_target_from_state(&binding_alias, &binding_state)?;
+    let mut projection = json!({
         "subject": remembered_alias_subject(rub_home, &alias),
         "result": {
             "action": "rebind",
             "previous_binding_alias": previous_binding_alias,
             "remembered_alias": updated,
-            "target": resolve_binding_target(rub_home, &binding_alias)?,
+            "target": target,
         }
-    }))
+    });
+    if let Some(error) = binding_state
+        .live_snapshot_error()
+        .map(project_live_registry_error)
+    {
+        projection["result"]["live_registry_error"] = error;
+    }
+    Ok(projection)
 }
 
 pub(crate) fn forget_remembered_alias(rub_home: &Path, alias: &str) -> Result<Value, RubError> {
     let alias = normalize_binding_alias(alias)?;
-    let mut registry = read_remembered_alias_registry(rub_home)?;
-    let original_len = registry.aliases.len();
-    registry.aliases.retain(|record| record.alias != alias);
-    if registry.aliases.len() == original_len {
-        return Err(remembered_alias_not_found_error(rub_home, &alias));
-    }
-    write_remembered_alias_registry(rub_home, &registry)?;
+    mutate_remembered_alias_registry(rub_home, |registry| {
+        let original_len = registry.aliases.len();
+        registry.aliases.retain(|record| record.alias != alias);
+        if registry.aliases.len() == original_len {
+            return Err(remembered_alias_not_found_error(rub_home, &alias));
+        }
+        Ok(())
+    })?;
 
     Ok(json!({
         "subject": remembered_alias_subject(rub_home, &alias),
@@ -171,6 +239,16 @@ pub(crate) fn forget_remembered_alias(rub_home: &Path, alias: &str) -> Result<Va
     }))
 }
 
+fn load_remembered_alias_resolution_state(
+    rub_home: &Path,
+) -> Result<(RememberedBindingAliasRegistryData, BindingResolutionState), RubError> {
+    let (binding_registry, remembered_registry) =
+        read_binding_and_remembered_alias_registries(rub_home)?;
+    let binding_state = load_binding_resolution_state_from_registry(rub_home, binding_registry)?;
+    Ok((remembered_registry, binding_state))
+}
+
+#[cfg(test)]
 pub(crate) fn remembered_aliases_referencing_binding(
     rub_home: &Path,
     binding_alias: &str,
@@ -223,9 +301,12 @@ pub(crate) fn remembered_alias_subject(rub_home: &Path, alias: &str) -> Value {
     })
 }
 
-fn ensure_binding_target_exists(rub_home: &Path, binding_alias: &str) -> Result<(), RubError> {
+fn ensure_binding_target_exists_in_registry(
+    rub_home: &Path,
+    registry: &BindingRegistryData,
+    binding_alias: &str,
+) -> Result<(), RubError> {
     let normalized = normalize_binding_alias(binding_alias)?;
-    let registry = read_binding_registry(rub_home)?;
     if registry
         .bindings
         .iter()

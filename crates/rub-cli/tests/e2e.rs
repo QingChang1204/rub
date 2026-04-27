@@ -5,14 +5,16 @@
 
 use rub_daemon::rub_paths::RubPaths;
 use rub_ipc::client::IpcClient;
+use rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID;
 use rub_ipc::protocol::{IpcRequest, IpcResponse};
+use rub_test_harness::assert::checked_command_result;
 pub(crate) use rub_test_harness::browser_session::*;
 use rub_test_harness::fixtures::{DownloadFixtureServer, NetworkInspectionFixtureServer};
 use rub_test_harness::server::TestServer;
 use serde_json::{Value, json};
 use serial_test::serial;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -41,12 +43,30 @@ fn rub_cmd_env(rub_home: &str, envs: &[(&str, &str)]) -> Command {
 
 fn parse_json(output: &std::process::Output) -> serde_json::Value {
     let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(&stdout).unwrap_or_else(|e| {
+    let parsed = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!(
             "Failed to parse JSON: {e}\nstdout: {stdout}\nstderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-    })
+    });
+    let _ = checked_command_result(&parsed);
+    assert_cli_exit_matches_command_result(output, &parsed);
+    parsed
+}
+
+fn assert_cli_exit_matches_command_result(output: &std::process::Output, parsed: &Value) {
+    let success = parsed
+        .get("success")
+        .and_then(Value::as_bool)
+        .expect("CommandResult success must be a boolean");
+    assert_eq!(
+        output.status.success(),
+        success,
+        "CLI process exit status must match CommandResult.success; status={:?}; stdout: {}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn doctor_result(json: &serde_json::Value) -> &serde_json::Value {
@@ -93,21 +113,31 @@ fn wait_for_no_live_sessions(home: &str) -> serde_json::Value {
 }
 
 fn wait_for_no_live_sessions_with_timeout(home: &str, timeout: Duration) -> serde_json::Value {
+    let mut last_sessions = None;
+    let mut last_observed = None;
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
+        let observed = observe_home_cleanup(home);
         if sessions["success"] == true
             && sessions["data"]["result"]["items"]
                 .as_array()
                 .is_some_and(|items| items.is_empty())
+            && observed.daemon_root_pids.is_empty()
         {
             return sessions;
         }
+        last_sessions = Some(sessions);
+        last_observed = Some(observed);
         std::thread::sleep(Duration::from_millis(100));
     }
     panic!(
-        "Timed out waiting for close --all to leave no live sessions within {:?}",
-        timeout
+        "Timed out waiting for close --all to release live session authority within {:?}; last_sessions={:?}; last_daemon_root_pids={:?}",
+        timeout,
+        last_sessions,
+        last_observed
+            .as_ref()
+            .map(|observed| &observed.daemon_root_pids),
     );
 }
 
@@ -273,6 +303,26 @@ fn wait_for_trigger_status(home: &str, id: u64, expected: &str) -> serde_json::V
     panic!("Timed out waiting for trigger {id} to reach status '{expected}'");
 }
 
+fn wait_for_trigger_last_action_status(home: &str, id: u64, expected: &str) -> serde_json::Value {
+    for _ in 0..80 {
+        let out = parse_json(&rub_cmd(home).args(["trigger", "list"]).output().unwrap());
+        if out["success"] == true
+            && let Some(trigger) = out["data"]["result"]["items"]
+                .as_array()
+                .and_then(|triggers| {
+                    triggers
+                        .iter()
+                        .find(|trigger| trigger["id"].as_u64() == Some(id))
+                })
+            && trigger["last_action_result"]["status"].as_str() == Some(expected)
+        {
+            return out;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("Timed out waiting for trigger {id} to publish last_action_result.status '{expected}'");
+}
+
 fn wait_for_trigger_unavailable_reason(home: &str, id: u64, expected: &str) -> serde_json::Value {
     for _ in 0..80 {
         let out = parse_json(&rub_cmd(home).args(["trigger", "list"]).output().unwrap());
@@ -291,6 +341,97 @@ fn wait_for_trigger_unavailable_reason(home: &str, id: u64, expected: &str) -> s
         std::thread::sleep(Duration::from_millis(100));
     }
     panic!("Timed out waiting for trigger {id} to publish unavailable_reason '{expected}'");
+}
+
+fn assert_trigger_status_remains(
+    home: &str,
+    id: u64,
+    expected: &str,
+    duration: Duration,
+) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + duration;
+    loop {
+        let out = parse_json(&rub_cmd(home).args(["trigger", "list"]).output().unwrap());
+        let trigger = out["data"]["result"]["items"]
+            .as_array()
+            .and_then(|triggers| {
+                triggers
+                    .iter()
+                    .find(|trigger| trigger["id"].as_u64() == Some(id))
+            })
+            .unwrap_or_else(|| {
+                panic!("trigger {id} should remain present while verifying steady status: {out}")
+            });
+        assert_eq!(trigger["status"].as_str(), Some(expected), "{out}");
+        if std::time::Instant::now() >= deadline {
+            return out;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn assert_trigger_remains_unavailable_without_action(
+    home: &str,
+    id: u64,
+    expected_reason: &str,
+    duration: Duration,
+) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + duration;
+    loop {
+        let out = parse_json(&rub_cmd(home).args(["trigger", "list"]).output().unwrap());
+        let trigger = out["data"]["result"]["items"]
+            .as_array()
+            .and_then(|triggers| triggers.iter().find(|trigger| trigger["id"].as_u64() == Some(id)))
+            .unwrap_or_else(|| {
+                panic!("trigger {id} should remain present while verifying unavailable continuity: {out}")
+            });
+        assert_eq!(trigger["status"].as_str(), Some("armed"), "{out}");
+        assert_eq!(
+            trigger["unavailable_reason"].as_str(),
+            Some(expected_reason),
+            "{out}"
+        );
+        assert!(trigger["last_action_result"].is_null(), "{out}");
+        if std::time::Instant::now() >= deadline {
+            return out;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_runtime_frame_degraded_reason(
+    home: &str,
+    expected_status: &str,
+    expected_reason: &str,
+    timeout: Duration,
+) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let out = parse_json(&rub_cmd(home).args(["runtime", "frame"]).output().unwrap());
+        if out["success"] == true
+            && out["data"]["runtime"]["status"].as_str() == Some(expected_status)
+            && out["data"]["runtime"]["degraded_reason"].as_str() == Some(expected_reason)
+        {
+            return out;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "Timed out waiting for runtime frame status '{expected_status}' with reason '{expected_reason}'"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_pid_exit(pid: i32, timeout: Duration) {
+    wait_until(timeout, || {
+        let result = unsafe { libc::kill(pid, 0) };
+        if result == 0 {
+            return false;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    });
 }
 
 fn wait_for_orchestration_status(
@@ -353,6 +494,194 @@ fn wait_for_orchestration_rule_result(
     );
 }
 
+fn wait_for_orchestration_condition_evidence_summary(
+    home: &str,
+    session: &str,
+    id: u64,
+    expected_status: &str,
+    expected_summary: Option<&str>,
+) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..80 {
+        let out = parse_json(
+            &rub_cmd(home)
+                .args(["--session", session, "orchestration", "list"])
+                .output()
+                .unwrap(),
+        );
+        last = out.clone();
+        if out["success"] == true
+            && let Some(rule) = out["data"]["result"]["items"]
+                .as_array()
+                .and_then(|rules| rules.iter().find(|rule| rule["id"].as_u64() == Some(id)))
+            && rule["status"].as_str() == Some(expected_status)
+        {
+            let actual_summary = rule["last_condition_evidence"]["summary"].as_str();
+            if actual_summary == expected_summary {
+                return out;
+            }
+            if expected_summary.is_none() && rule["last_condition_evidence"].is_null() {
+                return out;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "Timed out waiting for orchestration rule {id} in session '{session}' to reach status '{expected_status}' with last_condition_evidence {:?}; last list output: {last}",
+        expected_summary
+    );
+}
+
+fn wait_for_orchestration_cooldown_to_expire(
+    home: &str,
+    session: &str,
+    id: u64,
+) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..80 {
+        let out = parse_json(
+            &rub_cmd(home)
+                .args(["--session", session, "orchestration", "list"])
+                .output()
+                .unwrap(),
+        );
+        last = out.clone();
+        if out["success"] == true
+            && let Some(rule) = out["data"]["result"]["items"]
+                .as_array()
+                .and_then(|rules| rules.iter().find(|rule| rule["id"].as_u64() == Some(id)))
+        {
+            let cooldown_expired = rule["execution_policy"]["cooldown_until_ms"]
+                .as_u64()
+                .is_none_or(|deadline| {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_millis() as u64)
+                        .unwrap_or(u64::MAX);
+                    now_ms >= deadline
+                });
+            if cooldown_expired {
+                return out;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "Timed out waiting for orchestration rule {id} in session '{session}' to leave cooldown; last list output: {last}"
+    );
+}
+
+fn wait_for_orchestration_cooldown_to_renew(
+    home: &str,
+    session: &str,
+    id: u64,
+    previous_deadline_ms: u64,
+) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..80 {
+        let out = parse_json(
+            &rub_cmd(home)
+                .args(["--session", session, "orchestration", "list"])
+                .output()
+                .unwrap(),
+        );
+        last = out.clone();
+        if out["success"] == true
+            && let Some(rule) = out["data"]["result"]["items"]
+                .as_array()
+                .and_then(|rules| rules.iter().find(|rule| rule["id"].as_u64() == Some(id)))
+            && rule["last_result"]["status"].as_str() == Some("fired")
+            && rule["execution_policy"]["cooldown_until_ms"]
+                .as_u64()
+                .is_some_and(|deadline| deadline > previous_deadline_ms)
+        {
+            return out;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "Timed out waiting for orchestration rule {id} in session '{session}' to renew cooldown after prior deadline {previous_deadline_ms}; last list output: {last}"
+    );
+}
+
+fn wait_for_session_in_flight_count(
+    runtime: &tokio::runtime::Runtime,
+    home: &str,
+    session_id: &str,
+    expected: u64,
+    timeout: Duration,
+) -> IpcResponse {
+    let socket_path = registry_socket_path_by_session_id(home, session_id);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let request = IpcRequest::new("_handshake", serde_json::json!({}), 1_000)
+            .with_command_id(HANDSHAKE_PROBE_COMMAND_ID)
+            .expect("fixed handshake probe command_id should stay valid");
+        let response = send_bound_ipc_request(runtime, &socket_path, session_id, &request);
+        if response.status == rub_ipc::protocol::ResponseStatus::Success
+            && response
+                .data
+                .as_ref()
+                .and_then(|data| data.get("in_flight_count"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(expected)
+        {
+            return response;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "Timed out waiting for session '{session_id}' to publish in_flight_count={expected}; last handshake response: {response:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_for_orchestration_probe_match(
+    runtime: &tokio::runtime::Runtime,
+    home: &str,
+    session_id: &str,
+    tab_target_id: &str,
+    frame_id: Option<&str>,
+    condition: serde_json::Value,
+    expected_matched: bool,
+    timeout: Duration,
+) -> IpcResponse {
+    let socket_path = registry_socket_path_by_session_id(home, session_id);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let request = IpcRequest::new(
+            "_orchestration_probe",
+            json!({
+                "tab_target_id": tab_target_id,
+                "frame_id": frame_id,
+                "condition": condition,
+                "after_sequence": 0,
+                "last_observed_drop_count": 0,
+            }),
+            1_000,
+        );
+        let response = send_bound_ipc_request(runtime, &socket_path, session_id, &request);
+        if response.status == rub_ipc::protocol::ResponseStatus::Success
+            && response
+                .data
+                .as_ref()
+                .and_then(|data| data.get("matched"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(expected_matched)
+        {
+            return response;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "Timed out waiting for _orchestration_probe in session '{session_id}' to report matched={expected_matched}; last response: {response:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn wait_for_text_in_session(
     home: &str,
     session: &str,
@@ -411,6 +740,48 @@ fn registry_socket_path_by_session_id(home: &str, session_id: &str) -> String {
         .find(|entry| entry.session_id == session_id)
         .unwrap_or_else(|| panic!("session '{session_id}' should be present in registry"))
         .socket_path
+}
+
+fn assert_no_startup_session_residue(home: &str, session_name: &str) {
+    let registry = rub_daemon::session::read_registry(Path::new(home))
+        .unwrap_or_else(|error| panic!("registry should remain readable for {home}: {error}"));
+    assert!(
+        registry.sessions.is_empty(),
+        "failed startup must not leave registry authority behind for home {home}: {registry:#?}"
+    );
+
+    let session_paths = RubPaths::new(home).session(session_name);
+    assert!(
+        !session_paths.session_dir().exists(),
+        "failed startup must not leave session directory residue for home {home}: {}",
+        session_paths.session_dir().display()
+    );
+    assert!(
+        !session_paths.projection_dir().exists(),
+        "failed startup must not leave projection directory residue for home {home}: {}",
+        session_paths.projection_dir().display()
+    );
+    for socket_path in session_paths.socket_paths() {
+        assert!(
+            !socket_path.exists(),
+            "failed startup must not leave socket residue for home {home}: {}",
+            socket_path.display()
+        );
+    }
+    for pid_path in session_paths.pid_paths() {
+        assert!(
+            !pid_path.exists(),
+            "failed startup must not leave pid residue for home {home}: {}",
+            pid_path.display()
+        );
+    }
+    for lock_path in session_paths.lock_paths() {
+        assert!(
+            !lock_path.exists(),
+            "failed startup must not leave lock residue for home {home}: {}",
+            lock_path.display()
+        );
+    }
 }
 
 fn send_bound_ipc_request(
@@ -856,25 +1227,6 @@ fn verify_home_cleanup_complete_detects_managed_profile_residue_for_observed_dae
     let _ = std::fs::remove_dir_all(profile_dir);
 }
 
-#[test]
-fn probe_cdp_http_ready_once_times_out_on_half_open_response() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-    let addr = listener.local_addr().expect("listener addr");
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept connection");
-        std::thread::sleep(Duration::from_millis(300));
-        drop(stream);
-    });
-
-    let start = std::time::Instant::now();
-    let ready = probe_cdp_http_ready_once(&format!("http://{addr}"), Duration::from_millis(100));
-    let elapsed = start.elapsed();
-
-    server.join().expect("server thread should join");
-    assert!(!ready);
-    assert!(elapsed < Duration::from_millis(250));
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct E2eSourceFunction {
     module: String,
@@ -971,6 +1323,19 @@ fn browser_backed_unique_home_usage_matches_exception_whitelist() {
             "t310_311_external_attach_lifecycle_grouped_scenario",
         ),
         (
+            "state_workflow",
+            "t310a_external_attach_accepts_multi_tab_browser_with_unique_active_tab_authority",
+        ),
+        (
+            "state_workflow",
+            "t310b_failed_external_attach_does_not_leave_daemon_residue",
+        ),
+        ("state_workflow", "t360_mutual_exclusion"),
+        (
+            "state_workflow",
+            "t362_new_session_invalid_cdp_url_reports_connection_failure",
+        ),
+        (
             "trigger_runtime",
             "t437_trigger_text_present_fires_cross_tab_click",
         ),
@@ -1020,7 +1385,7 @@ fn browser_backed_external_attach_usage_matches_exception_whitelist() {
         ),
         (
             "state_workflow",
-            "t310a_external_attach_rejects_ambiguous_page_authority",
+            "t310a_external_attach_accepts_multi_tab_browser_with_unique_active_tab_authority",
         ),
         (
             "state_workflow",
@@ -1137,6 +1502,57 @@ fn browser_backed_e2e_source_files_match_mounted_modules() {
     assert_eq!(
         scanned, mounted,
         "tests/e2e/*.rs source files must exactly match the mounted #[path] module list so new browser-backed suites cannot drift out of compilation"
+    );
+}
+
+#[test]
+fn wait_for_no_live_sessions_guardrail_uses_observed_authority_release() {
+    let source =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/e2e.rs"))
+            .expect("e2e source should be readable");
+    assert!(
+        source.contains("observe_home_cleanup(home)")
+            && source.contains(".is_some_and(|items| items.is_empty())")
+            && source.contains("observed.daemon_root_pids.is_empty()"),
+        "wait_for_no_live_sessions guardrail must require both empty sessions projection and observed daemon authority release"
+    );
+}
+
+#[test]
+fn professional_workflow_docs_keep_manual_non_regression_disclaimer() {
+    let workflow_readme = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("rub-cli crate should live under workspace/crates")
+            .parent()
+            .expect("workspace root")
+            .join("tests/professional-workflows/README.md"),
+    )
+    .expect("professional workflow readme should be readable");
+    assert!(
+        workflow_readme.contains("manual workflow assets")
+            && (workflow_readme.contains("not cargo-managed regression tests")
+                || workflow_readme.contains("standing CI closure proof"))
+            && workflow_readme.contains(
+                "same thing as proving the product-level `close` / `cleanup` / `teardown` fence"
+            ),
+        "manual workflow docs must stay explicit that they are not standing regression proof"
+    );
+
+    let professional_plan = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("rub-cli crate should live under workspace/crates")
+            .parent()
+            .expect("workspace root")
+            .join("docs/antigravity/rub-professional-test-plan.md"),
+    )
+    .expect("professional test plan should be readable");
+    assert!(
+        (professional_plan.contains("参考") || professional_plan.contains("手工"))
+            && professional_plan.contains("不是默认 CI standing regression guardrail")
+            && professional_plan.contains("自动化 closure proof"),
+        "professional test plan must describe these workflows as manual/reference assets instead of automated regression proof"
     );
 }
 

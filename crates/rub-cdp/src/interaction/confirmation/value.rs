@@ -8,6 +8,8 @@ use tokio::time::Instant;
 use super::support::{
     OBSERVATION_WINDOW, confirmed, contradicted, degraded, sleep_observation_step, unconfirmed,
 };
+use crate::dialogs::SharedDialogRuntime;
+use crate::interaction::DialogFenceBaseline;
 use crate::interaction::observation::{
     PageObservation, editable_effect_contradicted, editable_effect_matches_expected,
     observe_element, observe_related_page, observed_editable_content, page_changed,
@@ -18,11 +20,20 @@ pub(crate) async fn confirm_input(
     object_id: &RemoteObjectId,
     expected: &str,
     before_page: PageObservation,
+    dialog_runtime: &SharedDialogRuntime,
+    dialog_baseline: &DialogFenceBaseline,
 ) -> InteractionConfirmation {
+    let target_id = page.target_id().as_ref().to_string();
     let deadline = Instant::now() + OBSERVATION_WINDOW;
     let mut poll_count = 0u32;
 
     loop {
+        if let Some(confirmation) =
+            super::dialog_confirmation(dialog_runtime, &target_id, dialog_baseline).await
+        {
+            return confirmation;
+        }
+
         let observed = observe_element(page, object_id).await.ok();
         if let Some(observed) = observed.as_ref()
             && editable_effect_matches_expected(observed, expected)
@@ -80,11 +91,20 @@ pub(crate) async fn confirm_select(
     expected_value: &str,
     expected_text: &str,
     before_page: PageObservation,
+    dialog_runtime: &SharedDialogRuntime,
+    dialog_baseline: &DialogFenceBaseline,
 ) -> InteractionConfirmation {
+    let target_id = page.target_id().as_ref().to_string();
     let deadline = Instant::now() + OBSERVATION_WINDOW;
     let mut poll_count = 0u32;
 
     loop {
+        if let Some(confirmation) =
+            super::dialog_confirmation(dialog_runtime, &target_id, dialog_baseline).await
+        {
+            return confirmation;
+        }
+
         let observed = observe_element(page, object_id).await.ok();
         if let Some(observed) = observed.as_ref()
             && observed.value.as_deref() == Some(expected_value)
@@ -143,11 +163,20 @@ pub(crate) async fn confirm_upload(
     object_id: &RemoteObjectId,
     expected_file_name: &str,
     before_page: PageObservation,
+    dialog_runtime: &SharedDialogRuntime,
+    dialog_baseline: &DialogFenceBaseline,
 ) -> InteractionConfirmation {
+    let target_id = page.target_id().as_ref().to_string();
     let deadline = Instant::now() + OBSERVATION_WINDOW;
     let mut poll_count = 0u32;
 
     loop {
+        if let Some(confirmation) =
+            super::dialog_confirmation(dialog_runtime, &target_id, dialog_baseline).await
+        {
+            return confirmation;
+        }
+
         let observed = observe_element(page, object_id).await.ok();
         if let Some(observed) = observed.as_ref()
             && observed

@@ -10,28 +10,36 @@ pub(crate) struct TransactionDeadline {
 }
 
 impl TransactionDeadline {
-    pub(super) fn new(timeout_ms: u64) -> Self {
+    pub(crate) fn new(timeout_ms: u64) -> Self {
         Self {
             started_at: Instant::now(),
             timeout_ms,
         }
     }
 
-    pub(super) fn elapsed_ms(self) -> u64 {
+    pub(crate) fn elapsed_ms(self) -> u64 {
         self.started_at.elapsed().as_millis() as u64
     }
 
-    pub(super) fn remaining_ms(self) -> u64 {
+    pub(crate) fn elapsed_ms_bounded_by_timeout(self) -> u64 {
+        self.elapsed_ms().min(self.timeout_ms)
+    }
+
+    pub(crate) fn remaining_ms(self) -> u64 {
         self.timeout_ms.saturating_sub(self.elapsed_ms())
     }
 
-    pub(super) fn remaining_duration(self) -> Option<std::time::Duration> {
+    pub(crate) fn remaining_duration(self) -> Option<std::time::Duration> {
         let remaining_ms = self.remaining_ms();
         if remaining_ms == 0 {
             None
         } else {
             Some(std::time::Duration::from_millis(remaining_ms))
         }
+    }
+
+    pub(crate) fn deadline_instant(self) -> Instant {
+        self.started_at + std::time::Duration::from_millis(self.timeout_ms)
     }
 }
 
@@ -40,6 +48,13 @@ pub(crate) enum PendingExternalDomCommit {
     #[default]
     Clear,
     Preserve,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum RouterFenceDisposition {
+    #[cfg_attr(not(test), allow(dead_code))]
+    Acquire,
+    ReuseCurrentTransaction,
 }
 
 #[derive(Debug)]

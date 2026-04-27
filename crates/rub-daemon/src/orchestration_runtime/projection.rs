@@ -109,6 +109,7 @@ impl OrchestrationRuntimeState {
 
     pub(super) fn refresh_status(&mut self) {
         self.projection.status = if self.projection.degraded_reason.is_some()
+            || all_rules_unavailable(&self.projection)
             || self.projection.rules.iter().any(|rule| {
                 rule.last_result.as_ref().is_some_and(|result| {
                     matches!(
@@ -124,4 +125,8 @@ impl OrchestrationRuntimeState {
             OrchestrationRuntimeStatus::Inactive
         };
     }
+}
+
+fn all_rules_unavailable(projection: &OrchestrationRuntimeInfo) -> bool {
+    !projection.rules.is_empty() && projection.unavailable_rule_count == projection.rules.len()
 }

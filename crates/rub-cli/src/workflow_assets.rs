@@ -2,7 +2,9 @@ mod export;
 mod listing;
 mod write;
 
+#[cfg(test)]
 pub use export::persist_history_export_asset;
+pub use export::persist_history_export_asset_until;
 pub use listing::list_workflows;
 pub(crate) use listing::local_workflow_asset_path_state;
 pub(crate) use rub_daemon::workflow_assets::{
@@ -14,10 +16,14 @@ mod tests {
     use super::write::{
         commit_asset_writes, pending_asset_write, remove_newly_created_asset_if_matches,
     };
-    use super::{list_workflows, persist_history_export_asset, resolve_named_workflow_path};
+    use super::{
+        list_workflows, persist_history_export_asset, persist_history_export_asset_until,
+        resolve_named_workflow_path,
+    };
     use crate::commands::{Commands, EffectiveCli, RequestedLaunchPolicy};
     use rub_core::error::ErrorCode;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     fn durable_history_export_projection_state() -> serde_json::Value {
         serde_json::json!({
@@ -50,6 +56,7 @@ mod tests {
             cdp_url: None,
             connect: false,
             profile: None,
+            profile_resolved_path: None,
             use_alias: None,
             no_stealth: false,
             humanize: false,
@@ -506,6 +513,60 @@ mod tests {
         persist_history_export_asset(&cli, &mut data)
             .expect_err("second write should fail and roll back the first");
         assert!(!saved.exists(), "first output should be rolled back");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn persist_history_export_asset_until_fails_closed_after_deadline_without_publishing() {
+        let home = std::env::temp_dir().join(format!(
+            "rub-workflow-assets-deadline-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let output_path = home.join("exports/history.json");
+        let cli = cli_with(
+            Commands::History {
+                last: 10,
+                from: None,
+                to: None,
+                export_pipe: true,
+                export_script: false,
+                include_observation: false,
+                save_as: None,
+                output: Some(output_path.display().to_string()),
+            },
+            home.clone(),
+        );
+
+        let mut data = serde_json::json!({
+            "subject": { "kind": "command_history" },
+            "result": {
+                "format": "pipe",
+                "projection_state": durable_history_export_projection_state(),
+                "complete": true,
+                "entries": [
+                    { "command": "open", "args": { "url": "https://example.com" } }
+                ]
+            }
+        });
+
+        let error = persist_history_export_asset_until(
+            &cli,
+            &mut data,
+            Instant::now() - Duration::from_millis(1),
+            30_000,
+        )
+        .expect_err("expired deadline should fail closed");
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::IpcTimeout);
+        let context = envelope.context.expect("deadline error context");
+        assert_eq!(context["reason"], "command_deadline_exhausted");
+        assert_eq!(context["phase"], "post_commit_history_export_persistence");
+        assert!(
+            !output_path.exists(),
+            "history export artifact must not publish after deadline"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }

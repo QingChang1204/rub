@@ -298,19 +298,23 @@ async fn verify_takeover_continuity(
     router: &DaemonRouter,
     state: &Arc<SessionState>,
 ) -> Result<(), RubError> {
-    let tabs = refresh_live_runtime_and_interference(
+    let tabs = match refresh_live_runtime_and_interference(
         &router.browser,
         state,
         InterferenceRefreshIntent::ReadOnly,
     )
     .await
-    .map_err(|error| {
-        RubError::domain_with_context(
-            ErrorCode::BrowserCrashed,
-            format!("Takeover continuity fence failed while refreshing runtime: {error}"),
-            serde_json::json!({ "phase": "runtime_refresh" }),
-        )
-    })?;
+    {
+        Ok(tabs) => tabs,
+        Err(error) => {
+            state
+                .mark_takeover_runtime_degraded("continuity_runtime_refresh_unavailable")
+                .await;
+            return Err(takeover_runtime_refresh_unavailable_error(
+                error.to_string(),
+            ));
+        }
+    };
 
     let active_tab = tabs.iter().any(|tab| tab.active);
     let frame_runtime = state.frame_runtime().await;
@@ -321,9 +325,9 @@ async fn verify_takeover_continuity(
 
     if let Some((reason, message)) = failure {
         state.mark_takeover_runtime_degraded(reason).await;
-        return Err(RubError::domain_with_context(
-            ErrorCode::BrowserCrashed,
+        return Err(takeover_degraded_authority_error(
             message,
+            reason,
             serde_json::json!({
                 "reason": reason,
                 "frame_runtime": frame_runtime,
@@ -337,6 +341,35 @@ async fn verify_takeover_continuity(
     state.clear_takeover_runtime_degraded().await;
     refresh_takeover_runtime(&router.browser, state).await;
     Ok(())
+}
+
+pub(super) fn takeover_runtime_refresh_unavailable_error(cause: impl Into<String>) -> RubError {
+    takeover_degraded_authority_error(
+        "Takeover continuity fence failed because runtime refresh authority is currently unavailable",
+        "continuity_runtime_refresh_unavailable",
+        serde_json::json!({
+            "phase": "runtime_refresh",
+            "cause": cause.into(),
+        }),
+    )
+}
+
+pub(super) fn takeover_degraded_authority_error(
+    message: impl Into<String>,
+    reason: &'static str,
+    extra_context: serde_json::Value,
+) -> RubError {
+    let mut context = serde_json::json!({
+        "reason": reason,
+    });
+    if let (Some(context_object), Some(extra_object)) =
+        (context.as_object_mut(), extra_context.as_object())
+    {
+        for (key, value) in extra_object {
+            context_object.insert(key.clone(), value.clone());
+        }
+    }
+    RubError::domain_with_context(ErrorCode::SessionBusy, message, context)
 }
 
 pub(super) fn takeover_continuity_failure(

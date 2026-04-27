@@ -50,6 +50,9 @@ async-trait = "0.1"
 # Base64 encoding (screenshots)
 base64 = "0.22"
 
+# Stable authority digests for short local runtime paths
+sha1 = "0.10.6"
+
 # Futures utilities
 futures = "0.3"
 

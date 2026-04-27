@@ -45,6 +45,7 @@ pub(crate) fn orchestration_failure_result(
         .and_then(|context| context.get("reason"))
         .and_then(|value| value.as_str())
         .map(|value| value.to_string());
+    let error_context = error.context.clone();
     committed_steps.push(OrchestrationStepResultInfo {
         step_index: failed_step_index,
         status: step_status,
@@ -59,6 +60,7 @@ pub(crate) fn orchestration_failure_result(
         result: None,
         error_code: Some(error.code),
         reason: reason.clone(),
+        error_context: error_context.clone(),
     });
     OrchestrationResultInfo {
         rule_id,
@@ -88,6 +90,7 @@ pub(crate) fn orchestration_failure_result(
         cooldown_until_ms: None,
         error_code: Some(error.code),
         reason,
+        error_context,
     }
 }
 

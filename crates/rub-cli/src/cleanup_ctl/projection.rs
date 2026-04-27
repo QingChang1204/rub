@@ -86,9 +86,12 @@ pub fn project_cleanup_result(rub_home: &Path, result: &CleanupResult) -> serde_
         "result": {
             "cleaned_stale_sessions": result.cleaned_stale_sessions,
             "kept_active_sessions": result.kept_active_sessions,
+            "compatibility_degraded_owned_sessions": result.compatibility_degraded_owned_sessions,
             "skipped_unreachable_sessions": result.skipped_unreachable_sessions,
             "cleaned_temp_daemons": result.cleaned_temp_daemons,
             "skipped_busy_temp_daemons": result.skipped_busy_temp_daemons,
+            "skipped_best_effort_phases": result.skipped_best_effort_phases,
+            "active_temp_homes_authority_complete": result.active_temp_homes_authority_complete,
             "removed_temp_homes": result.removed_temp_homes,
             "removed_temp_home_refs": cleanup_path_refs(
                 &result.removed_temp_homes,

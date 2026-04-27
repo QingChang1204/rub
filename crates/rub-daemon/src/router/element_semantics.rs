@@ -259,6 +259,7 @@ mod tests {
             text: String::new(),
             attributes: HashMap::new(),
             element_ref: Some("main:1".to_string()),
+            target_id: None,
             bounding_box: None,
             ax_info: None,
             listeners: None,

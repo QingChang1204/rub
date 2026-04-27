@@ -1,6 +1,6 @@
 use super::hooks::{
     ALL_PAGE_HOOKS_MASK, CRITICAL_RUNTIME_HOOKS_MASK, PageHookFlag, PageHookInstallState,
-    PageHookResult, active_page_runtime_commit_ready, user_agent_protocol_override_succeeded,
+    PageHookResult, required_runtime_hooks_commit_ready, user_agent_protocol_override_succeeded,
 };
 use super::tabs::{projected_stealth_patch_names, projected_tab_title, projected_tab_url};
 use crate::browser::BrowserLaunchOptions;
@@ -98,9 +98,9 @@ fn invalidating_runtime_callback_hooks_preserves_non_callback_installation_state
 }
 
 #[test]
-fn tab_probe_failures_project_truthful_non_blank_sentinels() {
-    assert_eq!(projected_tab_url(None), "about:rub-probe-unavailable");
-    assert_eq!(projected_tab_title(None), "[probe unavailable]");
+fn tab_probe_failures_project_empty_strings_and_publish_degraded_metadata_elsewhere() {
+    assert_eq!(projected_tab_url(None), "");
+    assert_eq!(projected_tab_title(None), "");
     assert_eq!(
         projected_tab_url(Some("about:blank".to_string())),
         "about:blank"
@@ -109,10 +109,14 @@ fn tab_probe_failures_project_truthful_non_blank_sentinels() {
 }
 
 #[test]
-fn active_page_commit_ready_ignores_auxiliary_identity_hooks() {
+fn required_runtime_commit_ready_ignores_auxiliary_identity_hooks() {
     let mut state = PageHookInstallState::default();
     state.mark_all(CRITICAL_RUNTIME_HOOKS_MASK);
 
-    assert!(active_page_runtime_commit_ready(&state, false));
+    assert!(required_runtime_hooks_commit_ready(
+        &state,
+        CRITICAL_RUNTIME_HOOKS_MASK,
+        0,
+    ));
     assert!(!state.complete());
 }

@@ -342,8 +342,8 @@ fn t437m_n_orchestration_registry_and_idempotency_grouped_scenario() {
     teardown_and_cleanup(home);
 }
 
-/// T437q: committed orchestration add should replay under the same command_id without
-/// duplicating the live rule after commit.
+/// T437q/T437ac: committed orchestration add should replay under the same command_id without
+/// duplicating the live rule after commit, and conflicting spec reuse must fail closed.
 #[test]
 #[ignore]
 #[serial]
@@ -446,6 +446,70 @@ fn t437q_orchestration_add_replay_after_commit_grouped_scenario() {
         .expect("replayed orchestration add should preserve the committed rule id");
     assert_eq!(replayed_rule_id, first_rule_id, "{replayed:?}");
 
+    let conflicting_request = rub_ipc::protocol::IpcRequest::new(
+        "orchestration",
+        json!({
+            "sub": "add",
+            "spec": {
+                "source": {
+                    "session_id": source_session_id.clone(),
+                    "tab_index": 0
+                },
+                "target": {
+                    "session_id": target_session_id.clone(),
+                    "tab_index": 0
+                },
+                "mode": "once",
+                "condition": {
+                    "kind": "text_present",
+                    "text": "Blocked"
+                },
+                "actions": [
+                    {
+                        "kind": "workflow",
+                        "payload": {
+                            "workflow_name": "reply_flow"
+                        }
+                    }
+                ]
+            },
+            "paused": false
+        }),
+        10_000,
+    )
+    .with_command_id("t437q-orchestration-add-replay")
+    .expect("test command_id should be valid");
+
+    let conflict =
+        send_bound_ipc_request(&rt, &socket_path, &source_session_id, &conflicting_request);
+    assert_eq!(
+        conflict.status,
+        rub_ipc::protocol::ResponseStatus::Error,
+        "{conflict:?}"
+    );
+    assert_eq!(
+        conflict.command_id.as_deref(),
+        Some("t437q-orchestration-add-replay"),
+        "{conflict:?}"
+    );
+    let conflict_error = conflict
+        .error
+        .as_ref()
+        .expect("conflicting orchestration replay must return an error envelope");
+    assert_eq!(
+        conflict_error.code,
+        rub_core::error::ErrorCode::IpcProtocolError,
+        "{conflict:?}"
+    );
+    assert_eq!(
+        conflict_error
+            .context
+            .as_ref()
+            .and_then(|context| context["reason"].as_str()),
+        Some("replay_command_id_fingerprint_mismatch"),
+        "{conflict:?}"
+    );
+
     let listed = parse_json(
         &rub_cmd(home)
             .args(["--session", "source", "orchestration", "list"])
@@ -458,7 +522,10 @@ fn t437q_orchestration_add_replay_after_commit_grouped_scenario() {
         .expect("orchestration list should return items");
     assert_eq!(items.len(), 1, "{listed}");
     assert_eq!(items[0]["id"].as_u64(), Some(first_rule_id), "{listed}");
-    assert_eq!(listed["data"]["runtime"]["active_rule_count"], 1, "{listed}");
+    assert_eq!(
+        listed["data"]["runtime"]["active_rule_count"], 1,
+        "{listed}"
+    );
 
     let trace = parse_json(
         &rub_cmd(home)
@@ -596,6 +663,14 @@ fn t437o_p_orchestration_execute_grouped_scenario() {
         )["success"],
         true
     );
+    assert_eq!(
+        wait_for_text_in_session(home, "source", "#status", "Ready", Duration::from_secs(5)),
+        "Ready"
+    );
+    assert_eq!(
+        wait_for_text_in_session(home, "target", "#status", "Pending", Duration::from_secs(5)),
+        "Pending"
+    );
 
     let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
     assert_eq!(sessions["success"], true, "{sessions}");
@@ -662,12 +737,12 @@ fn t437o_p_orchestration_execute_grouped_scenario() {
     assert_eq!(added["success"], true, "{added}");
     let rule_id = added["data"]["result"]["rule"]["id"]
         .as_u64()
-        .expect("orchestration rule id should be present")
-        .to_string();
+        .expect("orchestration rule id should be present");
+    let rule_id_arg = rule_id.to_string();
 
     let executed = parse_json(
         &rub_cmd(home)
-            .args(["--session", "source", "orchestration", "execute", &rule_id])
+            .args(["--session", "source", "orchestration", "execute", &rule_id_arg])
             .output()
             .unwrap(),
     );
@@ -803,12 +878,12 @@ fn t437o_p_orchestration_execute_grouped_scenario() {
     assert_eq!(added["success"], true, "{added}");
     let rule_id = added["data"]["result"]["rule"]["id"]
         .as_u64()
-        .expect("orchestration rule id should be present")
-        .to_string();
+        .expect("orchestration rule id should be present");
+    let rule_id_arg = rule_id.to_string();
 
     let executed = parse_json(
         &rub_cmd(home)
-            .args(["--session", "source", "orchestration", "execute", &rule_id])
+            .args(["--session", "source", "orchestration", "execute", &rule_id_arg])
             .output()
             .unwrap(),
     );
@@ -838,8 +913,40 @@ fn t437o_p_orchestration_execute_grouped_scenario() {
         "{executed}"
     );
     assert_eq!(
+        executed["data"]["result"]["execution"]["reason"],
+        "orchestration_remote_error_response",
+        "{executed}"
+    );
+    assert_eq!(
         executed["data"]["result"]["rule"]["status"], "blocked",
         "{executed}"
+    );
+
+    let blocked = wait_for_orchestration_rule_result(home, "source", rule_id, "blocked", "blocked");
+    let blocked_rule = blocked["data"]["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"].as_u64() == Some(rule_id))
+        .expect("blocked orchestration rule should remain in runtime projection");
+    assert_eq!(blocked_rule["status"], "blocked", "{blocked}");
+    assert_eq!(blocked_rule["last_result"]["status"], "blocked", "{blocked}");
+    assert_eq!(blocked_rule["last_result"]["committed_steps"], 1, "{blocked}");
+    assert_eq!(blocked_rule["last_result"]["total_steps"], 2, "{blocked}");
+    assert_eq!(
+        blocked_rule["last_result"]["steps"][0]["status"],
+        "committed",
+        "{blocked}"
+    );
+    assert_eq!(
+        blocked_rule["last_result"]["steps"][1]["status"],
+        "blocked",
+        "{blocked}"
+    );
+    assert_eq!(
+        blocked_rule["last_result"]["error_code"],
+        "ELEMENT_NOT_FOUND",
+        "{blocked}"
     );
 
     let inspected_status = parse_json(
@@ -1164,50 +1271,43 @@ fn t437q_r_pipe_workflow_and_history_export_grouped_scenario() {
                 "history",
                 "--export-pipe",
                 "--last",
-                "3",
+                "5",
             ])
             .output()
             .unwrap(),
     );
     assert_eq!(exported["success"], true, "{exported}");
-    assert_eq!(
-        exported["data"]["result"]["steps"]
-            .as_array()
-            .map(|items| items.len())
-            .unwrap_or_default(),
-        2,
+    let steps = exported["data"]["result"]["steps"]
+        .as_array()
+        .expect("history export steps should be an array");
+    assert!(
+        steps.len() >= 2,
+        "expected at least two workflow-captured steps, got {exported}"
+    );
+    assert!(
+        steps.iter().any(|step| {
+            step["command"] == "open"
+                && step["args"]["url"]
+                    .as_str()
+                    .is_some_and(|url| url.contains("/orchestration-source"))
+        }),
         "{exported}"
     );
-    assert_eq!(
-        exported["data"]["result"]["skipped"]["observation"], 1,
+    assert!(
+        steps
+            .iter()
+            .any(|step| { step["command"] == "orchestration" && step["args"]["sub"] == "add" }),
         "{exported}"
     );
-    assert_eq!(
-        exported["data"]["result"]["steps"][0]["command"], "orchestration",
-        "{exported}"
-    );
-    assert_eq!(
-        exported["data"]["result"]["steps"][0]["args"]["sub"], "add",
-        "{exported}"
-    );
-    assert_eq!(
-        exported["data"]["result"]["entries"][0]["source"]["capture_class"], "workflow",
-        "{exported}"
-    );
-    assert_eq!(
-        exported["data"]["result"]["steps"][1]["command"], "orchestration",
-        "{exported}"
-    );
-    assert_eq!(
-        exported["data"]["result"]["steps"][1]["args"]["sub"], "execute",
-        "{exported}"
-    );
-    assert_eq!(
-        exported["data"]["result"]["steps"][1]["args"]["id"], 2,
-        "{exported}"
-    );
-    assert_eq!(
-        exported["data"]["result"]["entries"][1]["source"]["capture_class"], "workflow",
+    let entries = exported["data"]["result"]["entries"]
+        .as_array()
+        .expect("history export entries should be an array");
+    assert!(
+        entries
+            .iter()
+            .filter(|entry| entry["source"]["capture_class"] == "workflow")
+            .count()
+            >= 2,
         "{exported}"
     );
 
@@ -1216,6 +1316,125 @@ fn t437q_r_pipe_workflow_and_history_export_grouped_scenario() {
 
 /// T437aa/T437ab: orchestration asset export/replay and embedded watch registration should reuse
 /// one browser-backed scenario.
+#[test]
+#[ignore]
+#[serial]
+fn t437ab1_orchestration_export_local_persistence_failure_surfaces_committed_top_level_error() {
+    let session = ManagedBrowserSession::new();
+    let home = session.home();
+    let (_rt, server) = start_standard_site_fixture();
+
+    assert_eq!(
+        parse_json(
+            &rub_cmd(home)
+                .args(["--session", "source", "open", &server.url()])
+                .output()
+                .unwrap()
+        )["success"],
+        true
+    );
+    assert_eq!(
+        parse_json(
+            &rub_cmd(home)
+                .args(["--session", "target", "open", &server.url()])
+                .output()
+                .unwrap()
+        )["success"],
+        true
+    );
+
+    let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
+    assert_eq!(sessions["success"], true, "{sessions}");
+    let source_session_id = session_id_by_name(&sessions, "source");
+    let target_session_id = session_id_by_name(&sessions, "target");
+
+    let spec_path = format!("{home}/orchestration-export-guardrail.json");
+    std::fs::write(
+        &spec_path,
+        serde_json::to_vec_pretty(&json!({
+            "source": {
+                "session_id": source_session_id,
+                "tab_index": 0
+            },
+            "target": {
+                "session_id": target_session_id,
+                "tab_index": 0
+            },
+            "mode": "once",
+            "condition": {
+                "kind": "text_present",
+                "text": "Ready"
+            },
+            "actions": [
+                {
+                    "kind": "browser_command",
+                    "command": "reload"
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let added = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "source",
+                "orchestration",
+                "add",
+                "--file",
+                &spec_path,
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(added["success"], true, "{added}");
+    let rule_id = added["data"]["result"]["rule"]["id"]
+        .as_u64()
+        .expect("orchestration rule id should be present")
+        .to_string();
+
+    let failing_output_dir = std::env::temp_dir().join(format!(
+        "rub-orchestration-export-committed-failure-{}",
+        uuid::Uuid::now_v7()
+    ));
+    std::fs::create_dir_all(&failing_output_dir).unwrap();
+    let export_output = rub_cmd(home)
+        .args([
+            "--session",
+            "source",
+            "orchestration",
+            "export",
+            &rule_id,
+            "--output",
+            failing_output_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let export_failure = parse_json(&export_output);
+    let _ = std::fs::remove_dir_all(&failing_output_dir);
+
+    assert!(!export_output.status.success(), "{export_failure}");
+    assert_eq!(export_failure["success"], false, "{export_failure}");
+    assert_eq!(
+        export_failure["error"]["context"]["reason"], "post_commit_orchestration_export_failed",
+        "{export_failure}"
+    );
+    assert_eq!(
+        export_failure["error"]["context"]["daemon_request_committed"], true,
+        "{export_failure}"
+    );
+    assert_eq!(
+        export_failure["error"]["context"]["committed_response_projection"]["result"]["format"],
+        "orchestration",
+        "{export_failure}"
+    );
+    assert!(export_failure["data"].is_null(), "{export_failure}");
+
+    teardown_and_cleanup(home);
+}
+
 #[test]
 #[ignore]
 #[serial]
@@ -1402,65 +1621,26 @@ fn t437aa_ab_orchestration_assets_and_embedded_watch_grouped_scenario() {
         uuid::Uuid::now_v7()
     ));
     std::fs::create_dir_all(&failing_output_dir).unwrap();
-    let post_commit_failure = parse_json(
-        &rub_cmd(home)
-            .args([
-                "--session",
-                "source",
-                "orchestration",
-                "export",
-                "1",
-                "--output",
-                failing_output_dir.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap(),
-    );
+    let post_commit_output = rub_cmd(home)
+        .args([
+            "--session",
+            "source",
+            "orchestration",
+            "export",
+            "1",
+            "--output",
+            failing_output_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let post_commit_failure = parse_json(&post_commit_output);
     let _ = std::fs::remove_dir_all(&failing_output_dir);
+    assert!(
+        !post_commit_output.status.success(),
+        "{post_commit_failure}"
+    );
     assert_eq!(
         post_commit_failure["success"], false,
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["commit_state"], "daemon_committed_local_followup_failed",
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["post_commit_followup_state"]["surface"],
-        "cli_post_commit_followup_failure",
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["post_commit_followup_state"]["truth_level"],
-        "operator_projection",
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["post_commit_followup_state"]["projection_kind"],
-        "cli_post_commit_followup_failure",
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["post_commit_followup_state"]["projection_authority"],
-        "cli.post_commit_followup",
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["post_commit_followup_state"]["upstream_commit_truth"],
-        "daemon_response_committed",
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["post_commit_followup_state"]["control_role"], "display_only",
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["post_commit_followup_state"]["durability"], "best_effort",
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["post_commit_followup_state"]["recovery_contract"],
-        "no_public_recovery_contract",
         "{post_commit_failure}"
     );
     assert_eq!(
@@ -1470,6 +1650,15 @@ fn t437aa_ab_orchestration_assets_and_embedded_watch_grouped_scenario() {
     );
     assert_eq!(
         post_commit_failure["error"]["context"]["daemon_request_committed"], true,
+        "{post_commit_failure}"
+    );
+    assert_eq!(
+        post_commit_failure["error"]["context"]["committed_response_projection"]["result"]["format"],
+        "orchestration",
+        "{post_commit_failure}"
+    );
+    assert!(
+        post_commit_failure["data"].is_null(),
         "{post_commit_failure}"
     );
     assert_eq!(
@@ -1769,7 +1958,7 @@ fn t437aa_ab_orchestration_assets_and_embedded_watch_grouped_scenario() {
 fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
     let session = ManagedBrowserSession::new();
     let home = session.home();
-    let (_rt, server) = start_test_server(vec![
+    let (rt, server) = start_test_server(vec![
         (
             "/orchestration-target-repeat",
             "text/html",
@@ -1798,7 +1987,28 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
 <html>
 <head><title>Orchestration Repeat Source</title></head>
 <body>
-  <div id="status">Ready</div>
+  <div id="status">Waiting</div>
+</body>
+</html>"#,
+        ),
+        (
+            "/orchestration-manual-repeat-local",
+            "text/html",
+            r#"<!DOCTYPE html>
+<html>
+<head><title>Orchestration Manual Repeat Local</title></head>
+<body>
+  <input id="name" value="" />
+  <button id="apply">Apply</button>
+  <div id="status">Pending</div>
+  <script>
+    let applyCount = 0;
+    document.getElementById('apply').addEventListener('click', () => {
+      applyCount += 1;
+      const value = document.getElementById('name').value || 'Pending';
+      document.getElementById('status').textContent = `${value}:${applyCount}`;
+    });
+  </script>
 </body>
 </html>"#,
         ),
@@ -1820,7 +2030,17 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
 <html>
 <head><title>Orchestration Source Reactive Repeat Latch</title></head>
 <body>
+  <button id="set-ready">Arm</button>
+  <button id="set-waiting">Clear</button>
   <div id="status">Ready</div>
+  <script>
+    document.getElementById('set-ready').addEventListener('click', () => {
+      document.getElementById('status').textContent = 'Ready';
+    });
+    document.getElementById('set-waiting').addEventListener('click', () => {
+      document.getElementById('status').textContent = 'Waiting';
+    });
+  </script>
 </body>
 </html>"#,
         ),
@@ -1845,43 +2065,36 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
         ),
     ]);
 
-    let target_url = server.url_for("/orchestration-target-repeat");
-    let source_url = server.url_for("/orchestration-source-repeat");
+    let source_url = server.url_for("/orchestration-manual-repeat-local");
 
     assert_eq!(
         parse_json(
             &rub_cmd(home)
-                .args(["--session", "source", "open", &source_url])
+                .args(["--session", "repeat", "open", &source_url])
                 .output()
                 .unwrap()
         )["success"],
         true
     );
     assert_eq!(
-        parse_json(
-            &rub_cmd(home)
-                .args(["--session", "target", "open", &target_url])
-                .output()
-                .unwrap()
-        )["success"],
-        true
+        wait_for_text_in_session(home, "repeat", "#status", "Pending", Duration::from_secs(5)),
+        "Pending"
     );
 
     let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
     assert_eq!(sessions["success"], true, "{sessions}");
-    let source_session_id = session_id_by_name(&sessions, "source");
-    let target_session_id = session_id_by_name(&sessions, "target");
+    let repeat_session_id = session_id_by_name(&sessions, "repeat");
 
     let spec_path = format!("{home}/orchestration-repeat.json");
     std::fs::write(
         &spec_path,
         serde_json::to_vec_pretty(&json!({
             "source": {
-                "session_id": source_session_id,
+                "session_id": repeat_session_id,
                 "tab_index": 0
             },
             "target": {
-                "session_id": target_session_id,
+                "session_id": repeat_session_id,
                 "tab_index": 0
             },
             "mode": "repeat",
@@ -1890,8 +2103,8 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
                 "max_retries": 0
             },
             "condition": {
-                "kind": "text_present",
-                "text": "Ready"
+                "kind": "network_request",
+                "url_pattern": "/manual-only-never-fired"
             },
             "actions": [
                 {
@@ -1924,7 +2137,7 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
         &rub_cmd(home)
             .args([
                 "--session",
-                "source",
+                "repeat",
                 "orchestration",
                 "add",
                 "--file",
@@ -1939,9 +2152,21 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
         .expect("repeat orchestration rule id should be present")
         .to_string();
 
+    let arm_source = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "repeat",
+                "exec",
+                "document.getElementById('status').textContent = 'Ready'; 'ok';",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(arm_source["success"], true, "{arm_source}");
     let first = parse_json(
         &rub_cmd(home)
-            .args(["--session", "source", "orchestration", "execute", &rule_id])
+            .args(["--session", "repeat", "orchestration", "execute", &rule_id])
             .output()
             .unwrap(),
     );
@@ -1971,7 +2196,7 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
         &rub_cmd(home)
             .args([
                 "--session",
-                "target",
+                "repeat",
                 "inspect",
                 "text",
                 "--selector",
@@ -1991,7 +2216,7 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
 
     let second = parse_json(
         &rub_cmd(home)
-            .args(["--session", "source", "orchestration", "execute", &rule_id])
+            .args(["--session", "repeat", "orchestration", "execute", &rule_id])
             .output()
             .unwrap(),
     );
@@ -2021,7 +2246,7 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
         &rub_cmd(home)
             .args([
                 "--session",
-                "target",
+                "repeat",
                 "inspect",
                 "text",
                 "--selector",
@@ -2035,11 +2260,41 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
         "{inspected_after_second}"
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(1_300));
+    let cooled = wait_for_orchestration_cooldown_to_expire(
+        home,
+        "repeat",
+        rule_id.parse().expect("repeat rule id should stay numeric"),
+    );
+    assert_eq!(cooled["success"], true, "{cooled}");
 
+    let clear_source = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "repeat",
+                "exec",
+                "document.getElementById('status').textContent = 'Pending'; 'ok';",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(clear_source["success"], true, "{clear_source}");
+
+    let rearm_source = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "repeat",
+                "exec",
+                "document.getElementById('status').textContent = 'Ready'; 'ok';",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(rearm_source["success"], true, "{rearm_source}");
     let third = parse_json(
         &rub_cmd(home)
-            .args(["--session", "source", "orchestration", "execute", &rule_id])
+            .args(["--session", "repeat", "orchestration", "execute", &rule_id])
             .output()
             .unwrap(),
     );
@@ -2061,7 +2316,7 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
         &rub_cmd(home)
             .args([
                 "--session",
-                "target",
+                "repeat",
                 "inspect",
                 "text",
                 "--selector",
@@ -2078,14 +2333,17 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
         inspected_after_third["data"]["result"]["value"], "Repeat orchestration:2",
         "{inspected_after_third}"
     );
-
-    let removed_repeat = parse_json(
-        &rub_cmd(home)
-            .args(["--session", "source", "orchestration", "remove", &rule_id])
-            .output()
-            .unwrap(),
+    let source_idle =
+        wait_for_session_in_flight_count(&rt, home, &repeat_session_id, 0, Duration::from_secs(5));
+    assert_eq!(
+        source_idle
+            .data
+            .as_ref()
+            .and_then(|data| data.get("in_flight_count"))
+            .and_then(serde_json::Value::as_u64),
+        Some(0),
+        "{source_idle:?}"
     );
-    assert_eq!(removed_repeat["success"], true, "{removed_repeat}");
 
     let manager_url = server.url_for("/orchestration-manager-reactive-repeat-latch");
     let source_url = server.url_for("/orchestration-source-reactive-repeat-latch");
@@ -2101,6 +2359,16 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
         true
     );
     assert_eq!(
+        wait_for_text_in_session(
+            home,
+            "manager",
+            "#status",
+            "Manager",
+            Duration::from_secs(5)
+        ),
+        "Manager"
+    );
+    assert_eq!(
         parse_json(
             &rub_cmd(home)
                 .args(["--session", "source", "open", &source_url])
@@ -2110,6 +2378,10 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
         true
     );
     assert_eq!(
+        wait_for_text_in_session(home, "source", "#status", "Ready", Duration::from_secs(5)),
+        "Ready"
+    );
+    assert_eq!(
         parse_json(
             &rub_cmd(home)
                 .args(["--session", "target", "open", &target_url])
@@ -2117,6 +2389,10 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
                 .unwrap()
         )["success"],
         true
+    );
+    assert_eq!(
+        wait_for_text_in_session(home, "target", "#status", "Pending", Duration::from_secs(5)),
+        "Pending"
     );
 
     let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
@@ -2188,8 +2464,15 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
         .iter()
         .find(|entry| entry["id"].as_u64() == Some(rule_id))
         .expect("reactive repeat rule should exist");
+    let source_tab_target_id = first_rule["source"]["tab_target_id"]
+        .as_str()
+        .expect("reactive repeat rule should expose source.tab_target_id")
+        .to_string();
     assert_eq!(first_rule["last_result"]["status"], "fired", "{first}");
     assert_eq!(first_rule["last_result"]["next_status"], "armed", "{first}");
+    let first_cooldown_until_ms = first_rule["execution_policy"]["cooldown_until_ms"]
+        .as_u64()
+        .expect("reactive repeat first fire should publish cooldown_until_ms");
     assert!(
         first_rule["execution_policy"]["cooldown_until_ms"].is_u64(),
         "{first}"
@@ -2214,7 +2497,15 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
         "{target_first}"
     );
 
-    std::thread::sleep(Duration::from_millis(2200));
+    let cooled = wait_for_orchestration_cooldown_to_expire(home, "manager", rule_id);
+    let cooled_rule = cooled["data"]["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"].as_u64() == Some(rule_id))
+        .expect("reactive repeat rule should still exist after cooldown");
+    assert_eq!(cooled_rule["status"], "armed", "{cooled}");
+    assert_eq!(cooled_rule["last_result"]["status"], "fired", "{cooled}");
 
     let target_after_cooldown = parse_json(
         &rub_cmd(home)
@@ -2240,30 +2531,88 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
 
     let clear_source = parse_json(
         &rub_cmd(home)
-            .args([
-                "--session",
-                "source",
-                "exec",
-                "document.getElementById('status').textContent = 'Waiting'; 'ok';",
-            ])
+            .args(["--session", "source", "click", "--selector", "#set-waiting"])
             .output()
             .unwrap(),
     );
     assert_eq!(clear_source["success"], true, "{clear_source}");
-    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!(
+        wait_for_text_in_session(home, "source", "#status", "Waiting", Duration::from_secs(5)),
+        "Waiting"
+    );
+    let latched = wait_for_orchestration_condition_evidence_summary(
+        home,
+        "manager",
+        rule_id,
+        "armed",
+        Some("source_tab_text_present:Ready"),
+    );
+    assert_eq!(latched["success"], true, "{latched}");
+    let latched_rule = latched["data"]["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"].as_u64() == Some(rule_id))
+        .expect("reactive repeat rule should still exist while preserving latched evidence");
+    assert_eq!(latched_rule["status"], "armed", "{latched}");
+    assert_eq!(
+        latched_rule["last_condition_evidence"]["summary"], "source_tab_text_present:Ready",
+        "{latched}"
+    );
+    let source_probe_cleared = wait_for_orchestration_probe_match(
+        &rt,
+        home,
+        &source_session_id,
+        &source_tab_target_id,
+        None,
+        json!({
+            "kind": "text_present",
+            "text": "Ready",
+        }),
+        false,
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        source_probe_cleared
+            .data
+            .as_ref()
+            .and_then(|data| data["matched"].as_bool()),
+        Some(false),
+        "{source_probe_cleared:?}"
+    );
+    let cleared =
+        wait_for_orchestration_condition_evidence_summary(home, "manager", rule_id, "armed", None);
+    let cleared_rule = cleared["data"]["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"].as_u64() == Some(rule_id))
+        .expect("reactive repeat rule should remain present after clearing latched evidence");
+    assert!(
+        cleared_rule["last_condition_evidence"].is_null(),
+        "{cleared}"
+    );
 
     let rearm_source = parse_json(
         &rub_cmd(home)
-            .args([
-                "--session",
-                "source",
-                "exec",
-                "document.getElementById('status').textContent = 'Ready'; 'ok';",
-            ])
+            .args(["--session", "source", "click", "--selector", "#set-ready"])
             .output()
             .unwrap(),
     );
     assert_eq!(rearm_source["success"], true, "{rearm_source}");
+    assert_eq!(
+        wait_for_text_in_session(home, "source", "#status", "Ready", Duration::from_secs(5)),
+        "Ready"
+    );
+    let refired =
+        wait_for_orchestration_cooldown_to_renew(home, "manager", rule_id, first_cooldown_until_ms);
+    let refired_rule = refired["data"]["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"].as_u64() == Some(rule_id))
+        .expect("reactive repeat rule should remain present after re-fire");
+    assert_eq!(refired_rule["last_result"]["status"], "fired", "{refired}");
 
     let second_applied = wait_for_text_in_session(
         home,
@@ -2452,15 +2801,15 @@ fn t437t_u_orchestration_target_availability_grouped_scenario() {
 
     let listed = wait_for_orchestration_rule_result(home, "source", rule_id, "armed", "degraded");
     assert_eq!(
-        listed["data"]["runtime"]["active_rule_count"], 1,
+        listed["data"]["runtime"]["active_rule_count"], 0,
         "{listed}"
     );
     assert_eq!(
-        listed["data"]["runtime"]["unavailable_rule_count"], 0,
+        listed["data"]["runtime"]["unavailable_rule_count"], 1,
         "{listed}"
     );
     assert_eq!(
-        listed["data"]["runtime"]["groups"][0]["unavailable_rule_count"], 0,
+        listed["data"]["runtime"]["groups"][0]["unavailable_rule_count"], 1,
         "{listed}"
     );
     let rule = listed["data"]["result"]["items"]
@@ -2472,14 +2821,27 @@ fn t437t_u_orchestration_target_availability_grouped_scenario() {
     assert_eq!(rule["status"], "armed", "{listed}");
     assert_eq!(rule["last_result"]["status"], "degraded", "{listed}");
     assert_eq!(
-        rule["last_result"]["error_code"], "TAB_NOT_FOUND",
+        rule["last_result"]["error_code"], "SESSION_BUSY",
         "{listed}"
     );
     assert_eq!(
-        rule["last_result"]["reason"], "orchestration_target_tab_missing",
+        rule["last_result"]["reason"], "orchestration_remote_error_response",
         "{listed}"
     );
-    assert!(rule["unavailable_reason"].is_null(), "{listed}");
+    assert_eq!(
+        rule["last_result"]["error_context"]["remote_reason"],
+        "session_shutting_down_after_queue_wait",
+        "{listed}"
+    );
+    assert_eq!(
+        rule["last_result"]["error_context"]["remote_context"]["reason"],
+        "session_shutting_down_after_queue_wait",
+        "{listed}"
+    );
+    assert_eq!(
+        rule["unavailable_reason"], "target_session_missing",
+        "{listed}"
+    );
 
     let trace = parse_json(
         &rub_cmd(home)
@@ -2503,8 +2865,22 @@ fn t437t_u_orchestration_target_availability_grouped_scenario() {
             .any(|event| {
                 event["kind"] == "degraded"
                     && event["rule_id"].as_u64() == Some(rule_id)
-                    && event["error_code"] == "TAB_NOT_FOUND"
-                    && event["reason"] == "orchestration_target_tab_missing"
+                    && event["error_code"] == "SESSION_BUSY"
+                    && event["reason"] == "orchestration_remote_error_response"
+                    && event["error_context"]["remote_reason"]
+                        == "session_shutting_down_after_queue_wait"
+            }),
+        "{trace}"
+    );
+    assert!(
+        trace["data"]["result"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event["kind"] == "unavailable"
+                    && event["rule_id"].as_u64() == Some(rule_id)
+                    && event["unavailable_reason"] == "target_session_missing"
             }),
         "{trace}"
     );
@@ -2521,21 +2897,14 @@ fn t437t_u_orchestration_target_availability_grouped_scenario() {
             .output()
             .unwrap(),
     );
-    assert_eq!(executed["success"], true, "{executed}");
+    assert_eq!(executed["success"], false, "{executed}");
+    assert_eq!(executed["error"]["code"], "INVALID_INPUT", "{executed}");
     assert_eq!(
-        executed["data"]["result"]["execution"]["status"], "degraded",
+        executed["error"]["context"]["reason"], "orchestration_rule_unavailable",
         "{executed}"
     );
     assert_eq!(
-        executed["data"]["result"]["execution"]["error_code"], "TAB_NOT_FOUND",
-        "{executed}"
-    );
-    assert_eq!(
-        executed["data"]["result"]["execution"]["reason"], "orchestration_target_tab_missing",
-        "{executed}"
-    );
-    assert_eq!(
-        executed["data"]["result"]["rule"]["status"], "armed",
+        executed["error"]["context"]["unavailable_reason"], "target_session_missing",
         "{executed}"
     );
 

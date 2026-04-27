@@ -9,6 +9,7 @@ use rub_core::model::{
     NetworkRule, NetworkRuleEffect, NetworkRuleEffectKind, NetworkRuleSpec, NetworkRuleStatus,
 };
 use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
@@ -207,6 +208,14 @@ async fn handle_request_paused(
         )
     });
 
+    publish_request_correlation_before_actuation(
+        &request_correlation,
+        event.request_id.as_ref(),
+        event.request.method.as_str(),
+        correlation.as_ref(),
+    )
+    .await;
+
     match plan.action {
         RequestPlanAction::Continue { url, headers } => {
             let mut builder = ContinueRequestParams::builder().request_id(event.request_id.clone());
@@ -216,49 +225,110 @@ async fn handle_request_paused(
             if let Some(headers) = headers {
                 builder = builder.headers(headers);
             }
-            page.execute(builder.build().map_err(RubError::Internal)?)
-                .await
-                .map_err(|e| {
-                    RubError::domain(
-                        ErrorCode::BrowserCrashed,
-                        format!("Failed to continue intercepted request: {e}"),
-                    )
-                })?;
-            if let Some((network_id, correlation)) = correlation {
-                request_correlation.lock().await.record(
-                    event.request_id.as_ref().to_string(),
-                    network_id,
-                    event.request.method.clone(),
-                    correlation,
-                );
-            }
+            run_request_actuation_with_prerecorded_correlation(
+                &request_correlation,
+                event.request_id.as_ref(),
+                move || {
+                    let command = builder.build().map_err(RubError::Internal)?;
+                    Ok(async move {
+                        page.execute(command).await.map_err(|e| {
+                            RubError::domain(
+                                ErrorCode::BrowserCrashed,
+                                format!("Failed to continue intercepted request: {e}"),
+                            )
+                        })
+                    })
+                },
+            )
+            .await?;
         }
         RequestPlanAction::Block => {
-            page.execute(
-                chromiumoxide::cdp::browser_protocol::fetch::FailRequestParams::new(
-                    event.request_id.clone(),
-                    ErrorReason::BlockedByClient,
-                ),
+            run_request_actuation_with_prerecorded_correlation(
+                &request_correlation,
+                event.request_id.as_ref(),
+                move || {
+                    Ok(async move {
+                        page.execute(
+                            chromiumoxide::cdp::browser_protocol::fetch::FailRequestParams::new(
+                                event.request_id.clone(),
+                                ErrorReason::BlockedByClient,
+                            ),
+                        )
+                        .await
+                        .map_err(|e| {
+                            RubError::domain(
+                                ErrorCode::BrowserCrashed,
+                                format!("Failed to block intercepted request: {e}"),
+                            )
+                        })
+                    })
+                },
             )
-            .await
-            .map_err(|e| {
-                RubError::domain(
-                    ErrorCode::BrowserCrashed,
-                    format!("Failed to block intercepted request: {e}"),
-                )
-            })?;
-            if let Some((network_id, correlation)) = correlation {
-                request_correlation.lock().await.record(
-                    event.request_id.as_ref().to_string(),
-                    network_id,
-                    event.request.method.clone(),
-                    correlation,
-                );
-            }
+            .await?;
         }
     }
 
     Ok(())
+}
+
+async fn publish_request_correlation_before_actuation(
+    request_correlation: &Arc<Mutex<RequestCorrelationRegistry>>,
+    fetch_request_id: &str,
+    method: &str,
+    correlation: Option<&(Option<String>, RequestCorrelation)>,
+) {
+    let Some((network_id, correlation)) = correlation else {
+        return;
+    };
+    request_correlation.lock().await.record(
+        fetch_request_id.to_string(),
+        network_id.clone(),
+        method.to_string(),
+        correlation.clone(),
+    );
+}
+
+async fn rollback_request_correlation_after_failed_actuation(
+    request_correlation: &Arc<Mutex<RequestCorrelationRegistry>>,
+    fetch_request_id: &str,
+) {
+    request_correlation
+        .lock()
+        .await
+        .discard_for_fetch_request_id(fetch_request_id);
+}
+
+async fn run_request_actuation_with_prerecorded_correlation<T, Prepare, Fut>(
+    request_correlation: &Arc<Mutex<RequestCorrelationRegistry>>,
+    fetch_request_id: &str,
+    prepare: Prepare,
+) -> Result<T, RubError>
+where
+    Prepare: FnOnce() -> Result<Fut, RubError>,
+    Fut: Future<Output = Result<T, RubError>>,
+{
+    let future = match prepare() {
+        Ok(future) => future,
+        Err(error) => {
+            rollback_request_correlation_after_failed_actuation(
+                request_correlation,
+                fetch_request_id,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    match future.await {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            rollback_request_correlation_after_failed_actuation(
+                request_correlation,
+                fetch_request_id,
+            )
+            .await;
+            Err(error)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -475,12 +545,22 @@ fn join_rewrite_target(target_base: &str, suffix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_request_plan, headers_to_map, join_rewrite_target, wildcard_matches};
+    use super::{
+        build_request_plan, headers_to_map, join_rewrite_target,
+        publish_request_correlation_before_actuation,
+        rollback_request_correlation_after_failed_actuation,
+        run_request_actuation_with_prerecorded_correlation, wildcard_matches,
+    };
     use chromiumoxide::cdp::browser_protocol::network::Headers;
+    use rub_core::error::{ErrorCode, RubError};
     use rub_core::model::{
         NetworkRule, NetworkRuleEffect, NetworkRuleEffectKind, NetworkRuleSpec, NetworkRuleStatus,
     };
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    use crate::request_correlation::{RequestCorrelation, RequestCorrelationRegistry};
 
     #[test]
     fn wildcard_matching_supports_exact_and_glob_patterns() {
@@ -606,6 +686,161 @@ mod tests {
             Some("application/json")
         );
         assert_eq!(map.get("x-number").map(String::as_str), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn prerecord_correlation_is_visible_before_actuation() {
+        let registry = Arc::new(Mutex::new(RequestCorrelationRegistry::default()));
+        let correlation = (
+            Some("net-1".to_string()),
+            RequestCorrelation {
+                tab_target_id: Some("tab-1".to_string()),
+                original_url: "https://example.com/original".to_string(),
+                rewritten_url: Some("https://example.com/final".to_string()),
+                effective_request_headers: None,
+                applied_rule_effects: vec![NetworkRuleEffect {
+                    rule_id: 1,
+                    kind: NetworkRuleEffectKind::Rewrite,
+                }],
+            },
+        );
+
+        publish_request_correlation_before_actuation(&registry, "req-1", "GET", Some(&correlation))
+            .await;
+
+        let resolved = registry.lock().await.peek_for_request(
+            "req-1",
+            "https://example.com/final",
+            "GET",
+            None,
+            Some("tab-1"),
+        );
+        assert!(
+            resolved.is_some(),
+            "pre-recorded correlation must be visible before request observatory callbacks run"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_actuation_rolls_back_prerecorded_correlation() {
+        let registry = Arc::new(Mutex::new(RequestCorrelationRegistry::default()));
+        let correlation = (
+            Some("net-2".to_string()),
+            RequestCorrelation {
+                tab_target_id: Some("tab-2".to_string()),
+                original_url: "https://example.com/original".to_string(),
+                rewritten_url: Some("https://example.com/final".to_string()),
+                effective_request_headers: None,
+                applied_rule_effects: vec![NetworkRuleEffect {
+                    rule_id: 2,
+                    kind: NetworkRuleEffectKind::Block,
+                }],
+            },
+        );
+
+        publish_request_correlation_before_actuation(&registry, "req-2", "GET", Some(&correlation))
+            .await;
+        rollback_request_correlation_after_failed_actuation(&registry, "req-2").await;
+
+        let resolved = registry.lock().await.take_for_request(
+            "req-2",
+            "https://example.com/final",
+            "GET",
+            None,
+            Some("tab-2"),
+        );
+        assert!(
+            resolved.is_none(),
+            "failed actuation must not leave pre-recorded correlation authority behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn prerecorded_correlation_rolls_back_when_actuation_prepare_fails() {
+        let registry = Arc::new(Mutex::new(RequestCorrelationRegistry::default()));
+        let correlation = (
+            Some("net-3".to_string()),
+            RequestCorrelation {
+                tab_target_id: Some("tab-3".to_string()),
+                original_url: "https://example.com/original".to_string(),
+                rewritten_url: Some("https://example.com/final".to_string()),
+                effective_request_headers: None,
+                applied_rule_effects: vec![NetworkRuleEffect {
+                    rule_id: 3,
+                    kind: NetworkRuleEffectKind::Rewrite,
+                }],
+            },
+        );
+
+        publish_request_correlation_before_actuation(&registry, "req-3", "GET", Some(&correlation))
+            .await;
+
+        let result: Result<(), RubError> = run_request_actuation_with_prerecorded_correlation(
+            &registry,
+            "req-3",
+            || -> Result<std::future::Ready<Result<(), RubError>>, RubError> {
+                Err(RubError::Internal("prepare failed".to_string()))
+            },
+        )
+        .await;
+
+        assert!(result.is_err(), "prepare failure should propagate");
+        let resolved = registry.lock().await.take_for_request(
+            "req-3",
+            "https://example.com/final",
+            "GET",
+            None,
+            Some("tab-3"),
+        );
+        assert!(
+            resolved.is_none(),
+            "prepare failure must roll back pre-recorded correlation authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn prerecorded_correlation_rolls_back_when_actuation_future_fails() {
+        let registry = Arc::new(Mutex::new(RequestCorrelationRegistry::default()));
+        let correlation = (
+            Some("net-4".to_string()),
+            RequestCorrelation {
+                tab_target_id: Some("tab-4".to_string()),
+                original_url: "https://example.com/original".to_string(),
+                rewritten_url: Some("https://example.com/final".to_string()),
+                effective_request_headers: None,
+                applied_rule_effects: vec![NetworkRuleEffect {
+                    rule_id: 4,
+                    kind: NetworkRuleEffectKind::Block,
+                }],
+            },
+        );
+
+        publish_request_correlation_before_actuation(&registry, "req-4", "GET", Some(&correlation))
+            .await;
+
+        let result: Result<(), RubError> =
+            run_request_actuation_with_prerecorded_correlation(&registry, "req-4", || {
+                Ok(async {
+                    Err(RubError::domain(
+                        ErrorCode::BrowserCrashed,
+                        "actuation failed",
+                    ))
+                })
+            })
+            .await;
+
+        assert!(result.is_err(), "actuation failure should propagate");
+        let resolved = registry.lock().await.take_for_request(
+            "req-4",
+            "https://example.com/final",
+            "GET",
+            None,
+            Some("tab-4"),
+        );
+        assert!(
+            resolved.is_none(),
+            "future failure must roll back pre-recorded correlation authority"
+        );
     }
 
     #[test]

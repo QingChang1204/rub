@@ -5,7 +5,7 @@ use rub_core::model::{
     RememberedBindingAliasTarget,
 };
 use rub_daemon::rub_paths::RubPaths;
-use rub_daemon::session::{RegistryAuthoritySnapshot, RegistryEntry, registry_authority_snapshot};
+use rub_daemon::session::{RegistryAuthoritySnapshot, RegistryEntry, RegistryEntryLiveness};
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -30,13 +30,17 @@ pub(crate) fn project_binding_list(rub_home: &Path) -> Result<Value, RubError> {
         })
         .collect::<Vec<_>>();
 
-    Ok(json!({
+    let mut projection = json!({
         "subject": binding_registry_subject(rub_home),
         "result": {
             "schema_version": state.registry.schema_version,
             "items": items,
         }
-    }))
+    });
+    if let Some(error) = state.live_registry_error_value() {
+        projection["result"]["live_registry_error"] = error;
+    }
+    Ok(projection)
 }
 
 pub(crate) fn project_binding_inspect(rub_home: &Path, alias: &str) -> Result<Value, RubError> {
@@ -51,30 +55,39 @@ pub(crate) fn project_binding_inspect(rub_home: &Path, alias: &str) -> Result<Va
         .ok_or_else(|| binding_alias_not_found_error(rub_home, &normalized))?;
     let (live_status, resolution) = project_live_status(&binding, state.live_snapshot());
 
-    Ok(json!({
+    let mut projection = json!({
         "subject": binding_alias_subject(rub_home, &normalized),
         "result": {
             "binding": binding,
             "live_status": live_status,
             "resolution": resolution,
         }
-    }))
-}
-
-pub(crate) fn resolve_binding_target(
-    rub_home: &Path,
-    binding_alias: &str,
-) -> Result<RememberedBindingAliasTarget, RubError> {
-    let state = load_binding_resolution_state(rub_home)?;
-    resolve_binding_target_from_state(binding_alias, &state)
+    });
+    if let Some(error) = state.live_registry_error_value() {
+        projection["result"]["live_registry_error"] = error;
+    }
+    Ok(projection)
 }
 
 pub(crate) fn load_binding_resolution_state(
     rub_home: &Path,
 ) -> Result<BindingResolutionState, RubError> {
+    let registry = read_binding_registry(rub_home)?;
+    load_binding_resolution_state_from_registry(rub_home, registry)
+}
+
+pub(crate) fn load_binding_resolution_state_from_registry(
+    rub_home: &Path,
+    registry: BindingRegistryData,
+) -> Result<BindingResolutionState, RubError> {
+    let (live_snapshot, live_snapshot_error) = match load_live_registry_snapshot(rub_home) {
+        Ok(snapshot) => (Some(snapshot), None),
+        Err(error) => (None, Some(error)),
+    };
     Ok(BindingResolutionState {
-        registry: read_binding_registry(rub_home)?,
-        live_snapshot: load_live_registry_snapshot(rub_home),
+        registry,
+        live_snapshot,
+        live_snapshot_error,
     })
 }
 
@@ -121,18 +134,60 @@ pub(crate) fn binding_alias_not_found_error(rub_home: &Path, alias: &str) -> Rub
     )
 }
 
-pub(crate) fn load_live_registry_snapshot(rub_home: &Path) -> Option<RegistryAuthoritySnapshot> {
-    registry_authority_snapshot(rub_home).ok()
+pub(crate) fn load_live_registry_snapshot(
+    rub_home: &Path,
+) -> Result<RegistryAuthoritySnapshot, RubError> {
+    crate::daemon_ctl::registry_authority_snapshot(rub_home)
 }
 
 pub(crate) struct BindingResolutionState {
     registry: BindingRegistryData,
     live_snapshot: Option<RegistryAuthoritySnapshot>,
+    live_snapshot_error: Option<RubError>,
 }
 
 impl BindingResolutionState {
     pub(crate) fn live_snapshot(&self) -> Option<&RegistryAuthoritySnapshot> {
         self.live_snapshot.as_ref()
+    }
+
+    pub(crate) fn live_snapshot_error(&self) -> Option<&RubError> {
+        self.live_snapshot_error.as_ref()
+    }
+
+    pub(crate) fn live_registry_error_value(&self) -> Option<Value> {
+        self.live_snapshot_error
+            .as_ref()
+            .map(project_live_registry_error)
+    }
+}
+
+pub(crate) fn project_live_registry_error(error: &RubError) -> Value {
+    match error {
+        RubError::Domain(envelope) => json!({
+            "code": envelope.code,
+            "message": envelope.message,
+            "context": envelope.context,
+            "suggestion": envelope.suggestion,
+        }),
+        RubError::Io(io_error) => json!({
+            "code": ErrorCode::IoError,
+            "message": io_error.to_string(),
+            "context": Value::Null,
+            "suggestion": ErrorCode::IoError.suggestion(),
+        }),
+        RubError::Json(json_error) => json!({
+            "code": ErrorCode::JsonError,
+            "message": json_error.to_string(),
+            "context": Value::Null,
+            "suggestion": ErrorCode::JsonError.suggestion(),
+        }),
+        RubError::Internal(message) => json!({
+            "code": ErrorCode::InternalError,
+            "message": message,
+            "context": Value::Null,
+            "suggestion": ErrorCode::InternalError.suggestion(),
+        }),
     }
 }
 
@@ -249,7 +304,23 @@ fn find_live_matches(
     binding: &BindingRecord,
     snapshot: &RegistryAuthoritySnapshot,
 ) -> Vec<LiveBindingMatch> {
-    let entries = snapshot.active_entries();
+    let entries = snapshot
+        .active_entry_snapshots()
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                entry.liveness,
+                RegistryEntryLiveness::Live
+                    | RegistryEntryLiveness::BusyOrUnknown
+                    | RegistryEntryLiveness::ProbeContractFailure
+            )
+        })
+        .map(|entry| entry.entry)
+        .collect::<Vec<_>>();
+    let attachment_identity_authority = binding.attachment_identity.as_ref().or(binding
+        .auth_provenance
+        .captured_from_attachment_identity
+        .as_ref());
 
     let exact_session_matches = entries
         .iter()
@@ -274,11 +345,10 @@ fn find_live_matches(
     let attachment_matches = entries
         .iter()
         .filter(|entry| {
-            binding
-                .attachment_identity
+            attachment_identity_authority
                 .as_ref()
                 .zip(entry.attachment_identity.as_ref())
-                .is_some_and(|(left, right)| left == right)
+                .is_some_and(|(left, right)| left.as_str() == right.as_str())
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -292,11 +362,7 @@ fn find_live_matches(
             .collect();
     }
 
-    if binding
-        .attachment_identity
-        .as_deref()
-        .is_some_and(|identity| identity.starts_with("profile:"))
-    {
+    if attachment_identity_authority.is_some_and(|identity| identity.starts_with("profile:")) {
         return Vec::new();
     }
 

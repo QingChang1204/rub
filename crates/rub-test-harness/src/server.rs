@@ -360,17 +360,14 @@ impl Drop for TestServer {
         let handle = self.runtime_handle.clone();
 
         if tokio::runtime::Handle::try_current().is_ok() {
-            let waiter = std::thread::spawn(move || {
-                handle.block_on(async move {
-                    if let Some(rx) = shutdown_done_rx {
-                        let _ = rx.await;
-                    }
-                    if let Some(task) = server_task {
-                        let _ = task.await;
-                    }
-                });
+            handle.spawn(async move {
+                if let Some(rx) = shutdown_done_rx {
+                    let _ = rx.await;
+                }
+                if let Some(task) = server_task {
+                    let _ = task.await;
+                }
             });
-            let _ = waiter.join();
         } else {
             handle.block_on(async move {
                 if let Some(rx) = shutdown_done_rx {
@@ -435,6 +432,21 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), server.stop_async())
             .await
             .expect("shutdown should not hang on half-open connections");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drop_on_current_thread_runtime_does_not_block_runtime_progress() {
+        let server = TestServer::start(vec![("/ok", "text/plain", "ok")]).await;
+        let addr = server.addr;
+
+        drop(server);
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            tokio::task::yield_now().await;
+        })
+        .await
+        .expect("drop must not block the current-thread runtime");
+
+        let _ = TcpStream::connect(addr).await;
     }
 
     #[tokio::test]

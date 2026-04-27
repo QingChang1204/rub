@@ -110,13 +110,9 @@ impl SessionState {
             BrowserSessionEvent::DialogRuntime {
                 browser_sequence,
                 generation,
-                status,
-                degraded_reason,
+                runtime,
             } => {
-                let _ = self.set_dialog_runtime(generation, status).await;
-                if let Some(reason) = degraded_reason {
-                    self.mark_dialog_runtime_degraded(generation, reason).await;
-                }
+                let _ = self.set_dialog_projection(generation, *runtime).await;
                 BrowserEventApplyOutcome {
                     browser_sequence,
                     clear_progress_overflow_latch: None,
@@ -174,24 +170,15 @@ impl SessionState {
             BrowserSessionEvent::DownloadRuntime {
                 browser_sequence,
                 generation,
-                status,
-                mode,
-                download_dir,
-                degraded_reason,
+                runtime,
             } => {
-                let clears_progress_overflow_latch = degraded_reason
+                let clears_progress_overflow_latch = runtime
+                    .degraded_reason
                     .as_ref()
                     .is_none()
                     .then_some((generation, browser_sequence));
                 let applied = self
-                    .apply_download_runtime_event_sequenced(
-                        generation,
-                        browser_sequence,
-                        status,
-                        mode,
-                        download_dir,
-                        degraded_reason,
-                    )
+                    .apply_download_runtime_event_sequenced(generation, browser_sequence, *runtime)
                     .await;
                 BrowserEventApplyOutcome {
                     browser_sequence,
@@ -529,19 +516,12 @@ impl SessionState {
         &self,
         generation: u64,
         browser_sequence: u64,
-        status: DownloadRuntimeStatus,
-        mode: DownloadMode,
-        download_dir: Option<String>,
-        degraded_reason: Option<String>,
+        runtime: DownloadRuntimeInfo,
     ) -> crate::downloads::DownloadRuntimeMutationOutcome {
-        self.downloads.write().await.apply_runtime_event_sequenced(
-            generation,
-            browser_sequence,
-            status,
-            mode,
-            download_dir,
-            degraded_reason,
-        )
+        self.downloads
+            .write()
+            .await
+            .apply_runtime_projection_sequenced(generation, browser_sequence, runtime)
     }
 
     /// Mark the download runtime as degraded when browser-side behavior cannot be configured.

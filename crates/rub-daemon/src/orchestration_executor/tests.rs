@@ -3,14 +3,15 @@ use super::{
     bind_orchestration_daemon_authority, classify_orchestration_error_status,
     decode_orchestration_success_payload_field, decode_orchestration_success_result_items,
     dispatch_remote_orchestration_request, orchestration_action_execution_info,
-    orchestration_failure_result, orchestration_step_command_id,
-    resolve_orchestration_workflow_spec,
+    orchestration_failure_result, orchestration_request_meta, orchestration_step_command_id,
+    resolve_orchestration_workflow_spec, resolve_source_session,
 };
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 use rub_core::model::{
     OrchestrationAddressInfo, OrchestrationExecutionPolicyInfo, OrchestrationMode,
-    OrchestrationRuleInfo, OrchestrationRuleStatus, OrchestrationStepStatus, TabInfo,
-    TriggerActionKind, TriggerActionSpec, TriggerConditionKind, TriggerConditionSpec,
+    OrchestrationRuleInfo, OrchestrationRuleStatus, OrchestrationRuntimeInfo,
+    OrchestrationSessionAvailability, OrchestrationStepStatus, TabInfo, TriggerActionKind,
+    TriggerActionSpec, TriggerConditionKind, TriggerConditionSpec,
 };
 use rub_ipc::protocol::{IpcRequest, IpcResponse};
 
@@ -42,6 +43,7 @@ fn orchestration_failure_result_blocks_rearm_after_partial_commit() {
             result: None,
             error_code: None,
             reason: None,
+            error_context: None,
         }],
         failed_action: None,
         failed_attempts: 1,
@@ -99,16 +101,16 @@ fn sample_rule() -> OrchestrationRuleInfo {
 }
 
 #[test]
-fn orchestration_step_command_id_is_stable_across_execution_attempts_when_identity_key_present() {
+fn orchestration_step_command_id_changes_across_execution_attempts_even_with_same_identity_key() {
     let rule = sample_rule();
     let first = orchestration_step_command_id(&rule, Some("evidence-key"), "exec-a", 1);
     let second = orchestration_step_command_id(&rule, Some("evidence-key"), "exec-b", 1);
 
-    assert_eq!(first, second);
+    assert_ne!(first, second);
 }
 
 #[test]
-fn orchestration_step_command_id_changes_when_evidence_identity_changes() {
+fn orchestration_step_command_id_changes_when_identity_key_changes() {
     let rule = sample_rule();
     let first = orchestration_step_command_id(&rule, Some("evidence-a"), "exec-a", 1);
     let second = orchestration_step_command_id(&rule, Some("evidence-b"), "exec-a", 1);
@@ -126,6 +128,23 @@ fn orchestration_step_command_id_falls_back_to_execution_attempt_without_identit
 }
 
 #[test]
+fn orchestration_request_meta_names_evidence_key_as_execution_scoped() {
+    let rule = sample_rule();
+    let meta = orchestration_request_meta(&rule, Some("evidence-key"), "exec-a", 1, "action");
+
+    assert_eq!(
+        meta.get("command_identity_kind")
+            .and_then(|value| value.as_str()),
+        Some("execution_scoped_evidence_key")
+    );
+    assert_eq!(
+        meta.get("command_identity_key")
+            .and_then(|value| value.as_str()),
+        Some("evidence-key")
+    );
+}
+
+#[test]
 fn orchestration_remote_request_binds_remote_daemon_authority() {
     let session = crate::orchestration_runtime::projected_orchestration_session(
         "daemon-b".to_string(),
@@ -134,6 +153,7 @@ fn orchestration_remote_request_binds_remote_daemon_authority() {
         "/tmp/rub.sock".to_string(),
         false,
         rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        OrchestrationSessionAvailability::Addressable,
         None,
     );
 
@@ -156,6 +176,7 @@ fn decode_orchestration_success_result_items_reads_wrapped_result_items() {
         "/tmp/rub.sock".to_string(),
         false,
         rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        OrchestrationSessionAvailability::Addressable,
         None,
     );
     let response = IpcResponse::success(
@@ -198,6 +219,7 @@ fn decode_orchestration_success_result_items_fails_closed_when_result_items_miss
         "/tmp/rub.sock".to_string(),
         false,
         rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        OrchestrationSessionAvailability::Addressable,
         None,
     );
     let response = IpcResponse::success(
@@ -238,6 +260,7 @@ fn decode_orchestration_success_payload_field_reads_named_runtime_payload() {
         "/tmp/rub.sock".to_string(),
         false,
         rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        OrchestrationSessionAvailability::Addressable,
         None,
     );
     let response = IpcResponse::success(
@@ -278,6 +301,7 @@ async fn remote_dispatch_unreachable_context_keeps_socket_path_state() {
         ),
         false,
         rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        OrchestrationSessionAvailability::Addressable,
         Some("/tmp/rub-profile".to_string()),
     );
 
@@ -417,4 +441,46 @@ fn workflow_source_vars_require_source_materialization_but_plain_actions_do_not(
             payload: Some(serde_json::json!({ "selector": "#submit" })),
         }
     ));
+}
+
+#[test]
+fn workflow_source_vars_fail_closed_when_source_session_is_present_but_not_addressable() {
+    let rule = sample_rule();
+    let runtime = OrchestrationRuntimeInfo {
+        known_sessions: vec![
+            crate::orchestration_runtime::projected_orchestration_session(
+                "source".to_string(),
+                "Source".to_string(),
+                42,
+                "/tmp/rub-source.sock".to_string(),
+                false,
+                "1.0".to_string(),
+                OrchestrationSessionAvailability::ProtocolIncompatible,
+                Some("/tmp/rub-source-profile".to_string()),
+            ),
+        ],
+        session_count: 1,
+        addressing_supported: true,
+        execution_supported: true,
+        ..OrchestrationRuntimeInfo::default()
+    };
+
+    let error = resolve_source_session(&runtime, &rule)
+        .expect_err("workflow source vars must fail closed for non-addressable source session");
+    let context = error
+        .context
+        .as_ref()
+        .expect("not-addressable error should include context");
+
+    assert_eq!(error.code, ErrorCode::SessionBusy);
+    assert_eq!(
+        context.get("reason").and_then(|value| value.as_str()),
+        Some("orchestration_source_session_not_addressable")
+    );
+    assert_eq!(
+        context
+            .get("user_data_dir")
+            .and_then(|value| value.as_str()),
+        Some("/tmp/rub-source-profile")
+    );
 }

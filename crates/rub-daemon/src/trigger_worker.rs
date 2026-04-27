@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +15,7 @@ use tracing::debug;
 
 use crate::router::DaemonRouter;
 use crate::router::automation_fence::ensure_committed_automation_result;
+use crate::router::handoff_blocked_error_for_command;
 use crate::runtime_refresh::{
     refresh_live_frame_runtime, refresh_live_runtime_state, refresh_live_trigger_runtime,
 };
@@ -36,7 +36,10 @@ use condition::{
     TriggerConditionState, TriggeredTriggerCondition, commit_trigger_network_progress,
     load_trigger_condition_state, reconcile_worker_state, trigger_evidence_consumption_key,
 };
-use outcome::record_trigger_failure;
+use outcome::{
+    TriggerEvidenceDisposition, contextualize_trigger_error, record_trigger_failure,
+    trigger_failure_consumes_evidence,
+};
 use reservation::{
     PendingTriggerConditionPolicy, PendingTriggerReservation, TriggerReservationCompletion,
     complete_trigger_reservation, spawn_trigger_reservation,
@@ -49,6 +52,7 @@ const TRIGGER_ACTION_BASE_TIMEOUT_MS: u64 = 30_000;
 struct TriggerWorkerEntry {
     last_status: TriggerStatus,
     network_cursor: u64,
+    network_cursor_primed: bool,
     observatory_drop_count: u64,
 }
 
@@ -77,6 +81,37 @@ fn trigger_rule_semantics_fingerprint(trigger: &TriggerInfo) -> String {
         "action": trigger.action,
     })
     .to_string()
+}
+
+pub(super) fn merge_trigger_error_context(
+    mut error: ErrorEnvelope,
+    extra_context: serde_json::Value,
+) -> ErrorEnvelope {
+    let mut context = error
+        .context
+        .take()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    if let Some(extra) = extra_context.as_object() {
+        for (key, value) in extra {
+            context.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    error.context = Some(serde_json::Value::Object(context));
+    error
+}
+
+pub(super) fn trigger_degraded_authority_error(
+    message: impl Into<String>,
+    reason: &'static str,
+    extra_context: serde_json::Value,
+) -> ErrorEnvelope {
+    let error = ErrorEnvelope::new(ErrorCode::SessionBusy, message.into()).with_context(
+        serde_json::json!({
+            "reason": reason,
+        }),
+    );
+    merge_trigger_error_context(error, extra_context)
 }
 
 pub(crate) fn spawn_trigger_worker(
@@ -161,14 +196,8 @@ async fn run_trigger_cycle(
         }
     };
 
-    let active_request_cursor = state.network_request_cursor().await;
-    let observatory_drop_count = state.network_request_drop_count().await;
-    reconcile_worker_state(
-        worker_state,
-        &triggers,
-        active_request_cursor,
-        observatory_drop_count,
-    );
+    let committed_baselines = state.trigger_network_request_baselines().await;
+    reconcile_worker_state(worker_state, &triggers, &committed_baselines);
     reconcile_pending_trigger_reservations(&triggers, pending_reservations);
     drain_trigger_reservation_completions(
         router,
@@ -285,12 +314,10 @@ async fn process_trigger_rule(
             record_trigger_failure(
                 state,
                 &trigger,
-                ErrorEnvelope::new(
-                    ErrorCode::BrowserCrashed,
-                    format!("trigger condition evaluation failed: {error}"),
-                ),
+                contextualize_trigger_error(error, "trigger condition evaluation failed"),
                 None,
                 None,
+                TriggerEvidenceDisposition::Preserve,
             )
             .await;
             return;
@@ -299,7 +326,9 @@ async fn process_trigger_rule(
 
     let triggered = match condition {
         TriggerConditionState::NotTriggered { network_progress } => {
-            let _ = state.set_trigger_condition_evidence(trigger.id, None).await;
+            let _ = state
+                .set_trigger_condition_evidence(trigger.id, trigger.lifecycle_generation, None)
+                .await;
             if let Some(worker) = worker_state.get_mut(&trigger.id) {
                 commit_trigger_network_progress(worker, network_progress);
             }
@@ -311,6 +340,24 @@ async fn process_trigger_rule(
         }
         TriggerConditionState::Triggered(triggered) => triggered,
     };
+
+    if trigger.consumed_evidence_fingerprint.as_deref() == Some(&triggered.evidence_fingerprint) {
+        let _ = state
+            .set_trigger_condition_evidence(
+                trigger.id,
+                trigger.lifecycle_generation,
+                Some(triggered.evidence.clone()),
+            )
+            .await;
+        if let Some(worker) = worker_state.get_mut(&trigger.id) {
+            commit_trigger_network_progress(worker, triggered.network_progress);
+        }
+        cancel_pending_trigger_reservation(
+            reservation_coordinator.pending_reservations,
+            trigger.id,
+        );
+        return;
+    }
 
     if reservation_coordinator
         .pending_reservations
@@ -330,6 +377,7 @@ async fn process_trigger_rule(
             *reservation_coordinator.next_reservation_attempt_id,
             triggered.network_progress,
             PendingTriggerConditionPolicy {
+                expected_lifecycle_generation: trigger.lifecycle_generation,
                 preserved_triggered: (!requires_revalidation).then_some(
                     TriggeredTriggerCondition {
                         evidence: triggered.evidence.clone(),
@@ -364,6 +412,12 @@ async fn handle_trigger_reservation_completion(
         }
         return;
     }
+    if state.is_shutdown_requested() {
+        if let Ok(transaction) = completion.result {
+            drop(transaction);
+        }
+        return;
+    }
 
     let worker = match worker_state.get_mut(&completion.trigger_id) {
         Some(worker) => worker,
@@ -375,38 +429,93 @@ async fn handle_trigger_reservation_completion(
         }
     };
 
-    let browser = router.browser_port();
     let reserved = match completion.result {
-        Ok(transaction) => match complete_trigger_reservation(
-            state,
-            &browser,
-            completion.trigger_id,
-            worker,
-            transaction,
-            pending.fallback_network_progress,
-            pending.condition_policy,
-        )
-        .await
-        {
-            Ok(Some(reserved)) => reserved,
-            Ok(None) => return,
-            Err(envelope) => {
+        Ok(transaction) => {
+            if let Some(error) = handoff_blocked_error_for_command("trigger_worker", state).await {
+                let preserved_evidence = pending
+                    .condition_policy
+                    .preserved_triggered
+                    .as_ref()
+                    .map(|triggered| triggered.evidence.clone());
                 if let Some(trigger) = state.trigger_rule(completion.trigger_id).await {
-                    record_trigger_failure(state, &trigger, envelope, None, None).await;
+                    record_trigger_failure(
+                        state,
+                        &trigger,
+                        error,
+                        preserved_evidence,
+                        None,
+                        TriggerEvidenceDisposition::Preserve,
+                    )
+                    .await;
                 }
+                drop(transaction);
                 return;
             }
-        },
+
+            let browser = router.browser_port();
+            match complete_trigger_reservation(
+                state,
+                &browser,
+                completion.trigger_id,
+                worker,
+                transaction,
+                pending.fallback_network_progress,
+                pending.condition_policy,
+            )
+            .await
+            {
+                Ok(Some(reserved)) => reserved,
+                Ok(None) => return,
+                Err(envelope) => {
+                    if let Some(trigger) = state.trigger_rule(completion.trigger_id).await {
+                        record_trigger_failure(
+                            state,
+                            &trigger,
+                            envelope,
+                            None,
+                            None,
+                            TriggerEvidenceDisposition::Preserve,
+                        )
+                        .await;
+                    }
+                    return;
+                }
+            }
+        }
         Err(envelope) => {
             if state.is_shutdown_requested() {
                 return;
             }
             if let Some(trigger) = state.trigger_rule(completion.trigger_id).await {
-                record_trigger_failure(state, &trigger, envelope, None, None).await;
+                record_trigger_failure(
+                    state,
+                    &trigger,
+                    envelope,
+                    None,
+                    None,
+                    TriggerEvidenceDisposition::Preserve,
+                )
+                .await;
             }
             return;
         }
     };
+
+    if state.is_shutdown_requested() {
+        return;
+    }
+    if let Some(error) = handoff_blocked_error_for_command("trigger_worker", state).await {
+        record_trigger_failure(
+            state,
+            &reserved.trigger,
+            error,
+            Some(reserved.evidence.clone()),
+            None,
+            TriggerEvidenceDisposition::Preserve,
+        )
+        .await;
+        return;
+    }
 
     let command_id = trigger_action_command_id(&reserved.trigger, &reserved.evidence);
     match fire_trigger(
@@ -420,15 +529,22 @@ async fn handle_trigger_reservation_completion(
     .await
     {
         Err(envelope) => {
+            let result_status = outcome::classify_trigger_error_status(envelope.code);
+            let consumes_evidence = trigger_failure_consumes_evidence(
+                &envelope,
+                result_status,
+                TriggerEvidenceDisposition::ConsumeOnPermanentActionFailure,
+            );
             record_trigger_failure(
                 state,
                 &reserved.trigger,
                 envelope,
                 Some(reserved.evidence.clone()),
                 Some(command_id),
+                TriggerEvidenceDisposition::ConsumeOnPermanentActionFailure,
             )
             .await;
-            if let Some(worker) = worker_state.get_mut(&reserved.trigger.id) {
+            if consumes_evidence && let Some(worker) = worker_state.get_mut(&reserved.trigger.id) {
                 commit_trigger_network_progress(worker, reserved.network_progress);
             }
         }
@@ -439,8 +555,9 @@ async fn handle_trigger_reservation_completion(
                 reserved.evidence.summary, action_summary, reserved.trigger.target_tab.index
             );
             let _ = state
-                .record_trigger_outcome(
-                    reserved.trigger.id,
+                .record_trigger_outcome_with_fallback(
+                    &reserved.trigger,
+                    reserved.trigger.lifecycle_generation,
                     Some(reserved.evidence),
                     TriggerResultInfo {
                         trigger_id: reserved.trigger.id,
@@ -455,6 +572,7 @@ async fn handle_trigger_reservation_completion(
                         result,
                         error_code: None,
                         reason: None,
+                        error_context: None,
                         consumed_evidence_fingerprint: Some(reserved.evidence_fingerprint),
                     },
                 )
@@ -489,15 +607,25 @@ fn reconcile_pending_trigger_reservations(
         .iter()
         .filter(|trigger| matches!(trigger.status, TriggerStatus::Armed))
         .filter(|trigger| trigger.unavailable_reason.is_none())
-        .map(|trigger| (trigger.id, trigger_rule_semantics_fingerprint(trigger)))
+        .map(|trigger| {
+            (
+                trigger.id,
+                (
+                    trigger.lifecycle_generation,
+                    trigger_rule_semantics_fingerprint(trigger),
+                ),
+            )
+        })
         .collect::<std::collections::HashMap<_, _>>();
     pending_reservations.retain(|trigger_id, pending| {
-        let keep = live_fingerprints
-            .get(trigger_id)
-            .is_some_and(|fingerprint| {
-                pending.condition_policy.requires_revalidation_after_queue
-                    || pending.condition_policy.rule_semantics_fingerprint == *fingerprint
-            });
+        let keep =
+            live_fingerprints
+                .get(trigger_id)
+                .is_some_and(|(lifecycle_generation, fingerprint)| {
+                    pending.condition_policy.expected_lifecycle_generation == *lifecycle_generation
+                        && (pending.condition_policy.requires_revalidation_after_queue
+                            || pending.condition_policy.rule_semantics_fingerprint == *fingerprint)
+                });
         if keep {
             return true;
         }

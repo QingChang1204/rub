@@ -2,17 +2,15 @@ use chromiumoxide::Page;
 use chromiumoxide::browser::Browser;
 use chromiumoxide::cdp::browser_protocol::target::TargetId;
 use rub_core::error::{ErrorCode, RubError};
-use rub_core::model::{ConnectionTarget, TabInfo};
+use rub_core::model::{ConnectionTarget, TabActiveAuthority, TabInfo};
 use serde::Deserialize;
 use std::sync::Arc;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep};
 
 use crate::browser::BrowserLaunchOptions;
 
 const ACTIVE_TAB_PROBE_TIMEOUT: Duration = Duration::from_millis(150);
 const TAB_INFO_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
-const TAB_URL_PROBE_UNAVAILABLE: &str = "about:rub-probe-unavailable";
-const TAB_TITLE_PROBE_UNAVAILABLE: &str = "[probe unavailable]";
 const LOCAL_ACTIVE_TARGET_AUTHORITY_MAX_AMBIGUOUS_SYNCS: u8 = 2;
 
 #[derive(Clone, Default)]
@@ -21,6 +19,7 @@ pub(crate) struct CommittedTabProjection {
     pub(crate) current_page: Option<Arc<Page>>,
     pub(crate) continuity_page: Option<Arc<Page>>,
     pub(crate) active_target_id: Option<TargetId>,
+    pub(crate) active_target_authority: Option<TabActiveAuthority>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -38,6 +37,7 @@ pub(crate) struct LocalActiveTargetAuthority {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActiveTargetAuthorityResolution {
     pub(crate) active_target: Option<TargetId>,
+    pub(crate) active_target_authority: Option<TabActiveAuthority>,
     pub(crate) next_local_active_target_authority: Option<LocalActiveTargetAuthority>,
 }
 
@@ -62,12 +62,14 @@ impl CommittedTabProjection {
             continuity_page: Some(page.clone()),
             current_page: Some(page),
             active_target_id,
+            active_target_authority: Some(TabActiveAuthority::BrowserTruth),
         }
     }
 
     pub(crate) fn from_projected_pages(
         pages: Vec<Arc<Page>>,
         active_target_id: Option<TargetId>,
+        active_target_authority: Option<TabActiveAuthority>,
         previous_continuity_target_id: Option<&TargetId>,
     ) -> Self {
         let current_page = active_target_id.as_ref().and_then(|active_target_id| {
@@ -90,11 +92,13 @@ impl CommittedTabProjection {
             current_page,
             continuity_page,
             active_target_id,
+            active_target_authority,
         }
     }
 
     pub(crate) fn with_local_active_page(mut self, page: Arc<Page>) -> Self {
         self.active_target_id = Some(page.target_id().clone());
+        self.active_target_authority = Some(TabActiveAuthority::LocalFallback);
         self.current_page = Some(page.clone());
         self.continuity_page = Some(page);
         self
@@ -120,12 +124,11 @@ pub(crate) fn projected_stealth_patch_names(
 }
 
 pub(crate) async fn wait_for_startup_page(browser: &mut Browser) -> Result<Page, RubError> {
-    const STARTUP_PAGE_POLL_ATTEMPTS: usize = 20;
+    const STARTUP_PAGE_POLL_TIMEOUT: Duration = Duration::from_secs(5);
     const STARTUP_PAGE_POLL_INTERVAL_MS: u64 = 50;
-    let mut last_error =
-        "Browser did not expose an authoritative startup page before startup commit".to_string();
+    let deadline = Instant::now() + STARTUP_PAGE_POLL_TIMEOUT;
 
-    for attempt in 0..STARTUP_PAGE_POLL_ATTEMPTS {
+    let last_error = loop {
         let pages = browser.pages().await.map_err(|e| {
             RubError::domain(
                 ErrorCode::BrowserLaunchFailed,
@@ -133,9 +136,8 @@ pub(crate) async fn wait_for_startup_page(browser: &mut Browser) -> Result<Page,
             )
         })?;
 
-        if pages.is_empty() {
-            last_error =
-                "Browser did not expose any startup pages before startup commit".to_string();
+        let last_error = if pages.is_empty() {
+            "Browser did not expose any startup pages before startup commit".to_string()
         } else if pages.len() == 1 {
             return Ok(pages.into_iter().next().expect("single startup page"));
         } else {
@@ -145,15 +147,21 @@ pub(crate) async fn wait_for_startup_page(browser: &mut Browser) -> Result<Page,
                     .nth(index)
                     .expect("browser-truth startup page index should be valid"));
             }
-            last_error =
-                "Browser did not expose a unique authoritative startup page before startup commit"
-                    .to_string();
+            "Browser did not expose a unique authoritative startup page before startup commit"
+                .to_string()
+        };
+
+        let now = Instant::now();
+        if now >= deadline {
+            break last_error;
         }
 
-        if attempt + 1 < STARTUP_PAGE_POLL_ATTEMPTS {
-            sleep(Duration::from_millis(STARTUP_PAGE_POLL_INTERVAL_MS)).await;
-        }
-    }
+        sleep(std::cmp::min(
+            Duration::from_millis(STARTUP_PAGE_POLL_INTERVAL_MS),
+            deadline.saturating_duration_since(now),
+        ))
+        .await;
+    };
 
     Err(RubError::domain(ErrorCode::BrowserLaunchFailed, last_error))
 }
@@ -162,24 +170,38 @@ pub(crate) async fn tab_info_for_page(
     index: u32,
     page: &Arc<Page>,
     active: Option<&TargetId>,
+    active_authority: Option<TabActiveAuthority>,
 ) -> TabInfo {
-    let url = match tokio::time::timeout(TAB_INFO_PROBE_TIMEOUT, page.url()).await {
-        Ok(Ok(Some(url))) => projected_tab_url(Some(url.to_string())),
-        _ => projected_tab_url(None),
-    };
-    let title = match tokio::time::timeout(TAB_INFO_PROBE_TIMEOUT, page.get_title()).await {
-        Ok(Ok(Some(title))) => projected_tab_title(Some(title)),
-        _ => projected_tab_title(None),
+    let (url, url_probe_failed) =
+        match tokio::time::timeout(TAB_INFO_PROBE_TIMEOUT, page.url()).await {
+            Ok(Ok(Some(url))) => (projected_tab_url(Some(url.to_string())), false),
+            _ => (projected_tab_url(None), true),
+        };
+    let (title, title_probe_failed) =
+        match tokio::time::timeout(TAB_INFO_PROBE_TIMEOUT, page.get_title()).await {
+            Ok(Ok(Some(title))) => (projected_tab_title(Some(title)), false),
+            _ => (projected_tab_title(None), true),
+        };
+    let degraded_reason = match (url_probe_failed, title_probe_failed) {
+        (true, true) => Some("tab_url_and_title_probe_failed".to_string()),
+        (true, false) => Some("tab_url_probe_failed".to_string()),
+        (false, true) => Some("tab_title_probe_failed".to_string()),
+        (false, false) => None,
     };
 
     TabInfo {
         index,
         target_id: page.target_id().as_ref().to_string(),
-        url: normalize_tab_url(url),
+        url,
         title,
         active: active
             .map(|target| target == page.target_id())
             .unwrap_or(false),
+        active_authority: active
+            .is_some_and(|target| target == page.target_id())
+            .then_some(active_authority)
+            .flatten(),
+        degraded_reason,
     }
 }
 
@@ -240,6 +262,7 @@ where
     if let Some(browser_truth) = browser_truth {
         return ActiveTargetAuthorityResolution {
             active_target: Some(browser_truth.clone()),
+            active_target_authority: Some(TabActiveAuthority::BrowserTruth),
             next_local_active_target_authority: None,
         };
     }
@@ -247,6 +270,7 @@ where
     let Some(local_active_target_authority) = local_active_target_authority else {
         return ActiveTargetAuthorityResolution {
             active_target: None,
+            active_target_authority: None,
             next_local_active_target_authority: None,
         };
     };
@@ -257,6 +281,7 @@ where
     {
         return ActiveTargetAuthorityResolution {
             active_target: None,
+            active_target_authority: None,
             next_local_active_target_authority: None,
         };
     }
@@ -270,6 +295,7 @@ where
 
     ActiveTargetAuthorityResolution {
         active_target: Some(local_active_target_authority.target_id.clone()),
+        active_target_authority: Some(TabActiveAuthority::LocalFallback),
         next_local_active_target_authority,
     }
 }
@@ -290,12 +316,11 @@ fn normalize_tab_url(url: String) -> String {
 }
 
 pub(super) fn projected_tab_url(url: Option<String>) -> String {
-    url.map(normalize_tab_url)
-        .unwrap_or_else(|| TAB_URL_PROBE_UNAVAILABLE.to_string())
+    url.map(normalize_tab_url).unwrap_or_default()
 }
 
 pub(super) fn projected_tab_title(title: Option<String>) -> String {
-    title.unwrap_or_else(|| TAB_TITLE_PROBE_UNAVAILABLE.to_string())
+    title.unwrap_or_default()
 }
 
 async fn probe_active_tab_state(page: &Page) -> Option<ActiveTabProbe> {
@@ -380,6 +405,7 @@ mod tests {
         resolve_active_target_authority,
     };
     use chromiumoxide::cdp::browser_protocol::target::TargetId;
+    use rub_core::model::TabActiveAuthority;
 
     fn target(id: &str) -> TargetId {
         TargetId::from(id.to_string())
@@ -494,6 +520,10 @@ mod tests {
             Some(&LocalActiveTargetAuthority::new(tab_b.clone())),
         );
         assert_eq!(resolution.active_target, Some(tab_b));
+        assert_eq!(
+            resolution.active_target_authority,
+            Some(TabActiveAuthority::LocalFallback)
+        );
         assert!(
             resolution.next_local_active_target_authority.is_some(),
             "local actuation authority should bridge browser-side ambiguity for a bounded handoff window"
@@ -509,6 +539,10 @@ mod tests {
             [&tab_a, &tab_b],
             Some(&tab_a),
             Some(&LocalActiveTargetAuthority::new(tab_b.clone())),
+        );
+        assert_eq!(
+            resolution.active_target_authority,
+            Some(TabActiveAuthority::BrowserTruth)
         );
         assert!(
             resolution.next_local_active_target_authority.is_none(),
@@ -531,6 +565,7 @@ mod tests {
             resolution.active_target.is_none(),
             "missing local target cannot stay authoritative after it leaves the live tab set"
         );
+        assert_eq!(resolution.active_target_authority, None);
         assert!(
             resolution.next_local_active_target_authority.is_none(),
             "stale local actuation authority must clear once its target is no longer live"
@@ -554,6 +589,10 @@ mod tests {
         );
 
         assert_eq!(second.active_target, Some(tab_b));
+        assert_eq!(
+            second.active_target_authority,
+            Some(TabActiveAuthority::LocalFallback)
+        );
         assert!(
             second.next_local_active_target_authority.is_none(),
             "local actuation authority must expire after the bounded ambiguity bridge is spent"
@@ -567,5 +606,6 @@ mod tests {
         assert!(projection.current_page.is_none());
         assert!(projection.continuity_page.is_none());
         assert!(projection.active_target_id.is_none());
+        assert!(projection.active_target_authority.is_none());
     }
 }

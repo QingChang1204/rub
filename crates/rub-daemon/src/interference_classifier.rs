@@ -108,14 +108,18 @@ pub(crate) fn classify(
 
 fn classify_observation(inputs: ClassifierInputs<'_>) -> Option<InterferenceObservation> {
     let active_tab = inputs.active_tab?;
-    let current_url = active_tab.url.as_str();
-    let title = active_tab.title.as_str();
+    let current_url = active_tab
+        .page_identity_authoritative()
+        .then_some(active_tab.url.as_str());
+    let title = active_tab
+        .page_identity_authoritative()
+        .then_some(active_tab.title.as_str());
 
     if has_human_verification_hint(current_url, title, inputs.readiness, inputs.handoff) {
         return Some(InterferenceObservation {
             kind: InterferenceKind::HumanVerificationRequired,
             summary: "human verification checkpoint detected".to_string(),
-            current_url: Some(current_url.to_string()),
+            current_url: current_url.map(ToOwned::to_owned),
             primary_url: inputs.primary_url.map(ToOwned::to_owned),
         });
     }
@@ -128,7 +132,7 @@ fn classify_observation(inputs: ClassifierInputs<'_>) -> Option<InterferenceObse
         return Some(InterferenceObservation {
             kind: InterferenceKind::PopupHijack,
             summary: "unexpected active tab drift with additional tab(s) detected".to_string(),
-            current_url: Some(current_url.to_string()),
+            current_url: current_url.map(ToOwned::to_owned),
             primary_url: inputs.primary_url.map(ToOwned::to_owned),
         });
     }
@@ -137,7 +141,7 @@ fn classify_observation(inputs: ClassifierInputs<'_>) -> Option<InterferenceObse
         return Some(InterferenceObservation {
             kind: InterferenceKind::OverlayInterference,
             summary: "overlay-related blocking signals detected".to_string(),
-            current_url: Some(current_url.to_string()),
+            current_url: current_url.map(ToOwned::to_owned),
             primary_url: inputs.primary_url.map(ToOwned::to_owned),
         });
     }
@@ -146,7 +150,7 @@ fn classify_observation(inputs: ClassifierInputs<'_>) -> Option<InterferenceObse
         return Some(InterferenceObservation {
             kind: InterferenceKind::InterstitialNavigation,
             summary: "interstitial-like navigation drift detected".to_string(),
-            current_url: Some(current_url.to_string()),
+            current_url: current_url.map(ToOwned::to_owned),
             primary_url: inputs.primary_url.map(ToOwned::to_owned),
         });
     }
@@ -155,12 +159,12 @@ fn classify_observation(inputs: ClassifierInputs<'_>) -> Option<InterferenceObse
         inputs.current,
         inputs.observatory,
         inputs.readiness,
-        inputs.primary_url.or(Some(current_url)),
+        inputs.primary_url.or(current_url),
     ) {
         return Some(InterferenceObservation {
             kind: InterferenceKind::ThirdPartyNoise,
             summary: "heavy unrelated third-party request noise detected".to_string(),
-            current_url: Some(current_url.to_string()),
+            current_url: current_url.map(ToOwned::to_owned),
             primary_url: inputs.primary_url.map(ToOwned::to_owned),
         });
     }
@@ -169,7 +173,7 @@ fn classify_observation(inputs: ClassifierInputs<'_>) -> Option<InterferenceObse
         return Some(InterferenceObservation {
             kind: InterferenceKind::UnknownNavigationDrift,
             summary: "unexpected navigation drift detected".to_string(),
-            current_url: Some(current_url.to_string()),
+            current_url: current_url.map(ToOwned::to_owned),
             primary_url: inputs.primary_url.map(ToOwned::to_owned),
         });
     }
@@ -178,15 +182,20 @@ fn classify_observation(inputs: ClassifierInputs<'_>) -> Option<InterferenceObse
 }
 
 fn has_human_verification_hint(
-    current_url: &str,
-    title: &str,
+    current_url: Option<&str>,
+    title: Option<&str>,
     readiness: &ReadinessInfo,
     handoff: &HumanVerificationHandoffInfo,
 ) -> bool {
     if matches!(handoff.status, HumanVerificationHandoffStatus::Active) {
         return true;
     }
-    let haystack = format!("{current_url} {title}").to_ascii_lowercase();
+    let haystack = format!(
+        "{} {}",
+        current_url.unwrap_or_default(),
+        title.unwrap_or_default()
+    )
+    .to_ascii_lowercase();
     [
         "captcha",
         "recaptcha",
@@ -225,14 +234,17 @@ fn has_overlay_interference(readiness: &ReadinessInfo) -> bool {
 }
 
 fn has_interstitial_navigation_hint(
-    current_url: &str,
-    title: &str,
+    current_url: Option<&str>,
+    title: Option<&str>,
     primary_url: Option<&str>,
 ) -> bool {
+    let Some(current_url) = current_url else {
+        return false;
+    };
     if primary_url.is_some_and(|primary| primary == current_url) {
         return false;
     }
-    let haystack = format!("{current_url} {title}").to_ascii_lowercase();
+    let haystack = format!("{current_url} {}", title.unwrap_or_default()).to_ascii_lowercase();
     ["interstitial", "vignette", "redirect notice"]
         .iter()
         .any(|needle| haystack.contains(needle))
@@ -315,7 +327,10 @@ fn is_readiness_stable_for_noise(readiness: &ReadinessInfo) -> bool {
             .is_none_or(|value| value.eq_ignore_ascii_case("complete"))
 }
 
-fn has_unknown_navigation_drift(current_url: &str, primary_url: Option<&str>) -> bool {
+fn has_unknown_navigation_drift(current_url: Option<&str>, primary_url: Option<&str>) -> bool {
+    let Some(current_url) = current_url else {
+        return false;
+    };
     let Some(primary_url) = primary_url else {
         return false;
     };

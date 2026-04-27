@@ -4,12 +4,18 @@ mod continuity;
 
 use self::continuity::attach_workflow_continuity;
 use rub_core::error::{ErrorCode, ErrorEnvelope};
-use rub_core::model::CommandResult;
+use rub_core::model::{
+    CommandResult, InteractionConfirmationStatus, projected_interaction_confirmation_status,
+    projected_interaction_effect_success,
+};
 use rub_ipc::protocol::IpcResponse;
 use serde_json::{Map, Value, json};
 use std::path::Path;
 
+#[cfg(test)]
 const POST_COMMIT_LOCAL_FAILURE_STATE: &str = "daemon_committed_local_followup_failed";
+const STDOUT_CONTRACT_FALLBACK_SURFACE: &str = "cli_stdout_contract_fallback";
+const INTERACTION_EFFECT_FAILURE_SURFACE: &str = "cli_interaction_effect_failure";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionTraceMode {
@@ -18,7 +24,14 @@ pub enum InteractionTraceMode {
     Trace,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormattedCommandResult {
+    pub output: String,
+    pub success: bool,
+}
+
 /// Convert an IPC response to a CLI stdout CommandResult.
+#[cfg(test)]
 pub fn format_response(
     response: &IpcResponse,
     command: &str,
@@ -27,8 +40,34 @@ pub fn format_response(
     pretty: bool,
     trace_mode: InteractionTraceMode,
 ) -> String {
+    format_response_with_success(response, command, session, rub_home, pretty, trace_mode).output
+}
+
+pub fn format_response_with_success(
+    response: &IpcResponse,
+    command: &str,
+    session: &str,
+    rub_home: &Path,
+    pretty: bool,
+    trace_mode: InteractionTraceMode,
+) -> FormattedCommandResult {
+    let result = checked_command_result(command_result_from_response(
+        response, command, session, rub_home, trace_mode,
+    ));
+    let success = result.success;
+    let output = serialize_command_result_json(&result, pretty);
+    FormattedCommandResult { output, success }
+}
+
+fn command_result_from_response(
+    response: &IpcResponse,
+    command: &str,
+    session: &str,
+    rub_home: &Path,
+    trace_mode: InteractionTraceMode,
+) -> CommandResult {
     if let Some(envelope) = response.contract_error_envelope() {
-        let result = CommandResult {
+        return CommandResult {
             success: false,
             command: command.to_string(),
             stdout_schema_version: CommandResult::STDOUT_SCHEMA_VERSION.to_string(),
@@ -39,7 +78,6 @@ pub fn format_response(
             data: None,
             error: Some(attach_authority_error_guidance(envelope)),
         };
-        return serialize_checked_command_result(result, pretty);
     }
 
     let mut result = CommandResult {
@@ -55,8 +93,10 @@ pub fn format_response(
     };
     attach_interaction_trace(&mut result, trace_mode);
     attach_workflow_continuity(&mut result, rub_home);
-
-    serialize_checked_command_result(result, pretty)
+    if let Some(effect_failure) = interaction_effect_failure_result(&result) {
+        return effect_failure;
+    }
+    result
 }
 
 /// Format the explicit raw stdout surface for `exec --raw`.
@@ -99,6 +139,7 @@ pub fn format_cli_error(
 }
 
 /// Format a CLI-side error that happened after the daemon had already committed a response.
+#[cfg(test)]
 pub fn format_post_commit_cli_error(
     response: &IpcResponse,
     command: &str,
@@ -106,10 +147,35 @@ pub fn format_post_commit_cli_error(
     envelope: ErrorEnvelope,
     pretty: bool,
 ) -> String {
-    let data = response
-        .data
-        .as_ref()
-        .map(annotate_post_commit_local_failure_data);
+    let followup_error = attach_authority_error_guidance(envelope);
+    let data = Some(annotate_post_commit_local_failure_data(
+        response.data.as_ref().unwrap_or(&Value::Null),
+        &followup_error,
+    ));
+    let result = CommandResult {
+        success: true,
+        command: command.to_string(),
+        stdout_schema_version: CommandResult::STDOUT_SCHEMA_VERSION.to_string(),
+        request_id: response.request_id.clone(),
+        command_id: response.command_id.clone(),
+        session: session.to_string(),
+        timing: response.timing,
+        data,
+        error: None,
+    };
+    serialize_checked_command_result(result, pretty)
+}
+
+/// Format a CLI-side failure that happened after the daemon had already
+/// committed a response, but where the caller-visible command contract now
+/// fails closed.
+pub fn format_committed_cli_error(
+    response: &IpcResponse,
+    command: &str,
+    session: &str,
+    envelope: ErrorEnvelope,
+    pretty: bool,
+) -> String {
     let result = CommandResult {
         success: false,
         command: command.to_string(),
@@ -118,16 +184,22 @@ pub fn format_post_commit_cli_error(
         command_id: response.command_id.clone(),
         session: session.to_string(),
         timing: response.timing,
-        data,
+        data: None,
         error: Some(attach_authority_error_guidance(envelope)),
     };
     serialize_checked_command_result(result, pretty)
 }
 
-fn annotate_post_commit_local_failure_data(data: &Value) -> Value {
+#[cfg(test)]
+fn annotate_post_commit_local_failure_data(data: &Value, followup_error: &ErrorEnvelope) -> Value {
+    let followup_error = serde_json::to_value(followup_error)
+        .unwrap_or_else(|_| json!({"code": "INTERNAL_ERROR", "message": "failed to serialize post-commit follow-up error"}));
     match data {
         Value::Object(object) => {
             let mut annotated = object.clone();
+            // Keep the legacy string field as a compatibility mirror, but the
+            // stdout contract now keys off the typed post_commit_followup_state
+            // object instead of this magic value.
             annotated.insert(
                 "commit_state".to_string(),
                 Value::String(POST_COMMIT_LOCAL_FAILURE_STATE.to_string()),
@@ -136,16 +208,21 @@ fn annotate_post_commit_local_failure_data(data: &Value) -> Value {
                 "post_commit_followup_state".to_string(),
                 post_commit_followup_state_json(),
             );
+            annotated.insert("post_commit_followup_error".to_string(), followup_error);
             Value::Object(annotated)
         }
         other => json!({
+            // Compatibility mirror only; typed readers should use
+            // post_commit_followup_state below.
             "commit_state": POST_COMMIT_LOCAL_FAILURE_STATE,
             "post_commit_followup_state": post_commit_followup_state_json(),
+            "post_commit_followup_error": followup_error,
             "daemon_response": other,
         }),
     }
 }
 
+#[cfg(test)]
 fn post_commit_followup_state_json() -> Value {
     json!({
         "surface": "cli_post_commit_followup_failure",
@@ -189,19 +266,118 @@ fn stdout_command_id(command_id: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn serialize_checked_command_result(result: CommandResult, pretty: bool) -> String {
-    if let Some(envelope) = result.contract_error_envelope() {
-        let mut fallback = CommandResult::error(
-            result.command,
-            result.session,
-            stdout_request_id(&result.request_id),
-            attach_authority_error_guidance(envelope),
-        )
-        .with_timing(result.timing);
-        fallback.command_id = stdout_command_id(result.command_id.as_deref());
-        return serialize_command_result_json(&fallback, pretty);
+fn interaction_effect_failure_result(result: &CommandResult) -> Option<CommandResult> {
+    if projected_interaction_effect_success(result.success, result.data.as_ref()) {
+        return None;
     }
-    serialize_command_result_json(&result, pretty)
+    let data = result.data.as_ref()?;
+    let confirmation_status = projected_interaction_confirmation_status(Some(data))?;
+    let envelope =
+        interaction_effect_failure_envelope(result.command.as_str(), data, confirmation_status);
+    Some(CommandResult {
+        success: false,
+        command: result.command.clone(),
+        stdout_schema_version: CommandResult::STDOUT_SCHEMA_VERSION.to_string(),
+        request_id: result.request_id.clone(),
+        command_id: result.command_id.clone(),
+        session: result.session.clone(),
+        timing: result.timing,
+        data: None,
+        error: Some(attach_authority_error_guidance(envelope)),
+    })
+}
+
+fn interaction_effect_failure_envelope(
+    command: &str,
+    data: &serde_json::Value,
+    confirmation_status: InteractionConfirmationStatus,
+) -> ErrorEnvelope {
+    let interaction = data
+        .as_object()
+        .and_then(|object| object.get("interaction"))
+        .and_then(Value::as_object);
+
+    let message = match confirmation_status {
+        InteractionConfirmationStatus::Contradicted => {
+            "Interaction actuation completed, but the observed browser effect contradicted the requested outcome"
+        }
+        InteractionConfirmationStatus::Degraded => {
+            "Interaction actuation completed, but the browser-side effect could not be confirmed before the commit fence degraded"
+        }
+        InteractionConfirmationStatus::Unconfirmed => {
+            "Interaction actuation completed, but the browser-side effect was not confirmed"
+        }
+        InteractionConfirmationStatus::Confirmed => {
+            "Interaction actuation completed and the browser-side effect was confirmed"
+        }
+    };
+
+    let mut context = Map::new();
+    context.insert(
+        "reason".to_string(),
+        Value::String("interaction_effect_not_confirmed".to_string()),
+    );
+    context.insert(
+        "effect_state".to_string(),
+        interaction_effect_failure_state_json(confirmation_status),
+    );
+    context.insert("command".to_string(), Value::String(command.to_string()));
+    context.insert("daemon_request_committed".to_string(), Value::Bool(true));
+    context.insert("committed_response_projection".to_string(), data.clone());
+    if let Some(kind) = interaction
+        .and_then(|interaction| interaction.get("confirmation_kind"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+    {
+        context.insert("confirmation_kind".to_string(), Value::String(kind));
+    }
+    ErrorEnvelope::new(ErrorCode::InteractionNotConfirmed, message)
+        .with_context(Value::Object(context))
+}
+
+fn interaction_effect_failure_state_json(
+    confirmation_status: InteractionConfirmationStatus,
+) -> Value {
+    let confirmation_status = match confirmation_status {
+        InteractionConfirmationStatus::Confirmed => "confirmed",
+        InteractionConfirmationStatus::Unconfirmed => "unconfirmed",
+        InteractionConfirmationStatus::Contradicted => "contradicted",
+        InteractionConfirmationStatus::Degraded => "degraded",
+    };
+    json!({
+        "surface": INTERACTION_EFFECT_FAILURE_SURFACE,
+        "truth_level": "operator_projection",
+        "projection_kind": INTERACTION_EFFECT_FAILURE_SURFACE,
+        "projection_authority": "cli.interaction_effect",
+        "upstream_commit_truth": "daemon_response_committed",
+        "control_role": "display_only",
+        "durability": "best_effort",
+        "recovery_contract": "no_public_recovery_contract",
+        "confirmation_status": confirmation_status,
+    })
+}
+
+fn checked_command_result(result: CommandResult) -> CommandResult {
+    if let Some(envelope) = result.contract_error_envelope() {
+        return CommandResult {
+            success: false,
+            command: result.command,
+            stdout_schema_version: CommandResult::STDOUT_SCHEMA_VERSION.to_string(),
+            request_id: stdout_request_id(&result.request_id),
+            command_id: stdout_command_id(result.command_id.as_deref()),
+            session: result.session,
+            timing: result.timing,
+            data: None,
+            error: Some(stdout_contract_fallback_error(
+                attach_authority_error_guidance(envelope),
+            )),
+        };
+    }
+    result
+}
+
+fn serialize_checked_command_result(result: CommandResult, pretty: bool) -> String {
+    serialize_command_result_json(&checked_command_result(result), pretty)
 }
 
 fn serialize_command_result_json(result: &CommandResult, pretty: bool) -> String {
@@ -265,6 +441,33 @@ fn attach_authority_error_guidance(mut envelope: ErrorEnvelope) -> ErrorEnvelope
     if let Some(object) = context.as_object_mut() {
         object.insert("authority_guidance".to_string(), guidance);
     }
+    envelope
+}
+
+fn stdout_contract_fallback_error(mut envelope: ErrorEnvelope) -> ErrorEnvelope {
+    let mut context = envelope
+        .context
+        .take()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    context.insert("stdout_contract_fallback".to_string(), Value::Bool(true));
+    context.insert(
+        "projection_kind".to_string(),
+        Value::String(STDOUT_CONTRACT_FALLBACK_SURFACE.to_string()),
+    );
+    context.insert(
+        "projection_authority".to_string(),
+        Value::String("cli.stdout_contract_fallback".to_string()),
+    );
+    context.insert(
+        "truth_level".to_string(),
+        Value::String("operator_projection".to_string()),
+    );
+    context.insert(
+        "replay_identity_truth".to_string(),
+        Value::String("absent".to_string()),
+    );
+    envelope.context = Some(Value::Object(context));
     envelope
 }
 
@@ -334,10 +537,17 @@ fn authority_error_guidance(code: ErrorCode, context: &Value) -> Option<Value> {
                 ],
             ))
         }
-        (ErrorCode::BrowserCrashed, _, Some("continuity_no_active_tab")) => {
+        (ErrorCode::BrowserCrashed, _, Some("continuity_no_active_tab"))
+        | (ErrorCode::SessionBusy, _, Some("continuity_no_active_tab"))
+        | (ErrorCode::SessionBusy, _, Some("continuity_target_tab_missing"))
+        | (ErrorCode::SessionBusy, _, Some("continuity_tab_refresh_failed")) => {
             Some(authority_guidance(
-                "continuity_no_active_tab",
-                "No active tab remained after the takeover transition. Re-establish tab authority before continuing automation.",
+                match reason {
+                    Some("continuity_target_tab_missing") => "continuity_target_tab_missing",
+                    Some("continuity_tab_refresh_failed") => "continuity_tab_refresh_failed",
+                    _ => "continuity_no_active_tab",
+                },
+                "Tab authority became unavailable during continuity recovery. Re-establish the intended tab before continuing automation.",
                 vec![
                     guidance_command_hint(
                         "rub tabs",
@@ -354,10 +564,11 @@ fn authority_error_guidance(code: ErrorCode, context: &Value) -> Option<Value> {
                 ],
             ))
         }
-        (ErrorCode::BrowserCrashed, _, Some("continuity_frame_unavailable")) => {
+        (ErrorCode::BrowserCrashed, _, Some("continuity_frame_unavailable"))
+        | (ErrorCode::SessionBusy, _, Some("continuity_frame_unavailable")) => {
             Some(authority_guidance(
                 "continuity_frame_unavailable",
-                "Frame authority became unavailable after the takeover transition. Re-select the intended frame and refresh page authority before continuing.",
+                "Frame authority became unavailable during continuity recovery. Re-select the intended frame and refresh page authority before continuing.",
                 vec![
                     guidance_command_hint(
                         "rub frames",

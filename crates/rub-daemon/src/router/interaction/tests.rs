@@ -16,6 +16,38 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[test]
+fn interaction_possible_commit_timeout_contract_redacts_raw_secret_bearing_args() {
+    let contract = super::interaction_possible_commit_recovery_contract(
+        "type",
+        &serde_json::json!({
+            "selector": "input.password",
+            "text": "typed-secret",
+            "keys": "Meta+K",
+            "value": "secret-option",
+            "path": "/tmp/private/upload.txt",
+            "label": "sensitive label",
+            "target_text": "sensitive text",
+            "wait_after": {"text": "done"},
+        }),
+    );
+    let serialized = serde_json::to_string(&contract).expect("serialize contract");
+
+    assert_eq!(contract["kind"], "interaction_possible_commit");
+    assert_eq!(contract["command"], "type");
+    assert_eq!(contract["request"]["locator"]["selector"], "input.password");
+    assert_eq!(contract["request"]["arguments_redacted"], true);
+    assert!(
+        !serialized.contains("typed-secret")
+            && !serialized.contains("Meta+K")
+            && !serialized.contains("secret-option")
+            && !serialized.contains("/tmp/private")
+            && !serialized.contains("sensitive label")
+            && !serialized.contains("sensitive text"),
+        "timeout recovery contract must not expose raw interaction args: {serialized}"
+    );
+}
+
 #[tokio::test]
 async fn post_interaction_projection_reads_refreshed_runtime_and_frame_state() {
     let state = Arc::new(SessionState::new(
@@ -169,9 +201,9 @@ async fn stable_post_interaction_projection_waits_for_browser_quiescence_before_
 
     let baseline = InteractionObservationBaseline {
         observatory_cursor: state.observatory_cursor().await,
-        observatory_drop_count: state.observatory().await.dropped_event_count,
+        observatory_ingress_drop_count: state.observatory_ingress_drop_count(),
         request_cursor: state.network_request_cursor().await,
-        network_request_drop_count: state.network_request_drop_count().await,
+        network_request_ingress_drop_count: state.network_request_ingress_drop_count(),
         download_cursor: state.download_cursor().await,
         download_ingress_drop_count: state.download_event_ingress_drop_count(),
         download_degraded_reason_before: None,
@@ -359,9 +391,9 @@ async fn interaction_trace_windows_are_capped_to_observation_fence() {
 
     let baseline = InteractionObservationBaseline {
         observatory_cursor: 0,
-        observatory_drop_count: 0,
+        observatory_ingress_drop_count: 0,
         request_cursor: 0,
-        network_request_drop_count: 0,
+        network_request_ingress_drop_count: 0,
         download_cursor: 0,
         download_ingress_drop_count: 0,
         download_degraded_reason_before: None,
@@ -371,9 +403,9 @@ async fn interaction_trace_windows_are_capped_to_observation_fence() {
     };
     let fence = InteractionObservationFence {
         observatory_cursor,
-        observatory_drop_count: state.observatory().await.dropped_event_count,
+        observatory_ingress_drop_count: state.observatory_ingress_drop_count(),
         request_cursor,
-        network_request_drop_count: state.network_request_drop_count().await,
+        network_request_ingress_drop_count: state.network_request_ingress_drop_count(),
         download_cursor,
         download_ingress_drop_count: state.download_event_ingress_drop_count(),
         download_degraded_reason_after: None,

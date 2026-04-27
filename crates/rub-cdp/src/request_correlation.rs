@@ -11,6 +11,10 @@ pub(crate) const CORRELATION_REGISTRY_TTL_EXPIRED_REASON: &str =
 pub(crate) const CORRELATION_STRICT_FALLBACK_REASON: &str =
     "request_correlation_unresolved_fallback";
 pub(crate) const CORRELATION_RELAXED_FALLBACK_REASON: &str = "request_correlation_relaxed_fallback";
+pub(crate) const CORRELATION_AMBIGUOUS_FALLBACK_REASON: &str =
+    "request_correlation_ambiguous_fallback";
+pub(crate) const CORRELATION_BROWSER_AUTHORITY_REBUILD_FAILED_REASON: &str =
+    "request_correlation_browser_authority_rebuild_failed";
 
 /// Correlated request metadata produced by network rule execution and consumed
 /// by the runtime observatory when the request later resolves or fails.
@@ -99,6 +103,13 @@ impl RequestCorrelationRegistry {
             tab_target_id,
             Instant::now(),
         )
+    }
+
+    pub fn discard_for_fetch_request_id(&mut self, fetch_request_id: &str) -> bool {
+        let Some(entry_id) = self.by_fetch_request_id.get(fetch_request_id).copied() else {
+            return false;
+        };
+        self.remove_entry(entry_id).is_some()
     }
 
     fn record_at(
@@ -218,6 +229,8 @@ impl RequestCorrelationRegistry {
         correlation: RequestCorrelation,
         now: Instant,
     ) {
+        self.retire_replaced_direct_authority(fetch_request_id.as_str(), network_id.as_deref());
+
         let entry_id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
 
@@ -259,6 +272,26 @@ impl RequestCorrelationRegistry {
             },
         );
         self.order.push_back(entry_id);
+    }
+
+    fn retire_replaced_direct_authority(
+        &mut self,
+        fetch_request_id: &str,
+        network_id: Option<&str>,
+    ) {
+        let mut replaced_entry_ids = Vec::new();
+        if let Some(entry_id) = self.by_fetch_request_id.get(fetch_request_id).copied() {
+            replaced_entry_ids.push(entry_id);
+        }
+        if let Some(network_id) = network_id
+            && let Some(entry_id) = self.by_network_request_id.get(network_id).copied()
+            && !replaced_entry_ids.contains(&entry_id)
+        {
+            replaced_entry_ids.push(entry_id);
+        }
+        for entry_id in replaced_entry_ids {
+            let _ = self.remove_entry(entry_id);
+        }
     }
 
     fn find_unique_unresolved(
@@ -327,6 +360,7 @@ impl RequestCorrelationRegistry {
         }
 
         if strict_ambiguous {
+            self.emit_degraded(CORRELATION_AMBIGUOUS_FALLBACK_REASON);
             return None;
         }
         if let Some(entry_id) = strict_match {
@@ -334,6 +368,7 @@ impl RequestCorrelationRegistry {
             return Some(entry_id);
         }
         if relaxed_ambiguous {
+            self.emit_degraded(CORRELATION_AMBIGUOUS_FALLBACK_REASON);
             return None;
         }
         if relaxed_match.is_some() {
@@ -385,6 +420,10 @@ impl RequestCorrelationRegistry {
 
     pub(crate) fn take_degraded_reasons(&mut self) -> Vec<&'static str> {
         self.degraded_reasons.drain(..).collect()
+    }
+
+    pub(crate) fn mark_runtime_degraded(&mut self, reason: &'static str) {
+        self.emit_degraded(reason);
     }
 
     fn emit_degraded(&mut self, reason: &'static str) {

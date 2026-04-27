@@ -262,6 +262,8 @@ mod tests {
             url: "https://example.com".to_string(),
             title: "Test".to_string(),
             active: true,
+            active_authority: None,
+            degraded_reason: None,
         }
     }
 
@@ -272,6 +274,8 @@ mod tests {
             url: "https://other.com".to_string(),
             title: "Other".to_string(),
             active: false,
+            active_authority: None,
+            degraded_reason: None,
         }
     }
 

@@ -15,7 +15,7 @@ pub(super) fn validate_registry_data_for_home(
     Ok(())
 }
 
-pub(super) fn validate_registry_entry_for_home(
+pub(crate) fn validate_registry_entry_for_home(
     home: &Path,
     entry: &RegistryEntry,
 ) -> std::io::Result<()> {
@@ -95,7 +95,10 @@ pub(super) fn validate_registry_entry_for_home(
     let expected_socket_path = RubPaths::new(home)
         .session_runtime(&entry.session_name, &entry.session_id)
         .socket_path();
-    if Path::new(&entry.socket_path) != expected_socket_path {
+    let recorded_socket_path = Path::new(&entry.socket_path);
+    if recorded_socket_path != expected_socket_path
+        && !is_legacy_runtime_socket_path(recorded_socket_path)
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -122,4 +125,50 @@ pub(super) fn validate_registry_entry_for_home(
         ));
     }
     Ok(())
+}
+
+pub(super) fn is_legacy_runtime_socket_path(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let mut components = path.components();
+    let (
+        Some(std::path::Component::RootDir),
+        Some(std::path::Component::Normal(tmp)),
+        Some(std::path::Component::Normal(parent)),
+        Some(std::path::Component::Normal(file)),
+        None,
+    ) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    )
+    else {
+        return false;
+    };
+    if tmp != "tmp" {
+        return false;
+    }
+    let Some(parent_name) = parent.to_str() else {
+        return false;
+    };
+    let Some(legacy_tag) = parent_name.strip_prefix("rub-sock-") else {
+        return false;
+    };
+    if legacy_tag.is_empty()
+        || !legacy_tag
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return false;
+    }
+    let Some(file_name) = file.to_str() else {
+        return false;
+    };
+    let Some(hex) = file_name.strip_suffix(".sock") else {
+        return false;
+    };
+    hex.len() == 16 && hex.chars().all(|ch| ch.is_ascii_hexdigit())
 }

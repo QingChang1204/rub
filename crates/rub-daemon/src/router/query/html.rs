@@ -7,7 +7,7 @@ use super::args::{GetHtmlArgs, InspectReadArgs};
 use super::result_projection::{
     live_read_subject, multi_read_result, page_subject, read_payload, scalar_read_result,
 };
-use super::*;
+use super::{reject_live_many_locator_selection, reject_snapshot_without_locator, *};
 
 use rub_core::locator::{CanonicalLocator, LiveLocator};
 
@@ -67,6 +67,14 @@ pub(super) async fn cmd_inspect_html(
         &locator_json(args.locator.clone()),
         LocatorParseOptions::OPTIONAL_ELEMENT_ADDRESS,
     )?;
+    reject_snapshot_without_locator(
+        "inspect html",
+        args.snapshot_id.as_deref(),
+        locator.as_ref(),
+    )?;
+    if args.many {
+        reject_live_many_locator_selection(locator.as_ref(), "html")?;
+    }
     let uses_snapshot_authority = args.snapshot_id.is_some()
         || matches!(
             locator,
@@ -88,13 +96,26 @@ pub(super) async fn cmd_inspect_html(
     }
 
     match (locator, args.many, uses_snapshot_authority) {
-        (None, false, _) => Ok(read_payload(
-            page_subject(None),
-            scalar_read_result(
-                "html",
-                serde_json::json!(router.browser.get_html(None).await?),
-            ),
-        )),
+        (None, false, _) => {
+            let frame_id =
+                super::super::frame_scope::effective_request_frame_id(router, raw_args, state)
+                    .await?;
+            let html = if frame_id.is_some() {
+                let value = router
+                    .browser
+                    .execute_js_in_frame(frame_id.as_deref(), "document.documentElement.outerHTML")
+                    .await?;
+                serde_json::from_value::<String>(value).map_err(|error| {
+                    RubError::Internal(format!("Parse inspect_html result failed: {error}"))
+                })?
+            } else {
+                router.browser.get_html(None).await?
+            };
+            Ok(read_payload(
+                page_subject(frame_id.as_deref()),
+                scalar_read_result("html", serde_json::json!(html)),
+            ))
+        }
         (None, true, _) => Err(RubError::domain_with_context_and_suggestion(
             ErrorCode::InvalidInput,
             "inspect html --many requires a locator",

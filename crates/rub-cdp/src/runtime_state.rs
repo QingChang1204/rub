@@ -5,17 +5,19 @@ use rub_core::model::{
     AuthState, OverlayState, ReadinessInfo, ReadinessStatus, RouteStability, RuntimeStateSnapshot,
     StateInspectorInfo, StateInspectorStatus,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::time::Duration;
 use tracing::warn;
 
 type RuntimeStateSequenceAllocator = Arc<dyn Fn() -> u64 + Send + Sync>;
-type RuntimeStateSnapshotCallback = Arc<dyn Fn(u64, RuntimeStateSnapshot) + Send + Sync>;
+type RuntimeStateSnapshotCallback =
+    Arc<dyn Fn(u64, u64, Option<String>, RuntimeStateSnapshot) + Send + Sync>;
 const RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
-const FRAME_SCOPED_PAGE_GLOBAL_COOKIE_REASON: &str =
-    "page_global_cookie_authority_in_frame_snapshot";
-const FRAME_SCOPED_PAGE_GLOBAL_COOKIE_SIGNAL: &str = "page_global_cookie_authority_mixed";
+const FRAME_SCOPED_COOKIE_AUTHORITY_UNAVAILABLE_REASON: &str =
+    "page_global_cookie_authority_unavailable_in_frame_snapshot";
+const FRAME_SCOPED_COOKIE_AUTHORITY_UNAVAILABLE_SIGNAL: &str =
+    "page_global_cookie_authority_unavailable";
 
 #[derive(Clone, Default)]
 pub struct RuntimeStateCallbacks {
@@ -51,12 +53,12 @@ struct ReadinessProbe {
     route_stability: String,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
-struct DocumentFenceProbe {
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+pub(crate) struct DocumentFenceProbe {
     #[serde(default)]
-    href: String,
+    pub(crate) href: String,
     #[serde(default)]
-    time_origin: Option<f64>,
+    pub(crate) time_origin: Option<f64>,
 }
 
 const STORAGE_PROBE_JS: &str = r#"
@@ -250,7 +252,7 @@ pub async fn probe_page_runtime_state(page: Arc<Page>, callbacks: RuntimeStateCa
 
     let sequence = allocate_sequence();
     let snapshot = capture_runtime_state(&page).await;
-    on_snapshot(sequence, snapshot);
+    on_snapshot(sequence, 0, None, snapshot);
 }
 
 pub async fn capture_runtime_state(page: &Arc<Page>) -> RuntimeStateSnapshot {
@@ -276,25 +278,48 @@ async fn capture_runtime_state_for_frame_context(
     page: &Arc<Page>,
     frame_id: Option<&str>,
 ) -> Result<RuntimeStateSnapshot, RubError> {
-    let context_id = crate::frame_runtime::resolve_frame_context(page, frame_id)
-        .await?
-        .execution_context_id;
+    let frame_context = crate::frame_runtime::resolve_frame_context(page, frame_id).await?;
+    let context_id = frame_context.execution_context_id;
+    let frame_scoped = runtime_snapshot_frame_scope(&frame_context);
 
-    Ok(capture_runtime_state_in_context(page, context_id, frame_id.is_some()).await)
+    Ok(capture_runtime_state_in_context(page, context_id, frame_scoped).await)
+}
+
+fn runtime_snapshot_frame_scope(
+    frame_context: &crate::frame_runtime::ResolvedFrameContext,
+) -> bool {
+    frame_context.frame_scoped
 }
 
 fn frame_context_unavailable_snapshot(error: RubError) -> RuntimeStateSnapshot {
+    let degraded_reason = runtime_frame_context_degraded_reason(error);
     RuntimeStateSnapshot {
         state_inspector: StateInspectorInfo {
             status: StateInspectorStatus::Degraded,
-            degraded_reason: Some(format!("frame_context_unavailable:{error}")),
+            degraded_reason: Some(degraded_reason.clone()),
             ..StateInspectorInfo::default()
         },
         readiness_state: ReadinessInfo {
             status: ReadinessStatus::Degraded,
-            degraded_reason: Some(format!("frame_context_unavailable:{error}")),
+            degraded_reason: Some(degraded_reason),
             ..ReadinessInfo::default()
         },
+    }
+}
+
+fn runtime_frame_context_degraded_reason(error: RubError) -> String {
+    match error {
+        RubError::Domain(envelope) => {
+            let code = envelope.code.to_string();
+            let reason = envelope
+                .context
+                .as_ref()
+                .and_then(|context| context.get("reason"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            format!("frame_context_unavailable:{code}:{reason}")
+        }
+        _ => "frame_context_unavailable:internal_error".to_string(),
     }
 }
 
@@ -342,6 +367,41 @@ async fn probe_document_fence(
     .ok()
 }
 
+pub(crate) async fn probe_live_read_document_fence(
+    page: &Arc<Page>,
+    context_id: Option<ExecutionContextId>,
+) -> Option<DocumentFenceProbe> {
+    probe_document_fence(page, context_id).await
+}
+
+pub(crate) fn ensure_live_read_document_fence(
+    operation: &str,
+    frame_id: &str,
+    before: Option<&DocumentFenceProbe>,
+    after: Option<&DocumentFenceProbe>,
+) -> Result<(), RubError> {
+    let Some(reason) = runtime_document_fence_failure_reason(before, after) else {
+        return Ok(());
+    };
+    let reason = if reason == "document_changed_during_runtime_probe" {
+        "document_changed_during_live_read"
+    } else {
+        reason
+    };
+    Err(RubError::domain_with_context_and_suggestion(
+        rub_core::error::ErrorCode::StaleSnapshot,
+        "Live read document authority changed while evaluating the request",
+        serde_json::json!({
+            "reason": reason,
+            "operation": operation,
+            "frame_id": frame_id,
+            "document_before": before,
+            "document_after": after,
+        }),
+        "Retry the read after reacquiring tab and frame authority with 'rub state'",
+    ))
+}
+
 async fn probe_state_inspector(
     page: &Arc<Page>,
     context_id: Option<ExecutionContextId>,
@@ -349,27 +409,39 @@ async fn probe_state_inspector(
 ) -> StateInspectorInfo {
     let mut degraded_reasons = Vec::new();
 
-    let cookie_count = match page.get_cookies().await {
-        Ok(cookies) => cookies.len() as u32,
-        Err(error) => {
-            degraded_reasons.push("cookie_query_failed".to_string());
-            warn!(error = %error, "State inspector failed to query cookies");
-            0
+    let (cookie_count, cookie_authority_available) = if frame_scoped {
+        degraded_reasons.push(FRAME_SCOPED_COOKIE_AUTHORITY_UNAVAILABLE_REASON.to_string());
+        (0, false)
+    } else {
+        match page.get_cookies().await {
+            Ok(cookies) => (cookies.len() as u32, true),
+            Err(error) => {
+                degraded_reasons.push("cookie_query_failed".to_string());
+                warn!(error = %error, "State inspector failed to query cookies");
+                (0, false)
+            }
         }
     };
 
-    let storage =
+    let (storage, storage_authority_available) =
         match probe_json_in_context(page, context_id, STORAGE_PROBE_JS, parse_storage_probe_json)
             .await
         {
-            Ok(storage) => storage,
+            Ok(storage) => (storage, true),
             Err(reason) => {
                 degraded_reasons.push(reason);
-                StorageProbe::default()
+                (StorageProbe::default(), false)
             }
         };
 
-    build_state_inspector_info(cookie_count, storage, degraded_reasons, frame_scoped)
+    build_state_inspector_info(
+        cookie_count,
+        storage,
+        degraded_reasons,
+        cookie_authority_available,
+        storage_authority_available,
+        frame_scoped,
+    )
 }
 
 async fn probe_readiness(
@@ -477,12 +549,31 @@ fn degrade_runtime_snapshot_for_document_fence(
     readiness_state: &mut ReadinessInfo,
     reason: &'static str,
 ) {
+    scrub_state_inspector_for_document_fence(state_inspector);
     state_inspector.status = StateInspectorStatus::Degraded;
     state_inspector.degraded_reason =
         append_degraded_reason(state_inspector.degraded_reason.take(), reason);
+    scrub_readiness_for_document_fence(readiness_state);
     readiness_state.status = ReadinessStatus::Degraded;
     readiness_state.degraded_reason =
         append_degraded_reason(readiness_state.degraded_reason.take(), reason);
+}
+
+fn scrub_state_inspector_for_document_fence(state_inspector: &mut StateInspectorInfo) {
+    state_inspector.auth_state = AuthState::Unknown;
+    state_inspector.cookie_count = 0;
+    state_inspector.local_storage_keys.clear();
+    state_inspector.session_storage_keys.clear();
+    state_inspector.auth_signals.clear();
+}
+
+fn scrub_readiness_for_document_fence(readiness_state: &mut ReadinessInfo) {
+    readiness_state.route_stability = RouteStability::Unknown;
+    readiness_state.loading_present = false;
+    readiness_state.skeleton_present = false;
+    readiness_state.overlay_state = OverlayState::None;
+    readiness_state.document_ready_state = None;
+    readiness_state.blocking_signals.clear();
 }
 
 fn append_degraded_reason(existing: Option<String>, reason: &str) -> Option<String> {
@@ -498,17 +589,23 @@ fn build_state_inspector_info(
     cookie_count: u32,
     storage: StorageProbe,
     mut degraded_reasons: Vec<String>,
+    cookie_authority_available: bool,
+    storage_authority_available: bool,
     frame_scoped: bool,
 ) -> StateInspectorInfo {
-    let auth_cookie_count = if frame_scoped { 0 } else { cookie_count };
     let mut auth_signals = infer_auth_signals(
-        auth_cookie_count,
+        cookie_count,
         &storage.local_storage_keys,
         &storage.session_storage_keys,
     );
     if frame_scoped {
-        degraded_reasons.push(FRAME_SCOPED_PAGE_GLOBAL_COOKIE_REASON.to_string());
-        auth_signals.push(FRAME_SCOPED_PAGE_GLOBAL_COOKIE_SIGNAL.to_string());
+        if !degraded_reasons
+            .iter()
+            .any(|reason| reason == FRAME_SCOPED_COOKIE_AUTHORITY_UNAVAILABLE_REASON)
+        {
+            degraded_reasons.push(FRAME_SCOPED_COOKIE_AUTHORITY_UNAVAILABLE_REASON.to_string());
+        }
+        auth_signals.push(FRAME_SCOPED_COOKIE_AUTHORITY_UNAVAILABLE_SIGNAL.to_string());
     }
 
     StateInspectorInfo {
@@ -518,9 +615,11 @@ fn build_state_inspector_info(
             StateInspectorStatus::Degraded
         },
         auth_state: infer_auth_state(
-            auth_cookie_count,
+            cookie_count,
             &storage.local_storage_keys,
             &storage.session_storage_keys,
+            cookie_authority_available,
+            storage_authority_available,
         ),
         cookie_count,
         auth_signals,
@@ -534,8 +633,13 @@ fn infer_auth_state(
     cookie_count: u32,
     local_storage_keys: &[String],
     session_storage_keys: &[String],
+    cookie_authority_available: bool,
+    storage_authority_available: bool,
 ) -> AuthState {
-    if cookie_count == 0 && local_storage_keys.is_empty() && session_storage_keys.is_empty() {
+    if !cookie_authority_available || !storage_authority_available {
+        AuthState::Unknown
+    } else if cookie_count == 0 && local_storage_keys.is_empty() && session_storage_keys.is_empty()
+    {
         AuthState::Anonymous
     } else {
         AuthState::Unknown

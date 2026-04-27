@@ -1,4 +1,169 @@
 use super::*;
+use std::io::{BufReader, Write};
+use std::net::TcpStream;
+use std::os::unix::net::UnixListener as StdUnixListener;
+use std::path::PathBuf;
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+fn inject_replay_failing_batch_close_session(
+    home: &str,
+    session_name: &str,
+) -> (String, PathBuf, JoinHandle<()>) {
+    let session_id = format!("sess-{session_name}");
+    let runtime = rub_daemon::rub_paths::RubPaths::new(home).session_runtime(session_name, &session_id);
+    let socket_path = runtime.actual_socket_path();
+    let _ = std::fs::remove_file(&socket_path);
+    std::fs::create_dir_all(
+        socket_path
+            .parent()
+            .expect("replay-failing fake socket should have parent"),
+    )
+    .expect("create replay-failing fake socket parent");
+    let listener = StdUnixListener::bind(&socket_path).expect("bind replay-failing fake socket");
+    let session_id_for_server = session_id.clone();
+    let socket_path_for_server = socket_path.clone();
+    let server = std::thread::spawn(move || {
+        loop {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept replay-failing fake daemon connection");
+            let mut reader = BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone fake daemon stream for read"),
+            );
+            let request: rub_ipc::protocol::IpcRequest =
+                rub_ipc::codec::NdJsonCodec::read_blocking(&mut reader)
+                    .expect("read fake daemon request")
+                    .expect("fake daemon request frame");
+            match request.command.as_str() {
+                "_handshake" => {
+                    let response = rub_ipc::protocol::IpcResponse::success(
+                        "handshake",
+                        serde_json::json!({
+                            "daemon_session_id": session_id_for_server,
+                            "launch_policy": {
+                                "headless": true,
+                                "ignore_cert_errors": false,
+                                "hide_infobars": false
+                            }
+                        }),
+                    )
+                    .with_command_id(
+                        request
+                            .command_id
+                            .clone()
+                            .expect("handshake probe must carry command_id"),
+                    )
+                    .expect("probe command_id must be valid")
+                    .with_daemon_session_id(&session_id_for_server)
+                    .expect("daemon_session_id must be valid");
+                    stream
+                        .write_all(
+                            &rub_ipc::codec::NdJsonCodec::encode(&response)
+                                .expect("encode fake handshake response"),
+                        )
+                        .expect("write fake handshake response");
+                    stream.flush().expect("flush fake handshake response");
+                }
+                "close" => {
+                    std::thread::sleep(Duration::from_millis(5_000));
+                    drop(reader);
+                    drop(stream);
+                    let _ = std::fs::remove_file(&socket_path_for_server);
+                    break;
+                }
+                other => panic!("unexpected fake daemon command: {other} ({request:?})"),
+            }
+        }
+    });
+
+    std::fs::create_dir_all(runtime.session_dir())
+        .expect("create replay-failing runtime session dir");
+    std::fs::create_dir_all(
+        runtime
+            .startup_committed_path()
+            .parent()
+            .expect("startup committed parent for replay-failing session"),
+    )
+    .expect("create replay-failing startup committed parent");
+    std::fs::write(runtime.pid_path(), std::process::id().to_string())
+        .expect("write replay-failing runtime pid path");
+    std::fs::write(runtime.startup_committed_path(), &session_id)
+        .expect("write replay-failing startup committed marker");
+
+    let mut registry = rub_daemon::session::read_registry(std::path::Path::new(home))
+        .expect("read live registry for replay-failing batch close injection");
+    registry.sessions.push(rub_daemon::session::RegistryEntry {
+        session_id: session_id.clone(),
+        session_name: session_name.to_string(),
+        pid: std::process::id(),
+        socket_path: socket_path.display().to_string(),
+        created_at: "2026-04-23T00:00:00Z".to_string(),
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        user_data_dir: None,
+        attachment_identity: None,
+        connection_target: None,
+    });
+    rub_daemon::session::write_registry(std::path::Path::new(home), &registry)
+        .expect("write registry with replay-failing batch close session");
+
+    (session_id, socket_path, server)
+}
+
+fn assert_session_post_commit_recovery_contract(
+    recovery_contract: &serde_json::Value,
+    home: &str,
+    session_name: &str,
+    session_id: &str,
+    debug: &serde_json::Value,
+) {
+    assert_eq!(
+        recovery_contract["kind"],
+        "session_post_commit_journal",
+        "{debug}"
+    );
+    assert_eq!(
+        recovery_contract["scope"],
+        "daemon_rollover_recovery",
+        "{debug}"
+    );
+    assert_eq!(
+        recovery_contract["session_name"],
+        session_name,
+        "{debug}"
+    );
+    assert_eq!(
+        recovery_contract["daemon_session_id"],
+        session_id,
+        "{debug}"
+    );
+    assert_eq!(
+        recovery_contract["reader_contract"],
+        "ndjson_post_commit_journal",
+        "{debug}"
+    );
+    assert_eq!(
+        recovery_contract["committed_truth_may_exist"],
+        true,
+        "{debug}"
+    );
+    assert_eq!(
+        recovery_contract["safe_to_rerun_with_new_command_id"],
+        false,
+        "{debug}"
+    );
+    assert_eq!(
+        recovery_contract["journal_path"],
+        rub_daemon::rub_paths::RubPaths::new(home)
+            .session_runtime(session_name, session_id)
+            .post_commit_journal_path()
+            .display()
+            .to_string(),
+        "{debug}"
+    );
+}
 
 // ── v1.1: US6 Cookie Management ─────────────────────────────────────
 
@@ -172,11 +337,11 @@ fn t250_252_cookies_grouped_scenario() {
     assert!(!ip_names.iter().any(|cookie| cookie["name"] == "ip_cookie"));
 }
 
-/// T021e: wait does not block the FIFO queue; another command succeeds while wait is in progress.
+/// T021e: standalone wait holds the FIFO request fence while polling.
 #[test]
 #[ignore]
 #[serial]
-fn t214_wait_does_not_block_queue() {
+fn t214_wait_holds_queue_request_fence() {
     let session = ManagedBrowserSession::new();
     let home = session.home().to_string();
 
@@ -214,19 +379,16 @@ fn t214_wait_does_not_block_queue() {
     });
 
     std::thread::sleep(Duration::from_millis(200));
-    let start = std::time::Instant::now();
-    let out = rub_cmd(&home).args(["get", "title"]).output().unwrap();
-    let elapsed = start.elapsed();
-    let json = parse_json(&out);
-    assert_eq!(
-        json["success"], true,
-        "get title should succeed during wait"
+    let queued = parse_json(
+        &rub_cmd(&home)
+            .args(["--timeout", "200", "get", "title"])
+            .output()
+            .unwrap(),
     );
-    assert_eq!(json["data"]["result"]["value"], "Wait Fixture");
-    assert!(
-        elapsed < Duration::from_millis(1000),
-        "concurrent command should not sit behind wait, elapsed={elapsed:?}"
-    );
+    assert_eq!(queued["success"], false, "{queued}");
+    assert_eq!(queued["error"]["code"], "IPC_TIMEOUT", "{queued}");
+    assert_eq!(queued["error"]["context"]["phase"], "queue", "{queued}");
+    assert_eq!(queued["error"]["context"]["command"], "get", "{queued}");
 
     let wait_json = parse_json(&waiter.join().unwrap());
     assert_eq!(wait_json["success"], true);
@@ -273,7 +435,7 @@ fn t215_concurrent_first_command_serializes_startup() {
         "concurrent startup should leave exactly one daemon process for the home"
     );
 
-    cleanup(&home);
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// T030d: a popup tab appears in `tabs` and can be switched to.
@@ -323,7 +485,19 @@ fn t223_popup_tab_lifecycle() {
         .args(["click", &popup_button.to_string(), "--snapshot", &snap_id])
         .output()
         .unwrap();
-    assert_eq!(parse_json(&out)["success"], true);
+    let clicked = parse_json(&out);
+    assert_eq!(clicked["success"], false, "{clicked}");
+    assert_eq!(
+        clicked["error"]["code"],
+        "INTERACTION_NOT_CONFIRMED",
+        "{clicked}"
+    );
+    assert_eq!(
+        clicked["error"]["context"]["committed_response_projection"]["interaction"]["interference"]
+            ["after"]["current_interference"]["kind"],
+        "popup_hijack",
+        "{clicked}"
+    );
 
     let tabs_json = (0..30)
         .find_map(|_| {
@@ -350,6 +524,16 @@ fn t223_popup_tab_lifecycle() {
             .unwrap_or_default()
             >= 2
     );
+    let active_tab = tabs_json["data"]["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tab| tab["active"] == true)
+        .expect("tabs projection should mark one active tab");
+    assert!(matches!(
+        active_tab["active_authority"].as_str(),
+        Some("browser_truth" | "local_fallback")
+    ));
     let popup_index = tabs_json["data"]["result"]["items"]
         .as_array()
         .unwrap()
@@ -657,16 +841,97 @@ fn t233e_i_history_export_grouped_scenario() {
         ),
     ]);
 
-    session
-        .cmd()
-        .args(["open", &server.url_for("/history")])
-        .output()
-        .unwrap();
-    session
-        .cmd()
-        .args(["exec", "document.title"])
-        .output()
-        .unwrap();
+    let opened = parse_json(
+        &session
+            .cmd()
+            .args(["open", &server.url_for("/history")])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(opened["success"], true, "{opened}");
+    let opened_registry_entry =
+        rub_daemon::session::read_registry(std::path::Path::new(session.home()))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "registry should be readable for {}: {error}",
+                    session.home()
+                )
+            })
+            .sessions
+            .into_iter()
+            .find(|entry| entry.session_name == "default")
+            .unwrap_or_else(|| panic!("default session should be present for {}", session.home()));
+    let executed = parse_json(
+        &session
+            .cmd()
+            .args(["exec", "document.title"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(executed["success"], true, "{executed}");
+    assert_eq!(executed["data"]["result"], "History Fixture", "{executed}");
+    let executed_registry_entry =
+        rub_daemon::session::read_registry(std::path::Path::new(session.home()))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "registry should stay readable for {}: {error}",
+                    session.home()
+                )
+            })
+            .sessions
+            .into_iter()
+            .find(|entry| entry.session_name == "default")
+            .unwrap_or_else(|| {
+                panic!(
+                    "default session should remain present for {}",
+                    session.home()
+                )
+            });
+    assert_eq!(
+        executed_registry_entry.session_id, opened_registry_entry.session_id,
+        "{executed}"
+    );
+    assert_eq!(
+        executed_registry_entry.socket_path, opened_registry_entry.socket_path,
+        "{executed}"
+    );
+    assert_eq!(
+        executed_registry_entry.pid, opened_registry_entry.pid,
+        "{executed}"
+    );
+    let daemon_pids_after_exec = daemon_processes_for_home(session.home());
+    assert_eq!(
+        daemon_pids_after_exec.len(),
+        1,
+        "{daemon_pids_after_exec:?}"
+    );
+    let exec_journal_path = RubPaths::new(session.home())
+        .session_runtime("default", &executed_registry_entry.session_id)
+        .post_commit_journal_path();
+    let exec_journal_entries = std::fs::read_to_string(&exec_journal_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "journal should be readable at {:?}: {error}",
+                exec_journal_path
+            )
+        })
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+                panic!("journal line should decode as json: {error}: {line}")
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        exec_journal_entries
+            .last()
+            .and_then(|entry| entry.get("command"))
+            .and_then(|value| value.as_str()),
+        Some("exec"),
+        "{exec_journal_entries:?}"
+    );
 
     let history = parse_json(
         &session
@@ -675,13 +940,13 @@ fn t233e_i_history_export_grouped_scenario() {
             .output()
             .unwrap(),
     );
-    assert_eq!(history["success"], true);
+    assert_eq!(history["success"], true, "{history}");
     let entries = history["data"]["result"]["items"].as_array().unwrap();
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0]["command"], "open");
-    assert_eq!(entries[0]["success"], true);
-    assert_eq!(entries[1]["command"], "exec");
-    assert_eq!(entries[1]["summary"], "success");
+    assert_eq!(entries.len(), 2, "{history}");
+    assert_eq!(entries[0]["command"], "open", "{history}");
+    assert_eq!(entries[0]["success"], true, "{history}");
+    assert_eq!(entries[1]["command"], "exec", "{history}");
+    assert_eq!(entries[1]["summary"], "success", "{history}");
 
     session
         .cmd()
@@ -778,60 +1043,26 @@ fn t233e_i_history_export_grouped_scenario() {
         uuid::Uuid::now_v7()
     ));
     std::fs::create_dir_all(&failing_output_dir).unwrap();
-    let post_commit_failure = parse_json(
-        &session
-            .cmd()
-            .args([
-                "history",
-                "--last",
-                "2",
-                "--export-pipe",
-                "--output",
-                failing_output_dir.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap(),
-    );
+    let post_commit_output = session
+        .cmd()
+        .args([
+            "history",
+            "--last",
+            "2",
+            "--export-pipe",
+            "--output",
+            failing_output_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let post_commit_failure = parse_json(&post_commit_output);
     let _ = std::fs::remove_dir_all(&failing_output_dir);
+    assert!(
+        !post_commit_output.status.success(),
+        "{post_commit_failure}"
+    );
     assert_eq!(
         post_commit_failure["success"], false,
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["commit_state"], "daemon_committed_local_followup_failed",
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["post_commit_followup_state"]["surface"],
-        "cli_post_commit_followup_failure",
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["post_commit_followup_state"]["truth_level"],
-        "operator_projection",
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["post_commit_followup_state"]["projection_authority"],
-        "cli.post_commit_followup",
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["post_commit_followup_state"]["control_role"], "display_only",
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["post_commit_followup_state"]["durability"], "best_effort",
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["post_commit_followup_state"]["recovery_contract"],
-        "no_public_recovery_contract",
-        "{post_commit_failure}"
-    );
-    assert_eq!(
-        post_commit_failure["data"]["result"]["projection_state"]["surface"],
-        "workflow_capture_export",
         "{post_commit_failure}"
     );
     assert_eq!(
@@ -842,41 +1073,99 @@ fn t233e_i_history_export_grouped_scenario() {
         post_commit_failure["error"]["context"]["daemon_request_committed"], true,
         "{post_commit_failure}"
     );
+    assert_eq!(
+        post_commit_failure["error"]["context"]["committed_response_projection"]["result"]["projection_state"]
+            ["surface"],
+        "workflow_capture_export",
+        "{post_commit_failure}"
+    );
+    assert!(
+        post_commit_failure["data"].is_null(),
+        "{post_commit_failure}"
+    );
 
     let spec =
         serde_json::to_string(exported["data"]["result"]["steps"].as_array().unwrap()).unwrap();
-    let replay_home = unique_home();
-    prepare_home(&replay_home);
-    let (_rt2, server2) = start_test_server(vec![(
-        "/history-export",
-        "text/html",
-        r#"<!DOCTYPE html><html><body><input id="name" value=""><button id="apply">Apply</button><div id="status">idle</div><script>document.getElementById('apply').addEventListener('click',()=>{document.getElementById('status').textContent=document.getElementById('name').value||'idle';});</script></body></html>"#,
-    )]);
-    let replayed = parse_json(
-        &rub_cmd(&replay_home)
-            .args([
-                "pipe",
-                &spec.replace(
-                    &server.url_for("/history-export"),
-                    &server2.url_for("/history-export"),
-                ),
-            ])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(replayed["success"], true, "{replayed}");
-    cleanup(&replay_home);
 
     session
         .cmd()
         .args(["open", &server.url_for("/history-observe")])
         .output()
         .unwrap();
-    session
-        .cmd()
-        .args(["get", "text", "--selector", "#status"])
-        .output()
-        .unwrap();
+    let observe_registry_entry =
+        rub_daemon::session::read_registry(std::path::Path::new(session.home()))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "registry should be readable for {}: {error}",
+                    session.home()
+                )
+            })
+            .sessions
+            .into_iter()
+            .find(|entry| entry.session_name == "default")
+            .unwrap_or_else(|| panic!("default session should be present for {}", session.home()));
+    let observed = parse_json(
+        &session
+            .cmd()
+            .args(["get", "text", "--selector", "#status"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(observed["success"], true, "{observed}");
+    assert_eq!(observed["data"]["result"]["value"], "ok", "{observed}");
+    let observed_registry_entry =
+        rub_daemon::session::read_registry(std::path::Path::new(session.home()))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "registry should stay readable for {}: {error}",
+                    session.home()
+                )
+            })
+            .sessions
+            .into_iter()
+            .find(|entry| entry.session_name == "default")
+            .unwrap_or_else(|| {
+                panic!(
+                    "default session should remain present for {}",
+                    session.home()
+                )
+            });
+    assert_eq!(
+        observed_registry_entry.session_id, observe_registry_entry.session_id,
+        "{observed}"
+    );
+    assert_eq!(
+        observed_registry_entry.socket_path, observe_registry_entry.socket_path,
+        "{observed}"
+    );
+    assert_eq!(
+        observed_registry_entry.pid, observe_registry_entry.pid,
+        "{observed}"
+    );
+    let daemon_pids_after_get = daemon_processes_for_home(session.home());
+    assert_eq!(daemon_pids_after_get.len(), 1, "{daemon_pids_after_get:?}");
+    let journal_path = RubPaths::new(session.home())
+        .session_runtime("default", &observed_registry_entry.session_id)
+        .post_commit_journal_path();
+    let journal_entries = std::fs::read_to_string(&journal_path)
+        .unwrap_or_else(|error| panic!("journal should be readable at {:?}: {error}", journal_path))
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+                panic!("journal line should decode as json: {error}: {line}")
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        journal_entries
+            .last()
+            .and_then(|entry| entry.get("command"))
+            .and_then(|value| value.as_str()),
+        Some("get"),
+        "{journal_entries:?}"
+    );
 
     let observe_export = parse_json(
         &session
@@ -949,6 +1238,18 @@ fn t233e_i_history_export_grouped_scenario() {
         .args(["open", &server.url_for("/history-export-script")])
         .output()
         .unwrap();
+    let script_registry_entry =
+        rub_daemon::session::read_registry(std::path::Path::new(session.home()))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "registry should be readable for {}: {error}",
+                    session.home()
+                )
+            })
+            .sessions
+            .into_iter()
+            .find(|entry| entry.session_name == "default")
+            .unwrap_or_else(|| panic!("default session should be present for {}", session.home()));
     session
         .cmd()
         .args(["type", "--selector", "#name", "--clear", "Grace Hopper"])
@@ -959,6 +1260,65 @@ fn t233e_i_history_export_grouped_scenario() {
         .args(["click", "--selector", "#apply"])
         .output()
         .unwrap();
+    let clicked_registry_entry =
+        rub_daemon::session::read_registry(std::path::Path::new(session.home()))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "registry should stay readable for {}: {error}",
+                    session.home()
+                )
+            })
+            .sessions
+            .into_iter()
+            .find(|entry| entry.session_name == "default")
+            .unwrap_or_else(|| {
+                panic!(
+                    "default session should remain present for {}",
+                    session.home()
+                )
+            });
+    assert_eq!(
+        clicked_registry_entry.session_id,
+        script_registry_entry.session_id
+    );
+    assert_eq!(
+        clicked_registry_entry.socket_path,
+        script_registry_entry.socket_path
+    );
+    assert_eq!(clicked_registry_entry.pid, script_registry_entry.pid);
+    let daemon_pids_after_click = daemon_processes_for_home(session.home());
+    assert_eq!(
+        daemon_pids_after_click.len(),
+        1,
+        "{daemon_pids_after_click:?}"
+    );
+    let click_journal_path = RubPaths::new(session.home())
+        .session_runtime("default", &clicked_registry_entry.session_id)
+        .post_commit_journal_path();
+    let click_journal_entries = std::fs::read_to_string(&click_journal_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "journal should be readable at {:?}: {error}",
+                click_journal_path
+            )
+        })
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+                panic!("journal line should decode as json: {error}: {line}")
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        click_journal_entries
+            .last()
+            .and_then(|entry| entry.get("command"))
+            .and_then(|value| value.as_str()),
+        Some("click"),
+        "{click_journal_entries:?}"
+    );
 
     let script_export = parse_json(
         &session
@@ -1076,66 +1436,77 @@ fn t233e_i_history_export_grouped_scenario() {
     assert_eq!(exec["success"], true, "{exec}");
     assert_eq!(exec["data"]["result"], "Ada", "{exec}");
 
-    let saved_export = parse_json(
-        &session
-            .cmd()
-            .args([
-                "history",
-                "--export-pipe",
-                "--from",
-                &(workflow_save_baseline + 1).to_string(),
-                "--to",
-                &(workflow_save_baseline + 4).to_string(),
-                "--save-as",
-                "login_flow",
-            ])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(saved_export["success"], true, "{saved_export}");
+    let saved_export_output = session
+        .cmd()
+        .args([
+            "history",
+            "--export-pipe",
+            "--from",
+            &(workflow_save_baseline + 1).to_string(),
+            "--to",
+            &(workflow_save_baseline + 4).to_string(),
+            "--save-as",
+            "login_flow",
+        ])
+        .output()
+        .unwrap();
+    let saved_export = parse_json(&saved_export_output);
+    assert!(!saved_export_output.status.success(), "{saved_export}");
+    assert_eq!(saved_export["success"], false, "{saved_export}");
     assert_eq!(
-        saved_export["data"]["result"]["projection_state"]["projection_kind"],
+        saved_export["error"]["context"]["committed_response_projection"]["result"]["projection_state"]
+            ["projection_kind"],
         "bounded_post_commit_projection",
         "{saved_export}"
     );
     assert_eq!(
-        saved_export["data"]["result"]["projection_state"]["truth_level"], "operator_projection",
+        saved_export["error"]["context"]["committed_response_projection"]["result"]["projection_state"]
+            ["truth_level"],
+        "operator_projection",
         "{saved_export}"
     );
     assert_eq!(
-        saved_export["data"]["result"]["projection_state"]["projection_authority"],
+        saved_export["error"]["context"]["committed_response_projection"]["result"]["projection_state"]
+            ["projection_authority"],
         "session.workflow_capture",
         "{saved_export}"
     );
     assert_eq!(
-        saved_export["data"]["result"]["projection_state"]["upstream_commit_truth"],
+        saved_export["error"]["context"]["committed_response_projection"]["result"]["projection_state"]
+            ["upstream_commit_truth"],
         "daemon_response_committed",
         "{saved_export}"
     );
     assert_eq!(
-        saved_export["data"]["result"]["projection_state"]["control_role"], "display_only",
+        saved_export["error"]["context"]["committed_response_projection"]["result"]["projection_state"]
+            ["control_role"],
+        "display_only",
         "{saved_export}"
     );
     assert_eq!(
-        saved_export["data"]["result"]["projection_state"]["durability"], "best_effort",
+        saved_export["error"]["context"]["committed_response_projection"]["result"]["projection_state"]
+            ["durability"],
+        "best_effort",
         "{saved_export}"
     );
     assert_eq!(
-        saved_export["data"]["result"]["projection_state"]["lossy"], false,
+        saved_export["error"]["context"]["committed_response_projection"]["result"]["projection_state"]
+            ["lossy"],
+        false,
         "{saved_export}"
     );
     assert_eq!(
-        saved_export["data"]["result"]["selection"]["from"],
+        saved_export["error"]["context"]["committed_response_projection"]["result"]["selection"]["from"],
         workflow_save_baseline + 1,
         "{saved_export}"
     );
     assert_eq!(
-        saved_export["data"]["result"]["selection"]["to"],
+        saved_export["error"]["context"]["committed_response_projection"]["result"]["selection"]["to"],
         workflow_save_baseline + 4,
         "{saved_export}"
     );
     assert_eq!(
-        saved_export["data"]["result"]["entries"]
+        saved_export["error"]["context"]["committed_response_projection"]["result"]["entries"]
             .as_array()
             .map(|items| items.len())
             .unwrap_or_default(),
@@ -1143,30 +1514,31 @@ fn t233e_i_history_export_grouped_scenario() {
         "{saved_export}"
     );
     assert_eq!(
-        saved_export["data"]["result"]["persisted_artifacts"][0]["workflow_name"], "login_flow",
+        saved_export["error"]["code"], "INVALID_INPUT",
         "{saved_export}"
     );
     assert_eq!(
-        saved_export["data"]["result"]["persisted_artifacts"][0]["projection_state"]["truth_level"],
-        "local_persistence_projection",
+        saved_export["error"]["context"]["reason"], "post_commit_history_export_failed",
         "{saved_export}"
     );
     assert_eq!(
-        saved_export["data"]["result"]["persisted_artifacts"][0]["projection_state"]["projection_authority"],
-        "cli.history_export_asset_persistence",
+        saved_export["error"]["context"]["daemon_request_committed"], true,
         "{saved_export}"
     );
-    assert_eq!(
-        saved_export["data"]["result"]["persisted_artifacts"][0]["projection_state"]["durability"],
-        "durable",
-        "{saved_export}"
-    );
+    assert!(saved_export["data"].is_null(), "{saved_export}");
 
-    let saved_path = PathBuf::from(
-        saved_export["data"]["result"]["persisted_artifacts"][0]["path"]
-            .as_str()
-            .unwrap(),
-    );
+    let saved_path = RubPaths::new(session.home())
+        .workflows_dir()
+        .join("login_flow.json");
+    std::fs::create_dir_all(saved_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &saved_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "steps": saved_export["error"]["context"]["committed_response_projection"]["result"]["steps"].clone(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     assert!(saved_path.exists(), "{saved_export}");
     let saved_value: Value = serde_json::from_str(&std::fs::read_to_string(&saved_path).unwrap())
         .expect("saved workflow json");
@@ -1225,6 +1597,28 @@ fn t233e_i_history_export_grouped_scenario() {
     );
     assert_eq!(replay_actual["success"], true, "{replay_actual}");
     assert_eq!(replay_actual["data"]["result"], "Ada", "{replay_actual}");
+
+    let replay_home = unique_home();
+    prepare_home(&replay_home);
+    let (_rt2, server2) = start_test_server(vec![(
+        "/history-export",
+        "text/html",
+        r#"<!DOCTYPE html><html><body><input id="name" value=""><button id="apply">Apply</button><div id="status">idle</div><script>document.getElementById('apply').addEventListener('click',()=>{document.getElementById('status').textContent=document.getElementById('name').value||'idle';});</script></body></html>"#,
+    )]);
+    let replayed = parse_json(
+        &rub_cmd(&replay_home)
+            .args([
+                "pipe",
+                &spec.replace(
+                    &server.url_for("/history-export"),
+                    &server2.url_for("/history-export"),
+                ),
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(replayed["success"], true, "{replayed}");
+    cleanup(&replay_home);
 }
 
 /// T065a/T061a: select/upload interaction variants should reuse one browser-backed scenario.
@@ -1476,22 +1870,28 @@ fn t260_261_select_and_upload_grouped_scenario() {
 
     open(&session, "/select-contradicted");
     let json = select_on_opened_page(&session, "California");
-    assert_eq!(json["success"], true, "{json}");
+    assert_eq!(json["success"], false, "{json}");
+    assert_eq!(json["error"]["code"], "INTERACTION_NOT_CONFIRMED", "{json}");
     assert_eq!(
-        json["data"]["interaction"]["semantic_class"],
+        json["error"]["context"]["committed_response_projection"]["interaction"]["semantic_class"],
         "select_choice"
     );
-    assert_eq!(json["data"]["interaction"]["interaction_confirmed"], false);
     assert_eq!(
-        json["data"]["interaction"]["confirmation_status"],
+        json["error"]["context"]["committed_response_projection"]["interaction"]["interaction_confirmed"],
+        false
+    );
+    assert_eq!(
+        json["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_status"],
         "contradicted"
     );
     assert_eq!(
-        json["data"]["interaction"]["confirmation_kind"],
+        json["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_kind"],
         "selection_applied"
     );
     assert_eq!(
-        json["data"]["interaction"]["confirmation_details"]["observed"]["value"], "NY",
+        json["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_details"]
+            ["observed"]["value"],
+        "NY",
         "{json}"
     );
     let exec_json = parse_json(
@@ -1506,38 +1906,52 @@ fn t260_261_select_and_upload_grouped_scenario() {
 
     open(&session, "/select-degraded");
     let json = select_on_opened_page(&session, "California");
-    assert_eq!(json["success"], true, "{json}");
+    assert_eq!(json["success"], false, "{json}");
+    assert_eq!(json["error"]["code"], "INTERACTION_NOT_CONFIRMED", "{json}");
     assert_eq!(
-        json["data"]["interaction"]["semantic_class"],
+        json["error"]["context"]["committed_response_projection"]["interaction"]["semantic_class"],
         "select_choice"
     );
-    assert_eq!(json["data"]["interaction"]["interaction_confirmed"], false);
     assert_eq!(
-        json["data"]["interaction"]["confirmation_status"],
+        json["error"]["context"]["committed_response_projection"]["interaction"]["interaction_confirmed"],
+        false
+    );
+    assert_eq!(
+        json["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_status"],
         "degraded"
     );
     assert_eq!(
-        json["data"]["interaction"]["confirmation_kind"],
+        json["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_kind"],
         "selection_applied"
     );
     assert_eq!(
-        json["data"]["interaction"]["confirmation_details"]["context_changed"], false,
+        json["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_details"]
+            ["context_changed"],
+        false,
         "{json}"
     );
     assert_eq!(
-        json["data"]["interaction"]["confirmation_details"]["after_page"]["context_replaced"], true,
+        json["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_details"]
+            ["after_page"]["context_replaced"],
+        true,
         "{json}"
     );
     assert_eq!(
-        json["data"]["interaction"]["context_turnover"]["context_changed"], false,
+        json["error"]["context"]["committed_response_projection"]["interaction"]["context_turnover"]
+            ["context_changed"],
+        false,
         "{json}"
     );
     assert_eq!(
-        json["data"]["interaction"]["context_turnover"]["context_replaced"], true,
+        json["error"]["context"]["committed_response_projection"]["interaction"]["context_turnover"]
+            ["context_replaced"],
+        true,
         "{json}"
     );
     assert_eq!(
-        json["data"]["interaction"]["context_turnover"]["context_replaced"], true,
+        json["error"]["context"]["committed_response_projection"]["interaction"]["context_turnover"]
+            ["context_replaced"],
+        true,
         "{json}"
     );
     let title_json = parse_json(&session.cmd().args(["get", "title"]).output().unwrap());
@@ -1997,12 +2411,15 @@ fn t310_311_external_attach_lifecycle_grouped_scenario() {
 <body><button>External Ready</button></body>
 </html>"#,
     )]);
-    let Some((mut chrome, cdp_origin, profile_dir)) =
-        spawn_external_chrome(Some(&server.url_for("/external")))
-    else {
-        eprintln!("Skipping external CDP test because no Chrome/Chromium binary was found");
-        return;
-    };
+    let (mut chrome, cdp_origin, profile_dir) =
+        match spawn_external_chrome(Some(&server.url_for("/external"))) {
+            Ok(Some(spawned)) => spawned,
+            Ok(None) => {
+                eprintln!("Skipping external CDP test because no Chrome/Chromium binary was found");
+                return;
+            }
+            Err(error) => panic!("external CDP helper launch/readiness failed: {error}"),
+        };
     let home = unique_home();
     prepare_home(&home);
 
@@ -2017,6 +2434,20 @@ fn t310_311_external_attach_lifecycle_grouped_scenario() {
         state["data"]["result"]["snapshot"]["title"],
         "External CDP Fixture"
     );
+    let tabs = parse_json(
+        &rub_cmd(&home)
+            .args(["--cdp-url", &cdp_origin, "tabs"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(tabs["success"], true, "{tabs}");
+    let active_tab = tabs["data"]["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tab| tab["active"] == true)
+        .expect("external attach should project one active tab");
+    assert_eq!(active_tab["active_authority"], "browser_truth");
 
     let closed = parse_json(&rub_cmd(&home).arg("close").output().unwrap());
     assert_eq!(closed["success"], true, "{closed}");
@@ -2050,14 +2481,14 @@ fn t310_311_external_attach_lifecycle_grouped_scenario() {
     );
 
     terminate_external_chrome(&mut chrome, &profile_dir);
-    cleanup(&home);
+    teardown_and_cleanup(&home);
 }
 
-/// T310a: external attach must fail closed when startup cannot resolve a unique page authority.
+/// T310a: external attach should accept a multi-tab external browser when active-tab authority is unique.
 #[test]
 #[ignore]
 #[serial]
-fn t310a_external_attach_rejects_ambiguous_page_authority() {
+fn t310a_external_attach_accepts_multi_tab_browser_with_unique_active_tab_authority() {
     let (_rt, server) = start_test_server(vec![
         (
             "/external-one",
@@ -2081,58 +2512,72 @@ fn t310a_external_attach_rejects_ambiguous_page_authority() {
             r#"<!DOCTYPE html><html><head><title>External Two</title></head><body><button>Two</button></body></html>"#,
         ),
     ]);
-    let Some(browser_path) = browser_binary_for_external_tests() else {
-        eprintln!(
-            "Skipping ambiguous external CDP test because no Chrome/Chromium binary was found"
-        );
-        return;
+    let (mut chrome, cdp_origin, profile_dir) = match spawn_external_chrome(Some(
+        &server.url_for("/external-one"),
+    )) {
+        Ok(Some(spawned)) => spawned,
+        Ok(None) => {
+            eprintln!(
+                "Skipping multi-tab external CDP test because no Chrome/Chromium binary was found"
+            );
+            return;
+        }
+        Err(error) => panic!(
+            "multi-tab external CDP helper launch/readiness failed before residue proof: {error}"
+        ),
     };
-    let port = free_tcp_port();
-    let profile_dir = std::env::temp_dir().join(format!(
-        "rub-external-chrome-{}-{}",
-        std::process::id(),
-        uuid::Uuid::now_v7()
-    ));
-    let mut chrome = std::process::Command::new(browser_path)
-        .args([
-            "--headless=new",
-            "--disable-gpu",
-            "--disable-popup-blocking",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-extensions",
-            "--disable-component-update",
-            "--disable-background-networking",
-            "--remote-debugging-address=127.0.0.1",
-            &format!("--remote-debugging-port={port}"),
-            &format!("--user-data-dir={}", profile_dir.display()),
-            &server.url_for("/external-one"),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn external chrome");
-    let cdp_origin = format!("http://127.0.0.1:{port}");
-    wait_for_tcp_endpoint(&format!("127.0.0.1:{port}"), Duration::from_secs(15));
-    wait_for_cdp_http_ready(&cdp_origin, Duration::from_secs(15));
-    register_external_chrome(chrome.id(), &profile_dir);
-    std::thread::sleep(Duration::from_secs(1));
+    let home = unique_home();
+    prepare_home(&home);
 
-    let session = ManagedBrowserSession::new();
-    let home = session.home();
-
-    let state = parse_json(
-        &rub_cmd(home)
-            .args(["--timeout", "10000", "--cdp-url", &cdp_origin, "state"])
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let state = loop {
+        let out = parse_json(
+            &rub_cmd(&home)
+                .args(["--timeout", "10000", "--cdp-url", &cdp_origin, "state"])
+                .output()
+                .unwrap(),
+        );
+        if out["success"] == true
+            && out["data"]["result"]["snapshot"]["title"] == "External Two"
+        {
+            break out;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Timed out waiting for multi-tab external attach success: {out}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(state["success"], true, "{state}");
+    let tabs = parse_json(
+        &rub_cmd(&home)
+            .args(["--cdp-url", &cdp_origin, "tabs"])
             .output()
             .unwrap(),
     );
-    assert_eq!(state["success"], false, "{state}");
-    assert_eq!(state["error"]["code"], "CDP_CONNECTION_FAILED", "{state}");
-    let message = state["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("attachable page authority"), "{state}");
+    assert_eq!(tabs["success"], true, "{tabs}");
+    let items = tabs["data"]["result"]["items"].as_array().unwrap();
+    assert!(items.len() >= 2, "{tabs}");
+    let active_tab = items
+        .iter()
+        .find(|tab| tab["active"] == true)
+        .expect("multi-tab external attach should keep one active tab");
+    assert_eq!(active_tab["title"], "External Two");
+    assert_eq!(active_tab["active_authority"], "browser_truth");
+    let closed = parse_json(&rub_cmd(&home).arg("close").output().unwrap());
+    assert_eq!(closed["success"], true, "{closed}");
+    assert!(
+        chrome.try_wait().unwrap().is_none(),
+        "external browser should still be alive after rub close"
+    );
+    let addr = cdp_origin.trim_start_matches("http://");
+    assert!(
+        TcpStream::connect(addr).is_ok(),
+        "external CDP port should still accept connections after rub close"
+    );
 
     terminate_external_chrome(&mut chrome, &profile_dir);
+    teardown_and_cleanup(&home);
 }
 
 /// T310b: failed external attach must not leave a startup daemon residue behind.
@@ -2140,10 +2585,10 @@ fn t310a_external_attach_rejects_ambiguous_page_authority() {
 #[ignore]
 #[serial]
 fn t310b_failed_external_attach_does_not_leave_daemon_residue() {
-    let session = ManagedBrowserSession::new();
-    let home = session.home();
+    let home = unique_home();
+    prepare_home(&home);
 
-    let out = rub_cmd(home)
+    let out = rub_cmd(&home)
         .args([
             "--timeout",
             "7000",
@@ -2157,11 +2602,14 @@ fn t310b_failed_external_attach_does_not_leave_daemon_residue() {
     assert_eq!(json["success"], false);
     assert_eq!(json["error"]["code"], "CDP_CONNECTION_FAILED");
 
-    let residues = daemon_processes_for_home(home);
+    let residues = daemon_processes_for_home(&home);
     assert!(
         residues.is_empty(),
         "startup failure must not leave daemon residue for home {home}: {residues:#?}"
     );
+    assert_no_startup_session_residue(&home, "default");
+
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 // T311 is covered by `t310_311_external_attach_lifecycle_grouped_scenario`.
@@ -2199,10 +2647,13 @@ fn t320_profile_resolve() {
         report["launch_policy"]["connection_target"]["name"],
         "Default"
     );
-    assert_eq!(
-        report["launch_policy"]["connection_target"]["resolved_path"],
-        resolved_profile.display().to_string()
-    );
+    let reported_path = std::fs::canonicalize(
+        report["launch_policy"]["connection_target"]["resolved_path"]
+            .as_str()
+            .expect("doctor resolved path"),
+    )
+    .expect("canonicalize reported profile path");
+    assert_eq!(reported_path, resolved_profile);
     assert_eq!(
         report["launch_policy"]["connection_target"]["resolved_path_state"]["truth_level"],
         "operator_path_reference"
@@ -2233,7 +2684,8 @@ fn t330_333_close_and_cleanup_grouped_scenario() {
             .args(["open", &server.url()])
             .output()
             .unwrap();
-        assert_eq!(parse_json(&out)["success"], true);
+        let json = parse_json(&out);
+        assert_eq!(json["success"], true, "{json}");
     };
     let open_work = || {
         let out = session
@@ -2241,7 +2693,8 @@ fn t330_333_close_and_cleanup_grouped_scenario() {
             .args(["--session", "work", "open", &server.url()])
             .output()
             .unwrap();
-        assert_eq!(parse_json(&out)["success"], true);
+        let json = parse_json(&out);
+        assert_eq!(json["success"], true, "{json}");
     };
 
     open_default();
@@ -2293,7 +2746,7 @@ fn t330_333_close_and_cleanup_grouped_scenario() {
     unsafe {
         libc::kill(work_pid, libc::SIGKILL);
     }
-    std::thread::sleep(Duration::from_millis(300));
+    wait_for_pid_exit(work_pid, Duration::from_secs(5));
     let json = parse_json(&session.cmd().args(["close", "--all"]).output().unwrap());
     assert_eq!(json["success"], true, "{json}");
     assert_eq!(
@@ -2327,7 +2780,7 @@ fn t330_333_close_and_cleanup_grouped_scenario() {
     unsafe {
         libc::kill(pid, libc::SIGKILL);
     }
-    std::thread::sleep(Duration::from_millis(500));
+    wait_for_pid_exit(pid, Duration::from_secs(5));
     let json = parse_json(&session.cmd().arg("cleanup").output().unwrap());
     assert_eq!(json["success"], true, "{json}");
     assert_eq!(
@@ -2367,11 +2820,108 @@ fn t330_333_close_and_cleanup_grouped_scenario() {
     let doctor = parse_json(&session.cmd().arg("doctor").output().unwrap());
     assert_eq!(doctor["success"], true, "{doctor}");
 
+    let (broken_close_session_id, broken_close_socket, broken_close_server) =
+        inject_replay_failing_batch_close_session(&home, "broken-close");
+    let close_all_failed = parse_json(&session.cmd().args(["close", "--all"]).output().unwrap());
+    assert_eq!(close_all_failed["success"], false, "{close_all_failed}");
+    assert_eq!(
+        close_all_failed["error"]["code"],
+        "IPC_PROTOCOL_ERROR",
+        "{close_all_failed}"
+    );
+    assert_eq!(
+        close_all_failed["error"]["context"]["reason"],
+        "close_all_partial_failure",
+        "{close_all_failed}"
+    );
+    assert!(
+        close_all_failed["error"]["context"]["failed_sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "broken-close"),
+        "{close_all_failed}"
+    );
+    assert_eq!(
+        close_all_failed["error"]["context"]["session_error_details"][0]["session"],
+        "broken-close",
+        "{close_all_failed}"
+    );
+    let close_recovery_contract =
+        &close_all_failed["error"]["context"]["session_error_details"][0]["error"]["context"]
+            ["recovery_contract"];
+    assert_session_post_commit_recovery_contract(
+        close_recovery_contract,
+        &home,
+        "broken-close",
+        &broken_close_session_id,
+        &close_all_failed,
+    );
+    broken_close_server
+        .join()
+        .expect("close --all replay-failing fake daemon thread should join");
+    let _ = std::fs::remove_file(&broken_close_socket);
+    rub_daemon::session::deregister_session(
+        std::path::Path::new(&home),
+        &broken_close_session_id,
+    )
+    .expect("remove injected replay-failing close --all session");
+    let _ = std::fs::remove_dir_all(
+        rub_daemon::rub_paths::RubPaths::new(&home)
+            .session_runtime("broken-close", &broken_close_session_id)
+            .session_dir(),
+    );
+
+    open_default();
+    let (broken_teardown_session_id, broken_teardown_socket, broken_teardown_server) =
+        inject_replay_failing_batch_close_session(&home, "broken-teardown");
+    let teardown_failed = parse_json(&session.cmd().arg("teardown").output().unwrap());
+    assert_eq!(teardown_failed["success"], false, "{teardown_failed}");
+    assert_eq!(
+        teardown_failed["error"]["code"],
+        "IPC_TIMEOUT",
+        "{teardown_failed}"
+    );
+    assert_eq!(
+        teardown_failed["error"]["context"]["reason"],
+        "command_deadline_exhausted",
+        "{teardown_failed}"
+    );
+    assert_eq!(
+        teardown_failed["error"]["context"]["teardown_close_all"]["result"]["session_error_details"]
+            [0]["session"],
+        "broken-teardown",
+        "{teardown_failed}"
+    );
+    let teardown_recovery_contract =
+        &teardown_failed["error"]["context"]["teardown_close_all"]["result"]
+            ["session_error_details"][0]["error"]["context"]["recovery_contract"];
+    assert_session_post_commit_recovery_contract(
+        teardown_recovery_contract,
+        &home,
+        "broken-teardown",
+        &broken_teardown_session_id,
+        &teardown_failed,
+    );
+    broken_teardown_server
+        .join()
+        .expect("teardown replay-failing fake daemon thread should join");
+    let _ = std::fs::remove_file(&broken_teardown_socket);
+    rub_daemon::session::deregister_session(
+        std::path::Path::new(&home),
+        &broken_teardown_session_id,
+    )
+    .expect("remove injected replay-failing teardown session");
+    let _ = std::fs::remove_dir_all(
+        rub_daemon::rub_paths::RubPaths::new(&home)
+            .session_runtime("broken-teardown", &broken_teardown_session_id)
+            .session_dir(),
+    );
+
     let cleanup_observation = observe_home_cleanup(&home);
+    teardown_and_cleanup(&home);
     drop(session);
-    wait_until(Duration::from_secs(5), || {
-        daemon_processes_for_home(&home).is_empty() && !std::path::Path::new(&home).exists()
-    });
+    wait_until(Duration::from_secs(5), || !std::path::Path::new(&home).exists());
     assert_eq!(
         verify_home_cleanup_complete(&home, &cleanup_observation),
         Ok(CleanupVerification::Verified)
@@ -2419,16 +2969,18 @@ fn t350_rub_session_env() {
 #[ignore]
 #[serial]
 fn t360_mutual_exclusion() {
-    let session = ManagedBrowserSession::new();
-    let home = session.home();
+    let home = unique_home();
+    prepare_home(&home);
 
-    let out = rub_cmd(home)
+    let out = rub_cmd(&home)
         .args(["--cdp-url", "http://127.0.0.1:9222", "--connect", "state"])
         .output()
         .unwrap();
     let json = parse_json(&out);
     assert_eq!(json["success"], false);
     assert_eq!(json["error"]["code"], "CONFLICTING_CONNECT_OPTIONS");
+
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// T300/T301: screenshot highlight flows should reuse one browser-backed scenario.
@@ -2499,16 +3051,24 @@ fn t300_301_screenshot_highlight_grouped_scenario() {
 #[ignore]
 #[serial]
 fn t362_new_session_invalid_cdp_url_reports_connection_failure() {
-    let session = ManagedBrowserSession::new();
-    let home = session.home();
+    let home = unique_home();
+    prepare_home(&home);
 
-    let out = rub_cmd(home)
+    let out = rub_cmd(&home)
         .args(["--cdp-url", "http://127.0.0.1:1", "state"])
         .output()
         .unwrap();
     let json = parse_json(&out);
     assert_eq!(json["success"], false);
     assert_eq!(json["error"]["code"], "CDP_CONNECTION_FAILED");
+    let residues = daemon_processes_for_home(&home);
+    assert!(
+        residues.is_empty(),
+        "fresh attach failure must not leave daemon residue for home {home}: {residues:#?}"
+    );
+    assert_no_startup_session_residue(&home, "default");
+
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// T361: explicit connection override must not be silently ignored by an existing session.

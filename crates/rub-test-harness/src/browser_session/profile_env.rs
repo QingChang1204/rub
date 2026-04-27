@@ -22,7 +22,11 @@ pub fn prepare_fake_profile_env() -> (PathBuf, PathBuf, Vec<(String, String)>) {
     )
     .unwrap();
     let envs = profile_envs_for_test_base(&base);
-    (base, root.join("Default"), envs)
+    let resolved_profile = root
+        .join("Default")
+        .canonicalize()
+        .unwrap_or_else(|_| root.join("Default"));
+    (base, resolved_profile, envs)
 }
 
 #[cfg(target_os = "macos")]

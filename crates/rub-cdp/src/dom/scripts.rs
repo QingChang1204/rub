@@ -88,13 +88,13 @@ const EXTRACT_ELEMENTS_JS_TEMPLATE: &str = r##"
         while (current !== current.top) {
             try {
                 const frameEl = current.frameElement;
-                if (!frameEl) break;
+                if (!frameEl) return null;
                 const fr = frameEl.getBoundingClientRect();
                 x += fr.x;
                 y += fr.y;
                 current = current.parent;
             } catch (_) {
-                break;
+                return null;
             }
         }
         return { x, y, width: r.width, height: r.height };
@@ -153,6 +153,87 @@ pub(super) fn extract_elements_script(include_listeners: bool) -> String {
         "__INCLUDE_LISTENERS__",
         if include_listeners { "true" } else { "false" },
     )
+}
+
+pub(crate) fn live_element_projection_fingerprint_function() -> &'static str {
+    r#"function() {
+        function getTag(el) {
+            const tag = (el.tagName || '').toLowerCase();
+            if (tag === 'a') return 'link';
+            if (tag === 'textarea') return 'textarea';
+            if (tag === 'select') return 'select';
+            if (tag === 'option') return 'option';
+            if (tag === 'input') {
+                const type = el.type || 'text';
+                if (type === 'checkbox') return 'checkbox';
+                if (type === 'radio') return 'radio';
+                return 'input';
+            }
+            if (tag === 'button') return 'button';
+            return 'other';
+        }
+
+        function getText(el) {
+            return (el.textContent || '').trim().substring(0, 200);
+        }
+
+        function getAttrs(el) {
+            const attrs = {};
+            for (const name of ['href', 'placeholder', 'aria-label', 'aria-readonly', 'type', 'name', 'value', 'role', 'title', 'alt', 'id', 'data-testid', 'data-test-id', 'data-test', 'contenteditable']) {
+                const val = el.getAttribute && el.getAttribute(name);
+                if (val != null && val !== '') attrs[name] = val;
+            }
+            if (el.isContentEditable && !('contenteditable' in attrs)) {
+                attrs.contenteditable = 'true';
+            }
+            if (el.hasAttribute && el.hasAttribute('disabled')) {
+                attrs.disabled = '';
+            }
+            if (el.hasAttribute && el.hasAttribute('readonly')) {
+                attrs.readonly = '';
+            }
+            return attrs;
+        }
+
+        function getRect(el) {
+            const r = el.getBoundingClientRect();
+            let x = r.x;
+            let y = r.y;
+            let current = window;
+            while (current !== current.top) {
+                try {
+                    const frameEl = current.frameElement;
+                    if (!frameEl) return null;
+                    const fr = frameEl.getBoundingClientRect();
+                    x += fr.x;
+                    y += fr.y;
+                    current = current.parent;
+                } catch (_) {
+                    return null;
+                }
+            }
+            return { x, y, width: r.width, height: r.height };
+        }
+
+        function getDepth(el) {
+            const root = document.body || document.documentElement;
+            let depth = 0;
+            let current = el;
+            while (current && current !== root) {
+                current = current.parentElement;
+                depth += 1;
+            }
+            return current === root ? depth : 0;
+        }
+
+        return JSON.stringify({
+            tag: getTag(this),
+            text: getText(this),
+            attributes: getAttrs(this),
+            bounding_box: getRect(this),
+            depth: getDepth(this),
+        });
+    }"#
 }
 
 /// JavaScript to remove all injected highlight overlays (shadow host cleanup).

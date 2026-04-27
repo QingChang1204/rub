@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use rub_core::error::{ErrorCode, RubError};
 use rub_daemon::rub_paths::SessionPaths;
 use rub_ipc::client::{IpcClient, IpcClientError};
-use rub_ipc::protocol::{IpcRequest, ResponseStatus};
+use rub_ipc::protocol::{IpcRequest, ResponseStatus, UPGRADE_CHECK_PROBE_COMMAND_ID};
 
 pub(super) fn cleanup_upgrade_status_error(
     code: ErrorCode,
@@ -59,6 +59,44 @@ pub(super) async fn fetch_upgrade_status_for_session(
     .await
 }
 
+fn parse_upgrade_status_payload(
+    socket_path: &Path,
+    data: serde_json::Value,
+) -> Result<UpgradeStatus, RubError> {
+    let idle = data
+        .get("idle")
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| {
+            cleanup_upgrade_status_error(
+                ErrorCode::IpcProtocolError,
+                "Failed to fetch upgrade status: daemon returned malformed upgrade check payload"
+                    .to_string(),
+                socket_path,
+                Some(serde_json::json!({
+                    "upgrade_check": data,
+                })),
+                "cleanup_upgrade_check_payload_invalid",
+            )
+        })?;
+    Ok(UpgradeStatus { idle })
+}
+
+fn upgrade_check_probe_request(timeout_ms: u64) -> IpcRequest {
+    IpcRequest::new("_upgrade_check", serde_json::json!({}), timeout_ms)
+        .with_command_id(UPGRADE_CHECK_PROBE_COMMAND_ID)
+        .expect("upgrade-check probe command_id must be valid")
+}
+
+async fn connect_cleanup_probe_client(
+    socket_path: &Path,
+    session_paths: &SessionPaths,
+) -> Result<IpcClient, std::io::Error> {
+    match session_paths.session_id() {
+        Some(session_id) => IpcClient::connect_bound(socket_path, session_id).await,
+        None => IpcClient::connect(socket_path).await,
+    }
+}
+
 pub(super) async fn fetch_upgrade_status_for_session_with_deadline(
     session_paths: &SessionPaths,
     deadline: Instant,
@@ -76,18 +114,21 @@ pub(super) async fn fetch_upgrade_status_for_session_with_deadline(
             deadline,
             timeout_ms,
             phase,
-            async { Ok::<_, RubError>(IpcClient::connect(&socket_path).await.ok()) },
+            async {
+                Ok::<_, RubError>(
+                    connect_cleanup_probe_client(&socket_path, session_paths)
+                        .await
+                        .ok(),
+                )
+            },
         )
         .await?
         {
             Some(client) => client,
             None => continue,
         };
-        let request = IpcRequest::new(
-            "_upgrade_check",
-            serde_json::json!({}),
-            remaining_budget_ms(deadline, timeout_ms, phase)?,
-        );
+        let request =
+            upgrade_check_probe_request(remaining_budget_ms(deadline, timeout_ms, phase)?);
         let response =
             crate::timeout_budget::run_with_remaining_budget(deadline, timeout_ms, phase, async {
                 client
@@ -101,9 +142,7 @@ pub(super) async fn fetch_upgrade_status_for_session_with_deadline(
         }
         let data = response.data.unwrap_or_default();
         return Ok(Some((
-            UpgradeStatus {
-                idle: data["idle"].as_bool().unwrap_or(false),
-            },
+            parse_upgrade_status_payload(&socket_path, data)?,
             socket_path,
         )));
     }
@@ -193,7 +232,7 @@ pub(super) async fn wait_for_shutdown_paths_until(
 mod tests {
     use super::{
         cleanup_upgrade_probe_response_error, fetch_upgrade_status_for_session_with_deadline,
-        wait_for_shutdown_paths_until,
+        parse_upgrade_status_payload, wait_for_shutdown_paths_until,
     };
     use std::path::Path;
     use std::time::Instant;
@@ -201,6 +240,10 @@ mod tests {
     use rub_core::error::{ErrorCode, ErrorEnvelope};
     use rub_core::model::Timing;
     use rub_daemon::rub_paths::RubPaths;
+    use rub_ipc::codec::NdJsonCodec;
+    use rub_ipc::protocol::{IpcRequest, IpcResponse, UPGRADE_CHECK_PROBE_COMMAND_ID};
+    use tokio::io::BufReader;
+    use tokio::net::UnixListener;
 
     #[test]
     fn upgrade_probe_error_response_preserves_socket_path_context() {
@@ -232,6 +275,7 @@ mod tests {
             rub_ipc::protocol::IpcResponse {
                 ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
                 command_id: None,
+                daemon_session_id: None,
                 request_id: "req-2".to_string(),
                 status: rub_ipc::protocol::ResponseStatus::Error,
                 data: None,
@@ -244,6 +288,23 @@ mod tests {
         assert_eq!(
             error.context.expect("context")["reason"],
             serde_json::json!("cleanup_upgrade_check_response_missing_error_envelope")
+        );
+    }
+
+    #[test]
+    fn cleanup_upgrade_probe_malformed_success_payload_is_protocol_error() {
+        let error = parse_upgrade_status_payload(
+            Path::new("/tmp/rub.sock"),
+            serde_json::json!({
+                "idle": "yes"
+            }),
+        )
+        .expect_err("malformed success payload must fail closed");
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
+        assert_eq!(
+            envelope.context.expect("context")["reason"],
+            serde_json::json!("cleanup_upgrade_check_payload_invalid")
         );
     }
 
@@ -264,6 +325,62 @@ mod tests {
         .expect_err("expired cleanup deadline must fail closed");
         assert_eq!(error.into_envelope().code, ErrorCode::IpcTimeout);
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn cleanup_upgrade_status_binds_probe_to_session_authority() {
+        let home = std::env::temp_dir().join(format!("rub-cleanup-probe-{}", uuid::Uuid::now_v7()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create cleanup probe home");
+        let session_paths = RubPaths::new(&home).session_runtime("default", "sess-default");
+        std::fs::create_dir_all(
+            session_paths
+                .socket_path()
+                .parent()
+                .expect("socket path parent"),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(session_paths.socket_path());
+        let listener = UnixListener::bind(session_paths.socket_path()).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let request: IpcRequest = NdJsonCodec::read(&mut reader)
+                .await
+                .expect("read request")
+                .expect("request");
+            assert_eq!(request.command, "_upgrade_check");
+            assert_eq!(
+                request.command_id.as_deref(),
+                Some(UPGRADE_CHECK_PROBE_COMMAND_ID)
+            );
+            assert_eq!(request.daemon_session_id.as_deref(), Some("sess-default"));
+            let response = IpcResponse::success("upgrade", serde_json::json!({ "idle": true }))
+                .with_command_id(UPGRADE_CHECK_PROBE_COMMAND_ID)
+                .expect("probe command_id must be valid")
+                .with_daemon_session_id("sess-default")
+                .expect("daemon session id must be valid");
+            NdJsonCodec::write(&mut writer, &response)
+                .await
+                .expect("write response");
+        });
+
+        let (status, socket_path) = fetch_upgrade_status_for_session_with_deadline(
+            &session_paths,
+            Instant::now() + std::time::Duration::from_secs(1),
+            1_000,
+            "cleanup_upgrade_check",
+        )
+        .await
+        .expect("upgrade check should succeed")
+        .expect("socket should respond");
+        assert!(status.idle);
+        assert_eq!(socket_path, session_paths.socket_path());
+
+        server.await.expect("server task");
         let _ = std::fs::remove_dir_all(&home);
     }
 

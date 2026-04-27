@@ -132,6 +132,7 @@ pub(super) fn blocked_cooldown_result(rule: &OrchestrationRuleInfo) -> Orchestra
         cooldown_until_ms: rule.execution_policy.cooldown_until_ms,
         error_code: Some(ErrorCode::WaitTimeout),
         reason: Some("orchestration_cooldown_active".to_string()),
+        error_context: None,
     }
 }
 
@@ -324,5 +325,15 @@ mod tests {
             .expect_err("frame binding without tab binding should fail");
         assert!(error.to_string().contains("source.frame_id"));
         assert!(error.to_string().contains("source.tab_index"));
+    }
+
+    #[test]
+    fn orchestration_registration_rejects_kind_irrelevant_condition_field() {
+        let mut spec = spec();
+        spec.condition.url_pattern = Some("/ready".to_string());
+
+        let error = validate_orchestration_registration_spec(&mut spec)
+            .expect_err("kind-irrelevant known condition field must fail closed");
+        assert!(error.to_string().contains("condition.url_pattern"));
     }
 }

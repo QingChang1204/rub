@@ -1,6 +1,10 @@
 use super::*;
 use crate::identity_coverage::IdentityCoverageRegistry;
+use crate::request_correlation::CORRELATION_BROWSER_AUTHORITY_REBUILD_FAILED_REASON;
 use crate::tab_projection::{CommittedTabProjection, LocalActiveTargetAuthority};
+use rub_core::model::DialogRuntimeStatus;
+
+const BROWSER_AUTHORITY_REBUILD_FAILED_REASON: &str = "browser_authority_rebuild_failed";
 
 #[derive(Clone)]
 pub(super) struct BrowserAuthoritySnapshot {
@@ -9,8 +13,10 @@ pub(super) struct BrowserAuthoritySnapshot {
     is_external: bool,
     connection_target: Option<ConnectionTarget>,
     managed_profile: Option<ManagedProfileDir>,
+    tab_projection: CommittedTabProjection,
     local_active_target_authority: Option<LocalActiveTargetAuthority>,
     dialog_runtime: rub_core::model::DialogRuntimeInfo,
+    download_runtime: crate::downloads::DownloadRuntimeProjectionState,
     dialog_intercept: Option<rub_core::model::DialogInterceptPolicy>,
     network_rule_runtime: NetworkRuleRuntime,
     request_correlation: RequestCorrelationRegistry,
@@ -19,12 +25,24 @@ pub(super) struct BrowserAuthoritySnapshot {
     identity_coverage: IdentityCoverageRegistry,
 }
 
+#[derive(Clone)]
+pub(super) struct BrowserRuntimeFallbackSnapshot {
+    dialog_runtime: rub_core::model::DialogRuntimeInfo,
+    download_runtime: crate::downloads::DownloadRuntimeProjectionState,
+    network_rule_runtime: NetworkRuleRuntime,
+    request_correlation: RequestCorrelationRegistry,
+    observatory_pending_registries:
+        HashMap<String, crate::runtime_observatory::SharedPendingRequestRegistry>,
+}
+
 pub(super) struct BrowserAuthorityInstall {
     pub(super) browser: Arc<Browser>,
     pub(super) page: Arc<Page>,
     pub(super) is_external: bool,
     pub(super) connection_target: Option<ConnectionTarget>,
     pub(super) managed_profile: Option<ManagedProfileDir>,
+    #[cfg(test)]
+    pub(super) managed_browser_test_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 pub(super) struct BrowserRuntimeCandidate {
@@ -195,6 +213,57 @@ impl BrowserAuthorityInstallTransaction {
 }
 
 impl BrowserManager {
+    pub(super) async fn restore_degraded_runtime_fallback_after_failed_authority_rebuild(
+        &self,
+        snapshot: BrowserRuntimeFallbackSnapshot,
+    ) {
+        let mut dialog_runtime = snapshot.dialog_runtime.clone();
+        dialog_runtime.degraded_reason = append_runtime_degraded_reason(
+            dialog_runtime.degraded_reason.take(),
+            BROWSER_AUTHORITY_REBUILD_FAILED_REASON,
+        );
+        dialog_runtime.status = DialogRuntimeStatus::Degraded;
+        *self.dialog_runtime.write().await = dialog_runtime;
+
+        let mut download_runtime = snapshot.download_runtime.clone();
+        download_runtime.mark_runtime_degraded(BROWSER_AUTHORITY_REBUILD_FAILED_REASON);
+        self.download_runtime
+            .write()
+            .await
+            .restore_snapshot(&download_runtime);
+
+        let mut network_rule_runtime = snapshot.network_rule_runtime.clone();
+        network_rule_runtime.clear_browser_installation_state();
+        *self.network_rule_runtime.write().await = network_rule_runtime;
+
+        let mut request_correlation = snapshot.request_correlation.clone();
+        request_correlation
+            .mark_runtime_degraded(CORRELATION_BROWSER_AUTHORITY_REBUILD_FAILED_REASON);
+        *self.request_correlation.lock().await = request_correlation;
+
+        *self.observatory_pending_registries.lock().await =
+            snapshot.observatory_pending_registries.clone();
+        self.replay_dialog_runtime_projection_to_callbacks().await;
+        self.replay_download_runtime_projection_to_callbacks().await;
+    }
+
+    pub(super) async fn degraded_dialog_runtime_after_failed_authority_rebuild(
+        &self,
+    ) -> Option<rub_core::model::DialogRuntimeInfo> {
+        let runtime = self.dialog_runtime.read().await.clone();
+        let degraded_for_failed_rebuild =
+            runtime.degraded_reason.as_deref().is_some_and(|reason| {
+                reason
+                    .split(',')
+                    .any(|current| current.trim() == BROWSER_AUTHORITY_REBUILD_FAILED_REASON)
+            });
+        if runtime.status == DialogRuntimeStatus::Degraded && degraded_for_failed_rebuild {
+            Some(runtime)
+        } else {
+            None
+        }
+    }
+
     #[cfg(test)]
     fn maybe_fail_generation_bound_runtime_reconcile_for_test(&self) -> Result<(), RubError> {
         if self
@@ -286,16 +355,24 @@ impl BrowserManager {
         browser: Arc<Browser>,
         listener_generation: ListenerGeneration,
     ) {
-        let callbacks = self.download_callbacks.lock().await.clone();
+        let callbacks = crate::browser::runtime_callbacks::guard_download_callbacks_for_commit(
+            self.download_callbacks.lock().await.clone(),
+            self.authority_commit_in_progress.clone(),
+            self.runtime_callback_reconfigure_in_progress.clone(),
+        );
         let options = self.current_options();
         let is_external = *self.is_external.lock().await;
         let download_runtime = crate::downloads::install_browser_download_runtime(
-            browser,
-            callbacks.clone(),
-            is_external,
-            options.download_dir,
-            listener_generation,
-            self.listener_generation_receiver(),
+            crate::downloads::DownloadRuntimeInstall {
+                browser,
+                projection_state: self.download_runtime.clone(),
+                callbacks: callbacks.clone(),
+                is_external,
+                download_dir: options.download_dir,
+                listener_generation,
+                listener_generation_rx: self.listener_generation_receiver(),
+                authority_release_in_progress: self.authority_release_in_progress.clone(),
+            },
         )
         .await;
         crate::downloads::publish_download_runtime(
@@ -303,6 +380,55 @@ impl BrowserManager {
             listener_generation,
             download_runtime,
         );
+    }
+
+    pub(super) async fn replay_download_runtime_projection_to_callbacks(&self) {
+        let callbacks = crate::browser::runtime_callbacks::guard_download_callbacks_for_commit(
+            self.download_callbacks.lock().await.clone(),
+            self.authority_commit_in_progress.clone(),
+            self.runtime_callback_reconfigure_in_progress.clone(),
+        );
+        if callbacks.is_empty() {
+            return;
+        }
+        let (generation, runtime) = self
+            .download_runtime
+            .read()
+            .await
+            .projection_with_generation();
+        if generation == 0 {
+            return;
+        }
+        crate::downloads::publish_download_runtime(&callbacks, generation, runtime);
+    }
+
+    pub(super) async fn replay_dialog_runtime_projection_to_callbacks(&self) {
+        let callbacks = crate::browser::runtime_callbacks::guard_dialog_callbacks_for_commit(
+            self.dialog_callbacks.lock().await.clone(),
+            self.authority_commit_in_progress.clone(),
+            self.runtime_callback_reconfigure_in_progress.clone(),
+        );
+        let Some(callback) = callbacks.on_runtime else {
+            return;
+        };
+        callback(crate::dialogs::DialogRuntimeUpdate {
+            generation: self.listener_generation(),
+            runtime: self.dialog_runtime.read().await.clone(),
+        });
+    }
+
+    pub(super) async fn replay_runtime_state_projection_to_callbacks(&self) {
+        #[cfg(test)]
+        self.runtime_state_replay_attempt_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let Some(browser) = self.browser.lock().await.clone() else {
+            return;
+        };
+        let context = self
+            .projection_context(browser, self.listener_generation())
+            .await;
+        crate::tab_projection::replay_runtime_state_for_committed_active_page(&context).await;
     }
 
     pub(super) async fn prepare_runtime_state_candidate(
@@ -438,8 +564,16 @@ impl BrowserManager {
             identity_policy: self.current_identity_policy(),
             identity_coverage: self.identity_coverage.clone(),
             authority_commit_in_progress: self.authority_commit_in_progress.clone(),
+            authority_release_in_progress: self.authority_release_in_progress.clone(),
+            runtime_callback_reconfigure_in_progress: self
+                .runtime_callback_reconfigure_in_progress
+                .clone(),
             listener_generation,
             listener_generation_rx: self.listener_generation_receiver(),
+            #[cfg(test)]
+            force_required_page_hook_install_failure: self
+                .force_required_page_hook_install_failure
+                .clone(),
         }
     }
 
@@ -456,12 +590,16 @@ impl BrowserManager {
         &self,
     ) -> Option<BrowserAuthoritySnapshot> {
         let browser = self.browser.lock().await.clone()?;
-        let page = self.projected_continuity_page().await?;
+        let page = self
+            .snapshot_current_browser_authority_page(&browser)
+            .await?;
         let is_external = *self.is_external.lock().await;
         let connection_target = self.connection_target.lock().await.clone();
         let managed_profile = self.managed_profile.lock().await.clone();
+        let tab_projection = self.tab_projection.lock().await.clone();
         let local_active_target_authority = self.local_active_target_authority.lock().await.clone();
         let dialog_runtime = self.dialog_runtime.read().await.clone();
+        let download_runtime = self.download_runtime.read().await.clone();
         let dialog_intercept = self.snapshot_dialog_intercept_state();
         let network_rule_runtime = self.network_rule_runtime.read().await.clone();
         let request_correlation = self.request_correlation.lock().await.clone();
@@ -474,8 +612,10 @@ impl BrowserManager {
             is_external,
             connection_target,
             managed_profile,
+            tab_projection,
             local_active_target_authority,
             dialog_runtime,
+            download_runtime,
             dialog_intercept,
             network_rule_runtime,
             request_correlation,
@@ -484,9 +624,103 @@ impl BrowserManager {
         })
     }
 
+    pub(super) async fn snapshot_browser_runtime_fallback(&self) -> BrowserRuntimeFallbackSnapshot {
+        BrowserRuntimeFallbackSnapshot {
+            dialog_runtime: self.dialog_runtime.read().await.clone(),
+            download_runtime: self.download_runtime.read().await.clone(),
+            network_rule_runtime: self.network_rule_runtime.read().await.clone(),
+            request_correlation: self.request_correlation.lock().await.clone(),
+            observatory_pending_registries: self
+                .observatory_pending_registries
+                .lock()
+                .await
+                .clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn snapshot_current_browser_authority_target_id_for_test(
+        &self,
+    ) -> Option<String> {
+        self.snapshot_current_browser_authority()
+            .await
+            .map(|snapshot| snapshot.page.target_id().as_ref().to_string())
+    }
+
+    async fn snapshot_current_browser_authority_page(
+        &self,
+        browser: &Arc<Browser>,
+    ) -> Option<Arc<Page>> {
+        let projection = self.tab_projection.lock().await.clone();
+        let projected_page = projection
+            .continuity_page
+            .clone()
+            .or(projection.current_page.clone())
+            .or_else(|| {
+                projection.active_target_id.as_ref().and_then(|target_id| {
+                    projection
+                        .pages
+                        .iter()
+                        .find(|page| page.target_id() == target_id)
+                        .cloned()
+                })
+            })
+            .or_else(|| projection.pages.first().cloned());
+        if projected_page.is_some() {
+            return projected_page;
+        }
+        browser.pages().await.ok()?.into_iter().next().map(Arc::new)
+    }
+
+    #[cfg(test)]
+    fn managed_browser_test_semaphore() -> Arc<tokio::sync::Semaphore> {
+        static MANAGED_BROWSER_TEST_SEMAPHORE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        MANAGED_BROWSER_TEST_SEMAPHORE
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(super) async fn holds_managed_browser_test_permit_for_test(&self) -> bool {
+        self.managed_browser_test_permit.lock().await.is_some()
+    }
+
+    #[cfg(test)]
+    async fn acquire_managed_browser_test_permit_if_needed(
+        &self,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if self.managed_browser_test_permit.lock().await.is_some() {
+            None
+        } else {
+            Some(
+                Self::managed_browser_test_semaphore()
+                    .acquire_owned()
+                    .await
+                    .expect("managed-browser test semaphore"),
+            )
+        }
+    }
+
+    #[cfg(test)]
+    async fn install_managed_browser_test_permit(
+        &self,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
+        if let Some(permit) = permit {
+            *self.managed_browser_test_permit.lock().await = Some(permit);
+        }
+    }
+
+    #[cfg(test)]
+    async fn release_managed_browser_test_permit(&self) {
+        self.managed_browser_test_permit.lock().await.take();
+    }
+
     pub(super) async fn resolve_browser_authority_install(
         &self,
         existing_target: Option<ConnectionTarget>,
+        managed_reconnect_url: Option<String>,
     ) -> Result<BrowserAuthorityInstall, RubError> {
         match existing_target.clone() {
             Some(ConnectionTarget::CdpUrl { url }) => {
@@ -497,6 +731,8 @@ impl BrowserManager {
                     is_external: true,
                     connection_target: Some(ConnectionTarget::CdpUrl { url }),
                     managed_profile: None,
+                    #[cfg(test)]
+                    managed_browser_test_permit: None,
                 })
             }
             Some(ConnectionTarget::AutoDiscovered { url, port }) => {
@@ -507,6 +743,8 @@ impl BrowserManager {
                     is_external: true,
                     connection_target: Some(ConnectionTarget::AutoDiscovered { url, port }),
                     managed_profile: None,
+                    #[cfg(test)]
+                    managed_browser_test_permit: None,
                 })
             }
             _ => {
@@ -514,8 +752,34 @@ impl BrowserManager {
                 let identity_policy = self.current_identity_policy();
                 let managed_profile = resolve_managed_profile_dir(
                     options.user_data_dir.clone(),
+                    options.profile_directory.clone(),
                     options.managed_profile_ephemeral,
                 );
+                if let Some(url) = managed_reconnect_url {
+                    match crate::runtime::attach_external_browser(&url).await {
+                        Ok((browser, page, _)) => {
+                            return Ok(BrowserAuthorityInstall {
+                                browser,
+                                page,
+                                is_external: false,
+                                connection_target: existing_target,
+                                managed_profile: Some(managed_profile),
+                                #[cfg(test)]
+                                managed_browser_test_permit: None,
+                            });
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                url = %url,
+                                error = %error,
+                                "Managed browser authority reconnect failed; falling back to relaunch"
+                            );
+                        }
+                    }
+                }
+                #[cfg(test)]
+                let managed_browser_test_permit =
+                    self.acquire_managed_browser_test_permit_if_needed().await;
                 let (browser, page) =
                     crate::runtime::launch_managed_browser(&options, &identity_policy).await?;
                 Ok(BrowserAuthorityInstall {
@@ -524,6 +788,8 @@ impl BrowserManager {
                     is_external: false,
                     connection_target: existing_target,
                     managed_profile: Some(managed_profile),
+                    #[cfg(test)]
+                    managed_browser_test_permit,
                 })
             }
         }
@@ -533,21 +799,31 @@ impl BrowserManager {
         &self,
         snapshot: BrowserAuthoritySnapshot,
     ) -> Result<(), RubError> {
-        self.install_runtime_state_locked(
+        self.install_runtime_state_locked_without_callback_replay(
             snapshot.browser.clone(),
             snapshot.page.clone(),
             snapshot.is_external,
             snapshot.connection_target.clone(),
             snapshot.managed_profile.clone(),
+            #[cfg(test)]
+            None,
         )
         .await?;
         self.restore_browser_authority_runtime_state(&snapshot)
             .await;
+        self.set_authority_commit_in_progress(false);
+        self.replay_runtime_state_projection_to_callbacks().await;
+        self.replay_dialog_runtime_projection_to_callbacks().await;
+        self.replay_download_runtime_projection_to_callbacks().await;
         Ok(())
     }
 
     async fn restore_browser_authority_runtime_state(&self, snapshot: &BrowserAuthoritySnapshot) {
         *self.dialog_runtime.write().await = snapshot.dialog_runtime.clone();
+        self.download_runtime
+            .write()
+            .await
+            .restore_snapshot(&snapshot.download_runtime);
         self.restore_dialog_intercept_state(snapshot.dialog_intercept.clone());
         *self.network_rule_runtime.write().await = snapshot.network_rule_runtime.clone();
         *self.request_correlation.lock().await = snapshot.request_correlation.clone();
@@ -555,6 +831,15 @@ impl BrowserManager {
             snapshot.observatory_pending_registries.clone();
         *self.local_active_target_authority.lock().await =
             snapshot.local_active_target_authority.clone();
+        let mut restored_tab_projection = snapshot.tab_projection.clone();
+        let mut tab_projection = self.tab_projection.lock().await;
+        if restored_tab_projection.current_page.is_none() {
+            restored_tab_projection.current_page = tab_projection.current_page.clone();
+        }
+        if restored_tab_projection.continuity_page.is_none() {
+            restored_tab_projection.continuity_page = tab_projection.continuity_page.clone();
+        }
+        *tab_projection = restored_tab_projection;
         *self.identity_coverage.lock().await = snapshot.identity_coverage.clone();
         self.update_stealth_coverage_projection(Some(snapshot.identity_coverage.project()));
     }
@@ -574,7 +859,11 @@ impl BrowserManager {
 
         let profile = snapshot.managed_profile.clone().unwrap_or_else(|| {
             let options = self.current_options();
-            resolve_managed_profile_dir(options.user_data_dir, options.managed_profile_ephemeral)
+            resolve_managed_profile_dir(
+                options.user_data_dir,
+                options.profile_directory,
+                options.managed_profile_ephemeral,
+            )
         });
         shutdown_managed_browser(snapshot.browser.as_ref(), &profile).await?;
         info!(
@@ -606,6 +895,7 @@ impl BrowserManager {
                     .unwrap_or_else(|| {
                         resolve_managed_profile_dir(
                             options.user_data_dir.clone(),
+                            options.profile_directory.clone(),
                             options.managed_profile_ephemeral,
                         )
                     });
@@ -618,13 +908,34 @@ impl BrowserManager {
             self.clear_local_browser_authority().await;
         }
 
+        #[cfg(test)]
+        if !is_external {
+            self.release_managed_browser_test_permit().await;
+        }
+
         Ok(())
+    }
+
+    pub(super) async fn release_current_browser_authority_with_callback_fence(
+        &self,
+    ) -> Result<(), RubError> {
+        self.set_authority_commit_in_progress(true);
+        self.authority_release_in_progress
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = self.release_current_browser_authority().await;
+        self.bump_listener_generation();
+        self.authority_release_in_progress
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.set_authority_commit_in_progress(false);
+        result
     }
 
     pub(super) async fn release_current_browser_authority_fail_closed(
         &self,
     ) -> Result<(), RubError> {
-        let release_result = self.release_current_browser_authority().await;
+        let release_result = self
+            .release_current_browser_authority_with_callback_fence()
+            .await;
         if release_result.is_err() {
             self.clear_local_browser_authority().await;
         }
@@ -669,6 +980,7 @@ impl BrowserManager {
     async fn reset_runtime_state_for_authority_install(&self) {
         self.page_hook_states.lock().await.clear();
         self.observatory_pending_registries.lock().await.clear();
+        self.download_runtime.write().await.clear();
         self.network_rule_runtime
             .write()
             .await
@@ -686,6 +998,7 @@ impl BrowserManager {
         is_external: bool,
         connection_target: Option<ConnectionTarget>,
         managed_profile: Option<ManagedProfileDir>,
+        #[cfg(test)] managed_browser_test_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<(), RubError> {
         self.set_authority_commit_in_progress(true);
         let result = BrowserAuthorityInstallTransaction::begin(
@@ -701,6 +1014,48 @@ impl BrowserManager {
         .commit_candidate(self)
         .await;
         self.set_authority_commit_in_progress(false);
+        if result.is_ok() {
+            self.replay_runtime_state_projection_to_callbacks().await;
+            self.replay_dialog_runtime_projection_to_callbacks().await;
+            self.replay_download_runtime_projection_to_callbacks().await;
+        }
+        #[cfg(test)]
+        if result.is_ok() {
+            self.install_managed_browser_test_permit(managed_browser_test_permit)
+                .await;
+        }
+        result
+    }
+
+    async fn install_runtime_state_locked_without_callback_replay(
+        &self,
+        browser: Arc<Browser>,
+        page: Arc<Page>,
+        is_external: bool,
+        connection_target: Option<ConnectionTarget>,
+        managed_profile: Option<ManagedProfileDir>,
+        #[cfg(test)] managed_browser_test_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<(), RubError> {
+        self.set_authority_commit_in_progress(true);
+        let result = BrowserAuthorityInstallTransaction::begin(
+            self,
+            browser,
+            page,
+            is_external,
+            connection_target,
+            managed_profile,
+            false,
+        )
+        .await
+        .commit_candidate(self)
+        .await;
+        if result.is_err() {
+            self.set_authority_commit_in_progress(false);
+            return result;
+        }
+        #[cfg(test)]
+        self.install_managed_browser_test_permit(managed_browser_test_permit)
+            .await;
         result
     }
 
@@ -752,6 +1107,11 @@ impl BrowserManager {
         }
         let result = transaction.release_previous_after_commit(self).await;
         self.set_authority_commit_in_progress(false);
+        if result.is_ok() {
+            self.replay_runtime_state_projection_to_callbacks().await;
+            self.replay_dialog_runtime_projection_to_callbacks().await;
+            self.replay_download_runtime_projection_to_callbacks().await;
+        }
         result
     }
 
@@ -777,6 +1137,12 @@ impl BrowserManager {
     pub(super) fn force_managed_profile_ownership_commit_failure(&self) {
         self.force_managed_profile_ownership_commit_failure
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_force_required_page_hook_install_failure(&self, enabled: bool) {
+        self.force_required_page_hook_install_failure
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -807,5 +1173,15 @@ impl BrowserManager {
         self.pause_authority_commit_after_projection
             .store(false, std::sync::atomic::Ordering::SeqCst);
         self.resume_authority_commit.notify_waiters();
+    }
+}
+
+fn append_runtime_degraded_reason(existing: Option<String>, reason: &str) -> Option<String> {
+    match existing {
+        None => Some(reason.to_string()),
+        Some(existing) if existing.split(',').any(|current| current.trim() == reason) => {
+            Some(existing)
+        }
+        Some(existing) => Some(format!("{existing},{reason}")),
     }
 }

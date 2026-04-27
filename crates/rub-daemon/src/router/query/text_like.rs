@@ -7,7 +7,7 @@ use super::args::{GetReadKind, InspectReadArgs, InspectReadKind, QueryReadArgs};
 use super::result_projection::{
     live_read_subject, multi_read_result, read_payload, scalar_read_result,
 };
-use super::*;
+use super::{reject_live_many_locator_selection, reject_snapshot_without_locator, *};
 
 use rub_core::locator::CanonicalLocator;
 
@@ -18,12 +18,13 @@ pub(super) async fn cmd_get_text_like(
     deadline: TransactionDeadline,
     state: &Arc<SessionState>,
     kind: GetReadKind,
+    command_name: &str,
 ) -> Result<serde_json::Value, RubError> {
-    let command_name = kind.command_name();
     let locator = parse_canonical_locator_from_value(
         &locator_json(args.locator.clone()),
         LocatorParseOptions::OPTIONAL_ELEMENT_ADDRESS,
     )?;
+    reject_snapshot_without_locator(command_name, args.snapshot_id.as_deref(), locator.as_ref())?;
     let uses_snapshot_authority = args.snapshot_id.is_some()
         || matches!(
             locator,
@@ -138,6 +139,7 @@ pub(super) async fn cmd_inspect_text_like(
                     deadline,
                     state,
                     GetReadKind::Text,
+                    "inspect text",
                 )
                 .await
             }
@@ -149,6 +151,7 @@ pub(super) async fn cmd_inspect_text_like(
                     deadline,
                     state,
                     GetReadKind::Value,
+                    "inspect value",
                 )
                 .await
             }
@@ -160,6 +163,7 @@ pub(super) async fn cmd_inspect_text_like(
                     deadline,
                     state,
                     GetReadKind::Attributes,
+                    "inspect attributes",
                 )
                 .await
             }
@@ -171,6 +175,7 @@ pub(super) async fn cmd_inspect_text_like(
                     deadline,
                     state,
                     GetReadKind::Bbox,
+                    "inspect bbox",
                 )
                 .await
             }
@@ -181,6 +186,13 @@ pub(super) async fn cmd_inspect_text_like(
         &locator_json(args.locator.clone()),
         LocatorParseOptions::OPTIONAL_ELEMENT_ADDRESS,
     )?;
+    let inspect_command = format!("inspect {}", kind.kind_name());
+    reject_snapshot_without_locator(
+        inspect_command.as_str(),
+        args.snapshot_id.as_deref(),
+        locator.as_ref(),
+    )?;
+    reject_live_many_locator_selection(locator.as_ref(), kind.kind_name())?;
     let uses_snapshot_authority = args.snapshot_id.is_some()
         || matches!(
             locator,

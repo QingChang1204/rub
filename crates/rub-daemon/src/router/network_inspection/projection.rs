@@ -19,7 +19,7 @@ pub(super) fn summarize_request_record(mut request: NetworkRequestRecord) -> Net
 pub(super) fn build_curl_export(request: &NetworkRequestRecord) -> Result<CurlExport, RubError> {
     if request.method.trim().is_empty() {
         return Err(RubError::domain_with_context(
-            ErrorCode::BrowserCrashed,
+            ErrorCode::SessionBusy,
             "inspect curl requires an authoritative recorded request method",
             serde_json::json!({
                 "kind": "network_request",

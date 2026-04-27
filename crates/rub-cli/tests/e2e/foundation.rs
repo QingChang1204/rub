@@ -226,8 +226,7 @@ fn t052_065_navigation_state_and_json_contract_grouped_scenario() {
         .args(["open", &server.url()])
         .output()
         .unwrap();
-    let open_json: serde_json::Value =
-        serde_json::from_slice(&open_output.stdout).expect("open output must be JSON");
+    let open_json = parse_json(&open_output);
     assert_eq!(open_json["success"], true, "{open_json}");
     assert_eq!(open_json["stdout_schema_version"], "3.0");
     let request_id = open_json["request_id"].as_str().unwrap();
@@ -239,8 +238,9 @@ fn t052_065_navigation_state_and_json_contract_grouped_scenario() {
     assert!(
         open_json
             .get("command_id")
-            .is_none_or(|value| value.is_null() || value.is_string()),
-        "command_id must be omitted/null or a string"
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty()),
+        "command_id must be a non-empty string for non-compat command 'open'"
     );
     assert!(
         open_json["data"]["result"]["page"]["url"]
@@ -275,8 +275,7 @@ fn t052_065_navigation_state_and_json_contract_grouped_scenario() {
     );
 
     let state_output = session.cmd().arg("state").output().unwrap();
-    let state_json: serde_json::Value =
-        serde_json::from_slice(&state_output.stdout).expect("state output must be JSON");
+    let state_json = parse_json(&state_output);
     let snapshot = &state_json["data"]["result"]["snapshot"];
     assert_eq!(state_json["success"], true);
     assert_eq!(state_json["stdout_schema_version"], "3.0");
@@ -332,20 +331,16 @@ fn t052_065_navigation_state_and_json_contract_grouped_scenario() {
     );
 
     let exec_output = session.cmd().args(["exec", "1+1"]).output().unwrap();
-    let _: serde_json::Value =
-        serde_json::from_slice(&exec_output.stdout).expect("exec output must be JSON");
+    let _ = parse_json(&exec_output);
 
     let sessions_output = session.cmd().arg("sessions").output().unwrap();
-    let _: serde_json::Value =
-        serde_json::from_slice(&sessions_output.stdout).expect("sessions output must be JSON");
+    let _ = parse_json(&sessions_output);
 
     let screenshot_output = session.cmd().arg("screenshot").output().unwrap();
-    let _: serde_json::Value =
-        serde_json::from_slice(&screenshot_output.stdout).expect("screenshot output must be JSON");
+    let _ = parse_json(&screenshot_output);
 
     let close_output = session.cmd().arg("close").output().unwrap();
-    let _: serde_json::Value =
-        serde_json::from_slice(&close_output.stdout).expect("close output must be JSON");
+    let _ = parse_json(&close_output);
 }
 
 #[test]
@@ -688,19 +683,26 @@ fn t075_081d_interaction_grouped_scenario() {
         .output()
         .unwrap();
     let json = parse_json(&out);
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["interaction"]["semantic_class"], "set_value");
-    assert_eq!(json["data"]["interaction"]["interaction_confirmed"], false);
+    assert_eq!(json["success"], false);
+    assert_eq!(json["error"]["code"], "INTERACTION_NOT_CONFIRMED", "{json}");
     assert_eq!(
-        json["data"]["interaction"]["confirmation_status"],
+        json["error"]["context"]["committed_response_projection"]["interaction"]["semantic_class"],
+        "set_value"
+    );
+    assert_eq!(
+        json["error"]["context"]["committed_response_projection"]["interaction"]["interaction_confirmed"],
+        false
+    );
+    assert_eq!(
+        json["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_status"],
         "contradicted"
     );
     assert_eq!(
-        json["data"]["interaction"]["confirmation_kind"],
+        json["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_kind"],
         "value_applied"
     );
     assert_eq!(
-        json["data"]["interaction"]["confirmation_details"]["observed"]["value"],
+        json["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_details"]["observed"]["value"],
         "TEST USER"
     );
     let out = session
@@ -854,6 +856,16 @@ fn t084_089_exec_grouped_scenario() {
             >= 2,
         "window.open side effect should still create a new tab"
     );
+    let active_tab = tabs["data"]["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tab| tab["active"] == true)
+        .expect("tabs projection should mark one active tab");
+    assert!(matches!(
+        active_tab["active_authority"].as_str(),
+        Some("browser_truth" | "local_fallback")
+    ));
 
     let out = session
         .cmd()
@@ -1494,8 +1506,10 @@ fn t108_legacy_automation_compat_mode_is_rejected() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--automation-compat-mode"));
+    let json = parse_json(&output);
+    assert!(json["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("--automation-compat-mode")));
 }
 
 #[test]

@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::process::extract_flag_value;
@@ -6,18 +7,15 @@ pub const MANAGED_PROFILE_PREFIX: &str = "rub-chrome";
 pub const MANAGED_PROFILE_TEMP_OWNERSHIP_MARKER: &str = ".rub-managed-profile-temp-owned";
 
 fn normalize_managed_profile_scope(scope: &str) -> String {
-    let normalized = scope
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
-            _ => '_',
-        })
-        .collect::<String>();
-    if normalized.is_empty() {
-        "default".to_string()
-    } else {
-        normalized
+    if scope.is_empty() {
+        return "hex-empty".to_string();
     }
+    let mut encoded = String::with_capacity("hex-".len() + scope.len() * 2);
+    encoded.push_str("hex-");
+    for byte in scope.as_bytes() {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -76,13 +74,19 @@ pub fn managed_profile_paths_equivalent(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }
-    match (
-        managed_profile_identity_suffix(left),
-        managed_profile_identity_suffix(right),
-    ) {
-        (Some(left_identity), Some(right_identity)) => left_identity == right_identity,
-        _ => false,
+    if !is_managed_profile_path(left) || !is_managed_profile_path(right) {
+        return false;
     }
+
+    if std::fs::canonicalize(left)
+        .ok()
+        .zip(std::fs::canonicalize(right).ok())
+        .is_some_and(|(left, right)| left == right)
+    {
+        return true;
+    }
+
+    normalize_private_alias(left) == normalize_private_alias(right)
 }
 
 pub fn managed_profile_temp_ownership_marker_path(profile_dir: &Path) -> PathBuf {
@@ -126,14 +130,23 @@ fn managed_profile_identity_suffix(path: &Path) -> Option<PathBuf> {
         .find_map(|root| path.strip_prefix(&root).ok().map(PathBuf::from))
 }
 
+fn normalize_private_alias(path: &Path) -> PathBuf {
+    if let Ok(stripped) = path.strip_prefix("/private") {
+        PathBuf::from("/").join(stripped)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         extract_managed_profile_path_from_command, has_temp_owned_managed_profile_marker,
         is_managed_profile_dir_name, is_managed_profile_path, is_temp_owned_managed_profile_path,
         managed_profile_paths_equivalent, managed_profile_temp_ownership_marker_path,
-        managed_profile_temp_roots, projected_managed_profile_path_for_scope,
-        projected_managed_profile_path_for_session, sync_temp_owned_managed_profile_marker,
+        managed_profile_temp_roots, normalize_private_alias,
+        projected_managed_profile_path_for_scope, projected_managed_profile_path_for_session,
+        sync_temp_owned_managed_profile_marker,
     };
     use std::path::PathBuf;
 
@@ -143,8 +156,19 @@ mod tests {
         assert!(
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name == "rub-chrome-session_abc_123")
+                .is_some_and(|name| name == "rub-chrome-hex-73657373696f6e3a6162632f313233")
         );
+    }
+
+    #[test]
+    fn projected_managed_profile_path_is_injective_for_punctuation() {
+        let colon = projected_managed_profile_path_for_scope("a:b");
+        let question = projected_managed_profile_path_for_scope("a?b");
+        let literal = projected_managed_profile_path_for_scope("a_3ab");
+
+        assert_ne!(colon, question);
+        assert_ne!(colon, literal);
+        assert_ne!(question, literal);
     }
 
     #[test]
@@ -217,5 +241,34 @@ mod tests {
         let tmp_alias = PathBuf::from("/tmp/rub-chrome-session-alias");
         let private_alias = PathBuf::from("/private/tmp/rub-chrome-session-alias");
         assert!(managed_profile_paths_equivalent(&tmp_alias, &private_alias));
+    }
+
+    #[test]
+    fn private_var_temp_alias_paths_compare_as_same_managed_profile_identity() {
+        let alias = std::env::temp_dir().join("rub-chrome-session-private-alias");
+        let private_alias = if let Ok(stripped) = alias.strip_prefix("/private") {
+            PathBuf::from("/").join(stripped)
+        } else {
+            PathBuf::from("/private").join(alias.strip_prefix("/").unwrap_or(&alias))
+        };
+        assert!(managed_profile_paths_equivalent(&alias, &private_alias));
+    }
+
+    #[test]
+    fn same_suffix_under_different_temp_roots_is_not_same_managed_profile_authority() {
+        let name = "rub-chrome-session-suffix-collision";
+        let tmp_alias = PathBuf::from("/tmp").join(name);
+        let env_temp_alias = std::env::temp_dir().join(name);
+
+        assert!(is_managed_profile_path(&tmp_alias));
+        assert!(is_managed_profile_path(&env_temp_alias));
+
+        let same_root_alias =
+            normalize_private_alias(&tmp_alias) == normalize_private_alias(&env_temp_alias);
+        assert_eq!(
+            managed_profile_paths_equivalent(&tmp_alias, &env_temp_alias),
+            same_root_alias,
+            "managed profile equivalence must not collapse same suffix across distinct temp roots"
+        );
     }
 }

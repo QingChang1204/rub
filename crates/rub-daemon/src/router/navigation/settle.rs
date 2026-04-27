@@ -74,7 +74,10 @@ async fn active_tab_and_frame_runtime_converged(
     state: &Arc<SessionState>,
     tabs: Option<&[TabInfo]>,
 ) -> bool {
-    let Some(active_tab) = tabs.and_then(|tabs| tabs.iter().find(|tab| tab.active)) else {
+    let Some(active_tab) = tabs.and_then(|tabs| {
+        tabs.iter()
+            .find(|tab| tab.active && tab.page_identity_authoritative())
+    }) else {
         return false;
     };
     state
@@ -96,6 +99,9 @@ pub(super) async fn active_tab_projection(router: &DaemonRouter) -> ActiveTabPro
 
 fn active_tab_projection_from_tabs(tabs: &[TabInfo]) -> ActiveTabProjection {
     match tabs.iter().find(|tab| tab.active) {
+        Some(active_tab) if !active_tab.page_identity_authoritative() => {
+            degraded_active_tab_projection("active_tab_probe_failed")
+        }
         Some(active_tab) => ActiveTabProjection {
             tab: Some(crate::router::projection::tab_entity(active_tab)),
             degraded_reason: None,
@@ -123,6 +129,8 @@ mod tests {
             url: format!("https://example.com/{index}"),
             title: format!("Tab {index}"),
             active,
+            active_authority: None,
+            degraded_reason: None,
         }
     }
 

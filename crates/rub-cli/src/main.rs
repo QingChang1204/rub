@@ -33,22 +33,54 @@ use self::main_dispatch::{
     try_handle_local_command_before_binding, try_handle_prebootstrap_command,
 };
 use self::main_support::{
-    command_timeout_envelope, daemon_args, finalize_response_output, rub_home_create_error,
+    FinalizeResponseContext, command_timeout_envelope, daemon_args, finalize_response_output,
+    rub_home_create_error,
 };
 #[cfg(test)]
 use self::main_support::{handle_sessions, use_alias_local_surface_error};
 use clap::Parser;
+use clap::error::ErrorKind as ClapErrorKind;
 use commands::{Cli, Commands};
 use session_policy::{
     materialize_connection_request_with_deadline, requested_attachment_identity,
     requires_existing_session_validation,
-    validate_existing_session_connection_request_with_deadline,
+    validate_existing_session_connection_request_via_authority_probe_with_deadline,
 };
 use std::time::Instant;
 
 #[tokio::main]
 async fn main() {
-    let parsed = Cli::parse();
+    let parsed = match Cli::try_parse() {
+        Ok(parsed) => parsed,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion
+            ) =>
+        {
+            let _ = error.print();
+            std::process::exit(0);
+        }
+        Err(error) => {
+            let message = error.to_string();
+            println!(
+                "{}",
+                output::format_cli_error(
+                    "parse",
+                    "default",
+                    rub_core::error::ErrorEnvelope::new(
+                        rub_core::error::ErrorCode::InvalidInput,
+                        message.trim().to_string(),
+                    )
+                    .with_context(serde_json::json!({
+                        "reason": "cli_parse_error",
+                    })),
+                    false,
+                )
+            );
+            std::process::exit(2);
+        }
+    };
     let session_name = parsed.session.clone();
     let pretty = parsed.json_pretty;
     let command_name = parsed.command.canonical_name().to_string();
@@ -139,12 +171,16 @@ async fn main() {
         Ok(request) => request,
         Err(error) => {
             let build_timeout_ms = timeout_budget::command_timeout_ms(&cli);
-            let build_deadline =
-                timeout_budget::deadline_from_start(command_started_at, build_timeout_ms);
-            let envelope = if timeout_budget::remaining_budget_duration(build_deadline).is_none() {
-                command_timeout_envelope(build_timeout_ms)
-            } else {
-                error.into_envelope()
+            let envelope = match timeout_budget::deadline_from_start_checked(
+                command_started_at,
+                build_timeout_ms,
+            ) {
+                Some(build_deadline)
+                    if timeout_budget::remaining_budget_duration(build_deadline).is_none() =>
+                {
+                    command_timeout_envelope(build_timeout_ms)
+                }
+                _ => error.into_envelope(),
             };
             println!(
                 "{}",
@@ -153,6 +189,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    if let Err(envelope) = request.validate_contract() {
+        println!(
+            "{}",
+            output::format_cli_error(command_name.as_str(), session, envelope, pretty,)
+        );
+        std::process::exit(1);
+    }
     let command_deadline =
         timeout_budget::deadline_from_start(command_started_at, request.timeout_ms);
 
@@ -237,7 +280,10 @@ async fn main() {
         command_deadline,
         request.timeout_ms,
         &daemon_args,
-        attachment_identity.as_deref(),
+        daemon_ctl::StartupAuthorityRequest {
+            connection_request: &connection_request,
+            attachment_identity: attachment_identity.as_deref(),
+        },
     )
     .await
     {
@@ -252,17 +298,19 @@ async fn main() {
     let mut client = bootstrap.client;
     let connected_to_existing_daemon = bootstrap.connected_to_existing_daemon;
     let daemon_session_id = bootstrap.daemon_session_id;
+    let authority_socket_path = bootstrap.authority_socket_path;
 
     if requires_existing_session_validation(connected_to_existing_daemon, &connection_request, &cli)
-        && let Err(error) = validate_existing_session_connection_request_with_deadline(
-            &cli,
-            &connection_request,
-            &mut client,
-            cli.session_id.as_deref().or(daemon_session_id.as_deref()),
-            Some(command_deadline),
-            Some(request.timeout_ms),
-        )
-        .await
+        && let Err(error) =
+            validate_existing_session_connection_request_via_authority_probe_with_deadline(
+                &cli,
+                &connection_request,
+                authority_socket_path.as_path(),
+                cli.session_id.as_deref().or(daemon_session_id.as_deref()),
+                command_deadline,
+                request.timeout_ms,
+            )
+            .await
     {
         println!(
             "{}",
@@ -297,6 +345,7 @@ async fn main() {
             rub_home: &cli.rub_home,
             session,
             daemon_args: &daemon_args,
+            connection_request: &connection_request,
             attachment_identity: attachment_identity.as_deref(),
             original_daemon_session_id: daemon_session_id.as_deref(),
         },
@@ -304,23 +353,21 @@ async fn main() {
     .await
     {
         Ok(mut response) => {
-            let output = match finalize_response_output(
+            let finalized_output = finalize_response_output(
                 &cli,
-                command_name.as_str(),
-                session,
-                &rub_home,
-                pretty,
-                binding_execution_projection.as_ref(),
+                FinalizeResponseContext {
+                    command_name: command_name.as_str(),
+                    session,
+                    rub_home: &rub_home,
+                    pretty,
+                    command_deadline,
+                    timeout_ms: request.timeout_ms,
+                    binding_execution_projection: binding_execution_projection.as_ref(),
+                },
                 &mut response,
-            ) {
-                Ok(output) => output,
-                Err(output) => {
-                    println!("{output}");
-                    std::process::exit(1);
-                }
-            };
-            println!("{output}");
-            if response.status == rub_ipc::protocol::ResponseStatus::Error {
+            );
+            println!("{}", finalized_output.output);
+            if !finalized_output.success {
                 std::process::exit(1);
             }
         }

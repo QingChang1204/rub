@@ -4,8 +4,17 @@ pub(crate) async fn cmd_close(
     router: &DaemonRouter,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
+    let external_session = matches!(
+        state.launch_identity().await.connection_target,
+        Some(
+            rub_core::model::ConnectionTarget::CdpUrl { .. }
+                | rub_core::model::ConnectionTarget::AutoDiscovered { .. }
+        )
+    );
     router.browser.close().await?;
-    state.request_shutdown();
+    if !external_session {
+        state.request_shutdown();
+    }
     Ok(serde_json::json!({
         "subject": {
             "kind": "session_browser",
@@ -13,7 +22,11 @@ pub(crate) async fn cmd_close(
         "result": {
             "closed": true,
             "daemon_stopped": false,
-            "daemon_exit_policy": "shutdown_requested_by_close",
+            "daemon_exit_policy": if external_session {
+                "daemon_kept_alive_for_external_reconnect"
+            } else {
+                "shutdown_requested_by_close"
+            },
         }
     }))
 }
@@ -63,6 +76,11 @@ pub(crate) async fn cmd_upgrade_check(
     let browser_event_ingress = state.browser_event_ingress_metrics().await;
     Ok(serde_json::json!({
         "idle": state.is_idle_for_upgrade().await && active_trigger_count == 0 && active_orchestration_count == 0,
+        "semantic_command_protocol": {
+            "compatible": true,
+            "daemon_protocol_version": IPC_PROTOCOL_VERSION,
+            "compatible_cli_protocol_versions": [IPC_PROTOCOL_VERSION],
+        },
         "in_flight_count": state.in_flight_count.load(std::sync::atomic::Ordering::SeqCst),
         "connected_client_count": state.connected_client_count.load(std::sync::atomic::Ordering::SeqCst),
         "active_trigger_count": active_trigger_count,

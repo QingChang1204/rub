@@ -1,7 +1,7 @@
 use super::super::element_semantics::semantic_role;
 use super::super::navigation::write_screenshot_artifact;
 use super::super::state_format::summarize_element_label;
-use super::super::{DaemonRouter, RubError};
+use super::super::{DaemonRouter, RubError, TransactionDeadline};
 
 #[derive(Debug, serde::Serialize)]
 pub(super) struct ObserveElementMapEntry {
@@ -41,6 +41,7 @@ pub(super) async fn capture_screenshot_payload(
     router: &DaemonRouter,
     full: bool,
     path: Option<&str>,
+    deadline: TransactionDeadline,
 ) -> Result<serde_json::Value, RubError> {
     let png_bytes = router.browser.screenshot(full).await?;
     if let Some(path) = path {
@@ -49,6 +50,7 @@ pub(super) async fn capture_screenshot_payload(
             &png_bytes,
             "router.observe_capture_artifact",
             "observe_capture_artifact",
+            deadline,
         );
     }
 

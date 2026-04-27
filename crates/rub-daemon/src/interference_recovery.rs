@@ -379,7 +379,9 @@ fn recovery_fence_satisfied(
             .baseline
             .primary_url
             .as_deref()
-            .is_none_or(|primary_url| active_tab.url == primary_url),
+            .is_none_or(|primary_url| {
+                active_tab.page_identity_authoritative() && active_tab.url == primary_url
+            }),
         InterferenceRecoveryAction::CloseUnexpectedTab => {
             let primary_ok = primary_context_restored(active_tab, context);
             let tab_count_ok = context.baseline.last_tab_count == 0
@@ -433,7 +435,7 @@ fn primary_context_restored(active_tab: &TabInfo, context: &InterferenceRecovery
             .baseline
             .primary_url
             .as_deref()
-            .is_some_and(|url| active_tab.url == url)
+            .is_some_and(|url| active_tab.page_identity_authoritative() && active_tab.url == url)
 }
 
 fn find_active_tab(tabs: &[TabInfo]) -> Option<&TabInfo> {
@@ -450,11 +452,10 @@ fn find_primary_tab<'a>(
         .as_deref()
         .and_then(|target_id| tabs.iter().find(|tab| tab.target_id == target_id))
         .or_else(|| {
-            context
-                .baseline
-                .primary_url
-                .as_deref()
-                .and_then(|url| tabs.iter().find(|tab| tab.url == url))
+            context.baseline.primary_url.as_deref().and_then(|url| {
+                tabs.iter()
+                    .find(|tab| tab.page_identity_authoritative() && tab.url == url)
+            })
         })
 }
 
@@ -529,6 +530,8 @@ mod tests {
             url: url.to_string(),
             title: "Title".to_string(),
             active: true,
+            active_authority: None,
+            degraded_reason: None,
         }
     }
 
@@ -595,6 +598,8 @@ mod tests {
             url: "https://app.example.test/home".to_string(),
             title: "Home".to_string(),
             active: true,
+            active_authority: None,
+            degraded_reason: None,
         };
         assert!(primary_context_restored(&primary, &context));
         assert!(find_primary_tab(&[primary], &context).is_some());

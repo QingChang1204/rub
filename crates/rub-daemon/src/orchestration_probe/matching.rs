@@ -28,11 +28,15 @@ pub(super) fn readiness_matches(
         return false;
     }
 
+    if readiness.degraded_reason.is_some() {
+        return false;
+    }
+
     if requested == "ready" {
         return matches!(
             readiness.route_stability,
             rub_core::model::RouteStability::Stable
-        ) && readiness.degraded_reason.is_none();
+        );
     }
 
     requested == format!("{:?}", readiness.status).to_ascii_lowercase()

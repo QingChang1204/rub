@@ -12,14 +12,13 @@ fn rub_paths_projects_canonical_home_artifacts() {
         paths.sessions_dir(),
         PathBuf::from("/tmp/rub-home/sessions")
     );
-    // Socket runtime dir is now user-scoped; verify it contains the
-    // current username (or UID fallback) rather than a hardcoded string.
-    let tag = std::env::var("USER")
-        .or_else(|_| std::env::var("UID"))
-        .unwrap_or_else(|_| "unknown".to_string());
-    assert_eq!(
-        paths.socket_runtime_dir(),
-        PathBuf::from(format!("/tmp/rub-sock-{tag}"))
+    assert!(
+        paths
+            .socket_runtime_dir()
+            .to_string_lossy()
+            .starts_with("/tmp/rub-sock-"),
+        "{}",
+        paths.socket_runtime_dir().display()
     );
     assert_eq!(
         paths.workflows_dir(),
@@ -153,13 +152,13 @@ fn runtime_session_paths_key_actual_artifacts_by_session_id_while_preserving_nam
         session.canonical_socket_path(),
         PathBuf::from("/tmp/rub-home/sessions/default/daemon.sock")
     );
-    let tag = std::env::var("USER")
-        .or_else(|_| std::env::var("UID"))
-        .unwrap_or_else(|_| "unknown".to_string());
     assert!(
         session
             .socket_path()
-            .starts_with(format!("/tmp/rub-sock-{tag}"))
+            .to_string_lossy()
+            .starts_with("/tmp/rub-sock-"),
+        "{}",
+        session.socket_path().display()
     );
     assert_eq!(
         session.pid_path(),
@@ -204,15 +203,121 @@ fn session_socket_authority_stays_short_under_deep_rub_home() {
         .join("overflow");
     let session = RubPaths::new(&deep_home).session_runtime("default", "sess-123");
     let socket = session.socket_path();
-    let tag = std::env::var("USER")
-        .or_else(|_| std::env::var("UID"))
-        .unwrap_or_else(|_| "unknown".to_string());
-    assert!(socket.starts_with(format!("/tmp/rub-sock-{tag}")));
+    assert!(
+        socket.to_string_lossy().starts_with("/tmp/rub-sock-"),
+        "{}",
+        socket.display()
+    );
     assert!(
         socket.as_os_str().len() < 100,
         "actual socket authority should stay below Unix socket path limits: {}",
         socket.display()
     );
+}
+
+#[test]
+fn runtime_socket_authority_ignores_user_environment_drift() {
+    let home =
+        std::env::temp_dir().join(format!("rub-runtime-socket-env-{}", uuid::Uuid::now_v7()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+
+    let previous_user = std::env::var_os("USER");
+    let previous_uid = std::env::var_os("UID");
+    unsafe {
+        std::env::set_var("USER", "rub-user-a");
+        std::env::set_var("UID", "1111");
+    }
+    let first = RubPaths::new(&home)
+        .session_runtime("default", "sess-123")
+        .socket_path();
+    unsafe {
+        std::env::set_var("USER", "rub-user-b");
+        std::env::set_var("UID", "2222");
+    }
+    let second = RubPaths::new(&home)
+        .session_runtime("default", "sess-123")
+        .socket_path();
+
+    match previous_user {
+        Some(value) => unsafe { std::env::set_var("USER", value) },
+        None => unsafe { std::env::remove_var("USER") },
+    }
+    match previous_uid {
+        Some(value) => unsafe { std::env::set_var("UID", value) },
+        None => unsafe { std::env::remove_var("UID") },
+    }
+
+    assert_eq!(
+        first, second,
+        "runtime socket authority must not drift with mutable USER/UID projection"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_socket_authority_canonicalizes_existing_home_aliases() {
+    let root =
+        std::env::temp_dir().join(format!("rub-runtime-socket-alias-{}", uuid::Uuid::now_v7()));
+    let real_home = root.join("real-home");
+    let alias_home = root.join("alias-home");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&real_home).unwrap();
+    std::os::unix::fs::symlink(&real_home, &alias_home).unwrap();
+
+    let real_socket = RubPaths::new(&real_home)
+        .session_runtime("default", "sess-123")
+        .socket_path();
+    let alias_socket = RubPaths::new(&alias_home)
+        .session_runtime("default", "sess-123")
+        .socket_path();
+
+    assert_eq!(
+        real_socket, alias_socket,
+        "runtime socket authority must derive from canonical RUB_HOME rather than path spelling"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_socket_authority_preserves_symlink_semantics_before_dotdot_collapse() {
+    let root = std::env::temp_dir().join(format!(
+        "rub-runtime-socket-dotdot-{}",
+        uuid::Uuid::now_v7()
+    ));
+    let nested = root.join("actual").join("nested");
+    let target_home = root.join("actual").join("home");
+    let lexical_home = root.join("home");
+    let alias = root.join("alias-nested");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir_all(&target_home).unwrap();
+    std::fs::create_dir_all(&lexical_home).unwrap();
+    std::os::unix::fs::symlink(&nested, &alias).unwrap();
+
+    let via_symlink_dotdot = alias.join("..").join("home");
+    let resolved_socket = RubPaths::new(&via_symlink_dotdot)
+        .session_runtime("default", "sess-123")
+        .socket_path();
+    let target_socket = RubPaths::new(&target_home)
+        .session_runtime("default", "sess-123")
+        .socket_path();
+    let lexical_socket = RubPaths::new(&lexical_home)
+        .session_runtime("default", "sess-123")
+        .socket_path();
+
+    assert_eq!(
+        resolved_socket, target_socket,
+        "runtime socket authority must canonicalize through symlinks before applying '..'"
+    );
+    assert_ne!(
+        resolved_socket, lexical_socket,
+        "lexical '..' collapse before canonicalization would bind the wrong RUB_HOME authority"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -257,6 +362,20 @@ fn canonicalized_private_temp_root_is_still_treated_as_temp_owned() {
     assert!(is_temp_root_path(&home));
     assert!(paths.mark_temp_home_owner_if_applicable().unwrap());
     assert!(is_temp_owned_home(&home));
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn arbitrary_temp_root_is_not_auto_marked_temp_owned() {
+    let home =
+        std::env::temp_dir().join(format!("rub-runtime-socket-env-{}", uuid::Uuid::now_v7()));
+    let _ = std::fs::remove_dir_all(&home);
+    let paths = RubPaths::new(&home);
+
+    assert!(is_temp_root_path(&home));
+    assert!(!paths.mark_temp_home_owner_if_applicable().unwrap());
+    assert!(!is_temp_owned_home(&home));
 
     let _ = std::fs::remove_dir_all(&home);
 }

@@ -15,10 +15,8 @@ pub use self::cleanup::{
     prepare_home, session_pid_path, verify_home_cleanup_complete, wait_for_home_processes_to_exit,
 };
 pub use self::external_chrome::{
-    browser_binary_for_external_tests, external_chrome_pid_matches_profile_in_snapshot,
-    free_tcp_port, probe_cdp_http_ready_once, spawn_external_chrome, terminate_external_chrome,
-    verify_external_chrome_cleanup_complete, wait_for_cdp_http_ready, wait_for_tcp_endpoint,
-    wait_until,
+    external_chrome_pid_matches_profile_in_snapshot, spawn_external_chrome,
+    terminate_external_chrome, verify_external_chrome_cleanup_complete, wait_until,
 };
 pub use self::profile_env::prepare_fake_profile_env;
 
@@ -82,7 +80,7 @@ pub fn unregister_home(home: &str) {
     homes.retain(|existing| existing != home);
 }
 
-pub fn register_external_chrome(pid: u32, profile_dir: &Path) {
+fn register_external_chrome(pid: u32, profile_dir: &Path) {
     install_cleanup_hook();
     let mut entries = registered_external_chromes().lock().unwrap();
     if !entries.iter().any(|(existing_pid, _)| *existing_pid == pid) {
@@ -90,7 +88,7 @@ pub fn register_external_chrome(pid: u32, profile_dir: &Path) {
     }
 }
 
-pub fn unregister_external_chrome(pid: u32) {
+fn unregister_external_chrome(pid: u32) {
     let mut entries = registered_external_chromes().lock().unwrap();
     entries.retain(|(existing_pid, _)| *existing_pid != pid);
 }
@@ -108,9 +106,10 @@ where
     let mut failed_homes = Vec::new();
     for home in homes {
         match cleanup_home(&home) {
-            Ok(
-                CleanupVerification::Verified | CleanupVerification::VerifiedWithHarnessFallback,
-            ) => {}
+            Ok(CleanupVerification::Verified) => {}
+            Ok(CleanupVerification::VerifiedWithHarnessFallback) => {
+                failed_homes.push(home);
+            }
             Ok(CleanupVerification::SkippedDuringPanic) | Err(_) => {
                 failed_homes.push(home);
             }
@@ -120,9 +119,10 @@ where
     let mut failed_external = Vec::new();
     for (pid, profile_dir) in external {
         match cleanup_external(pid, &profile_dir) {
-            Ok(
-                CleanupVerification::Verified | CleanupVerification::VerifiedWithHarnessFallback,
-            ) => {}
+            Ok(CleanupVerification::Verified) => {}
+            Ok(CleanupVerification::VerifiedWithHarnessFallback) => {
+                failed_external.push((pid, profile_dir));
+            }
             Ok(CleanupVerification::SkippedDuringPanic) | Err(_) => {
                 failed_external.push((pid, profile_dir));
             }
@@ -335,6 +335,22 @@ mod tests {
 
         assert_eq!(home_calls.load(Ordering::SeqCst), 1);
         assert_eq!(external_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failed_homes, homes);
+        assert_eq!(failed_external, external);
+    }
+
+    #[test]
+    fn registered_artifact_cleanup_retains_harness_fallback_for_retry_tracking() {
+        let homes = vec!["/tmp/rub-home-a".to_string()];
+        let external = vec![(41, std::path::PathBuf::from("/tmp/rub-profile-a"))];
+
+        let (failed_homes, failed_external) = cleanup_registered_artifacts_with(
+            homes.clone(),
+            external.clone(),
+            |_: &str| Ok(CleanupVerification::VerifiedWithHarnessFallback),
+            |_: u32, _: &Path| Ok(CleanupVerification::VerifiedWithHarnessFallback),
+        );
+
         assert_eq!(failed_homes, homes);
         assert_eq!(failed_external, external);
     }

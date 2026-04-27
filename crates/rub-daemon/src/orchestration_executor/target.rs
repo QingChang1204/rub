@@ -11,11 +11,13 @@ use rub_ipc::protocol::{IpcRequest, IpcResponse};
 use serde::Deserialize;
 
 use crate::router::DaemonRouter;
+use crate::router::TransactionDeadline;
 use crate::session::SessionState;
 
 use super::protocol::RemoteDispatchContract;
 use super::{
-    ORCHESTRATION_ACTION_BASE_TIMEOUT_MS, decode_orchestration_success_payload_field,
+    ORCHESTRATION_ACTION_BASE_TIMEOUT_MS, bind_live_orchestration_phase_command_id,
+    bounded_orchestration_timeout_ms, decode_orchestration_success_payload_field,
     decode_orchestration_success_result_items, dispatch_remote_orchestration_request,
     ensure_orchestration_success_response,
 };
@@ -33,7 +35,7 @@ pub(super) fn resolve_target_session<'a>(
     runtime: &'a OrchestrationRuntimeInfo,
     rule: &OrchestrationRuleInfo,
 ) -> Result<&'a OrchestrationSessionInfo, ErrorEnvelope> {
-    runtime
+    let session = runtime
         .known_sessions
         .iter()
         .find(|session| session.session_id == rule.target.session_id)
@@ -50,7 +52,26 @@ pub(super) fn resolve_target_session<'a>(
                 "target_session_id": rule.target.session_id,
                 "target_session_name": rule.target.session_name,
             }))
-        })
+        })?;
+    if let Some(reason) =
+        crate::orchestration_runtime::orchestration_session_addressability_reason(session)
+    {
+        let _ = reason;
+        return Err(
+            crate::orchestration_runtime::orchestration_session_not_addressable_error(
+                session,
+                ErrorCode::SessionBusy,
+                format!(
+                    "Target session '{}' is still present but not addressable for orchestration execution",
+                    rule.target.session_name
+                ),
+                "orchestration_target_session_not_addressable",
+                "target_session_id",
+                "target_session_name",
+            ),
+        );
+    }
+    Ok(session)
 }
 
 pub(crate) async fn ensure_orchestration_target_continuity(
@@ -58,13 +79,22 @@ pub(crate) async fn ensure_orchestration_target_continuity(
     state: &Arc<SessionState>,
     session: &OrchestrationSessionInfo,
     address: &OrchestrationAddressInfo,
+    outer_deadline: Option<TransactionDeadline>,
 ) -> Result<TabInfo, ErrorEnvelope> {
-    let tabs = list_target_tabs(router, state, session).await?;
+    let tabs = list_target_tabs(router, state, session, outer_deadline).await?;
     let target_tab = resolve_target_tab(&tabs, address)?;
     if target_tab.active {
-        ensure_orchestration_target_frame_continuity(router, state, session, address).await?;
+        ensure_orchestration_target_frame_continuity(
+            router,
+            state,
+            session,
+            address,
+            outer_deadline,
+        )
+        .await?;
         let runtime_summary =
-            fetch_orchestration_target_runtime_summary(router, state, session).await?;
+            fetch_orchestration_target_runtime_summary(router, state, session, outer_deadline)
+                .await?;
         if let Some(error) =
             orchestration_target_continuity_failure(address, target_tab, &runtime_summary)
         {
@@ -76,27 +106,45 @@ pub(crate) async fn ensure_orchestration_target_continuity(
     let switch_request = IpcRequest::new(
         "switch",
         serde_json::json!({ "index": target_tab.index }),
-        ORCHESTRATION_ACTION_BASE_TIMEOUT_MS,
+        bounded_target_timeout_ms(outer_deadline)?,
     );
-    dispatch_to_target_session(router, state, session, switch_request).await?;
+    dispatch_target_continuity_request(
+        router,
+        state,
+        session,
+        bind_live_orchestration_phase_command_id(
+            switch_request,
+            "orchestration_target_continuity_switch",
+        )?,
+        outer_deadline,
+        RemoteDispatchContract {
+            dispatch_subject: "target tab switch",
+            unreachable_reason: "orchestration_target_session_unreachable",
+            transport_failure_reason: "orchestration_target_switch_transport_failed",
+            protocol_failure_reason: "orchestration_target_switch_protocol_failed",
+            missing_error_message:
+                "remote orchestration target switch returned an error without an envelope",
+        },
+    )
+    .await?;
 
-    let tabs = list_target_tabs(router, state, session).await?;
+    let tabs = list_target_tabs(router, state, session, outer_deadline).await?;
     let target_tab = resolve_target_tab(&tabs, address)?;
     if !target_tab.active {
-        return Err(ErrorEnvelope::new(
-            ErrorCode::BrowserCrashed,
+        return Err(orchestration_target_degraded_authority_error(
+            address,
+            "orchestration_target_not_active",
             "Orchestration target continuity fence failed: target tab is not active after switch",
-        )
-        .with_context(serde_json::json!({
-            "reason": "orchestration_target_not_active",
-            "target_session_id": address.session_id,
-            "target_tab_index": target_tab.index,
-            "target_tab_target_id": target_tab.target_id,
-        })));
+            serde_json::json!({
+                "target_tab_index": target_tab.index,
+                "target_tab_target_id": target_tab.target_id,
+            }),
+        ));
     }
-    ensure_orchestration_target_frame_continuity(router, state, session, address).await?;
+    ensure_orchestration_target_frame_continuity(router, state, session, address, outer_deadline)
+        .await?;
     let runtime_summary =
-        fetch_orchestration_target_runtime_summary(router, state, session).await?;
+        fetch_orchestration_target_runtime_summary(router, state, session, outer_deadline).await?;
     if let Some(error) =
         orchestration_target_continuity_failure(address, target_tab, &runtime_summary)
     {
@@ -110,13 +158,29 @@ async fn list_target_tabs(
     router: &DaemonRouter,
     state: &Arc<SessionState>,
     session: &OrchestrationSessionInfo,
+    outer_deadline: Option<TransactionDeadline>,
 ) -> Result<Vec<TabInfo>, ErrorEnvelope> {
-    let request = IpcRequest::new(
-        "tabs",
-        serde_json::json!({}),
-        ORCHESTRATION_ACTION_BASE_TIMEOUT_MS,
-    );
-    let response = dispatch_to_target_session(router, state, session, request).await?;
+    let response = dispatch_target_continuity_request(
+        router,
+        state,
+        session,
+        target_continuity_phase_request(
+            "tabs",
+            serde_json::json!({}),
+            outer_deadline,
+            "orchestration_target_continuity_tabs",
+        )?,
+        outer_deadline,
+        RemoteDispatchContract {
+            dispatch_subject: "target tabs",
+            unreachable_reason: "orchestration_target_session_unreachable",
+            transport_failure_reason: "orchestration_target_tabs_transport_failed",
+            protocol_failure_reason: "orchestration_target_tabs_protocol_failed",
+            missing_error_message:
+                "remote orchestration target tabs returned an error without an envelope",
+        },
+    )
+    .await?;
     decode_orchestration_success_result_items(
         response,
         session,
@@ -131,13 +195,29 @@ async fn list_target_frames(
     router: &DaemonRouter,
     state: &Arc<SessionState>,
     session: &OrchestrationSessionInfo,
+    outer_deadline: Option<TransactionDeadline>,
 ) -> Result<Vec<FrameInventoryEntry>, ErrorEnvelope> {
-    let request = IpcRequest::new(
-        "frames",
-        serde_json::json!({}),
-        ORCHESTRATION_ACTION_BASE_TIMEOUT_MS,
-    );
-    let response = dispatch_to_target_session(router, state, session, request).await?;
+    let response = dispatch_target_continuity_request(
+        router,
+        state,
+        session,
+        target_continuity_phase_request(
+            "frames",
+            serde_json::json!({}),
+            outer_deadline,
+            "orchestration_target_continuity_frames",
+        )?,
+        outer_deadline,
+        RemoteDispatchContract {
+            dispatch_subject: "target frame inventory",
+            unreachable_reason: "orchestration_target_session_unreachable",
+            transport_failure_reason: "orchestration_target_frames_transport_failed",
+            protocol_failure_reason: "orchestration_target_frames_protocol_failed",
+            missing_error_message:
+                "remote orchestration target frames returned an error without an envelope",
+        },
+    )
+    .await?;
     decode_orchestration_success_result_items(
         response,
         session,
@@ -153,17 +233,18 @@ async fn ensure_orchestration_target_frame_continuity(
     state: &Arc<SessionState>,
     session: &OrchestrationSessionInfo,
     address: &OrchestrationAddressInfo,
+    outer_deadline: Option<TransactionDeadline>,
 ) -> Result<(), ErrorEnvelope> {
     let Some(frame_id) = address.frame_id.as_deref() else {
         return Ok(());
     };
-    let frames = list_target_frames(router, state, session).await?;
+    let frames = list_target_frames(router, state, session, outer_deadline).await?;
     let frame = frames
         .iter()
         .find(|entry| entry.frame.frame_id == frame_id)
         .ok_or_else(|| {
             ErrorEnvelope::new(
-                ErrorCode::BrowserCrashed,
+                ErrorCode::InvalidInput,
                 format!(
                     "Orchestration target frame '{frame_id}' is not present in session '{}'",
                     address.session_name
@@ -181,7 +262,7 @@ async fn ensure_orchestration_target_frame_continuity(
         return Ok(());
     }
     Err(ErrorEnvelope::new(
-        ErrorCode::BrowserCrashed,
+        ErrorCode::InvalidInput,
         format!(
             "Orchestration target frame '{frame_id}' is not same-origin accessible for frame-scoped execution"
         ),
@@ -200,13 +281,29 @@ async fn fetch_orchestration_target_runtime_summary(
     router: &DaemonRouter,
     state: &Arc<SessionState>,
     session: &OrchestrationSessionInfo,
+    outer_deadline: Option<TransactionDeadline>,
 ) -> Result<OrchestrationTargetRuntimeSummary, ErrorEnvelope> {
-    let request = IpcRequest::new(
-        "runtime",
-        serde_json::json!({ "sub": "summary" }),
-        ORCHESTRATION_ACTION_BASE_TIMEOUT_MS,
-    );
-    let response = dispatch_to_target_session(router, state, session, request).await?;
+    let response = dispatch_target_continuity_request(
+        router,
+        state,
+        session,
+        target_continuity_phase_request(
+            "runtime",
+            serde_json::json!({ "sub": "summary" }),
+            outer_deadline,
+            "orchestration_target_continuity_runtime_summary",
+        )?,
+        outer_deadline,
+        RemoteDispatchContract {
+            dispatch_subject: "target runtime summary",
+            unreachable_reason: "orchestration_target_session_unreachable",
+            transport_failure_reason: "orchestration_target_runtime_summary_transport_failed",
+            protocol_failure_reason: "orchestration_target_runtime_summary_protocol_failed",
+            missing_error_message:
+                "remote orchestration target runtime summary returned an error without an envelope",
+        },
+    )
+    .await?;
     decode_orchestration_success_payload_field(
         response,
         session,
@@ -249,21 +346,15 @@ fn orchestration_target_continuity_failure(
             FrameContextStatus::Unknown | FrameContextStatus::Stale | FrameContextStatus::Degraded
         ) || summary.frame_runtime.current_frame.is_none())
     {
-        return Some(
-            ErrorEnvelope::new(
-                ErrorCode::BrowserCrashed,
-                "Orchestration target continuity fence failed: frame context became unavailable",
-            )
-            .with_context(serde_json::json!({
-                "reason": "continuity_frame_unavailable",
-                "target_session_id": address.session_id,
-                "target_session_name": address.session_name,
-                "target_tab_target_id": address.tab_target_id,
-                "target_frame_id": address.frame_id,
+        return Some(orchestration_target_degraded_authority_error(
+            address,
+            "continuity_frame_unavailable",
+            "Orchestration target continuity fence failed: frame context became unavailable",
+            serde_json::json!({
                 "frame_runtime": summary.frame_runtime,
                 "readiness_state": summary.readiness_state,
-            })),
-        );
+            }),
+        ));
     }
     if address.frame_id.is_none()
         && summary
@@ -273,38 +364,26 @@ fn orchestration_target_continuity_failure(
             .and_then(|frame| frame.target_id.as_deref())
             != Some(target_tab.target_id.as_str())
     {
-        return Some(
-            ErrorEnvelope::new(
-                ErrorCode::BrowserCrashed,
-                "Orchestration target continuity fence failed: frame context no longer matches the target tab authority",
-            )
-            .with_context(serde_json::json!({
-                "reason": "continuity_frame_target_mismatch",
-                "target_session_id": address.session_id,
-                "target_session_name": address.session_name,
-                "target_tab_target_id": address.tab_target_id,
-                "target_frame_id": address.frame_id,
+        return Some(orchestration_target_degraded_authority_error(
+            address,
+            "continuity_frame_target_mismatch",
+            "Orchestration target continuity fence failed: frame context no longer matches the target tab authority",
+            serde_json::json!({
                 "frame_runtime": summary.frame_runtime,
-            })),
-        );
+            }),
+        ));
     }
 
     if matches!(summary.readiness_state.status, ReadinessStatus::Degraded) {
-        return Some(
-            ErrorEnvelope::new(
-                ErrorCode::BrowserCrashed,
-                "Orchestration target continuity fence failed: readiness surface degraded",
-            )
-            .with_context(serde_json::json!({
-                "reason": "continuity_readiness_degraded",
-                "target_session_id": address.session_id,
-                "target_session_name": address.session_name,
-                "target_tab_target_id": address.tab_target_id,
-                "target_frame_id": address.frame_id,
+        return Some(orchestration_target_degraded_authority_error(
+            address,
+            "continuity_readiness_degraded",
+            "Orchestration target continuity fence failed: readiness surface degraded",
+            serde_json::json!({
                 "readiness_state": summary.readiness_state,
                 "integration_runtime": summary.integration_runtime,
-            })),
-        );
+            }),
+        ));
     }
 
     let runtime_required_surface_degraded = summary
@@ -322,24 +401,41 @@ fn orchestration_target_continuity_failure(
         IntegrationRuntimeStatus::Degraded
     ) && runtime_required_surface_degraded
     {
-        return Some(
-            ErrorEnvelope::new(
-                ErrorCode::BrowserCrashed,
-                "Orchestration target continuity fence failed: integration runtime degraded",
-            )
-            .with_context(serde_json::json!({
-                "reason": "continuity_runtime_degraded",
-                "target_session_id": address.session_id,
-                "target_session_name": address.session_name,
-                "target_tab_target_id": address.tab_target_id,
-                "target_frame_id": address.frame_id,
+        return Some(orchestration_target_degraded_authority_error(
+            address,
+            "continuity_runtime_degraded",
+            "Orchestration target continuity fence failed: integration runtime degraded",
+            serde_json::json!({
                 "integration_runtime": summary.integration_runtime,
                 "human_verification_handoff": summary.human_verification_handoff,
-            })),
-        );
+            }),
+        ));
     }
 
     None
+}
+
+fn orchestration_target_degraded_authority_error(
+    address: &OrchestrationAddressInfo,
+    reason: &'static str,
+    message: &'static str,
+    extra_context: serde_json::Value,
+) -> ErrorEnvelope {
+    let mut context = serde_json::json!({
+        "reason": reason,
+        "target_session_id": address.session_id,
+        "target_session_name": address.session_name,
+        "target_tab_target_id": address.tab_target_id,
+        "target_frame_id": address.frame_id,
+    });
+    if let (Some(context_object), Some(extra_object)) =
+        (context.as_object_mut(), extra_context.as_object())
+    {
+        for (key, value) in extra_object {
+            context_object.insert(key.clone(), value.clone());
+        }
+    }
+    ErrorEnvelope::new(ErrorCode::SessionBusy, message).with_context(context)
 }
 
 fn resolve_target_tab<'a>(
@@ -404,45 +500,14 @@ pub(crate) async fn dispatch_to_target_session(
     state: &Arc<SessionState>,
     session: &OrchestrationSessionInfo,
     request: IpcRequest,
-) -> Result<IpcResponse, ErrorEnvelope> {
-    dispatch_target_request(router, state, session, request).await
-}
-
-pub(crate) async fn dispatch_action_to_target_session(
-    router: &DaemonRouter,
-    state: &Arc<SessionState>,
-    session: &OrchestrationSessionInfo,
-    address: &OrchestrationAddressInfo,
-    request: IpcRequest,
+    outer_deadline: Option<TransactionDeadline>,
 ) -> Result<IpcResponse, ErrorEnvelope> {
     dispatch_target_request(
         router,
         state,
         session,
-        orchestration_target_dispatch_request(address, request),
-    )
-    .await
-}
-
-async fn dispatch_target_request(
-    router: &DaemonRouter,
-    state: &Arc<SessionState>,
-    session: &OrchestrationSessionInfo,
-    request: IpcRequest,
-) -> Result<IpcResponse, ErrorEnvelope> {
-    if session.session_id == state.session_id {
-        return ensure_orchestration_success_response(
-            router
-                .dispatch_within_active_transaction_preserving_replay(request, state)
-                .await,
-            "local orchestration dispatch returned an error without an envelope",
-        );
-    }
-
-    dispatch_remote_orchestration_request(
-        session,
-        "target",
         request,
+        outer_deadline,
         RemoteDispatchContract {
             dispatch_subject: "request",
             unreachable_reason: "orchestration_target_session_unreachable",
@@ -453,6 +518,94 @@ async fn dispatch_target_request(
         },
     )
     .await
+}
+
+pub(crate) async fn dispatch_action_to_target_session(
+    router: &DaemonRouter,
+    state: &Arc<SessionState>,
+    session: &OrchestrationSessionInfo,
+    address: &OrchestrationAddressInfo,
+    request: IpcRequest,
+    outer_deadline: Option<TransactionDeadline>,
+) -> Result<IpcResponse, ErrorEnvelope> {
+    dispatch_target_request(
+        router,
+        state,
+        session,
+        orchestration_target_dispatch_request(address, request),
+        outer_deadline,
+        RemoteDispatchContract {
+            dispatch_subject: "request",
+            unreachable_reason: "orchestration_target_session_unreachable",
+            transport_failure_reason: "orchestration_target_dispatch_transport_failed",
+            protocol_failure_reason: "orchestration_target_dispatch_protocol_failed",
+            missing_error_message:
+                "remote orchestration dispatch returned an error without an envelope",
+        },
+    )
+    .await
+}
+
+async fn dispatch_target_request(
+    router: &DaemonRouter,
+    state: &Arc<SessionState>,
+    session: &OrchestrationSessionInfo,
+    request: IpcRequest,
+    outer_deadline: Option<TransactionDeadline>,
+    contract: RemoteDispatchContract,
+) -> Result<IpcResponse, ErrorEnvelope> {
+    if session.session_id == state.session_id {
+        return ensure_orchestration_success_response(
+            router
+                .dispatch_within_active_transaction_preserving_replay_until(
+                    request,
+                    state,
+                    outer_deadline,
+                )
+                .await,
+            "local orchestration dispatch returned an error without an envelope",
+        );
+    }
+
+    dispatch_remote_orchestration_request(session, "target", request, contract).await
+}
+
+fn target_continuity_phase_request(
+    command: &'static str,
+    args: serde_json::Value,
+    outer_deadline: Option<TransactionDeadline>,
+    phase: &'static str,
+) -> Result<IpcRequest, ErrorEnvelope> {
+    bind_live_orchestration_phase_command_id(
+        IpcRequest::new(command, args, bounded_target_timeout_ms(outer_deadline)?),
+        phase,
+    )
+}
+
+async fn dispatch_target_continuity_request(
+    router: &DaemonRouter,
+    state: &Arc<SessionState>,
+    session: &OrchestrationSessionInfo,
+    request: IpcRequest,
+    outer_deadline: Option<TransactionDeadline>,
+    contract: RemoteDispatchContract,
+) -> Result<IpcResponse, ErrorEnvelope> {
+    dispatch_target_request(router, state, session, request, outer_deadline, contract).await
+}
+
+fn bounded_target_timeout_ms(
+    outer_deadline: Option<TransactionDeadline>,
+) -> Result<u64, ErrorEnvelope> {
+    bounded_orchestration_timeout_ms(ORCHESTRATION_ACTION_BASE_TIMEOUT_MS, outer_deadline)
+        .ok_or_else(|| {
+            ErrorEnvelope::new(
+                ErrorCode::IpcTimeout,
+                "Orchestration target dispatch exhausted the caller-owned timeout budget before dispatch",
+            )
+            .with_context(serde_json::json!({
+                "reason": "orchestration_target_timeout_budget_exhausted",
+            }))
+        })
 }
 
 fn orchestration_target_dispatch_request(

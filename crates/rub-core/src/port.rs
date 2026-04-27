@@ -52,14 +52,19 @@ pub trait BrowserPort: Send + Sync {
     /// Click an element resolved from a previously published snapshot.
     async fn click(&self, element: &Element) -> Result<InteractionOutcome, RubError>;
 
-    /// Click an element, wait for focus, then type text.
-    /// Atomic click+type prevents focus-stealing race in multi-client sessions.
+    /// Focus a resolved editable element, then type text with the same
+    /// keyboard semantics as `type_into`.
+    ///
+    /// This is an element-targeted typing alias. It does not own an
+    /// independent click actuation fence.
     async fn input(
         &self,
         element: &Element,
         text: &str,
         clear: bool,
-    ) -> Result<InteractionOutcome, RubError>;
+    ) -> Result<InteractionOutcome, RubError> {
+        self.type_into(element, text, clear).await
+    }
 
     /// Execute JavaScript and return the result as JSON.
     async fn execute_js(&self, code: &str) -> Result<serde_json::Value, RubError>;
@@ -161,11 +166,20 @@ pub trait BrowserPort: Send + Sync {
     /// Send a key combination (e.g., Enter, Control+a).
     async fn send_keys(&self, combo: &KeyCombo) -> Result<InteractionOutcome, RubError>;
 
+    /// Send a key combination while requiring the requested frame context to
+    /// currently own page-global keyboard focus (`None` = top/primary frame).
+    async fn send_keys_in_frame(
+        &self,
+        frame_id: Option<&str>,
+        combo: &KeyCombo,
+    ) -> Result<InteractionOutcome, RubError>;
+
     /// Type text character-by-character (keyDown → char → keyUp per char).
     async fn type_text(&self, text: &str) -> Result<InteractionOutcome, RubError>;
 
     /// Type text into the active element inside an explicit frame context
-    /// (`None` = top/primary frame).
+    /// (`None` = top/primary frame), but only after proving that frame
+    /// currently owns page-global keyboard focus.
     async fn type_text_in_frame(
         &self,
         frame_id: Option<&str>,

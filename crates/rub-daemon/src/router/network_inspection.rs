@@ -95,7 +95,8 @@ async fn cmd_network_wait(
     let deadline = started + timeout;
     let notify = state.network_request_notifier();
     let mut cursor = state.network_request_cursor().await;
-    let mut observed_drop_count = state.network_request_drop_count().await;
+    let mut observed_ingress_drop_count = state.network_request_ingress_drop_count();
+    let mut dropped_request_count = state.network_request_drop_count().await;
     let error_context = NetworkWaitErrorContext {
         request_id,
         url_match,
@@ -105,16 +106,26 @@ async fn cmd_network_wait(
         started,
     };
 
+    let initial_window = state
+        .network_request_window_between(0, cursor, 0, observed_ingress_drop_count)
+        .await;
+    if !initial_window.authoritative {
+        return Err(network_wait_not_authoritative_error(
+            error_context,
+            cursor,
+            dropped_request_count,
+            initial_window.degraded_reason,
+        ));
+    }
+
     if let Some(request) = find_matching_network_wait_record(
-        state,
+        initial_window.records,
         request_id,
         url_match,
         method,
         status,
         desired_state,
-    )
-    .await
-    {
+    ) {
         return Ok(network_payload(
             network_wait_subject(request_id, url_match, method, status, desired_state),
             serde_json::json!({
@@ -129,47 +140,28 @@ async fn cmd_network_wait(
     loop {
         let notified = notify.notified();
         let window = state
-            .network_request_window_after(cursor, observed_drop_count)
+            .network_request_window_after(cursor, observed_ingress_drop_count)
             .await;
-        observed_drop_count = state.network_request_drop_count().await;
+        observed_ingress_drop_count = state.network_request_ingress_drop_count();
+        dropped_request_count = state.network_request_drop_count().await;
         cursor = window.next_cursor;
         if !window.authoritative {
             return Err(network_wait_not_authoritative_error(
                 error_context,
                 cursor,
-                observed_drop_count,
+                dropped_request_count,
                 window.degraded_reason,
             ));
         }
 
-        let mut matches = if let Some(request_id) = request_id {
-            state
-                .network_request_record(request_id)
-                .await
-                .into_iter()
-                .collect::<Vec<_>>()
-        } else {
-            window.records
-        };
-
-        matches = filter_requests_by_wait_state(matches, Some(desired_state));
-        if request_id.is_none() {
-            matches.retain(|record| {
-                url_match
-                    .map(|needle| record.url.contains(needle))
-                    .unwrap_or(true)
-                    && method
-                        .map(|needle| record.method.eq_ignore_ascii_case(needle))
-                        .unwrap_or(true)
-                    && status
-                        .map(|value| record.status == Some(value))
-                        .unwrap_or(true)
-            });
-        }
-        if let Some(request_id) = request_id {
-            matches.retain(|record| record.request_id == request_id);
-        }
-        if let Some(request) = matches.into_iter().next() {
+        if let Some(request) = find_matching_network_wait_record(
+            window.records,
+            request_id,
+            url_match,
+            method,
+            status,
+            desired_state,
+        ) {
             return Ok(network_payload(
                 network_wait_subject(request_id, url_match, method, status, desired_state),
                 serde_json::json!({
@@ -192,31 +184,32 @@ async fn cmd_network_wait(
     }
 }
 
-async fn find_matching_network_wait_record(
-    state: &Arc<SessionState>,
+fn find_matching_network_wait_record(
+    requests: Vec<rub_core::model::NetworkRequestRecord>,
     request_id: Option<&str>,
     url_match: Option<&str>,
     method: Option<&str>,
     status: Option<u16>,
     desired_state: NetworkRequestWaitState,
 ) -> Option<rub_core::model::NetworkRequestRecord> {
-    if let Some(request_id) = request_id {
-        let request = state.network_request_record(request_id).await?;
-        return desired_state.matches(request.lifecycle).then_some(request);
+    let mut matches = filter_requests_by_wait_state(requests, Some(desired_state));
+    if request_id.is_none() {
+        matches.retain(|record| {
+            url_match
+                .map(|needle| record.url.contains(needle))
+                .unwrap_or(true)
+                && method
+                    .map(|needle| record.method.eq_ignore_ascii_case(needle))
+                    .unwrap_or(true)
+                && status
+                    .map(|value| record.status == Some(value))
+                    .unwrap_or(true)
+        });
     }
-
-    let requests = state
-        .network_request_records(
-            None,
-            url_match,
-            method,
-            status,
-            desired_state.actual_filter(),
-        )
-        .await;
-    filter_requests_by_wait_state(requests, Some(desired_state))
-        .into_iter()
-        .next()
+    if let Some(request_id) = request_id {
+        matches.retain(|record| record.request_id == request_id);
+    }
+    matches.into_iter().next()
 }
 
 fn network_wait_timeout_error(context: NetworkWaitErrorContext<'_>) -> RubError {
@@ -242,7 +235,7 @@ fn network_wait_not_authoritative_error(
     degraded_reason: Option<String>,
 ) -> RubError {
     RubError::domain_with_context(
-        ErrorCode::BrowserCrashed,
+        ErrorCode::SessionBusy,
         "Network wait is no longer authoritative because observatory evidence was dropped",
         serde_json::json!({
             "kind": "network_request",
@@ -334,7 +327,7 @@ mod tests {
             .expect("wait task should join")
             .expect_err("degraded evidence should fail closed")
             .into_envelope();
-        assert_eq!(error.code, ErrorCode::BrowserCrashed);
+        assert_eq!(error.code, ErrorCode::SessionBusy);
         assert_eq!(
             error
                 .context
@@ -397,6 +390,125 @@ mod tests {
         assert_eq!(
             result["result"]["outcome_summary"]["class"],
             "confirmed_terminal_request"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_wait_existing_terminal_record_fails_closed_when_authority_is_already_degraded()
+    {
+        let state = Arc::new(crate::session::SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-test"),
+            None,
+        ));
+        assert_eq!(state.record_network_request_ingress_overflow(), 1);
+        state
+            .upsert_network_request_record(NetworkRequestRecord {
+                request_id: "req-existing".to_string(),
+                sequence: 1,
+                lifecycle: NetworkRequestLifecycle::Completed,
+                url: "https://example.com/api/delayed?order=7".to_string(),
+                method: "POST".to_string(),
+                tab_target_id: Some("tab-1".to_string()),
+                status: Some(200),
+                request_headers: BTreeMap::new(),
+                response_headers: BTreeMap::new(),
+                request_body: None,
+                response_body: None,
+                original_url: None,
+                rewritten_url: None,
+                applied_rule_effects: Vec::new(),
+                error_text: None,
+                frame_id: Some("frame-1".to_string()),
+                resource_type: Some("Fetch".to_string()),
+                mime_type: Some("application/json".to_string()),
+            })
+            .await;
+
+        let error = cmd_network_wait(
+            NetworkTimelineArgs {
+                wait: true,
+                id: None,
+                last: None,
+                url_match: Some("/api/delayed".to_string()),
+                method: Some("POST".to_string()),
+                status: None,
+                lifecycle: Some("terminal".to_string()),
+                timeout_ms: Some(5_000),
+            },
+            &state,
+        )
+        .await
+        .expect_err("degraded request authority must fail closed before immediate match");
+
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::SessionBusy);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("degraded_reason"))
+                .and_then(|value| value.as_str()),
+            Some("network_request_ingress_overflow")
+        );
+    }
+
+    #[tokio::test]
+    async fn network_wait_request_id_path_still_uses_authoritative_window_for_existing_record() {
+        let state = Arc::new(crate::session::SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-test"),
+            None,
+        ));
+        assert_eq!(state.record_network_request_ingress_overflow(), 1);
+        state
+            .upsert_network_request_record(NetworkRequestRecord {
+                request_id: "req-existing".to_string(),
+                sequence: 1,
+                lifecycle: NetworkRequestLifecycle::Completed,
+                url: "https://example.com/api/delayed?order=7".to_string(),
+                method: "POST".to_string(),
+                tab_target_id: Some("tab-1".to_string()),
+                status: Some(200),
+                request_headers: BTreeMap::new(),
+                response_headers: BTreeMap::new(),
+                request_body: None,
+                response_body: None,
+                original_url: None,
+                rewritten_url: None,
+                applied_rule_effects: Vec::new(),
+                error_text: None,
+                frame_id: Some("frame-1".to_string()),
+                resource_type: Some("Fetch".to_string()),
+                mime_type: Some("application/json".to_string()),
+            })
+            .await;
+
+        let error = cmd_network_wait(
+            NetworkTimelineArgs {
+                wait: true,
+                id: Some("req-existing".to_string()),
+                last: None,
+                url_match: None,
+                method: None,
+                status: None,
+                lifecycle: Some("terminal".to_string()),
+                timeout_ms: Some(5_000),
+            },
+            &state,
+        )
+        .await
+        .expect_err("request-id wait must not bypass degraded authoritative window");
+
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::SessionBusy);
+        assert_eq!(
+            envelope
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("degraded_reason"))
+                .and_then(|value| value.as_str()),
+            Some("network_request_ingress_overflow")
         );
     }
 
@@ -495,7 +607,7 @@ mod tests {
         let error = build_curl_export(&request)
             .expect_err("missing authoritative request method should fail closed")
             .into_envelope();
-        assert_eq!(error.code, ErrorCode::BrowserCrashed);
+        assert_eq!(error.code, ErrorCode::SessionBusy);
         assert_eq!(
             error
                 .context
@@ -503,6 +615,11 @@ mod tests {
                 .and_then(|context| context.get("reason"))
                 .and_then(|value| value.as_str()),
             Some("request_method_missing")
+        );
+        assert!(
+            error
+                .message
+                .contains("authoritative recorded request method")
         );
     }
 

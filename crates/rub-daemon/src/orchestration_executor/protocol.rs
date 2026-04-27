@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -8,8 +9,93 @@ use rub_ipc::protocol::{IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse, ResponseS
 use serde::de::DeserializeOwned;
 
 use crate::orchestration_runtime::extend_orchestration_session_path_context;
+use crate::router::TransactionDeadline;
+#[cfg(test)]
+use crate::router::replay_request_fingerprint;
 
 const IPC_REPLAY_TIMEOUT_BUFFER_MS: u64 = 1_000;
+
+#[cfg(test)]
+static TEST_REMOTE_ORCHESTRATION_CONNECTIONS: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::BTreeMap<
+            std::path::PathBuf,
+            std::collections::VecDeque<tokio::net::UnixStream>,
+        >,
+    >,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn queue_remote_orchestration_connection_for_test(
+    socket_path: impl Into<std::path::PathBuf>,
+    stream: tokio::net::UnixStream,
+) {
+    let mut connections = TEST_REMOTE_ORCHESTRATION_CONNECTIONS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .expect("test remote orchestration connection queue");
+    connections
+        .entry(socket_path.into())
+        .or_default()
+        .push_back(stream);
+}
+
+async fn connect_remote_orchestration_client(
+    socket_path: &Path,
+) -> Result<IpcClient, std::io::Error> {
+    #[cfg(test)]
+    if let Some(stream) = {
+        let mut connections = TEST_REMOTE_ORCHESTRATION_CONNECTIONS
+            .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+            .lock()
+            .expect("test remote orchestration connection queue");
+        let stream = connections
+            .get_mut(socket_path)
+            .and_then(std::collections::VecDeque::pop_front);
+        if connections
+            .get(socket_path)
+            .is_some_and(std::collections::VecDeque::is_empty)
+        {
+            connections.remove(socket_path);
+        }
+        stream
+    } {
+        return Ok(IpcClient::from_connected_stream_for_test(stream));
+    }
+
+    IpcClient::connect(socket_path).await
+}
+
+pub(crate) fn bounded_orchestration_timeout_ms(
+    cap_ms: u64,
+    outer_deadline: Option<TransactionDeadline>,
+) -> Option<u64> {
+    outer_deadline
+        .map(|deadline| cap_ms.min(deadline.remaining_ms()))
+        .or(Some(cap_ms))
+        .filter(|timeout_ms| *timeout_ms > 0)
+}
+
+pub(crate) async fn run_orchestration_future_with_outer_deadline<T, E, F, G>(
+    outer_deadline: Option<TransactionDeadline>,
+    timeout_error: G,
+    future: F,
+) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+    G: FnOnce() -> E,
+{
+    let Some(deadline) = outer_deadline else {
+        return future.await;
+    };
+    let Some(timeout) = deadline.remaining_duration() else {
+        return Err(timeout_error());
+    };
+    match tokio::time::timeout(timeout, future).await {
+        Ok(result) => result,
+        Err(_) => Err(timeout_error()),
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct RemoteDispatchContract {
@@ -25,6 +111,8 @@ struct RemoteDispatchFailureInfo<'a> {
     session: &'a OrchestrationSessionInfo,
     role: &'static str,
     command: &'a str,
+    command_id: Option<&'a str>,
+    daemon_session_id: Option<&'a str>,
     dispatch_subject: &'static str,
     transport_failure_reason: &'static str,
     protocol_failure_reason: &'static str,
@@ -91,19 +179,72 @@ pub(crate) fn ensure_orchestration_success_response(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn bind_stable_orchestration_phase_command_id(
+    request: IpcRequest,
+    phase: &'static str,
+) -> Result<IpcRequest, ErrorEnvelope> {
+    let replay_fingerprint = replay_request_fingerprint(&request);
+    let command = request.command.clone();
+    let command_id = format!(
+        "{phase}:{}",
+        hex_encode_command_identity(replay_fingerprint.as_bytes())
+    );
+    request.with_command_id(command_id).map_err(|error| {
+        ErrorEnvelope::new(
+            ErrorCode::IpcProtocolError,
+            format!("Failed to bind stable orchestration phase command_id for {phase}: {error}"),
+        )
+        .with_context(serde_json::json!({
+            "reason": "orchestration_phase_command_id_bind_failed",
+            "phase": phase,
+            "command": command,
+        }))
+    })
+}
+
+pub(crate) fn bind_live_orchestration_phase_command_id(
+    request: IpcRequest,
+    phase: &'static str,
+) -> Result<IpcRequest, ErrorEnvelope> {
+    let command = request.command.clone();
+    let command_id = format!("{phase}:{}", uuid::Uuid::now_v7());
+    request.with_command_id(command_id).map_err(|error| {
+        ErrorEnvelope::new(
+            ErrorCode::IpcProtocolError,
+            format!("Failed to bind live orchestration phase command_id for {phase}: {error}"),
+        )
+        .with_context(serde_json::json!({
+            "reason": "orchestration_live_phase_command_id_bind_failed",
+            "phase": phase,
+            "command": command,
+        }))
+    })
+}
+
+#[cfg(test)]
+fn hex_encode_command_identity(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
+}
+
 pub(crate) async fn dispatch_remote_orchestration_request(
     session: &OrchestrationSessionInfo,
     role: &'static str,
     request: IpcRequest,
     contract: RemoteDispatchContract,
 ) -> Result<IpcResponse, ErrorEnvelope> {
-    // Replay is only safe once the caller has bound this transport request to a
-    // stable command_id. The remote daemon owns the commit fence and can return
-    // a cached committed response for that same request identity. Without a
-    // wrapper command_id we fail closed after transport loss instead of
-    // attempting a best-effort resend.
+    // Replay is only safe once the caller has bound this transport request to
+    // an explicit command_id for the owning phase. Live-read phases use
+    // request-scoped identities; deterministic frozen phases may choose stable
+    // identities. Without a wrapper command_id we fail closed after transport
+    // loss instead of attempting a best-effort resend.
     ensure_orchestration_session_protocol(session, role)?;
-    let mut client = IpcClient::connect(Path::new(&session.socket_path))
+    let mut client = connect_remote_orchestration_client(Path::new(&session.socket_path))
         .await
         .map_err(|error| {
             let mut context = serde_json::json!({
@@ -130,10 +271,14 @@ pub(crate) async fn dispatch_remote_orchestration_request(
         session,
         role,
         command: &command,
+        command_id: request.command_id.as_deref(),
+        daemon_session_id: request.daemon_session_id.as_deref(),
         dispatch_subject: contract.dispatch_subject,
         transport_failure_reason: contract.transport_failure_reason,
         protocol_failure_reason: contract.protocol_failure_reason,
     };
+    let mut response_retry_reason = None;
+    let mut response_replay_phase = None;
     let request = project_orchestration_request_onto_deadline(&request, deadline)
         .map_err(|reason| {
             orchestration_timeout_projection_error(failure, &reason, None, Some("initial_send"))
@@ -153,16 +298,17 @@ pub(crate) async fn dispatch_remote_orchestration_request(
             let retry_reason = orchestration_recoverable_transport_reason(&error)
                 .filter(|_| request.command_id.is_some());
             if let Some(retry_reason) = retry_reason {
-                let mut replay_client = IpcClient::connect(Path::new(&session.socket_path))
-                    .await
-                    .map_err(|reconnect_error| {
-                    orchestration_transport_dispatch_error(
-                        failure,
-                        &reconnect_error,
-                        Some(retry_reason),
-                        Some("replay_reconnect"),
-                    )
-                })?;
+                let mut replay_client =
+                    connect_remote_orchestration_client(Path::new(&session.socket_path))
+                        .await
+                        .map_err(|reconnect_error| {
+                            orchestration_transport_dispatch_error(
+                                failure,
+                                &reconnect_error,
+                                Some(retry_reason),
+                                Some("replay_reconnect"),
+                            )
+                        })?;
                 let replay_request =
                     project_orchestration_request_onto_deadline(&request, deadline)
                         .map_err(|reason| {
@@ -183,7 +329,11 @@ pub(crate) async fn dispatch_remote_orchestration_request(
                             )
                         })?;
                 match replay_client.send(&replay_request).await {
-                    Ok(response) => response,
+                    Ok(response) => {
+                        response_retry_reason = Some(retry_reason);
+                        response_replay_phase = Some("replay_send");
+                        response
+                    }
                     Err(error) => {
                         return Err(orchestration_dispatch_error(
                             failure,
@@ -198,7 +348,13 @@ pub(crate) async fn dispatch_remote_orchestration_request(
             }
         }
     };
-    ensure_orchestration_success_response(response, contract.missing_error_message)
+    ensure_remote_orchestration_success_response(
+        response,
+        failure,
+        contract.missing_error_message,
+        response_retry_reason,
+        response_replay_phase,
+    )
 }
 
 fn project_orchestration_request_onto_deadline(
@@ -274,6 +430,20 @@ fn align_embedded_timeout_authority(request: &mut IpcRequest) {
                     .saturating_sub(IPC_REPLAY_TIMEOUT_BUFFER_MS),
             )
         }
+        "inspect"
+            if request
+                .args
+                .get("sub")
+                .and_then(|value| value.as_str())
+                .is_some_and(|sub| sub == "list")
+                && request.args.get("wait_timeout_ms").is_some() =>
+        {
+            Some(
+                request
+                    .timeout_ms
+                    .saturating_sub(IPC_REPLAY_TIMEOUT_BUFFER_MS),
+            )
+        }
         "download"
             if request
                 .args
@@ -292,9 +462,19 @@ fn align_embedded_timeout_authority(request: &mut IpcRequest) {
 
     if let Some(timeout_ms) = embedded_timeout_ms
         && let Some(object) = request.args.as_object_mut()
-        && object.contains_key("timeout_ms")
     {
-        object.insert("timeout_ms".to_string(), serde_json::json!(timeout_ms));
+        if object.contains_key("timeout_ms") {
+            object.insert("timeout_ms".to_string(), serde_json::json!(timeout_ms));
+        }
+        if request.command == "inspect"
+            && object
+                .get("sub")
+                .and_then(|value| value.as_str())
+                .is_some_and(|sub| sub == "list")
+            && object.contains_key("wait_timeout_ms")
+        {
+            object.insert("wait_timeout_ms".to_string(), serde_json::json!(timeout_ms));
+        }
     }
 }
 
@@ -382,6 +562,9 @@ fn orchestration_recoverable_protocol_reason(
         Some("ipc_response_timeout_after_request_commit") => {
             Some("response_timeout_after_request_commit")
         }
+        Some("ipc_response_transport_failure_after_request_commit") => {
+            Some("response_transport_failure_after_request_commit")
+        }
         _ => None,
     }
 }
@@ -417,8 +600,16 @@ fn orchestration_dispatch_context(
     let mut context = serde_json::json!({
         "reason": reason,
         "command": failure.command,
+        "command_id": failure.command_id,
+        "daemon_session_id": failure.daemon_session_id,
         "session_id": failure.session.session_id,
         "session_name": failure.session.session_name,
+        "possible_commit_recovery_contract": {
+            "kind": "target_replay_or_spent_tombstone",
+            "target_command_id": failure.command_id,
+            "target_daemon_session_id": failure.daemon_session_id,
+            "retry_requires_same_command_id": failure.command_id.is_some(),
+        },
     });
     extend_orchestration_session_path_context(&mut context, failure.session);
     if let Some(context_object) = context.as_object_mut() {
@@ -455,6 +646,69 @@ fn orchestration_transport_dispatch_error(
         ),
     )
     .with_context(context)
+}
+
+fn ensure_remote_orchestration_success_response(
+    response: IpcResponse,
+    failure: RemoteDispatchFailureInfo<'_>,
+    missing_error_message: &'static str,
+    replay_retry_reason: Option<&str>,
+    replay_phase: Option<&str>,
+) -> Result<IpcResponse, ErrorEnvelope> {
+    match response.status {
+        ResponseStatus::Success => Ok(response),
+        ResponseStatus::Error => {
+            let error = response.error.unwrap_or_else(|| {
+                ErrorEnvelope::new(ErrorCode::IpcProtocolError, missing_error_message)
+            });
+            Err(augment_remote_orchestration_error(
+                failure,
+                error,
+                replay_retry_reason,
+                replay_phase,
+            ))
+        }
+    }
+}
+
+fn augment_remote_orchestration_error(
+    failure: RemoteDispatchFailureInfo<'_>,
+    mut error: ErrorEnvelope,
+    replay_retry_reason: Option<&str>,
+    replay_phase: Option<&str>,
+) -> ErrorEnvelope {
+    let remote_context = error
+        .context
+        .take()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let remote_reason = remote_context.get("reason").cloned();
+    let dispatch_context = orchestration_dispatch_context(
+        failure,
+        "orchestration_remote_error_response",
+        replay_retry_reason,
+        replay_phase,
+    );
+    let mut context = dispatch_context.as_object().cloned().unwrap_or_default();
+    if !remote_context.is_empty() {
+        context.insert(
+            "remote_context".to_string(),
+            serde_json::Value::Object(remote_context),
+        );
+    }
+    if let Some(reason) = remote_reason {
+        context.insert("remote_reason".to_string(), reason);
+    }
+    context.insert(
+        "reason".to_string(),
+        serde_json::json!("orchestration_remote_error_response"),
+    );
+    context.insert(
+        "local_dispatch_reason".to_string(),
+        serde_json::json!(failure.protocol_failure_reason),
+    );
+    error.context = Some(serde_json::Value::Object(context));
+    error
 }
 
 fn insert_transport_error_context(

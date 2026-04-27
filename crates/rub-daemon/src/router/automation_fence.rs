@@ -1,14 +1,11 @@
 use rub_core::error::{ErrorCode, ErrorEnvelope};
+use rub_core::model::projected_wait_after_fallback_matched;
 
 pub(crate) fn ensure_committed_automation_result(
     command: &str,
     data: Option<&serde_json::Value>,
 ) -> Result<(), ErrorEnvelope> {
-    let wait_after_matched = data
-        .and_then(|value| value.get("wait_after"))
-        .and_then(|value| value.get("matched"))
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
+    let wait_after_matched = projected_wait_after_fallback_matched(data);
     let Some(interaction) = data
         .and_then(|value| value.get("interaction"))
         .and_then(|value| value.as_object())

@@ -6,6 +6,7 @@ use super::*;
 pub(crate) struct LaunchIdentity {
     pub(crate) attachment_identity: Option<String>,
     pub(crate) connection_target: Option<ConnectionTarget>,
+    pub(crate) managed_profile_ephemeral: bool,
 }
 
 impl SessionState {
@@ -32,5 +33,9 @@ impl SessionState {
 
     pub async fn connection_target(&self) -> Option<ConnectionTarget> {
         self.launch_identity.read().await.connection_target.clone()
+    }
+
+    pub async fn set_managed_profile_ephemeral(&self, ephemeral: bool) {
+        self.launch_identity.write().await.managed_profile_ephemeral = ephemeral;
     }
 }

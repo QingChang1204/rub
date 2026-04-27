@@ -1,5 +1,42 @@
 use super::*;
 
+pub(super) fn resolve_close_tab_index(
+    requested_index: Option<u32>,
+    page_target_ids: &[String],
+    active_target_id: Option<&str>,
+) -> Result<usize, RubError> {
+    if let Some(index) = requested_index {
+        return Ok(index as usize);
+    }
+    if page_target_ids.len() <= 1 {
+        return Ok(0);
+    }
+    let Some(active_target_id) = active_target_id else {
+        return Err(RubError::domain_with_context(
+            ErrorCode::InvalidInput,
+            "Cannot close the current tab because active tab authority is unavailable",
+            serde_json::json!({
+                "reason": "active_tab_authority_missing",
+                "tab_count": page_target_ids.len(),
+            }),
+        ));
+    };
+    page_target_ids
+        .iter()
+        .position(|target| target == active_target_id)
+        .ok_or_else(|| {
+            RubError::domain_with_context(
+                ErrorCode::InvalidInput,
+                "Cannot close the current tab because active tab authority is not present in the committed tab projection",
+                serde_json::json!({
+                    "reason": "active_tab_authority_missing",
+                    "tab_count": page_target_ids.len(),
+                    "active_target_id": active_target_id,
+                }),
+            )
+        })
+}
+
 impl BrowserManager {
     async fn commit_local_active_page_authority(&self, page: Arc<Page>) {
         let target_id = page.target_id().clone();
@@ -24,10 +61,21 @@ impl BrowserManager {
         let pending_dialog =
             pending_dialog_authority(crate::dialogs::pending_dialog(&self.dialog_runtime()).await)?;
         let target_id = pending_dialog_target_id(&pending_dialog)?;
-        let page = self
-            .page_for_target_id(&target_id)
-            .await
-            .map_err(|error| stale_pending_dialog_target_error(&target_id, &error))?;
+        let page = match self.page_for_target_id(&target_id).await {
+            Ok(page) => page,
+            Err(error) => {
+                let code = match &error {
+                    RubError::Domain(envelope) => envelope.code,
+                    RubError::Io(_) => ErrorCode::IoError,
+                    RubError::Json(_) => ErrorCode::JsonError,
+                    RubError::Internal(_) => ErrorCode::InternalError,
+                };
+                if code == ErrorCode::TabNotFound {
+                    return Err(stale_pending_dialog_target_error(&target_id, &error));
+                }
+                return Err(error);
+            }
+        };
         crate::dialogs::handle_dialog(&page, accept, prompt_text).await
     }
 
@@ -36,15 +84,19 @@ impl BrowserManager {
     pub async fn page_for_target_id(&self, target_id: &str) -> Result<Arc<Page>, RubError> {
         let _launch_guard = self.launch_lock.lock().await;
         self.ensure_browser_locked().await?;
-        self.sync_tabs_projection().await?;
-
-        self.tab_projection
-            .lock()
+        self.browser_handle()
+            .await?
+            .pages()
             .await
-            .pages
+            .map_err(|e| {
+                RubError::domain(
+                    ErrorCode::BrowserCrashed,
+                    format!("Failed to enumerate browser tabs: {e}"),
+                )
+            })?
             .iter()
             .find(|page| page.target_id().as_ref() == target_id)
-            .cloned()
+            .map(|page| Arc::new(page.clone()))
             .ok_or_else(|| {
                 RubError::domain(
                     ErrorCode::TabNotFound,
@@ -60,21 +112,7 @@ impl BrowserManager {
         self.sync_tabs_projection().await?;
 
         let projection = self.tab_projection.lock().await.clone();
-        let pages = projection.pages;
-        let active_target_id = projection.active_target_id;
-
-        let mut tabs = Vec::with_capacity(pages.len());
-        for (index, page) in pages.iter().enumerate() {
-            tabs.push(
-                crate::tab_projection::tab_info_for_page(
-                    index as u32,
-                    page,
-                    active_target_id.as_ref(),
-                )
-                .await,
-            );
-        }
-        Ok(tabs)
+        self.tab_list_from_projection(&projection).await
     }
 
     /// Switch to a tab by index and mark it as the active tab.
@@ -99,14 +137,13 @@ impl BrowserManager {
         self.sync_tabs_projection().await?;
 
         let active_target_id = self.tab_projection.lock().await.active_target_id.clone();
-        Ok(
-            crate::tab_projection::tab_info_for_page(
-                index,
-                &target_page,
-                active_target_id.as_ref(),
-            )
-            .await,
+        Ok(crate::tab_projection::tab_info_for_page(
+            index,
+            &target_page,
+            active_target_id.as_ref(),
+            self.tab_projection.lock().await.active_target_authority,
         )
+        .await)
     }
 
     /// Close a tab by index. If it is the last tab, create `about:blank` first.
@@ -118,15 +155,15 @@ impl BrowserManager {
         let projection_before = self.tab_projection.lock().await.clone();
         let pages_before = projection_before.pages;
         let active_before = projection_before.active_target_id;
-        let active_index = active_before
-            .as_ref()
-            .and_then(|target| {
-                pages_before
-                    .iter()
-                    .position(|page| page.target_id() == target)
-            })
-            .unwrap_or(0);
-        let idx = index.map(|v| v as usize).unwrap_or(active_index);
+        let page_target_ids = pages_before
+            .iter()
+            .map(|page| page.target_id().as_ref().to_string())
+            .collect::<Vec<_>>();
+        let idx = resolve_close_tab_index(
+            index,
+            &page_target_ids,
+            active_before.as_ref().map(|target| target.as_ref()),
+        )?;
         if idx >= pages_before.len() {
             return Err(crate::tab_projection::tab_not_found(
                 idx as u32,
@@ -144,7 +181,8 @@ impl BrowserManager {
                 RubError::Internal(format!("Failed to reset last tab to about:blank: {e}"))
             })?;
             self.commit_local_active_page_authority(target_page).await;
-            return self.tab_list().await;
+            let projection = self.tab_projection.lock().await.clone();
+            return self.tab_list_from_projection(&projection).await;
         }
 
         target_page
@@ -168,7 +206,8 @@ impl BrowserManager {
             self.commit_local_active_page_authority(active_page).await;
         }
 
-        self.tab_list().await
+        let projection = self.tab_projection.lock().await.clone();
+        self.tab_list_from_projection(&projection).await
     }
 
     /// CDP health check: Browser.getVersion().
@@ -201,8 +240,7 @@ impl BrowserManager {
     /// If external, only disconnects the CDP session (browser keeps running).
     pub async fn close(&self) -> Result<(), RubError> {
         let _launch_guard = self.launch_lock.lock().await;
-        self.bump_listener_generation();
-        self.release_current_browser_authority().await?;
+        self.release_current_browser_authority_fail_closed().await?;
         Ok(())
     }
 
@@ -222,9 +260,8 @@ impl BrowserManager {
             return Ok(self.launch_policy_info());
         }
 
-        self.bump_listener_generation();
         let restore_url = self.current_restore_url().await;
-        self.release_current_browser_authority().await?;
+        self.release_current_browser_authority_fail_closed().await?;
 
         self.set_current_headless(false);
         self.reset_identity_coverage().await;
@@ -233,7 +270,7 @@ impl BrowserManager {
             .relaunch_and_restore_visible_locked(restore_url.as_deref())
             .await
         {
-            let rollback_cleanup = self.release_current_browser_authority().await;
+            let rollback_cleanup = self.release_current_browser_authority_fail_closed().await;
             self.set_current_headless(previous_options.headless);
             self.reset_identity_coverage().await;
             let restored = self
@@ -334,6 +371,29 @@ impl BrowserManager {
         }
 
         Ok(pages_after.first().cloned())
+    }
+
+    async fn tab_list_from_projection(
+        &self,
+        projection: &CommittedTabProjection,
+    ) -> Result<Vec<TabInfo>, RubError> {
+        let pages = &projection.pages;
+        let active_target_id = projection.active_target_id.as_ref();
+        let active_target_authority = projection.active_target_authority;
+
+        let mut tabs = Vec::with_capacity(pages.len());
+        for (index, page) in pages.iter().enumerate() {
+            tabs.push(
+                crate::tab_projection::tab_info_for_page(
+                    index as u32,
+                    page,
+                    active_target_id,
+                    active_target_authority,
+                )
+                .await,
+            );
+        }
+        Ok(tabs)
     }
 }
 

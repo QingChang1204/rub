@@ -50,7 +50,9 @@ impl DownloadRuntimeState {}
 #[cfg(test)]
 mod tests {
     use super::{DownloadProgressEvent, DownloadRuntimeState};
-    use rub_core::model::{DownloadMode, DownloadRuntimeStatus, DownloadState};
+    use rub_core::model::{
+        DownloadEntry, DownloadMode, DownloadRuntimeInfo, DownloadRuntimeStatus, DownloadState,
+    };
 
     #[test]
     fn download_runtime_state_tracks_started_and_completed_downloads() {
@@ -367,5 +369,164 @@ mod tests {
             projection.download_dir.as_deref(),
             Some("/tmp/rub-downloads-b")
         );
+    }
+
+    #[test]
+    fn runtime_projection_advances_cursor_for_recovered_download_truth() {
+        let mut state = DownloadRuntimeState::default();
+        let recovered = DownloadEntry {
+            guid: "guid-recovered".to_string(),
+            state: DownloadState::Completed,
+            url: Some("https://example.test/recovered.csv".to_string()),
+            suggested_filename: Some("recovered.csv".to_string()),
+            final_path: Some("/tmp/rub-downloads/recovered.csv".to_string()),
+            mime_hint: None,
+            received_bytes: 128,
+            total_bytes: Some(128),
+            started_at: "2026-03-30T00:00:00Z".to_string(),
+            completed_at: Some("2026-03-30T00:00:01Z".to_string()),
+            frame_id: None,
+            trigger_command_id: None,
+        };
+
+        let outcome = state.apply_runtime_projection_sequenced(
+            1,
+            7,
+            DownloadRuntimeInfo {
+                status: DownloadRuntimeStatus::Active,
+                mode: DownloadMode::Managed,
+                download_dir: Some("/tmp/rub-downloads".to_string()),
+                active_downloads: Vec::new(),
+                completed_downloads: vec![recovered.clone()],
+                last_download: None,
+                degraded_reason: None,
+            },
+        );
+
+        assert!(outcome.applied);
+        assert!(state.cursor() > 0);
+        assert_eq!(
+            state
+                .projection()
+                .last_download
+                .as_ref()
+                .map(|entry| &entry.guid),
+            Some(&recovered.guid)
+        );
+        let events = state.events_after(0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].download.guid, recovered.guid);
+        assert_eq!(events[0].download.state, DownloadState::Completed);
+    }
+
+    #[test]
+    fn repeated_runtime_projection_does_not_reemit_unchanged_download_truth() {
+        let mut state = DownloadRuntimeState::default();
+        let recovered = DownloadEntry {
+            guid: "guid-recovered".to_string(),
+            state: DownloadState::Completed,
+            url: Some("https://example.test/recovered.csv".to_string()),
+            suggested_filename: Some("recovered.csv".to_string()),
+            final_path: Some("/tmp/rub-downloads/recovered.csv".to_string()),
+            mime_hint: None,
+            received_bytes: 128,
+            total_bytes: Some(128),
+            started_at: "2026-03-30T00:00:00Z".to_string(),
+            completed_at: Some("2026-03-30T00:00:01Z".to_string()),
+            frame_id: None,
+            trigger_command_id: None,
+        };
+        let runtime = DownloadRuntimeInfo {
+            status: DownloadRuntimeStatus::Active,
+            mode: DownloadMode::Managed,
+            download_dir: Some("/tmp/rub-downloads".to_string()),
+            active_downloads: Vec::new(),
+            completed_downloads: vec![recovered],
+            last_download: None,
+            degraded_reason: None,
+        };
+
+        state.apply_runtime_projection_sequenced(1, 7, runtime.clone());
+        let cursor_after_first_projection = state.cursor();
+        state.apply_runtime_projection_sequenced(1, 8, runtime);
+
+        assert_eq!(state.events_after(cursor_after_first_projection).len(), 0);
+    }
+
+    #[test]
+    fn runtime_projection_browser_sequence_does_not_suppress_later_download_progress_sequence() {
+        let mut state = DownloadRuntimeState::default();
+        let recovered = DownloadEntry {
+            guid: "guid-active".to_string(),
+            state: DownloadState::Started,
+            url: Some("https://example.test/active.csv".to_string()),
+            suggested_filename: Some("active.csv".to_string()),
+            final_path: None,
+            mime_hint: None,
+            received_bytes: 0,
+            total_bytes: Some(128),
+            started_at: "2026-03-30T00:00:00Z".to_string(),
+            completed_at: None,
+            frame_id: None,
+            trigger_command_id: None,
+        };
+        state.apply_runtime_projection_sequenced(
+            1,
+            99,
+            DownloadRuntimeInfo {
+                status: DownloadRuntimeStatus::Active,
+                mode: DownloadMode::Managed,
+                download_dir: Some("/tmp/rub-downloads".to_string()),
+                active_downloads: vec![recovered.clone()],
+                completed_downloads: Vec::new(),
+                last_download: Some(recovered.clone()),
+                degraded_reason: None,
+            },
+        );
+
+        let progress = state
+            .record_progress(DownloadProgressEvent {
+                generation: 1,
+                sequence: 1,
+                guid: recovered.guid.clone(),
+                state: DownloadState::InProgress,
+                received_bytes: 64,
+                total_bytes: Some(128),
+                final_path: None,
+            })
+            .expect("download-local progress sequence must not be blocked by browser sequence");
+
+        assert_eq!(progress.state, DownloadState::InProgress);
+        assert_eq!(progress.received_bytes, 64);
+    }
+
+    #[test]
+    fn generation_rollover_clears_timeline_eviction_state() {
+        let mut state = DownloadRuntimeState::default();
+        for index in 0..140 {
+            state.record_started(
+                1,
+                index + 1,
+                format!("guid-{index}"),
+                format!("https://example.test/{index}.csv"),
+                format!("{index}.csv"),
+                None,
+            );
+        }
+
+        assert!(state.dropped_event_count() > 0);
+        assert!(state.last_evicted_sequence() > 0);
+
+        state.set_runtime(
+            2,
+            DownloadRuntimeStatus::Active,
+            DownloadMode::Managed,
+            Some("/tmp/rub-downloads-next".to_string()),
+        );
+
+        assert_eq!(state.dropped_event_count(), 0);
+        assert_eq!(state.last_evicted_sequence(), 0);
+        assert_eq!(state.cursor(), 0);
+        assert!(state.events_after(0).is_empty());
     }
 }

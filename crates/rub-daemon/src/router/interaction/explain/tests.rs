@@ -17,6 +17,7 @@ fn interactability_assessment_flags_disabled_and_overlay_blockers() {
         text: "Consent".to_string(),
         attributes,
         element_ref: Some("main:33".to_string()),
+        target_id: None,
         bounding_box: Some(BoundingBox {
             x: 10.0,
             y: 20.0,
@@ -88,6 +89,7 @@ fn interactability_assessment_reports_ready_targets_as_likely_interactable() {
         text: "Continue".to_string(),
         attributes: HashMap::new(),
         element_ref: Some("main:11".to_string()),
+        target_id: None,
         bounding_box: Some(BoundingBox {
             x: 10.0,
             y: 20.0,
@@ -122,6 +124,7 @@ fn interactability_probe_suggests_direct_click_for_overlay_recovery_target() {
         text: "Consent".to_string(),
         attributes: HashMap::new(),
         element_ref: Some("main:33".to_string()),
+        target_id: None,
         bounding_box: Some(BoundingBox {
             x: 10.0,
             y: 20.0,
@@ -169,6 +172,7 @@ fn interactability_probe_avoids_direct_click_for_disabled_targets() {
         text: "Consent".to_string(),
         attributes,
         element_ref: Some("main:33".to_string()),
+        target_id: None,
         bounding_box: Some(BoundingBox {
             x: 10.0,
             y: 20.0,
@@ -216,6 +220,7 @@ fn enriched_interactability_error_adds_assessment_and_guidance() {
         text: "Consent".to_string(),
         attributes,
         element_ref: Some("main:55".to_string()),
+        target_id: None,
         bounding_box: Some(BoundingBox {
             x: 1.0,
             y: 2.0,
@@ -294,6 +299,7 @@ fn non_interactability_error_enrichment_is_noop() {
         text: "Continue".to_string(),
         attributes: HashMap::new(),
         element_ref: Some("main:11".to_string()),
+        target_id: None,
         bounding_box: None,
         ax_info: None,
         listeners: None,

@@ -12,11 +12,124 @@ use crate::commands::{
 };
 use rub_core::DEFAULT_WAIT_AFTER_TIMEOUT_MS;
 use rub_core::error::ErrorCode;
+use rub_ipc::protocol::MAX_IPC_TIMEOUT_MS;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 fn cli_with(command: Commands) -> EffectiveCli {
     cli_with_with_home(command, PathBuf::from("/tmp/rub-test"))
+}
+
+#[test]
+fn build_request_rejects_timeout_outside_ipc_protocol_budget_before_dispatch() {
+    let mut cli = cli_with(Commands::State {
+        limit: None,
+        format: None,
+        format_alias: None,
+        a11y: false,
+        viewport: false,
+        diff: None,
+        listeners: false,
+        scope: ObservationScopeArgs::default(),
+        projection: ObservationProjectionArgs::default(),
+    });
+    cli.timeout = MAX_IPC_TIMEOUT_MS + 1;
+
+    let envelope = build_request(&cli)
+        .expect_err("oversized CLI timeout must fail before IPC dispatch")
+        .into_envelope();
+
+    assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
+    assert_eq!(
+        envelope.context.as_ref().unwrap()["reason"],
+        "invalid_ipc_request_contract"
+    );
+    assert_eq!(
+        envelope.context.as_ref().unwrap()["field"],
+        serde_json::json!("timeout_ms")
+    );
+}
+
+#[test]
+fn build_request_rejects_final_timeout_after_subcommand_budget_expansion() {
+    let mut cli = cli_with(Commands::Download {
+        subcommand: crate::commands::DownloadSubcommand::Wait {
+            id: None,
+            state: crate::commands::DownloadWaitStateArg::Completed,
+        },
+    });
+    cli.timeout = MAX_IPC_TIMEOUT_MS;
+
+    let envelope = build_request(&cli)
+        .expect_err("download wait expansion must not produce protocol-invalid IPC request")
+        .into_envelope();
+
+    assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
+    assert_eq!(
+        envelope.context.as_ref().unwrap()["field"],
+        serde_json::json!("timeout_ms")
+    );
+    assert_eq!(
+        envelope.context.as_ref().unwrap()["actual_timeout_ms"],
+        serde_json::json!(MAX_IPC_TIMEOUT_MS + WAIT_IPC_BUFFER_MS)
+    );
+}
+
+#[test]
+fn build_request_rejects_final_inspect_network_wait_timeout_expansion() {
+    let cli = cli_with(Commands::Inspect(InspectSubcommand::Network {
+        id: None,
+        wait: true,
+        last: None,
+        url_match: Some("api/items".to_string()),
+        method: None,
+        status: None,
+        lifecycle: None,
+        timeout: Some(MAX_IPC_TIMEOUT_MS),
+    }));
+
+    let envelope = build_request(&cli)
+        .expect_err("inspect network wait expansion must not produce protocol-invalid IPC request")
+        .into_envelope();
+
+    assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
+    assert_eq!(
+        envelope.context.as_ref().unwrap()["actual_timeout_ms"],
+        serde_json::json!(MAX_IPC_TIMEOUT_MS + WAIT_IPC_BUFFER_MS)
+    );
+}
+
+#[test]
+fn build_request_rejects_final_inspect_list_scan_timeout_expansion() {
+    let mut cli = cli_with(Commands::Inspect(InspectSubcommand::List {
+        builder_help: false,
+        spec: None,
+        file: None,
+        collection: Some(".feed-card".to_string()),
+        row_scope: None,
+        field: vec!["title=text:.title".to_string()],
+        snapshot: None,
+        scan_until: Some(10),
+        scan_key: Some("title".to_string()),
+        max_scrolls: Some(1),
+        scroll_amount: None,
+        settle_ms: Some(1),
+        stall_limit: None,
+        wait_field: None,
+        wait_contains: None,
+        wait_timeout: None,
+    }));
+    cli.timeout = MAX_IPC_TIMEOUT_MS;
+
+    let envelope = build_request(&cli)
+        .expect_err("inspect list scan expansion must not produce protocol-invalid IPC request")
+        .into_envelope();
+
+    assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
+    assert_eq!(
+        envelope.context.as_ref().unwrap()["actual_timeout_ms"],
+        serde_json::json!(MAX_IPC_TIMEOUT_MS + WAIT_IPC_BUFFER_MS + 1)
+    );
 }
 
 fn cli_with_with_home(command: Commands, rub_home: PathBuf) -> EffectiveCli {
@@ -36,6 +149,7 @@ fn cli_with_with_home(command: Commands, rub_home: PathBuf) -> EffectiveCli {
         cdp_url: None,
         connect: false,
         profile: None,
+        profile_resolved_path: None,
         use_alias: None,
         no_stealth: false,
         humanize: false,
@@ -274,6 +388,34 @@ fn align_embedded_timeout_authority_shrinks_download_save_timeout_with_request_b
     super::align_embedded_timeout_authority(&mut request);
 
     assert_eq!(request.args["timeout_ms"], serde_json::json!(5_000));
+}
+
+#[test]
+fn align_embedded_timeout_authority_shrinks_inspect_list_wait_timeout_with_request_budget() {
+    let cli = cli_with(Commands::Inspect(InspectSubcommand::List {
+        builder_help: false,
+        spec: None,
+        file: None,
+        collection: Some(".mail-row".to_string()),
+        row_scope: None,
+        field: vec!["subject=text:.subject".to_string()],
+        snapshot: None,
+        scan_until: None,
+        scan_key: None,
+        max_scrolls: None,
+        scroll_amount: None,
+        settle_ms: None,
+        stall_limit: None,
+        wait_field: Some("subject".to_string()),
+        wait_contains: Some("Confirm".to_string()),
+        wait_timeout: Some(12_500),
+    }));
+
+    let mut request = build_request(&cli).expect("inspect list wait request should build");
+    request.timeout_ms = 5_000 + WAIT_IPC_BUFFER_MS;
+    super::align_embedded_timeout_authority(&mut request);
+
+    assert_eq!(request.args["wait_timeout_ms"], serde_json::json!(5_000));
 }
 
 #[test]
@@ -600,7 +742,7 @@ fn fill_request_extends_timeout_for_step_wait_after_budget() {
 }
 
 #[test]
-fn fill_validate_request_uses_internal_read_only_projection() {
+fn fill_validate_request_uses_internal_read_only_projection_with_replay_identity() {
     let cli = cli_with(Commands::Fill {
         spec: Some(r##"[{"selector":"#name","value":"Ada"}]"##.to_string()),
         file: None,
@@ -623,8 +765,8 @@ fn fill_validate_request_uses_internal_read_only_projection() {
     let request = build_request(&cli).expect("fill validate request should build");
     assert_eq!(request.command, "_fill_validate");
     assert!(
-        request.command_id.is_none(),
-        "validate surface should not look mutating at the protocol layer"
+        request.command_id.is_some(),
+        "read-only internal requests still need replay identity on the wire"
     );
 }
 
@@ -931,6 +1073,13 @@ fn explain_blockers_projects_to_internal_probe() {
     let request = build_request(&cli).expect("explain blockers should build");
     assert_eq!(request.command, "_blocker_diagnose");
     assert_eq!(request.args, serde_json::json!({}));
+    assert!(
+        request
+            .command_id
+            .as_deref()
+            .is_some_and(|command_id| command_id.starts_with("explain-blockers-")),
+        "public explain output needs a command_id even when the internal control-plane command allows it to be absent"
+    );
 }
 
 #[test]
@@ -1723,7 +1872,7 @@ fn trigger_list_request_projects_registry_subcommand() {
 
     let request = build_request(&cli).expect("trigger list request should build");
     assert_eq!(request.command, "trigger");
-    assert!(request.command_id.is_none());
+    assert!(request.command_id.is_some());
     assert_eq!(request.args["sub"], "list");
 }
 
@@ -1743,7 +1892,7 @@ fn trigger_trace_request_projects_dedicated_trace_surface() {
 
     let request = build_request(&cli).expect("trigger trace request should build");
     assert_eq!(request.command, "trigger");
-    assert!(request.command_id.is_none());
+    assert!(request.command_id.is_some());
     assert_eq!(request.args["sub"], "trace");
     assert_eq!(request.args["last"], 7);
 }
@@ -1995,7 +2144,7 @@ fn orchestration_export_request_projects_export_surface() {
 
     let request = build_request(&cli).expect("orchestration export request should build");
     assert_eq!(request.command, "orchestration");
-    assert!(request.command_id.is_none());
+    assert!(request.command_id.is_some());
     assert_eq!(request.args["sub"], "export");
     assert_eq!(request.args["id"], 7);
 }
@@ -2095,6 +2244,29 @@ fn wait_after_budget_uses_bounded_default_timeout() {
     assert_eq!(request.timeout_ms, 30_000 + DEFAULT_WAIT_AFTER_TIMEOUT_MS);
     assert_eq!(request.args["wait_after"]["selector"], "#ready");
     assert!(request.args["wait_after"].get("timeout_ms").is_none());
+}
+
+#[test]
+fn exec_request_supports_post_wait_fence_before_dispatch() {
+    let cli = cli_with(Commands::Exec {
+        code: "document.body.dataset.ready = '1'".to_string(),
+        raw: false,
+        wait_after: WaitAfterArgs {
+            selector: Some("body[data-ready='1']".to_string()),
+            timeout_ms: Some(1_200),
+            ..WaitAfterArgs::default()
+        },
+    });
+
+    let request = build_request(&cli).expect("exec request should build");
+    assert_eq!(request.command, "exec");
+    assert_eq!(request.args["code"], "document.body.dataset.ready = '1'");
+    assert_eq!(
+        request.args["wait_after"]["selector"],
+        "body[data-ready='1']"
+    );
+    assert_eq!(request.args["wait_after"]["timeout_ms"], 1_200);
+    assert_eq!(request.timeout_ms, 31_200);
 }
 
 #[test]

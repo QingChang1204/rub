@@ -624,6 +624,7 @@ mod tests {
             text: "Hello snapshot".to_string(),
             attributes,
             element_ref: Some("main:7".to_string()),
+            target_id: None,
             bounding_box: Some(BoundingBox {
                 x: 10.0,
                 y: 20.0,

@@ -120,7 +120,7 @@ pub(crate) async fn navigate_with_lifecycle(
         NavigateCommitKind::Download { warning } => Ok(Some(warning)),
         NavigateCommitKind::SameDocument => {
             wait_for_same_document_navigation_from_listener(
-                main_frame,
+                committed_navigation_frame(main_frame, navigate.frame_id.clone()),
                 &mut same_document_listener,
                 timeout,
             )
@@ -130,7 +130,7 @@ pub(crate) async fn navigate_with_lifecycle(
         NavigateCommitKind::Lifecycle => {
             wait_for_navigation_lifecycle_or_stop_loading(
                 page,
-                main_frame,
+                committed_navigation_frame(main_frame, navigate.frame_id.clone()),
                 &mut lifecycle_listener,
                 lifecycle_name,
                 timeout,
@@ -139,6 +139,16 @@ pub(crate) async fn navigate_with_lifecycle(
             Ok(None)
         }
     }
+}
+
+pub(crate) fn committed_navigation_frame(
+    pre_command_main_frame: FrameId,
+    navigate_frame: FrameId,
+) -> FrameId {
+    if navigate_frame != pre_command_main_frame {
+        return navigate_frame;
+    }
+    pre_command_main_frame
 }
 
 pub(crate) fn classify_navigate_commit(
@@ -568,10 +578,73 @@ where
         Ok(()) => Ok(()),
         Err(error) => {
             if matches!(&error, RubError::Domain(envelope) if envelope.code == ErrorCode::PageLoadTimeout)
+                && let Err(stop_error) = page.execute(StopLoadingParams::default()).await
             {
-                let _ = page.execute(StopLoadingParams::default()).await;
+                tracing::warn!(
+                    error = %stop_error,
+                    "StopLoading failed after navigation timeout"
+                );
+                return Err(navigation_timeout_with_stop_loading_failure(
+                    error,
+                    stop_error.to_string(),
+                ));
             }
             Err(error)
         }
+    }
+}
+
+fn navigation_timeout_with_stop_loading_failure(error: RubError, stop_error: String) -> RubError {
+    let RubError::Domain(mut envelope) = error else {
+        return error;
+    };
+
+    let mut context = envelope
+        .context
+        .take()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !context.is_object() {
+        context = serde_json::json!({ "previous_context": context });
+    }
+    if let Some(object) = context.as_object_mut() {
+        object.insert(
+            "stop_loading_attempted".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        object.insert(
+            "stop_loading_error".to_string(),
+            serde_json::Value::String(stop_error),
+        );
+    }
+    envelope.context = Some(context);
+    RubError::Domain(envelope)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn navigation_timeout_preserves_stop_loading_failure_context() {
+        let error = RubError::domain(ErrorCode::PageLoadTimeout, "navigation timed out");
+        let envelope = navigation_timeout_with_stop_loading_failure(
+            error,
+            "target closed before StopLoading".to_string(),
+        )
+        .into_envelope();
+        let context = envelope
+            .context
+            .expect("stop loading failure should be caller-visible context");
+
+        assert_eq!(
+            context.get("stop_loading_attempted"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            context.get("stop_loading_error"),
+            Some(&serde_json::Value::String(
+                "target closed before StopLoading".to_string()
+            ))
+        );
     }
 }

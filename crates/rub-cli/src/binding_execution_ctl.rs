@@ -55,7 +55,8 @@ pub(crate) fn resolve_command_execution_binding(
         ));
     }
 
-    let (remembered_alias, target) = resolve_remembered_alias_target(&cli.rub_home, alias)?;
+    let (remembered_alias, target, binding_state) =
+        resolve_remembered_alias_target(&cli.rub_home, alias)?;
     let RememberedBindingAliasTarget::Resolved {
         binding_alias,
         binding,
@@ -78,6 +79,16 @@ pub(crate) fn resolve_command_execution_binding(
     };
 
     let binding = *binding;
+    if matches!(resolution, BindingResolution::LiveStatusUnavailable)
+        && let Some(error) = binding_state.live_snapshot_error()
+    {
+        return Err(remembered_alias_live_registry_authority_error(
+            &cli.rub_home,
+            &remembered_alias,
+            &binding,
+            error,
+        ));
+    }
     match &resolution {
         BindingResolution::LiveMatch {
             session_name,
@@ -192,6 +203,59 @@ pub(crate) fn resolve_command_execution_binding(
             execution_unavailable_message(&remembered_alias, &live_status, &resolution),
         )),
     }
+}
+
+fn remembered_alias_live_registry_authority_error(
+    rub_home: &Path,
+    remembered_alias: &RememberedBindingAliasRecord,
+    binding: &BindingRecord,
+    error: &RubError,
+) -> RubError {
+    let (code, source_message, source_context, source_suggestion) = match error {
+        RubError::Domain(envelope) => (
+            envelope.code,
+            envelope.message.clone(),
+            envelope.context.clone(),
+            envelope.suggestion.clone(),
+        ),
+        RubError::Io(io_error) => (
+            ErrorCode::IoError,
+            io_error.to_string(),
+            None,
+            ErrorCode::IoError.suggestion().to_string(),
+        ),
+        RubError::Json(json_error) => (
+            ErrorCode::JsonError,
+            json_error.to_string(),
+            None,
+            ErrorCode::JsonError.suggestion().to_string(),
+        ),
+        RubError::Internal(message) => (
+            ErrorCode::InternalError,
+            message.clone(),
+            None,
+            ErrorCode::InternalError.suggestion().to_string(),
+        ),
+    };
+    RubError::domain_with_context(
+        code,
+        format!(
+            "Remembered alias '{}' cannot be reused because live registry authority is unavailable right now",
+            remembered_alias.alias
+        ),
+        json!({
+            "reason": "remembered_alias_live_registry_authority_unavailable",
+            "remembered_alias": remembered_alias,
+            "binding": binding,
+            "live_registry_error": {
+                "code": code,
+                "message": source_message,
+                "context": source_context,
+                "suggestion": source_suggestion,
+            },
+            "rub_home": rub_home.display().to_string(),
+        }),
+    )
 }
 
 pub(crate) fn attach_binding_execution_projection(

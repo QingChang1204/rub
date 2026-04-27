@@ -1,8 +1,9 @@
 use super::{
     FrameId, HistoryDirection, NavigateCommitKind, build_scroll_evaluate_params,
-    classify_navigate_commit, history_boundary_from_history_state, history_navigation_deadline,
-    optional_history_budget, parse_scroll_position_json, required_history_budget,
-    wait_for_lifecycle_event_from_listener, wait_for_same_document_navigation_from_listener,
+    classify_navigate_commit, committed_navigation_frame, history_boundary_from_history_state,
+    history_navigation_deadline, optional_history_budget, parse_scroll_position_json,
+    required_history_budget, wait_for_lifecycle_event_from_listener,
+    wait_for_same_document_navigation_from_listener,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
     EventNavigatedWithinDocument, NavigatedWithinDocumentNavigationType,
@@ -111,6 +112,14 @@ fn navigate_commit_classifies_protocol_result_exhaustively() {
     )
     .expect_err("protocol error text should fail immediately");
     assert_eq!(error.into_envelope().code, ErrorCode::NavigationFailed);
+}
+
+#[test]
+fn navigation_wait_uses_committed_response_frame_authority() {
+    assert_eq!(
+        committed_navigation_frame(frame_id("pre-main"), frame_id("committed-main")),
+        frame_id("committed-main")
+    );
 }
 
 #[test]

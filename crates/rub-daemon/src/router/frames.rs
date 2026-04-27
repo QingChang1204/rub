@@ -101,7 +101,6 @@ fn resolve_selected_frame_id(
                     format!("Frame index {index} is not present in the current inventory"),
                 )
             })?;
-        ensure_frame_switchable(entry)?;
         return Ok(Some(entry.frame.frame_id.clone()));
     }
 
@@ -131,7 +130,6 @@ fn resolve_selected_frame_id(
         let entry = matches.into_iter().next().ok_or_else(|| {
             RubError::Internal("Frame selection unexpectedly lost its single match".to_string())
         })?;
-        ensure_frame_switchable(&entry)?;
         return Ok(Some(entry.frame.frame_id));
     }
 
@@ -141,30 +139,12 @@ fn resolve_selected_frame_id(
     ))
 }
 
-fn ensure_frame_switchable(entry: &FrameInventoryEntry) -> Result<(), RubError> {
-    if entry.is_primary || matches!(entry.frame.same_origin_accessible, Some(true)) {
-        return Ok(());
-    }
-
-    Err(RubError::domain_with_context(
-        ErrorCode::InvalidInput,
-        format!(
-            "Frame '{}' is not same-origin accessible for frame-scoped snapshot and interaction",
-            entry.frame.frame_id
-        ),
-        serde_json::json!({
-            "frame_id": entry.frame.frame_id,
-            "same_origin_accessible": entry.frame.same_origin_accessible,
-            "index": entry.index,
-        }),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{FrameSelectionArgs, frame_selection_subject};
+    use super::{FrameSelectionArgs, frame_selection_subject, resolve_selected_frame_id};
     use crate::router::request_args::parse_json_args;
     use rub_core::error::ErrorCode;
+    use rub_core::model::{FrameContextInfo, FrameInventoryEntry};
 
     #[test]
     fn typed_frame_payload_rejects_unknown_fields() {
@@ -189,5 +169,35 @@ mod tests {
         };
         assert_eq!(frame_selection_subject(&selector)["kind"], "index");
         assert_eq!(frame_selection_subject(&selector)["index"], 2);
+    }
+
+    #[test]
+    fn frame_selection_accepts_frame_without_hit_test_authority() {
+        let frames = vec![FrameInventoryEntry {
+            index: 1,
+            frame: FrameContextInfo {
+                frame_id: "child".to_string(),
+                name: Some("child".to_string()),
+                parent_frame_id: Some("root".to_string()),
+                target_id: Some("target-1".to_string()),
+                url: Some("https://example.test/frame".to_string()),
+                depth: 1,
+                same_origin_accessible: Some(false),
+            },
+            is_primary: false,
+            is_current: false,
+        }];
+
+        let selected = resolve_selected_frame_id(
+            &FrameSelectionArgs {
+                top: false,
+                index: Some(1),
+                name: None,
+            },
+            &frames,
+        )
+        .expect("frame selection only records continuity; interaction paths own hit-test checks");
+
+        assert_eq!(selected.as_deref(), Some("child"));
     }
 }

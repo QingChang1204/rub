@@ -50,7 +50,7 @@ When a language model drives a browser through Playwright or Puppeteer, it runs 
 
 **Errors tell the agent exactly what to do next.** Every error response has a `code` (machine-readable), a `message` (human-readable), a `suggestion` (actionable), and a `context` object (structured data for the failure). When `inspect text` matched 51 elements instead of one, the error said: `"suggestion": "use --first, --last, or --nth to select a single match"`. When `open` timed out, it said: `"suggestion": "use --load-strategy domcontentloaded"`. This is the contract: errors never just fail — they tell the agent what to try next.
 
-**Retry is structurally safe.** A mutating command (click, type, fill, submit) that carries a `command_id` is deduplicated inside the daemon. If the network drops between the command dispatch and the response, the agent can retry with the same `command_id`. While the original post-commit response is still retained, the daemon returns that exact cached response; after bounded retention eviction, it returns an explicit "already executed / original response no longer retained" failure instead of rerunning the action. The action never runs twice. This works without any coordination logic on the agent side.
+**Retry is structurally safe within the daemon's bounded replay fence.** A mutating command (click, type, fill, submit) that carries a `command_id` is deduplicated inside the daemon. The CLI normally generates a fresh `command_id` for each new invocation; safe retry means replaying the same request identity through the recovery path, not inventing a new ID after an ambiguous failure. If the network drops between dispatch and response, retrying with the same `command_id` returns the exact cached post-commit response while it is retained; after bounded retention eviction, the daemon returns an explicit "already executed / original response no longer retained" failure instead of rerunning the action. The action does not run twice while that `command_id` is still covered by the session's bounded replay-spent authority.
 
 **One call gives a health dashboard.** `rub runtime summary` returns the status of every subsystem in one round trip: dialog state (is a JS alert blocking?), frame context (am I in an iframe?), download progress, handoff state, interference mode, network observatory health, orchestration connectivity. When something is wrong and I don't know why, this is the first call I make.
 
@@ -65,8 +65,18 @@ When a language model drives a browser through Playwright or Puppeteer, it runs 
 
 ### 🤖 Agent-Native Interface
 - **Structured stdout contract** — default command surfaces return one JSON object to stdout; `exec --raw` is an explicit raw-value surface. No HTML to parse, no selectors to guess.
+- **Effect-truth interaction contract** — interaction commands only publish `success=true` when the browser-side effect is confirmed; unconfirmed, contradicted, or degraded interaction aftermath fails closed as `INTERACTION_NOT_CONFIRMED` while preserving the committed daemon projection under `error.context.committed_response_projection`.
+- **Artifact-truth export contract** — requested `history export` / `orchestration export` calls only finish successfully once local artifact publication succeeds before the command deadline; local persistence failure or publish-fence timeout fails closed while preserving the committed daemon projection under `error.context.committed_response_projection`.
+- **Active-tab provenance** — tab projections publish `active_authority` so callers can tell whether `tab.active` came from browser truth or a bounded local fallback bridge.
+- **Replay recovery contract** — replay / daemon-rollover failures publish a machine-readable `error.context.recovery_contract` instead of leaving recovery authority implicit in internal-only journal state.
+  The current public fields are `kind`, `scope`, `session_name`,
+  `daemon_session_id`, `journal_path`, `reader_contract`,
+  `committed_truth_may_exist`, and `safe_to_rerun_with_new_command_id`.
+  Batch close / teardown surfaces preserve the same per-session replay-recovery
+  envelope under `session_error_details` instead of collapsing it to a bare
+  failed-session list.
 - **Snapshot-based element targeting** — elements are addressed by snapshot ID + index, eliminating race conditions from DOM mutations.
-- **At-most-once execution** — mutating commands carry a `command_id` to prevent duplicate side effects during retries.
+- **At-most-once execution** — mutating commands carry a `command_id`; the daemon prevents duplicate side effects only for retries that preserve the same request identity inside its bounded replay fence.
 - **Interaction trace** — `--verbose` / `--trace` flags expose what the runtime observed before and after each action.
 
 ### 🔗 Persistent Daemon Architecture
@@ -104,7 +114,7 @@ When a language model drives a browser through Playwright or Puppeteer, it runs 
 - `scroll` with directional control and pixel amounts
 - `wait` for conditions: CSS selector, text, role, label, testid, page URL/title, and accessible description — with state control (`visible`, `hidden`, `attached`, `detached`, `interactable`)
   - `--url-contains`, `--title-contains`, `--description-contains` cover page-context and target-description waits without dropping to shell loops
-  - `--wait --state interactable` confirms DOM-level visible/enabled/writable readiness; it does **not** claim live `--topmost` hit-test authority
+  - `--wait --state interactable` confirms current-runtime visible/enabled/writable readiness with live top-level hit-test geometry authority; if that geometry authority is unavailable, it fails closed instead of projecting DOM-only readiness as interactable
 
 **Element Targeting** (works across `click`, `type`, `inspect`, etc.)
 - Snapshot index: `rub click 3 --snapshot <id>`
@@ -450,10 +460,11 @@ rub orchestration list-assets                  # List all saved orchestration as
 
 **Rule structure** (JSON spec):
 - `mode`: `once` (fires then becomes `fired`) or `repeat` (re-arms after cooldown)
-- `source`: `{session_name, tab_target_id, frame_id}` — where conditions are evaluated
-- `target`: `{session_name}` — where actions are dispatched
+- `source`: `{session_id, tab_index?, tab_target_id?, frame_id?}` — where conditions are evaluated
+- `target`: `{session_id, tab_index?, tab_target_id?, frame_id?}` — where actions are dispatched
 - `actions[]`: ordered list of `{kind: "browser_command"|"workflow", command, payload}`
-- `execution_policy`: `{cooldown_ms, retry_limit}` — up to 3 transient retries with 100ms delay
+- `execution_policy`: `{cooldown_ms, max_retries}` — up to 3 transient retries with 100ms delay
+- `tab_index` and `tab_target_id` are mutually exclusive when both addresses are provided
 - Workflow actions support `vars` (static bindings) and `source_vars` (live bindings read from source tab at dispatch time)
 
 ### 💬 Dialog Handling
@@ -498,7 +509,7 @@ rub trigger trace --last 20                     # Recent fire/block/degraded eve
 
 **Reliability guarantees**:
 - **Double-fire prevention**: evidence fingerprint (`consumed_evidence_fingerprint`) gates each fire cycle — same network request or storage value cannot trigger twice
-- **Post-queue re-validation**: condition is re-checked after acquiring the FIFO lock, preventing stale fires if the condition cleared while queued
+- **Post-queue re-validation**: live conditions are re-checked after acquiring the FIFO lock; immutable `network_request` evidence instead carries its matched request identity/fingerprint through the queue and is dropped if trigger lifecycle or rule semantics drift
 - **Tab reconciliation**: if source or target tab closes/reopens, the trigger degrades to `unavailable` and auto-recovers when tabs reappear
 - **Mode**: `once` (trigger fires once then stops) or `repeat` (re-arms after each fire)
 
@@ -532,6 +543,11 @@ rub --connect open https://example.com
 # Connect using a named Chrome profile
 rub --profile "Work" open https://example.com
 ```
+
+rub can attach to an already-running multi-tab external browser when browser
+truth exposes one unique active tab. If active-tab authority is ambiguous, the
+attach lane fails closed instead of guessing which page owns follow-on tab
+authority.
 
 ## Installation
 
@@ -671,13 +687,13 @@ CLI flags override file configuration.
 
 ### IPC Transport
 
-The CLI and daemon communicate over **Unix domain sockets** using an **NDJSON (newline-delimited JSON) codec**. Each CLI invocation opens one connection, writes exactly one `IpcRequest`, reads one `IpcResponse`, and exits. The protocol is framed by newline as the commit fence — a partial write without a trailing newline is classified as `partial_ndjson_frame` and rejected cleanly.
+The CLI and daemon communicate over **Unix domain sockets** using an **NDJSON (newline-delimited JSON) codec**. The served product contract remains one request / one response per CLI invocation. Internal protocol helpers may still expose reusable connection wrappers, but the compatibility lane is now owned by request-aware transport decoding for `_handshake`, `_upgrade_check`, and `_blocker_diagnose`, and attach/startup only hand back an execution client after re-verifying the same socket-path identity and attachment authority that the handshake proved. The protocol is framed by newline as the commit fence — a partial write without a trailing newline is classified as `partial_ndjson_frame` and rejected cleanly.
 
 The socket bind path is guarded by a `.bind.lock` file (acquired via `flock(LOCK_EX)`) to serialize concurrent startup races. Before binding, the server probes the existing socket file: if it accepts connections it belongs to a live daemon and the new process backs off; if it refuses (`ConnectionRefused`) the stale file is unlinked — but only after verifying the socket's `(dev, inode)` identity matches, preventing a TOCTOU race where a new daemon creates a fresh socket between the probe and the unlink.
 
 ### FIFO Command Queue
 
-`DaemonRouter` owns a `tokio::sync::Semaphore` initialized to **1 permit**. Every incoming request must acquire this permit before executing, which means commands are serialized FIFO — there is no concurrent execution within a session. This is the foundational invariant that makes snapshot-based element addressing correct: no DOM mutation can race with a read.
+`DaemonRouter` owns a `tokio::sync::Semaphore` initialized to **1 permit**. Public requests acquire this permit before dispatch, so top-level command execution is serialized FIFO through response commit/delivery bookkeeping. Long observation waits are not browser mutations, but when they are submitted as standalone commands they still hold the request FIFO while polling. Snapshot-based element addressing relies on the same commit invariant for its actual read/mutate phase, not on a separate parallel wait lane.
 
 The queue enforces a **timeout budget** split into two phases:
 1. **Queue wait** — time spent waiting for the Semaphore permit
@@ -689,11 +705,13 @@ Both are measured independently and returned in every response as `timing.queue_
 
 Mutating commands that carry a `command_id` field participate in the **replay fence**:
 
-1. First arrival: daemon claims `command_id` ownership via a `watch` channel, executes the command, marks that `command_id` as spent for the session lifetime, and caches the exact response while bounded replay retention allows.
+1. First arrival: daemon claims `command_id` ownership via a `watch` channel, executes the command, marks that `command_id` as spent inside the session's bounded replay-spent budget, and caches the exact response while bounded replay retention allows.
 2. Concurrent duplicate: waits on the same `watch` channel until the first execution completes, then returns the cached response directly when it is still retained — otherwise it fails closed with an explicit "already executed / response evicted" replay result, never a silent rerun.
-3. Conflicting fingerprint: same `command_id` but different command/args — rejected with `IpcVersionMismatch`.
+3. Conflicting fingerprint: same `command_id` but different command/args — rejected with `IpcProtocolError`.
 
 The cached response stored is the **post-commit** shaped response (after frame-limit enforcement and timing injection), ensuring any retained replay observes exactly the same wire format as the original caller.
+
+Spent replay authority is intentionally **bounded**, not session-lifetime durable. When the oldest spent identities age out of the replay-spent budget, that `command_id` can become claimable again; callers that need stronger lifetime idempotency must own it above the daemon session boundary.
 
 ### Snapshot Authority & DOM Epoch
 
@@ -739,7 +757,7 @@ rub-cli
 
 | Invariant | Enforcement Point |
 |-----------|------------------|
-| Commands execute FIFO, one at a time | `DaemonRouter::exec_semaphore` (capacity = 1) |
+| Top-level command execution is serialized FIFO through the router request fence; long waits submitted as standalone commands also occupy that fence while polling | `DaemonRouter::exec_semaphore` around prepared request dispatch and response commit/delivery bookkeeping |
 | Mutating commands are at-most-once | Replay fence in `prepare_command_dispatch` |
 | Stale element addresses are rejected | `dom_epoch` guard in snapshot validation |
 | Daemon startup is atomic or rolled back | `StartupCommitGuard` drop impl |

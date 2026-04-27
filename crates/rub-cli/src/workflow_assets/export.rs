@@ -1,12 +1,33 @@
 use rub_core::error::{ErrorCode, RubError};
 use serde_json::{Value, json};
+use std::time::Instant;
 
 use crate::commands::{Commands, EffectiveCli};
 
-use super::write::{commit_asset_writes, pending_asset_write};
+use super::write::{commit_asset_writes, commit_asset_writes_until, pending_asset_write};
 use super::{normalize_workflow_name, resolve_named_workflow_path};
 
+const HISTORY_EXPORT_PERSISTENCE_PHASE: &str = "post_commit_history_export_persistence";
+
+#[cfg(test)]
 pub fn persist_history_export_asset(cli: &EffectiveCli, data: &mut Value) -> Result<(), RubError> {
+    persist_history_export_asset_with_deadline(cli, data, None)
+}
+
+pub fn persist_history_export_asset_until(
+    cli: &EffectiveCli,
+    data: &mut Value,
+    deadline: Instant,
+    timeout_ms: u64,
+) -> Result<(), RubError> {
+    persist_history_export_asset_with_deadline(cli, data, Some((deadline, timeout_ms)))
+}
+
+fn persist_history_export_asset_with_deadline(
+    cli: &EffectiveCli,
+    data: &mut Value,
+    deadline: Option<(Instant, u64)>,
+) -> Result<(), RubError> {
     let Commands::History {
         export_pipe,
         export_script,
@@ -85,7 +106,16 @@ pub fn persist_history_export_asset(cli: &EffectiveCli, data: &mut Value) -> Res
     }
 
     if !pending_writes.is_empty() {
-        persisted_artifacts.extend(commit_asset_writes(pending_writes)?);
+        let committed = match deadline {
+            Some((deadline, timeout_ms)) => commit_asset_writes_until(
+                pending_writes,
+                deadline,
+                timeout_ms,
+                HISTORY_EXPORT_PERSISTENCE_PHASE,
+            )?,
+            None => commit_asset_writes(pending_writes)?,
+        };
+        persisted_artifacts.extend(committed);
     }
 
     if !persisted_artifacts.is_empty() {

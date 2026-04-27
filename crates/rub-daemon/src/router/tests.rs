@@ -3,8 +3,8 @@ use super::timeout::{
     TimeoutPhase, augment_wait_timeout_error, timeout_context, wait_timeout_error,
 };
 use super::transaction::{
-    finalize_response, prepare_replay_fence, protocol_version_mismatch_response,
-    replay_request_fingerprint,
+    execution_timeout_error, finalize_response, prepare_replay_fence,
+    protocol_version_mismatch_response, replay_request_fingerprint,
 };
 use super::{
     DaemonRouter, PendingExternalDomCommit, TransactionDeadline, attach_interaction_projection,
@@ -1020,6 +1020,76 @@ fn wait_timeout_context_merges_probe_and_execution_attribution() {
 }
 
 #[test]
+fn execution_timeout_error_preserves_partial_commit_projection() {
+    let request = IpcRequest::new("pipe", serde_json::json!({}), 1_000)
+        .with_command_id("cmd-timeout")
+        .expect("static command id should validate");
+    let error = execution_timeout_error(
+        &request,
+        100,
+        900,
+        request.timeout_ms,
+        Some(serde_json::json!({
+            "subject": { "kind": "pipe" },
+            "transaction": {
+                "status": "timed_out",
+                "recovery_contract": { "kind": "partial_commit" },
+            },
+            "steps": [{
+                "step_index": 0,
+                "status": "committed",
+            }],
+        })),
+    )
+    .into_envelope();
+
+    assert_eq!(error.code, ErrorCode::IpcTimeout);
+    let context = error.context.expect("timeout context");
+    assert_eq!(context["phase"], "execution");
+    assert_eq!(context["transaction"]["status"], "timed_out");
+    assert_eq!(
+        context["transaction"]["recovery_contract"]["kind"],
+        "partial_commit"
+    );
+    assert_eq!(context["steps"][0]["status"], "committed");
+}
+
+#[test]
+fn execution_timeout_error_preserves_post_wait_committed_projection() {
+    let request = IpcRequest::new("click", serde_json::json!({}), 1_000);
+    let error = execution_timeout_error(
+        &request,
+        100,
+        900,
+        request.timeout_ms,
+        Some(serde_json::json!({
+            "reason": "post_wait_failed_after_partial_commit",
+            "partial_commit": {
+                "kind": "post_wait_after_commit",
+                "recovery_contract": { "kind": "partial_commit" },
+            },
+            "committed_response_projection": {
+                "interaction": { "semantic_class": "click" },
+                "dom_epoch": 7,
+            },
+        })),
+    )
+    .into_envelope();
+
+    let context = error.context.expect("timeout context");
+    assert_eq!(context["phase"], "execution");
+    assert_eq!(context["reason"], "post_wait_failed_after_partial_commit");
+    assert_eq!(
+        context["partial_commit"]["recovery_contract"]["kind"],
+        "partial_commit"
+    );
+    assert_eq!(
+        context["committed_response_projection"]["interaction"]["semantic_class"],
+        "click"
+    );
+}
+
+#[test]
 fn handoff_allowlist_blocks_mutating_commands_but_keeps_runtime_surfaces_reachable() {
     assert!(!command_allowed_during_handoff("click"));
     assert!(!command_allowed_during_handoff("exec"));
@@ -1282,7 +1352,7 @@ async fn finalize_response_preserves_command_id_for_protocol_version_mismatch() 
 }
 
 #[tokio::test]
-async fn finalize_response_turns_oversized_payload_into_structured_domain_error() {
+async fn finalize_response_preserves_oversized_payload_as_committed_truth() {
     let state = Arc::new(SessionState::new(
         "default",
         PathBuf::from("/tmp/rub-router-test"),
@@ -1301,26 +1371,21 @@ async fn finalize_response_turns_oversized_payload_into_structured_domain_error(
     let finalized = finalize_response(&request, oversized, false, None, &state).await;
 
     assert_eq!(finalized.command_id.as_deref(), Some("cmd-large"));
+    assert_eq!(finalized.status, rub_ipc::protocol::ResponseStatus::Success);
+    assert!(finalized.error.is_none());
     assert_eq!(
-        finalized.error.as_ref().map(|error| error.code),
-        Some(ErrorCode::IpcProtocolError)
-    );
-    assert_eq!(finalized.status, rub_ipc::protocol::ResponseStatus::Error);
-    let error_context = finalized
-        .error
-        .as_ref()
-        .and_then(|error| error.context.as_ref())
-        .expect("frame limit rejection should preserve error context");
-    assert_eq!(
-        error_context
-            .get("reason")
-            .and_then(serde_json::Value::as_str),
-        Some("response_exceeds_ipc_frame_limit")
+        finalized
+            .data
+            .as_ref()
+            .and_then(|data| data.get("payload"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::len),
+        Some(rub_ipc::codec::MAX_FRAME_BYTES)
     );
 }
 
 #[tokio::test]
-async fn replay_cache_commits_oversized_response_in_its_final_on_wire_shape() {
+async fn replay_cache_preserves_oversized_committed_truth_not_transport_projection() {
     let state = Arc::new(SessionState::new(
         "default",
         PathBuf::from("/tmp/rub-router-test"),
@@ -1349,10 +1414,8 @@ async fn replay_cache_commits_oversized_response_in_its_final_on_wire_shape() {
 
     let finalized = finalize_response(&request, oversized, false, Some(replay_owner), &state).await;
     assert_eq!(finalized.command_id.as_deref(), Some("cmd-large-replay"));
-    assert_eq!(
-        finalized.error.as_ref().map(|error| error.code),
-        Some(ErrorCode::IpcProtocolError)
-    );
+    assert_eq!(finalized.status, rub_ipc::protocol::ResponseStatus::Success);
+    assert!(finalized.error.is_none());
 
     let replay = prepare_replay_fence(
         &request,
@@ -1363,22 +1426,17 @@ async fn replay_cache_commits_oversized_response_in_its_final_on_wire_shape() {
     .await
     .expect_err("replay should return cached finalized response");
     assert_eq!(replay.command_id.as_deref(), Some("cmd-large-replay"));
-    assert_eq!(
-        replay.error.as_ref().map(|error| error.code),
-        Some(ErrorCode::IpcProtocolError)
-    );
+    assert_eq!(replay.status, rub_ipc::protocol::ResponseStatus::Success);
+    assert!(replay.error.is_none());
     assert_eq!(
         replay
-            .error
+            .data
             .as_ref()
-            .and_then(|error| error.context.as_ref())
-            .and_then(|context| context.get("reason"))
-            .and_then(|value| value.as_str()),
-        Some("response_exceeds_ipc_frame_limit")
-    );
-    assert!(
-        replay.data.is_none(),
-        "replay cache should not preserve the oversized pre-fence success payload"
+            .and_then(|data| data.get("payload"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::len),
+        Some(rub_ipc::codec::MAX_FRAME_BYTES),
+        "replay cache must preserve command outcome truth, not the transport overflow projection"
     );
 }
 

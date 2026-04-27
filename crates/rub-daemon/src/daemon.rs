@@ -11,16 +11,17 @@ use crate::session::{
     deregister_session, ensure_rub_home, promote_session_authority, register_pending_session,
     rfc3339_now,
 };
-use rub_core::error::{ErrorCode, ErrorEnvelope};
 use rub_ipc::protocol::IPC_PROTOCOL_VERSION;
 
 mod io;
 mod projection;
 mod shutdown;
 
+#[cfg(test)]
+use io::protocol_read_failure_response;
 use io::{
     ConnectedClientGuard, PreRequestResponseFenceGuard, handle_connection,
-    protocol_read_failure_response, write_response_with_timeout,
+    pre_framing_session_busy_response, write_response_with_timeout,
 };
 use projection::{
     publish_pid_projection, publish_socket_projection, publish_startup_commit_marker,
@@ -65,13 +66,21 @@ impl Drop for StartupCommitGuard {
         let _ = deregister_session(&self.home, &self.entry.session_id);
         cleanup_projections(&self.home, &self.entry);
         if let Some(previous_authority) = self.previous_authority.as_ref() {
-            match restore_previous_authority_if_live(&self.home, previous_authority) {
+            match restore_previous_authority_if_live(&self.home, &self.entry, previous_authority) {
                 Ok(projection::RestorePreviousAuthorityOutcome::Restored) => {}
                 Ok(projection::RestorePreviousAuthorityOutcome::SkippedNotLive) => {
                     warn!(
                         session_name = previous_authority.session_name,
                         session_id = previous_authority.session_id,
                         "Skipped startup rollback authority restore because the previous authority is no longer live"
+                    );
+                }
+                Ok(projection::RestorePreviousAuthorityOutcome::SkippedSuperseded) => {
+                    warn!(
+                        session_name = previous_authority.session_name,
+                        session_id = previous_authority.session_id,
+                        failed_session_id = self.entry.session_id,
+                        "Skipped startup rollback authority restore because a newer startup authority already owns the session"
                     );
                 }
                 Err(error) => {
@@ -202,18 +211,17 @@ pub async fn run_daemon(
                         PreRequestResponseFenceGuard::new(reject_state.clone());
                     tokio::spawn(async move {
                         let _reject_response_fence = reject_response_fence;
-                        let (_reader, mut writer) = stream.into_split();
-                        let response = protocol_read_failure_response(
-                            ErrorEnvelope::new(
-                                ErrorCode::SessionBusy,
-                                "Daemon is temporarily at its pre-request connection limit",
-                            )
-                            .with_context(serde_json::json!({
-                                "phase": "ipc_accept",
-                                "reason": "pre_framing_connection_limit",
-                                "limit": MAX_PRE_FRAMING_CONNECTIONS,
-                            })),
-                        );
+                        let (reader, mut writer) = stream.into_split();
+                        let mut reader = tokio::io::BufReader::new(reader);
+                        let Some(response) = pre_framing_session_busy_response(
+                            &mut reader,
+                            Some(reject_state.session_id.as_str()),
+                            MAX_PRE_FRAMING_CONNECTIONS,
+                        )
+                        .await
+                        else {
+                            return;
+                        };
                         let _ = write_response_with_timeout(&mut writer, &response).await;
                     });
                     continue;

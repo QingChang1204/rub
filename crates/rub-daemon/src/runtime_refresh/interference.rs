@@ -27,11 +27,15 @@ pub(crate) async fn refresh_live_interference_state(
         }
         Err(error) => {
             state
-                .mark_interference_runtime_degraded(format!("tab_probe_failed:{error}"))
+                .mark_interference_runtime_degraded(interference_tab_probe_degraded_reason())
                 .await;
             Err(error)
         }
     }
+}
+
+fn interference_tab_probe_degraded_reason() -> &'static str {
+    "tab_probe_failed"
 }
 
 pub(crate) async fn refresh_live_runtime_and_interference_snapshot(
@@ -92,5 +96,15 @@ pub(super) async fn apply_policy_driven_handoff(
     ) {
         state.activate_handoff().await;
         state.refresh_takeover_runtime(launch_policy).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interference_tab_probe_degraded_reason_is_stable() {
+        assert_eq!(interference_tab_probe_degraded_reason(), "tab_probe_failed");
     }
 }

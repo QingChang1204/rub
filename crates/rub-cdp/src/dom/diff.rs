@@ -50,7 +50,9 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> DiffResult {
             }
         } else {
             let fallback_match = old.elements.iter().find(|oe| {
-                !matched_old_indices.contains(&oe.index)
+                oe.element_ref.is_none()
+                    && new_el.element_ref.is_none()
+                    && !matched_old_indices.contains(&oe.index)
                     && oe.tag == new_el.tag
                     && oe.text == new_el.text
             });
@@ -293,4 +295,88 @@ fn append_ax_change(
         from: old.unwrap_or_default().to_string(),
         to: new.unwrap_or_default().to_string(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rub_core::model::{ElementTag, FrameContextInfo, ScrollPosition, SnapshotProjection};
+
+    fn element(index: u32, text: &str, element_ref: Option<&str>) -> Element {
+        Element {
+            index,
+            tag: ElementTag::Button,
+            text: text.to_string(),
+            attributes: HashMap::new(),
+            element_ref: element_ref.map(str::to_string),
+            target_id: Some("target-1".to_string()),
+            bounding_box: None,
+            ax_info: None,
+            listeners: None,
+            depth: Some(0),
+        }
+    }
+
+    fn snapshot(snapshot_id: &str, elements: Vec<Element>) -> Snapshot {
+        Snapshot {
+            snapshot_id: snapshot_id.to_string(),
+            dom_epoch: 1,
+            frame_context: FrameContextInfo {
+                frame_id: "main".to_string(),
+                name: None,
+                parent_frame_id: None,
+                target_id: Some("target-1".to_string()),
+                url: Some("https://example.com".to_string()),
+                depth: 0,
+                same_origin_accessible: Some(true),
+            },
+            frame_lineage: vec!["main".to_string()],
+            url: "https://example.com".to_string(),
+            title: "Example".to_string(),
+            total_count: elements.len() as u32,
+            elements,
+            truncated: false,
+            scroll: ScrollPosition {
+                x: 0.0,
+                y: 0.0,
+                at_bottom: false,
+            },
+            timestamp: "2026-04-24T00:00:00Z".to_string(),
+            projection: SnapshotProjection {
+                verified: true,
+                js_traversal_count: 1,
+                backend_traversal_count: 1,
+                resolved_ref_count: 1,
+                warning: None,
+            },
+            viewport_filtered: None,
+            viewport_count: None,
+        }
+    }
+
+    #[test]
+    fn diff_does_not_fallback_match_distinct_element_refs() {
+        let old = snapshot("old", vec![element(0, "Submit", Some("frame-a:10"))]);
+        let new = snapshot("new", vec![element(0, "Submit", Some("frame-a:11"))]);
+
+        let diff = diff_snapshots(&old, &new);
+
+        assert_eq!(diff.added.len(), 1, "{diff:?}");
+        assert_eq!(diff.removed.len(), 1, "{diff:?}");
+        assert!(diff.changed.is_empty(), "{diff:?}");
+        assert_eq!(diff.unchanged_count, 0, "{diff:?}");
+    }
+
+    #[test]
+    fn diff_fallback_match_remains_available_for_ref_less_elements() {
+        let old = snapshot("old", vec![element(0, "Submit", None)]);
+        let new = snapshot("new", vec![element(0, "Submit", None)]);
+
+        let diff = diff_snapshots(&old, &new);
+
+        assert!(diff.added.is_empty(), "{diff:?}");
+        assert!(diff.removed.is_empty(), "{diff:?}");
+        assert!(diff.changed.is_empty(), "{diff:?}");
+        assert_eq!(diff.unchanged_count, 1, "{diff:?}");
+    }
 }

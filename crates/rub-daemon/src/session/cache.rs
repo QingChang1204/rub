@@ -2,6 +2,27 @@ use super::journal::redacted_post_commit_request;
 use super::*;
 use tracing::trace;
 
+struct PostCommitProjectionDrainGuard<'a> {
+    state: &'a SessionState,
+}
+
+impl<'a> PostCommitProjectionDrainGuard<'a> {
+    fn new(state: &'a SessionState) -> Self {
+        state
+            .post_commit_followup_count
+            .fetch_add(1, Ordering::SeqCst);
+        Self { state }
+    }
+}
+
+impl Drop for PostCommitProjectionDrainGuard<'_> {
+    fn drop(&mut self) {
+        self.state
+            .post_commit_followup_count
+            .fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn serialized_json_len<T: serde::Serialize>(value: &T) -> usize {
     serde_json::to_vec(value)
         .map(|bytes| bytes.len())
@@ -61,6 +82,25 @@ fn trim_replay_cache_with_limits(
 
 fn trim_replay_cache(replay: &mut ReplayProtocolState) {
     trim_replay_cache_with_limits(replay, REPLAY_CACHE_LIMIT, REPLAY_CACHE_LIMIT_BYTES);
+}
+
+fn trim_replay_spent_with_limit(replay: &mut ReplayProtocolState, max_entries: usize) {
+    if max_entries == usize::MAX {
+        return;
+    }
+    while replay.spent.len() > max_entries {
+        let Some(oldest) = replay.spent_order.pop_front() else {
+            break;
+        };
+        replay.spent.remove(&oldest);
+    }
+}
+
+fn trim_replay_spent(replay: &mut ReplayProtocolState) {
+    // A spent command_id is the session-lifetime fallback authority once the
+    // cached response has been evicted. Dropping the tombstone would let the
+    // same command_id become Owner again and violate at-most-once execution.
+    trim_replay_spent_with_limit(replay, usize::MAX);
 }
 
 impl SessionState {
@@ -138,6 +178,7 @@ impl SessionState {
 
     /// Flush pending projections into the bounded history/workflow views.
     pub async fn drain_post_commit_projections(&self) {
+        let _drain_guard = PostCommitProjectionDrainGuard::new(self);
         loop {
             let _drain = self.post_commit_projection_drain.lock().await;
 
@@ -255,6 +296,8 @@ impl SessionState {
                         fingerprint: fingerprint.to_string(),
                     },
                 );
+                replay.spent_order.push_back(command_id.to_string());
+                trim_replay_spent(&mut replay);
             }
         }
     }
@@ -450,7 +493,7 @@ mod tests {
     use super::{
         PostCommitProjection, PostCommitProjectionQueue, ReplayCacheEntry, ReplayProtocolState,
         ReplaySpentEntry, trim_post_commit_projection_queue_with_limits,
-        trim_replay_cache_with_limits,
+        trim_replay_cache_with_limits, trim_replay_spent_with_limit,
     };
     use crate::workflow_capture::WorkflowCaptureDeliveryState;
     use rub_ipc::protocol::{IpcRequest, IpcResponse};
@@ -494,6 +537,7 @@ mod tests {
             order: VecDeque::new(),
             in_flight: HashMap::new(),
             spent: HashMap::new(),
+            spent_order: VecDeque::new(),
             total_bytes: 0,
         };
         replay.cache.insert(
@@ -538,6 +582,7 @@ mod tests {
                     fingerprint: "fp-1".to_string(),
                 },
             )]),
+            spent_order: VecDeque::from(["cmd-1".to_string()]),
             total_bytes: 0,
         };
         replay.cache.insert(
@@ -565,5 +610,50 @@ mod tests {
 
         assert!(replay.spent.contains_key("cmd-1"));
         assert!(!replay.cache.contains_key("cmd-1"));
+    }
+
+    #[test]
+    fn replay_spent_budget_evicts_oldest_spent_authority() {
+        let mut replay = ReplayProtocolState {
+            cache: HashMap::new(),
+            order: VecDeque::new(),
+            in_flight: HashMap::new(),
+            spent: HashMap::from([
+                (
+                    "cmd-1".to_string(),
+                    ReplaySpentEntry {
+                        fingerprint: "fp-1".to_string(),
+                    },
+                ),
+                (
+                    "cmd-2".to_string(),
+                    ReplaySpentEntry {
+                        fingerprint: "fp-2".to_string(),
+                    },
+                ),
+                (
+                    "cmd-3".to_string(),
+                    ReplaySpentEntry {
+                        fingerprint: "fp-3".to_string(),
+                    },
+                ),
+            ]),
+            spent_order: VecDeque::from([
+                "cmd-1".to_string(),
+                "cmd-2".to_string(),
+                "cmd-3".to_string(),
+            ]),
+            total_bytes: 0,
+        };
+
+        trim_replay_spent_with_limit(&mut replay, 2);
+
+        assert!(!replay.spent.contains_key("cmd-1"));
+        assert!(replay.spent.contains_key("cmd-2"));
+        assert!(replay.spent.contains_key("cmd-3"));
+        assert_eq!(
+            replay.spent_order,
+            VecDeque::from(["cmd-2".to_string(), "cmd-3".to_string()])
+        );
     }
 }

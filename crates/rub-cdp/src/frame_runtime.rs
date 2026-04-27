@@ -14,7 +14,7 @@ const SAME_ORIGIN_ACCESS_JS: &str = r#"
 (() => {
     try {
         let current = window;
-        while (current !== current.top) {
+        while (current !== current.parent) {
             void current.parent.document;
             current = current.parent;
         }
@@ -23,6 +23,13 @@ const SAME_ORIGIN_ACCESS_JS: &str = r#"
         return false;
     }
 })()
+"#;
+
+const FRAME_DOCUMENT_FENCE_JS: &str = r#"
+JSON.stringify({
+    href: String(window.location.href || ''),
+    time_origin: Number.isFinite(window.performance?.timeOrigin) ? window.performance.timeOrigin : null,
+})
 "#;
 
 thread_local! {
@@ -49,6 +56,13 @@ pub(crate) struct ResolvedFrameContext {
     pub frame: FrameContextInfo,
     pub lineage: Vec<String>,
     pub execution_context_id: Option<ExecutionContextId>,
+    pub frame_scoped: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct FrameDocumentFence {
+    pub(crate) href: String,
+    pub(crate) time_origin: Option<f64>,
 }
 
 pub async fn capture_frame_runtime(page: &Arc<Page>) -> Result<FrameRuntimeInfo, RubError> {
@@ -91,21 +105,11 @@ pub(crate) async fn resolve_frame_context(
                 ErrorCode::InvalidInput,
                 format!("Frame '{frame_id}' is not present in the current frame inventory"),
                 serde_json::json!({
+                    "reason": "frame_inventory_missing",
                     "frame_id": frame_id,
                 }),
             )
         })?;
-
-    if !selected.is_primary && !matches!(selected.frame.same_origin_accessible, Some(true)) {
-        return Err(RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            format!("Frame '{frame_id}' is not same-origin accessible for frame-scoped snapshot"),
-            serde_json::json!({
-                "frame_id": frame_id,
-                "same_origin_accessible": selected.frame.same_origin_accessible,
-            }),
-        ));
-    }
 
     let execution_context_id = if selected.is_primary {
         None
@@ -121,6 +125,7 @@ pub(crate) async fn resolve_frame_context(
                         ErrorCode::InvalidInput,
                         format!("Frame '{frame_id}' has no live execution context"),
                         serde_json::json!({
+                            "reason": "frame_execution_context_missing",
                             "frame_id": frame_id,
                         }),
                     )
@@ -128,10 +133,17 @@ pub(crate) async fn resolve_frame_context(
         )
     };
 
+    let document_fence = probe_frame_document_fence(page, execution_context_id).await?;
+    let mut frame = selected.frame.clone();
+    if !document_fence.href.is_empty() {
+        frame.url = Some(document_fence.href);
+    }
+
     Ok(ResolvedFrameContext {
-        frame: selected.frame.clone(),
+        frame,
         lineage: build_lineage(frame_id, &inventory),
         execution_context_id,
+        frame_scoped: !selected.is_primary,
     })
 }
 
@@ -143,6 +155,8 @@ async fn resolve_primary_frame_context(page: &Arc<Page>) -> Result<ResolvedFrame
         .ok_or_else(|| RubError::Internal("Main frame is unavailable".to_string()))?;
     let main_frame_key = main_frame.as_ref().to_string();
 
+    let document_fence = probe_frame_document_fence(page, None).await?;
+
     Ok(ResolvedFrameContext {
         frame: FrameContextInfo {
             frame_id: main_frame_key.clone(),
@@ -152,16 +166,64 @@ async fn resolve_primary_frame_context(page: &Arc<Page>) -> Result<ResolvedFrame
                 .map_err(|error| RubError::Internal(format!("Read frame name failed: {error}")))?,
             parent_frame_id: None,
             target_id: Some(page.target_id().as_ref().to_string()),
-            url: page
-                .frame_url(main_frame)
-                .await
-                .map_err(|error| RubError::Internal(format!("Read frame URL failed: {error}")))?,
+            url: Some(document_fence.href),
             depth: 0,
             same_origin_accessible: Some(true),
         },
         lineage: vec![main_frame_key],
         execution_context_id: None,
+        frame_scoped: false,
     })
+}
+
+pub(crate) async fn probe_frame_document_fence(
+    page: &Arc<Page>,
+    context_id: Option<ExecutionContextId>,
+) -> Result<FrameDocumentFence, RubError> {
+    let payload =
+        crate::js::evaluate_returning_string_in_context(page, context_id, FRAME_DOCUMENT_FENCE_JS)
+            .await?;
+    let fence: FrameDocumentFence = serde_json::from_str(&payload).map_err(|error| {
+        RubError::domain_with_context(
+            ErrorCode::InvalidInput,
+            format!("Frame document fence probe returned malformed payload: {error}"),
+            serde_json::json!({
+                "reason": "frame_document_fence_malformed",
+            }),
+        )
+    })?;
+    if fence.href.is_empty() || fence.time_origin.is_none() {
+        return Err(RubError::domain_with_context(
+            ErrorCode::InvalidInput,
+            "Frame document fence is unavailable for the selected frame",
+            serde_json::json!({
+                "reason": "frame_document_fence_unavailable",
+            }),
+        ));
+    }
+    Ok(fence)
+}
+
+pub(crate) fn ensure_same_frame_document(
+    before: &FrameDocumentFence,
+    after: &FrameDocumentFence,
+    frame_id: &str,
+    phase: &str,
+) -> Result<(), RubError> {
+    if before == after {
+        return Ok(());
+    }
+    Err(RubError::domain_with_context(
+        ErrorCode::InvalidInput,
+        format!("Frame '{frame_id}' navigated while {phase} was reading document state"),
+        serde_json::json!({
+            "reason": "frame_document_changed_during_projection",
+            "frame_id": frame_id,
+            "phase": phase,
+            "before": before,
+            "after": after,
+        }),
+    ))
 }
 
 async fn collect_frame_inventory(page: &Arc<Page>) -> Result<Vec<FrameInventoryEntry>, RubError> {
@@ -239,8 +301,8 @@ async fn collect_frame_inventory(page: &Arc<Page>) -> Result<Vec<FrameInventoryE
                 &mut depth_cache,
             );
             frame.depth = depth;
+            frame.target_id = Some(page.target_id().as_ref().to_string());
             if depth == 0 {
-                frame.target_id = Some(page.target_id().as_ref().to_string());
                 frame.same_origin_accessible = Some(true);
             }
             frame
@@ -290,15 +352,29 @@ async fn probe_same_origin_accessibility(
         .context_id(context_id)
         .build()
         .map_err(|error| RubError::Internal(format!("Build evaluate params failed: {error}")))?;
-    let response = page
-        .execute(params)
-        .await
-        .map_err(|error| RubError::Internal(format!("Same-origin probe failed: {error}")))?;
+    let response = match page.execute(params).await {
+        Ok(response) => response,
+        Err(error) => {
+            let message = error.to_string();
+            if same_origin_probe_context_churn(&message) {
+                return Ok(None);
+            }
+            return Err(RubError::Internal(format!(
+                "Same-origin probe failed: {error}"
+            )));
+        }
+    };
     Ok(response
         .result
         .result
         .value
         .and_then(|value| value.as_bool()))
+}
+
+fn same_origin_probe_context_churn(message: &str) -> bool {
+    message.contains("Cannot find context with specified id")
+        || message.contains("Execution context was destroyed")
+        || message.contains("Inspected target navigated or closed")
 }
 
 fn build_ordered_frame_inventory(main_frame: FrameId, frames: Vec<FrameId>) -> Vec<FrameId> {
@@ -530,5 +606,34 @@ mod tests {
                 same_origin_probe_requests: 0,
             }
         );
+    }
+
+    #[test]
+    fn same_origin_probe_requires_parent_chain_access_for_top_hit_test_authority() {
+        assert!(
+            super::SAME_ORIGIN_ACCESS_JS.contains("current.parent"),
+            "frame same-origin projection must prove parent-chain access for top-level hit-test authority"
+        );
+        assert!(
+            super::SAME_ORIGIN_ACCESS_JS.contains("current !== current.parent"),
+            "primary frame should remain the only zero-parent fast path"
+        );
+        assert!(
+            super::SAME_ORIGIN_ACCESS_JS.contains("document"),
+            "same-origin projection must actually touch parent document authority"
+        );
+    }
+
+    #[test]
+    fn same_origin_probe_context_churn_is_not_authoritative_failure() {
+        assert!(super::same_origin_probe_context_churn(
+            "Error -32000: Cannot find context with specified id"
+        ));
+        assert!(super::same_origin_probe_context_churn(
+            "Execution context was destroyed"
+        ));
+        assert!(!super::same_origin_probe_context_churn(
+            "Protocol error: permission denied"
+        ));
     }
 }

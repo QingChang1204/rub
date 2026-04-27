@@ -41,6 +41,7 @@ fn cli(home: &Path) -> EffectiveCli {
         cdp_url: None,
         connect: false,
         profile: None,
+        profile_resolved_path: None,
         use_alias: Some("finance".to_string()),
         no_stealth: false,
         humanize: false,
@@ -249,6 +250,40 @@ fn remembered_alias_live_match_clears_default_user_data_dir_from_reuse_path() {
     assert!(resolved.cli.user_data_dir.is_none());
     assert!(resolved.cli.requested_launch_policy.user_data_dir.is_none());
     assert!(resolved.cli.effective_launch_policy.user_data_dir.is_none());
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn remembered_alias_live_registry_authority_failure_is_not_republished_as_alias_invalid_input() {
+    let home = temp_home();
+    std::fs::create_dir_all(&home).unwrap();
+    write_binding(&home, BindingPersistencePolicy::RubHomeLocalDurable);
+    std::fs::write(
+        RubPaths::new(&home).registry_path(),
+        "{ this is not valid registry json",
+    )
+    .unwrap();
+
+    let error = resolve_command_execution_binding(&cli(&home))
+        .expect_err("live registry authority failure must fail closed");
+    let envelope = error.into_envelope();
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|context| context.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("remembered_alias_live_registry_authority_unavailable")
+    );
+    assert!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|context| context.get("live_registry_error"))
+            .is_some(),
+        "machine-visible live registry authority details must be preserved"
+    );
 
     let _ = std::fs::remove_dir_all(home);
 }

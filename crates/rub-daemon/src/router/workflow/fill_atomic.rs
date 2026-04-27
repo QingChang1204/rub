@@ -11,7 +11,10 @@ use crate::router::addressing::{load_snapshot, resolve_element};
 use crate::router::automation_fence::ensure_committed_automation_result;
 use crate::router::dispatch::execute_named_command_with_fence;
 use crate::router::request_args::{LocatorParseOptions, parse_canonical_locator};
+use crate::router::timeout_projection::record_mutating_possible_commit_timeout_projection;
 use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
+
+const ATOMIC_FILL_ROLLBACK_RESERVE_MS_PER_STEP: u64 = 1_000;
 
 #[derive(Debug, Clone)]
 struct AtomicFillPlannedStep {
@@ -81,15 +84,53 @@ pub(super) async fn execute_atomic_fill(
             parsed_args._orchestration.as_ref(),
             inheritance_policy,
         );
-        match execute_named_command_with_fence(
-            router,
-            planned.forward_command,
-            &forward_args,
-            deadline,
-            state,
-        )
-        .await
-        {
+        record_atomic_fill_possible_commit_timeout_projection(planned, &committed_indices);
+        let rollback_target_count = committed_indices.len().saturating_add(1);
+        let forward_result: Result<serde_json::Value, (RubError, Option<usize>)> =
+            match atomic_fill_step_timeout(deadline, rollback_target_count) {
+                Some(timeout) => {
+                    match tokio::time::timeout(
+                        timeout,
+                        execute_named_command_with_fence(
+                            router,
+                            planned.forward_command,
+                            &forward_args,
+                            deadline,
+                            state,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(result) => result.map_err(|error| (error, Some(index))),
+                        Err(_) => Err((
+                            RubError::domain_with_context(
+                                ErrorCode::IpcTimeout,
+                                "fill --atomic step exhausted its rollback fence budget after possible commit",
+                                serde_json::json!({
+                                    "reason": "fill_atomic_step_possible_commit_timeout",
+                                    "step_index": index,
+                                    "command": planned.forward_command,
+                                    "rollback_required": true,
+                                }),
+                            ),
+                            Some(index),
+                        )),
+                    }
+                }
+                None => Err((
+                    RubError::domain_with_context(
+                        ErrorCode::IpcTimeout,
+                        "fill --atomic exhausted its timeout budget before starting a rollback-safe step",
+                        serde_json::json!({
+                            "reason": "fill_atomic_step_timeout_budget_exhausted",
+                            "step_index": index,
+                            "command": planned.forward_command,
+                        }),
+                    ),
+                    None,
+                )),
+            };
+        match forward_result {
             Ok(data) => {
                 if let Err(error) =
                     ensure_committed_automation_result(planned.forward_command, Some(&data))
@@ -115,12 +156,12 @@ pub(super) async fn execute_atomic_fill(
                     atomic_step_projection(planned, "committed", Some(data), None);
                 committed_indices.push(index);
             }
-            Err(error) => {
+            Err((error, failing_step_index)) => {
                 let rollback = rollback_atomic_fill_steps(
                     &rollback_ctx,
                     &plan.steps,
                     &committed_indices,
-                    Some(index),
+                    failing_step_index,
                     &mut step_results,
                 )
                 .await;
@@ -151,6 +192,35 @@ pub(super) async fn execute_atomic_fill(
         },
         "steps": step_results,
     }))
+}
+
+fn atomic_fill_step_timeout(
+    deadline: TransactionDeadline,
+    rollback_target_count: usize,
+) -> Option<std::time::Duration> {
+    let remaining = deadline.remaining_duration()?;
+    let rollback_reserve_ms = (rollback_target_count.max(1) as u64)
+        .saturating_mul(ATOMIC_FILL_ROLLBACK_RESERVE_MS_PER_STEP);
+    remaining
+        .checked_sub(std::time::Duration::from_millis(rollback_reserve_ms))
+        .filter(|timeout| !timeout.is_zero())
+}
+
+fn record_atomic_fill_possible_commit_timeout_projection(
+    planned: &AtomicFillPlannedStep,
+    committed_indices: &[usize],
+) {
+    record_mutating_possible_commit_timeout_projection(
+        planned.forward_command,
+        serde_json::json!({
+            "kind": "fill_atomic_possible_commit",
+            "step_index": planned.step_index,
+            "committed_step_indices": committed_indices,
+            "rollback_required": true,
+            "rollback_command": planned.rollback_command,
+            "rollback_class": planned.rollback_class,
+        }),
+    );
 }
 
 async fn preflight_atomic_fill_plan(
@@ -313,17 +383,11 @@ async fn rollback_atomic_fill_steps(
     failing_step_index: Option<usize>,
     step_results: &mut [serde_json::Value],
 ) -> Result<(), Vec<String>> {
-    let mut rollback_targets: Vec<usize> = committed_indices.to_vec();
-    if let Some(failing_index) = failing_step_index
-        && !rollback_targets.contains(&failing_index)
-    {
-        rollback_targets.push(failing_index);
-    }
-    rollback_targets.sort_unstable();
-    rollback_targets.reverse();
+    let rollback_targets = atomic_fill_rollback_targets(committed_indices, failing_step_index);
 
     let mut errors = Vec::new();
-    for step_index in rollback_targets {
+    let rollback_target_count = rollback_targets.len();
+    for (position, step_index) in rollback_targets.into_iter().enumerate() {
         let planned = &plan_steps[step_index];
         let mut rollback_args = planned.rollback_args.clone();
         inherit_orchestration_metadata(
@@ -331,16 +395,50 @@ async fn rollback_atomic_fill_steps(
             ctx.orchestration,
             ctx.inheritance_policy,
         );
-        match execute_named_command_with_fence(
-            ctx.router,
-            planned.rollback_command,
-            &rollback_args,
-            ctx.deadline,
-            ctx.state,
+        let remaining_targets = rollback_target_count.saturating_sub(position);
+        let Some(rollback_timeout) =
+            atomic_fill_rollback_step_timeout(ctx.deadline, remaining_targets)
+        else {
+            let envelope = atomic_fill_rollback_timeout_error(
+                planned,
+                step_index,
+                "fill_atomic_rollback_budget_exhausted",
+            );
+            step_results[step_index] =
+                atomic_step_projection(planned, "rollback_failed", None, Some(&envelope));
+            errors.push(format!(
+                "step {} rollback budget exhausted before execution",
+                step_index
+            ));
+            continue;
+        };
+        let rollback_deadline = TransactionDeadline::new(duration_ms_u64(rollback_timeout));
+        let rollback_result = tokio::time::timeout(
+            rollback_timeout,
+            execute_named_command_with_fence(
+                ctx.router,
+                planned.rollback_command,
+                &rollback_args,
+                rollback_deadline,
+                ctx.state,
+            ),
         )
-        .await
-        {
-            Ok(data) => {
+        .await;
+        match rollback_result {
+            Err(_) => {
+                let envelope = atomic_fill_rollback_timeout_error(
+                    planned,
+                    step_index,
+                    "fill_atomic_rollback_step_timeout",
+                );
+                step_results[step_index] =
+                    atomic_step_projection(planned, "rollback_failed", None, Some(&envelope));
+                errors.push(format!(
+                    "step {} rollback timed out after its rollback fence budget",
+                    step_index
+                ));
+            }
+            Ok(Ok(data)) => {
                 if let Err(error) =
                     ensure_committed_automation_result(planned.rollback_command, Some(&data))
                 {
@@ -356,7 +454,7 @@ async fn rollback_atomic_fill_steps(
                         atomic_step_projection(planned, "rolled_back", Some(data), None);
                 }
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 let envelope = error.into_envelope();
                 step_results[step_index] =
                     atomic_step_projection(planned, "rollback_failed", None, Some(&envelope));
@@ -373,6 +471,56 @@ async fn rollback_atomic_fill_steps(
     } else {
         Err(errors)
     }
+}
+
+fn atomic_fill_rollback_targets(
+    committed_indices: &[usize],
+    failing_step_index: Option<usize>,
+) -> Vec<usize> {
+    let mut rollback_targets: Vec<usize> = committed_indices.to_vec();
+    if let Some(failing_index) = failing_step_index
+        && !rollback_targets.contains(&failing_index)
+    {
+        rollback_targets.push(failing_index);
+    }
+    rollback_targets.sort_unstable();
+    rollback_targets.reverse();
+    rollback_targets
+}
+
+fn atomic_fill_rollback_step_timeout(
+    deadline: TransactionDeadline,
+    remaining_targets: usize,
+) -> Option<std::time::Duration> {
+    if remaining_targets == 0 {
+        return None;
+    }
+    let remaining = deadline.remaining_duration()?;
+    let fair_share = remaining / remaining_targets as u32;
+    let per_target_cap = std::time::Duration::from_millis(ATOMIC_FILL_ROLLBACK_RESERVE_MS_PER_STEP);
+    Some(fair_share.min(per_target_cap)).filter(|timeout| !timeout.is_zero())
+}
+
+fn duration_ms_u64(duration: std::time::Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX).max(1)
+}
+
+fn atomic_fill_rollback_timeout_error(
+    planned: &AtomicFillPlannedStep,
+    step_index: usize,
+    reason: &'static str,
+) -> ErrorEnvelope {
+    let mut envelope = ErrorEnvelope::new(
+        ErrorCode::IpcTimeout,
+        "fill --atomic rollback exhausted its per-step rollback fence budget",
+    );
+    envelope.context = Some(serde_json::json!({
+        "reason": reason,
+        "step_index": step_index,
+        "command": planned.rollback_command,
+        "rollback_required": true,
+    }));
+    envelope
 }
 
 fn atomic_step_projection(
@@ -460,4 +608,67 @@ fn atomic_plan_requires_a11y(steps: &[FillStepSpec], submit: &SubmitLocatorArgs)
         .flatten()
         .map(|locator| locator.requires_a11y_snapshot())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_fill_step_timeout_reserves_rollback_budget_per_target() {
+        let single = atomic_fill_step_timeout(TransactionDeadline::new(2_500), 1)
+            .expect("single rollback target should leave forward budget");
+        assert!(
+            single.as_millis() <= 1_500,
+            "forward timeout must reserve one rollback budget"
+        );
+
+        let two = atomic_fill_step_timeout(TransactionDeadline::new(3_500), 2)
+            .expect("two rollback targets should leave forward budget");
+        assert!(
+            two.as_millis() <= 1_500,
+            "forward timeout must reserve committed plus possible rollback budgets"
+        );
+
+        assert!(
+            atomic_fill_step_timeout(TransactionDeadline::new(2_000), 2).is_none(),
+            "forward step must not start when it would consume the rollback reserve"
+        );
+    }
+
+    #[test]
+    fn atomic_fill_rollback_step_timeout_slices_budget_across_remaining_targets() {
+        let first = atomic_fill_rollback_step_timeout(TransactionDeadline::new(2_500), 2)
+            .expect("first rollback target should receive a step budget");
+        assert!(
+            first.as_millis() <= ATOMIC_FILL_ROLLBACK_RESERVE_MS_PER_STEP as u128,
+            "rollback target must not consume more than its per-step reserve"
+        );
+
+        let constrained = atomic_fill_rollback_step_timeout(TransactionDeadline::new(1_500), 2)
+            .expect("rollback should still slice constrained remaining budget");
+        assert!(
+            constrained.as_millis() <= 750,
+            "first rollback must leave budget for the remaining target"
+        );
+
+        assert!(
+            atomic_fill_rollback_step_timeout(TransactionDeadline::new(0), 2).is_none(),
+            "rollback must fail closed when no per-step budget remains"
+        );
+    }
+
+    #[test]
+    fn atomic_fill_rollback_targets_exclude_not_started_current_step() {
+        assert_eq!(
+            atomic_fill_rollback_targets(&[0, 1], None),
+            vec![1, 0],
+            "budget-exhausted-before-start must only rollback committed steps"
+        );
+        assert_eq!(
+            atomic_fill_rollback_targets(&[0, 1], Some(2)),
+            vec![2, 1, 0],
+            "possible-commit current step remains a rollback target"
+        );
+    }
 }

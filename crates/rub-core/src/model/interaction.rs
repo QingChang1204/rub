@@ -98,6 +98,47 @@ pub enum InteractionConfirmationKind {
     DialogOpened,
 }
 
+pub fn projected_interaction_confirmation_status(
+    data: Option<&serde_json::Value>,
+) -> Option<InteractionConfirmationStatus> {
+    let interaction = data
+        .and_then(|value| value.get("interaction"))
+        .and_then(|value| value.as_object())?;
+    serde_json::from_value(interaction.get("confirmation_status")?.clone()).ok()
+}
+
+pub fn projected_interaction_present(data: Option<&serde_json::Value>) -> bool {
+    data.and_then(|value| value.get("interaction"))
+        .and_then(|value| value.as_object())
+        .is_some()
+}
+
+pub fn projected_interaction_effect_success(
+    attempt_success: bool,
+    data: Option<&serde_json::Value>,
+) -> bool {
+    if !attempt_success {
+        return false;
+    }
+
+    if !projected_interaction_present(data) {
+        return true;
+    }
+
+    match projected_interaction_confirmation_status(data) {
+        Some(InteractionConfirmationStatus::Confirmed) => true,
+        Some(_) => projected_wait_after_fallback_matched(data),
+        None => false,
+    }
+}
+
+pub fn projected_wait_after_fallback_matched(data: Option<&serde_json::Value>) -> bool {
+    data.and_then(|value| value.get("wait_after"))
+        .and_then(|value| value.get("matched"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 /// Structured confirmation payload published for an interaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InteractionConfirmation {
@@ -152,6 +193,9 @@ pub struct Element {
     /// Survives re-renders if the underlying DOM node persists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub element_ref: Option<String>,
+    /// Stable tab/target authority the element was captured from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
     /// For visibility checks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounding_box: Option<BoundingBox>,
@@ -193,6 +237,25 @@ pub struct TabInfo {
     pub title: String,
     /// Whether this is the currently active tab.
     pub active: bool,
+    /// Which authority proved the current active tab projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_authority: Option<TabActiveAuthority>,
+    /// Whether URL/title projection degraded while tab identity remained available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TabActiveAuthority {
+    BrowserTruth,
+    LocalFallback,
+}
+
+impl TabInfo {
+    pub fn page_identity_authoritative(&self) -> bool {
+        self.degraded_reason.is_none()
+    }
 }
 
 /// Keyboard modifier keys.
@@ -318,10 +381,11 @@ pub enum WaitState {
     Hidden,
     Attached,
     Detached,
-    /// DOM-level interactable: visible and not disabled/readonly on writable controls.
+    /// Runtime interactable: visible, writable controls are not disabled/readonly,
+    /// and the target can prove top-level hit-test geometry authority.
     ///
-    /// This deliberately excludes live hit-test/overlay authority. Commands that need
-    /// topmost/hittable confirmation must use stronger runtime surfaces.
+    /// If the active browser/frame cannot establish that geometry authority,
+    /// implementations must fail closed instead of returning a DOM-only guess.
     Interactable,
 }
 
@@ -414,4 +478,40 @@ pub struct HistoryNavigationResult {
     pub page: Page,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at_boundary: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::projected_interaction_effect_success;
+
+    #[test]
+    fn interaction_effect_success_requires_confirmation_when_interaction_surface_exists() {
+        assert!(projected_interaction_effect_success(
+            true,
+            Some(&serde_json::json!({"result": "ok"})),
+        ));
+        assert!(!projected_interaction_effect_success(
+            true,
+            Some(&serde_json::json!({"interaction": {}})),
+        ));
+        assert!(projected_interaction_effect_success(
+            true,
+            Some(&serde_json::json!({
+                "interaction": {"confirmation_status": "confirmed"}
+            })),
+        ));
+        assert!(!projected_interaction_effect_success(
+            true,
+            Some(&serde_json::json!({
+                "interaction": {"confirmation_status": "degraded"}
+            })),
+        ));
+        assert!(projected_interaction_effect_success(
+            true,
+            Some(&serde_json::json!({
+                "interaction": {"confirmation_status": "degraded"},
+                "wait_after": {"matched": true, "text": "Saved"}
+            })),
+        ));
+    }
 }

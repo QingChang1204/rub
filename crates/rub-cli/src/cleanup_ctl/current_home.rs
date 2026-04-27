@@ -1,6 +1,7 @@
 use super::CleanupResult;
 use super::projection::{CleanupPathContext, cleanup_path_error};
 use super::upgrade_probe::fetch_upgrade_status_for_session_with_deadline;
+use crate::daemon_ctl::compatibility_degraded_owned_from_snapshot;
 use std::path::Path;
 use std::time::Instant;
 
@@ -34,6 +35,14 @@ pub(super) async fn cleanup_current_home_stale(
 
     for session in snapshot.sessions {
         for entry_snapshot in session.entries {
+            if let Some(compatibility_degraded_owned) =
+                compatibility_degraded_owned_from_snapshot(&entry_snapshot)
+            {
+                result
+                    .compatibility_degraded_owned_sessions
+                    .push(compatibility_degraded_owned);
+                continue;
+            }
             let pending_startup = entry_snapshot.is_pending_startup();
             let live_authority = entry_snapshot.is_live_authority();
             let entry = entry_snapshot.entry;

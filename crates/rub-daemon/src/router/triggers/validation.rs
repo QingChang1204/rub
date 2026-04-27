@@ -1,5 +1,8 @@
 use crate::trigger_workflow_bridge::validate_trigger_workflow_bindings;
 use crate::workflow_assets::normalize_workflow_name;
+use crate::workflow_policy::{
+    trigger_workflow_allowed_step_descriptions, trigger_workflow_request_allowed,
+};
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::locator::CanonicalLocator;
 use rub_core::model::{
@@ -20,9 +23,11 @@ pub(crate) fn validate_trigger_condition(
 ) -> Result<(), RubError> {
     match condition.kind {
         TriggerConditionKind::TextPresent => {
+            reject_irrelevant_trigger_condition_fields(condition, &["text"], "text_present")?;
             require_non_empty(condition.text.as_deref(), "condition.text")?;
         }
         TriggerConditionKind::LocatorPresent => {
+            reject_irrelevant_trigger_condition_fields(condition, &["locator"], "locator_present")?;
             let locator = condition.locator.as_ref().ok_or_else(|| {
                 RubError::domain(
                     ErrorCode::InvalidInput,
@@ -40,18 +45,34 @@ pub(crate) fn validate_trigger_condition(
             }
         }
         TriggerConditionKind::UrlMatch => {
+            reject_irrelevant_trigger_condition_fields(condition, &["url_pattern"], "url_match")?;
             require_non_empty(condition.url_pattern.as_deref(), "condition.url_pattern")?;
         }
         TriggerConditionKind::Readiness => {
+            reject_irrelevant_trigger_condition_fields(
+                condition,
+                &["readiness_state"],
+                "readiness",
+            )?;
             require_non_empty(
                 condition.readiness_state.as_deref(),
                 "condition.readiness_state",
             )?;
         }
         TriggerConditionKind::NetworkRequest => {
+            reject_irrelevant_trigger_condition_fields(
+                condition,
+                &["url_pattern", "method", "status_code"],
+                "network_request",
+            )?;
             require_non_empty(condition.url_pattern.as_deref(), "condition.url_pattern")?;
         }
         TriggerConditionKind::StorageValue => {
+            reject_irrelevant_trigger_condition_fields(
+                condition,
+                &["storage_area", "key", "value"],
+                "storage_value",
+            )?;
             require_non_empty(condition.key.as_deref(), "condition.key")?;
         }
     }
@@ -77,7 +98,7 @@ fn validate_browser_command_trigger_action(action: &mut TriggerActionSpec) -> Re
         return Err(RubError::domain(
             ErrorCode::InvalidInput,
             format!(
-                "trigger browser_command '{command}' is not supported in V1; use one of: click, type, fill, open, reload, exec"
+                "trigger browser_command '{command}' is not supported in V1; use one of: click, type, fill, open, reload"
             ),
         ));
     }
@@ -147,6 +168,7 @@ fn validate_workflow_trigger_action(action: &mut TriggerActionSpec) -> Result<()
         validate_workflow_vars(vars)?;
     }
     validate_trigger_workflow_bindings(object)?;
+    validate_inline_trigger_workflow_steps(object)?;
 
     match (has_name, has_steps) {
         (true, false) => {
@@ -184,6 +206,38 @@ fn validate_workflow_trigger_action(action: &mut TriggerActionSpec) -> Result<()
             "trigger workflow payload requires non-empty payload.workflow_name or payload.steps",
         )),
     }
+}
+
+fn validate_inline_trigger_workflow_steps(
+    payload: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), RubError> {
+    let Some(steps) = payload.get("steps").and_then(|value| value.as_array()) else {
+        return Ok(());
+    };
+    for (index, step) in steps.iter().enumerate() {
+        let Some(command) = step
+            .get("command")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let args = step.get("args").unwrap_or(&serde_json::Value::Null);
+        if !trigger_workflow_request_allowed(command, args) {
+            return Err(RubError::domain_with_context(
+                ErrorCode::InvalidInput,
+                format!("trigger workflow step command '{command}' is not supported"),
+                serde_json::json!({
+                    "reason": "trigger_workflow_step_not_supported",
+                    "step_index": index,
+                    "command": command,
+                    "allowed_commands": trigger_workflow_allowed_step_descriptions(),
+                }),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_workflow_vars(vars: &serde_json::Value) -> Result<(), RubError> {
@@ -238,10 +292,7 @@ fn reject_reserved_trigger_metadata_keys(
 }
 
 fn browser_trigger_command_allowed(command: &str) -> bool {
-    matches!(
-        command,
-        "click" | "type" | "fill" | "open" | "reload" | "exec"
-    )
+    matches!(command, "click" | "type" | "fill" | "open" | "reload")
 }
 
 fn require_non_empty<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str, RubError> {
@@ -268,4 +319,101 @@ fn normalize_optional_key(key: &mut Option<String>, field: &str) -> Result<(), R
         *value = trimmed.to_string();
     }
     Ok(())
+}
+
+fn reject_irrelevant_trigger_condition_fields(
+    condition: &rub_core::model::TriggerConditionSpec,
+    allowed_fields: &[&str],
+    kind_name: &str,
+) -> Result<(), RubError> {
+    for (field, present) in [
+        ("locator", condition.locator.is_some()),
+        ("text", condition.text.is_some()),
+        ("url_pattern", condition.url_pattern.is_some()),
+        ("readiness_state", condition.readiness_state.is_some()),
+        ("method", condition.method.is_some()),
+        ("status_code", condition.status_code.is_some()),
+        ("storage_area", condition.storage_area.is_some()),
+        ("key", condition.key.is_some()),
+        ("value", condition.value.is_some()),
+    ] {
+        if present && !allowed_fields.contains(&field) {
+            return Err(RubError::domain(
+                ErrorCode::InvalidInput,
+                format!("trigger {kind_name} condition must not set condition.{field}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_trigger_condition;
+    use rub_core::model::{TriggerConditionKind, TriggerConditionSpec};
+    use rub_core::storage::StorageArea;
+
+    fn text_present_condition() -> TriggerConditionSpec {
+        TriggerConditionSpec {
+            kind: TriggerConditionKind::TextPresent,
+            locator: None,
+            text: Some("Ready".to_string()),
+            url_pattern: None,
+            readiness_state: None,
+            method: None,
+            status_code: None,
+            storage_area: None,
+            key: None,
+            value: None,
+        }
+    }
+
+    #[test]
+    fn trigger_condition_rejects_irrelevant_known_field_for_text_present() {
+        let mut condition = text_present_condition();
+        condition.url_pattern = Some("/ready".to_string());
+
+        let error = validate_trigger_condition(&condition)
+            .expect_err("kind-irrelevant known fields must fail closed");
+        assert!(error.to_string().contains("condition.url_pattern"));
+    }
+
+    #[test]
+    fn trigger_network_request_condition_accepts_method_and_status_code_filters() {
+        let condition = TriggerConditionSpec {
+            kind: TriggerConditionKind::NetworkRequest,
+            locator: None,
+            text: None,
+            url_pattern: Some("/api/reply".to_string()),
+            readiness_state: None,
+            method: Some("POST".to_string()),
+            status_code: Some(201),
+            storage_area: None,
+            key: None,
+            value: None,
+        };
+
+        validate_trigger_condition(&condition)
+            .expect("network request condition should accept method/status filters");
+    }
+
+    #[test]
+    fn trigger_storage_value_condition_rejects_irrelevant_url_pattern() {
+        let condition = TriggerConditionSpec {
+            kind: TriggerConditionKind::StorageValue,
+            locator: None,
+            text: None,
+            url_pattern: Some("/reply".to_string()),
+            readiness_state: None,
+            method: None,
+            status_code: None,
+            storage_area: Some(StorageArea::Local),
+            key: Some("reply_state".to_string()),
+            value: Some("done".to_string()),
+        };
+
+        let error = validate_trigger_condition(&condition)
+            .expect_err("storage_value must reject unrelated known fields");
+        assert!(error.to_string().contains("condition.url_pattern"));
+    }
 }

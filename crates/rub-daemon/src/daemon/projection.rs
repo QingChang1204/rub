@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::session::{
-    RegistryEntry, SessionState, cleanup_projections, deregister_session,
-    register_session_with_displaced, registry_entry_is_live_for_home,
+    RegistryEntry, SessionState, cleanup_projections, load_registry_for_home,
+    registry_entry_has_runtime_authority_for_home, registry_entry_is_live_for_home,
+    registry_entry_is_pending_startup_for_home, store_registry_for_home,
+    validate_registry_entry_for_home, with_registry_lock,
 };
 use rub_core::fs::{FileCommitOutcome, atomic_write_bytes, sync_parent_dir};
 
@@ -18,23 +20,64 @@ pub(super) fn signal_ready() -> std::io::Result<()> {
 pub(super) enum RestorePreviousAuthorityOutcome {
     Restored,
     SkippedNotLive,
+    SkippedSuperseded,
 }
 
 pub(super) fn restore_previous_authority_if_live(
     home: &Path,
+    failed_entry: &RegistryEntry,
     entry: &RegistryEntry,
 ) -> std::io::Result<RestorePreviousAuthorityOutcome> {
-    if !registry_entry_is_live_for_home(home, entry) {
-        let _ = deregister_session(home, &entry.session_id);
-        cleanup_projections(home, entry);
-        return Ok(RestorePreviousAuthorityOutcome::SkippedNotLive);
-    }
+    with_registry_lock(home, true, |path| {
+        let mut data = load_registry_for_home(home, path)?;
+        validate_registry_entry_for_home(home, entry)?;
 
-    let _ = register_session_with_displaced(home, entry.clone())?;
-    restore_socket_projection(home, entry)?;
-    restore_pid_projection(home, entry)?;
-    restore_startup_commit_marker(home, entry)?;
-    Ok(RestorePreviousAuthorityOutcome::Restored)
+        let superseded_by_other_candidate = data
+            .sessions
+            .iter()
+            .filter(|existing| existing.session_name == entry.session_name)
+            .filter(|existing| existing.session_id != failed_entry.session_id)
+            .filter(|existing| existing.session_id != entry.session_id)
+            .any(|candidate| {
+                registry_entry_is_live_for_home(home, candidate)
+                    || registry_entry_is_pending_startup_for_home(home, candidate)
+            });
+        if superseded_by_other_candidate {
+            return Ok(RestorePreviousAuthorityOutcome::SkippedSuperseded);
+        }
+
+        if !registry_entry_has_runtime_authority_for_home(home, entry) {
+            data.sessions
+                .retain(|existing| existing.session_id != entry.session_id);
+            store_registry_for_home(home, path, &data)?;
+            cleanup_projections(home, entry);
+            return Ok(RestorePreviousAuthorityOutcome::SkippedNotLive);
+        }
+
+        if !data
+            .sessions
+            .iter()
+            .any(|existing| existing.session_id == entry.session_id)
+        {
+            data.sessions.push(entry.clone());
+            store_registry_for_home(home, path, &data)?;
+        }
+
+        clear_startup_commit_marker_if_matches(home, &entry.session_name, &entry.session_id);
+        restore_socket_projection(home, entry)?;
+        restore_pid_projection(home, entry)?;
+        restore_startup_commit_marker(home, entry)?;
+
+        if !registry_entry_has_runtime_authority_for_home(home, entry) {
+            data.sessions
+                .retain(|existing| existing.session_id != entry.session_id);
+            store_registry_for_home(home, path, &data)?;
+            cleanup_projections(home, entry);
+            return Ok(RestorePreviousAuthorityOutcome::SkippedNotLive);
+        }
+
+        Ok(RestorePreviousAuthorityOutcome::Restored)
+    })
 }
 
 pub(super) fn startup_ready_marker_path() -> Option<PathBuf> {
@@ -78,6 +121,18 @@ fn restore_startup_commit_marker(home: &Path, entry: &RegistryEntry) -> std::io:
         0o600,
     )?;
     Ok(())
+}
+
+fn clear_startup_commit_marker_if_matches(home: &Path, session_name: &str, session_id: &str) {
+    let path = crate::rub_paths::RubPaths::new(home)
+        .session(session_name)
+        .startup_committed_path();
+    let matches_entry = std::fs::read_to_string(&path)
+        .ok()
+        .is_some_and(|current| current.trim() == session_id);
+    if matches_entry {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn restore_pid_projection(home: &Path, entry: &RegistryEntry) -> std::io::Result<()> {

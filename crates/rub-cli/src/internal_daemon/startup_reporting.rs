@@ -19,6 +19,7 @@ pub(super) async fn exit_startup_error_with_browser_cleanup(
         None
     };
     if cleanup_result.as_ref().is_some_and(|result| result.is_ok())
+        && !startup_error_requires_parent_cleanup_fallback(&envelope)
         && let Some(cleanup_path) = crate::daemon_ctl::startup_cleanup_signal_path()
     {
         let _ = crate::daemon_ctl::clear_startup_cleanup_proof(&cleanup_path);
@@ -30,6 +31,24 @@ pub(super) async fn exit_startup_error_with_browser_cleanup(
     };
 
     exit_startup_error(envelope);
+}
+
+fn startup_error_requires_parent_cleanup_fallback(envelope: &ErrorEnvelope) -> bool {
+    let Some(context) = envelope
+        .context
+        .as_ref()
+        .and_then(|value| value.as_object())
+    else {
+        return false;
+    };
+    context
+        .get("prelaunch_cleanup_succeeded")
+        .and_then(|value| value.as_bool())
+        == Some(false)
+        || context
+            .get("launch_cleanup_succeeded")
+            .and_then(|value| value.as_bool())
+            == Some(false)
 }
 
 pub(super) fn annotate_startup_error_with_browser_cleanup(
@@ -127,4 +146,30 @@ pub(super) fn rotate_logs(path: &Path, max_bytes: u64, retention: usize) -> std:
     let rotated = path.with_file_name("daemon.log.1");
     std::fs::rename(path, rotated)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::startup_error_requires_parent_cleanup_fallback;
+    use rub_core::error::{ErrorCode, ErrorEnvelope};
+
+    #[test]
+    fn startup_error_retains_parent_cleanup_proof_after_prelaunch_cleanup_failure() {
+        let envelope = ErrorEnvelope::new(ErrorCode::BrowserLaunchFailed, "launch failed")
+            .with_context(serde_json::json!({
+                "prelaunch_cleanup_succeeded": false,
+            }));
+
+        assert!(startup_error_requires_parent_cleanup_fallback(&envelope));
+    }
+
+    #[test]
+    fn startup_error_can_clear_parent_cleanup_proof_after_successful_local_cleanup() {
+        let envelope = ErrorEnvelope::new(ErrorCode::BrowserLaunchFailed, "launch failed")
+            .with_context(serde_json::json!({
+                "prelaunch_cleanup_succeeded": true,
+            }));
+
+        assert!(!startup_error_requires_parent_cleanup_fallback(&envelope));
+    }
 }

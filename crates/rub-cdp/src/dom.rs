@@ -22,6 +22,7 @@ use rub_core::model::{AXInfo, BoundingBox, Element, ElementTag, ScrollPosition, 
 use rub_core::port::DEFAULT_SNAPSHOT_LIMIT;
 
 pub use self::diff::diff_snapshots;
+pub(crate) use self::scripts::live_element_projection_fingerprint_function;
 pub use self::scripts::{CLEANUP_HIGHLIGHT_JS, highlight_overlay_js};
 
 /// Build a DOM snapshot from the current page state.
@@ -106,9 +107,19 @@ async fn build_snapshot_internal(
     frame_id: Option<&str>,
 ) -> Result<Snapshot, RubError> {
     let snapshot_id = Uuid::now_v7().to_string();
-    let frame_context = crate::frame_runtime::resolve_frame_context(page, frame_id).await?;
+    let mut frame_context = crate::frame_runtime::resolve_frame_context(page, frame_id).await?;
+    let document_before =
+        crate::frame_runtime::probe_frame_document_fence(page, frame_context.execution_context_id)
+            .await?;
+    bind_snapshot_frame_context_to_document_fence(&mut frame_context, &document_before);
 
     let url = frame_context.frame.url.clone().unwrap_or_default();
+    let js_traversal_root_backend_node_id =
+        crate::projection::capture_js_traversal_root_backend_node_id(
+            page,
+            frame_context.execution_context_id,
+        )
+        .await;
 
     let extract_script = scripts::extract_elements_script(include_listeners);
     let raw_elements = if include_listeners {
@@ -121,19 +132,31 @@ async fn build_snapshot_internal(
     } else {
         extract_raw_elements(page, &extract_script, frame_context.execution_context_id).await?
     };
+    let document_after =
+        crate::frame_runtime::probe_frame_document_fence(page, frame_context.execution_context_id)
+            .await?;
+    crate::frame_runtime::ensure_same_frame_document(
+        &document_before,
+        &document_after,
+        frame_context.frame.frame_id.as_str(),
+        "snapshot",
+    )?;
 
     let total_count = raw_elements.elements.len() as u32;
     let effective_limit = normalize_snapshot_limit(limit);
+    let projection_inputs = raw_elements
+        .elements
+        .iter()
+        .take(effective_limit)
+        .map(projection_element_input_from_raw)
+        .collect::<Vec<_>>();
 
     let projection_resolution = crate::projection::resolve_backend_refs_for_frame(
         page,
         frame_context.frame.frame_id.as_str(),
-        &raw_elements
-            .elements
-            .iter()
-            .map(|raw| raw.dom_index)
-            .collect::<Vec<_>>(),
+        &projection_inputs,
         raw_elements.traversal_count,
+        js_traversal_root_backend_node_id,
     )
     .await?;
 
@@ -144,7 +167,7 @@ async fn build_snapshot_internal(
         .enumerate()
         .take(effective_limit)
         .map(|(position, raw)| {
-            let element_ref = projection_resolution.refs.get(position).cloned().flatten();
+            let element_ref = projected_element_ref(&projection_resolution, position);
             let ax_info = element_ref
                 .as_ref()
                 .and_then(|key| crate::targeting::parse_backend_node_id(Some(key.as_str())))
@@ -156,6 +179,7 @@ async fn build_snapshot_internal(
                 text: raw.text,
                 attributes: raw.attributes,
                 element_ref,
+                target_id: frame_context.frame.target_id.clone(),
                 bounding_box: raw.bounding_box.map(|bb| BoundingBox {
                     x: bb.x,
                     y: bb.y,
@@ -208,11 +232,48 @@ async fn build_snapshot_internal(
     })
 }
 
+fn bind_snapshot_frame_context_to_document_fence(
+    frame_context: &mut crate::frame_runtime::ResolvedFrameContext,
+    document_fence: &crate::frame_runtime::FrameDocumentFence,
+) {
+    frame_context.frame.url = Some(document_fence.href.clone());
+}
+
+fn projected_element_ref(
+    projection_resolution: &crate::projection::ProjectionResolution,
+    position: usize,
+) -> Option<String> {
+    if !projection_resolution.projection.verified {
+        return None;
+    }
+
+    projection_resolution.refs.get(position).cloned().flatten()
+}
+
 fn normalize_snapshot_limit(limit: Option<u32>) -> usize {
     match limit {
         None => DEFAULT_SNAPSHOT_LIMIT as usize,
         Some(0) => usize::MAX,
         Some(value) => value as usize,
+    }
+}
+
+fn projection_element_input_from_raw(
+    raw: &RawElement,
+) -> crate::projection::ProjectionElementInput {
+    crate::projection::ProjectionElementInput {
+        index: raw.index,
+        dom_index: raw.dom_index,
+        depth: raw.depth,
+        tag: raw.tag.clone(),
+        text: raw.text.clone(),
+        attributes: raw.attributes.clone(),
+        bounding_box: raw.bounding_box.as_ref().map(|bb| BoundingBox {
+            x: bb.x,
+            y: bb.y,
+            width: bb.width,
+            height: bb.height,
+        }),
     }
 }
 

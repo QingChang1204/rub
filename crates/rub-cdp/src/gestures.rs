@@ -2,21 +2,13 @@ use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::input::MouseButton;
 use rub_core::InteractionOutcome;
 use rub_core::error::RubError;
-use rub_core::model::{
-    Element, ElementTag, InteractionActuation, InteractionConfirmation,
-    InteractionConfirmationKind, InteractionConfirmationStatus, InteractionSemanticClass,
-};
-use serde_json::json;
+use rub_core::model::{Element, ElementTag, InteractionActuation, InteractionSemanticClass};
 use std::sync::Arc;
-use tokio::time::{Duration, Instant};
-use tracing::info;
+use tokio::time::Duration;
 
-use crate::dialogs::{SharedDialogRuntime, pending_dialog_for_target};
+use crate::dialogs::SharedDialogRuntime;
 use crate::humanize::HumanizeConfig;
-
-const DIALOG_ACTUATION_TIMEOUT: Duration = Duration::from_millis(500);
-const DIALOG_ACTUATION_GRACE_PERIOD: Duration = Duration::from_millis(500);
-const DIALOG_ACTUATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+use crate::interaction::{ActuationFence, await_actuation_or_dialog};
 
 pub(crate) async fn click(
     page: &Arc<Page>,
@@ -61,7 +53,13 @@ pub(crate) async fn click(
             &expected_target_id,
         )
         .await?;
-        if let Some(confirmation) = dialog_confirmation(dialog_runtime, &expected_target_id).await {
+        if let Some(confirmation) = crate::interaction::dialog_confirmation(
+            dialog_runtime,
+            &expected_target_id,
+            &fence.dialog_baseline,
+        )
+        .await
+        {
             return Ok(InteractionOutcome {
                 semantic_class: click_semantic_class(element.tag),
                 element_verified: resolved.verified,
@@ -69,20 +67,22 @@ pub(crate) async fn click(
                 confirmation: Some(confirmation),
             });
         }
-        if matches!(fence, ActuationFence::DialogOpened) {
+        if matches!(fence.fence, ActuationFence::DialogOpened) {
             return Ok(InteractionOutcome {
                 semantic_class: click_semantic_class(element.tag),
                 element_verified: resolved.verified,
                 actuation: Some(InteractionActuation::Semantic),
-                confirmation: Some(unconfirmed_dialog_opening()),
+                confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
             });
         }
-        if matches!(fence, ActuationFence::Indeterminate) {
+        if matches!(fence.fence, ActuationFence::Indeterminate) {
             return Ok(InteractionOutcome {
                 semantic_class: click_semantic_class(element.tag),
                 element_verified: resolved.verified,
                 actuation: Some(InteractionActuation::Semantic),
-                confirmation: Some(indeterminate_actuation_confirmation("semantic_click")),
+                confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
+                    "semantic_click",
+                )),
             });
         }
         let confirmation = crate::interaction::confirm_click(
@@ -91,6 +91,7 @@ pub(crate) async fn click(
             element.tag,
             baseline,
             dialog_runtime,
+            &fence.dialog_baseline,
         )
         .await;
         return Ok(InteractionOutcome {
@@ -120,7 +121,13 @@ pub(crate) async fn click(
         &expected_target_id,
     )
     .await?;
-    if let Some(confirmation) = dialog_confirmation(dialog_runtime, &expected_target_id).await {
+    if let Some(confirmation) = crate::interaction::dialog_confirmation(
+        dialog_runtime,
+        &expected_target_id,
+        &fence.dialog_baseline,
+    )
+    .await
+    {
         return Ok(InteractionOutcome {
             semantic_class: click_semantic_class(element.tag),
             element_verified: resolved.verified,
@@ -128,20 +135,22 @@ pub(crate) async fn click(
             confirmation: Some(confirmation),
         });
     }
-    if matches!(fence, ActuationFence::DialogOpened) {
+    if matches!(fence.fence, ActuationFence::DialogOpened) {
         return Ok(InteractionOutcome {
             semantic_class: click_semantic_class(element.tag),
             element_verified: resolved.verified,
             actuation: Some(InteractionActuation::Pointer),
-            confirmation: Some(unconfirmed_dialog_opening()),
+            confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
         });
     }
-    if matches!(fence, ActuationFence::Indeterminate) {
+    if matches!(fence.fence, ActuationFence::Indeterminate) {
         return Ok(InteractionOutcome {
             semantic_class: click_semantic_class(element.tag),
             element_verified: resolved.verified,
             actuation: Some(InteractionActuation::Pointer),
-            confirmation: Some(indeterminate_actuation_confirmation("pointer_click")),
+            confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
+                "pointer_click",
+            )),
         });
     }
     let confirmation = crate::interaction::confirm_click(
@@ -150,6 +159,7 @@ pub(crate) async fn click(
         element.tag,
         baseline,
         dialog_runtime,
+        &fence.dialog_baseline,
     )
     .await;
 
@@ -182,7 +192,13 @@ pub(crate) async fn click_xy(
             &expected_target_id,
         )
         .await?;
-    if let Some(confirmation) = dialog_confirmation(dialog_runtime, &expected_target_id).await {
+    if let Some(confirmation) = crate::interaction::dialog_confirmation(
+        dialog_runtime,
+        &expected_target_id,
+        &fence.dialog_baseline,
+    )
+    .await
+    {
         return Ok(InteractionOutcome {
             semantic_class: InteractionSemanticClass::Activate,
             element_verified: false,
@@ -190,23 +206,31 @@ pub(crate) async fn click_xy(
             confirmation: Some(confirmation),
         });
     }
-    if matches!(fence, ActuationFence::DialogOpened) {
+    if matches!(fence.fence, ActuationFence::DialogOpened) {
         return Ok(InteractionOutcome {
             semantic_class: InteractionSemanticClass::Activate,
             element_verified: false,
             actuation: Some(InteractionActuation::Pointer),
-            confirmation: Some(unconfirmed_dialog_opening()),
+            confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
         });
     }
-    if matches!(fence, ActuationFence::Indeterminate) {
+    if matches!(fence.fence, ActuationFence::Indeterminate) {
         return Ok(InteractionOutcome {
             semantic_class: InteractionSemanticClass::Activate,
             element_verified: false,
             actuation: Some(InteractionActuation::Pointer),
-            confirmation: Some(indeterminate_actuation_confirmation("pointer_click_xy")),
+            confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
+                "pointer_click_xy",
+            )),
         });
     }
-    let confirmation = crate::interaction::confirm_click_xy(page, baseline, dialog_runtime).await;
+    let confirmation = crate::interaction::confirm_click_xy(
+        page,
+        baseline,
+        dialog_runtime,
+        &fence.dialog_baseline,
+    )
+    .await;
     Ok(InteractionOutcome {
         semantic_class: InteractionSemanticClass::Activate,
         element_verified: false,
@@ -236,7 +260,13 @@ pub(crate) async fn dblclick_xy(
             &expected_target_id,
         )
         .await?;
-    if let Some(confirmation) = dialog_confirmation(dialog_runtime, &expected_target_id).await {
+    if let Some(confirmation) = crate::interaction::dialog_confirmation(
+        dialog_runtime,
+        &expected_target_id,
+        &fence.dialog_baseline,
+    )
+    .await
+    {
         return Ok(InteractionOutcome {
             semantic_class: InteractionSemanticClass::Activate,
             element_verified: false,
@@ -244,23 +274,31 @@ pub(crate) async fn dblclick_xy(
             confirmation: Some(confirmation),
         });
     }
-    if matches!(fence, ActuationFence::DialogOpened) {
+    if matches!(fence.fence, ActuationFence::DialogOpened) {
         return Ok(InteractionOutcome {
             semantic_class: InteractionSemanticClass::Activate,
             element_verified: false,
             actuation: Some(InteractionActuation::Pointer),
-            confirmation: Some(unconfirmed_dialog_opening()),
+            confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
         });
     }
-    if matches!(fence, ActuationFence::Indeterminate) {
+    if matches!(fence.fence, ActuationFence::Indeterminate) {
         return Ok(InteractionOutcome {
             semantic_class: InteractionSemanticClass::Activate,
             element_verified: false,
             actuation: Some(InteractionActuation::Pointer),
-            confirmation: Some(indeterminate_actuation_confirmation("pointer_dblclick_xy")),
+            confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
+                "pointer_dblclick_xy",
+            )),
         });
     }
-    let confirmation = crate::interaction::confirm_click_xy(page, baseline, dialog_runtime).await;
+    let confirmation = crate::interaction::confirm_click_xy(
+        page,
+        baseline,
+        dialog_runtime,
+        &fence.dialog_baseline,
+    )
+    .await;
     Ok(InteractionOutcome {
         semantic_class: InteractionSemanticClass::Activate,
         element_verified: false,
@@ -289,7 +327,13 @@ pub(crate) async fn rightclick_xy(
         &expected_target_id,
     )
     .await?;
-    if let Some(confirmation) = dialog_confirmation(dialog_runtime, &expected_target_id).await {
+    if let Some(confirmation) = crate::interaction::dialog_confirmation(
+        dialog_runtime,
+        &expected_target_id,
+        &fence.dialog_baseline,
+    )
+    .await
+    {
         return Ok(InteractionOutcome {
             semantic_class: InteractionSemanticClass::Activate,
             element_verified: false,
@@ -297,25 +341,31 @@ pub(crate) async fn rightclick_xy(
             confirmation: Some(confirmation),
         });
     }
-    if matches!(fence, ActuationFence::DialogOpened) {
+    if matches!(fence.fence, ActuationFence::DialogOpened) {
         return Ok(InteractionOutcome {
             semantic_class: InteractionSemanticClass::Activate,
             element_verified: false,
             actuation: Some(InteractionActuation::Pointer),
-            confirmation: Some(unconfirmed_dialog_opening()),
+            confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
         });
     }
-    if matches!(fence, ActuationFence::Indeterminate) {
+    if matches!(fence.fence, ActuationFence::Indeterminate) {
         return Ok(InteractionOutcome {
             semantic_class: InteractionSemanticClass::Activate,
             element_verified: false,
             actuation: Some(InteractionActuation::Pointer),
-            confirmation: Some(indeterminate_actuation_confirmation(
+            confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
                 "pointer_rightclick_xy",
             )),
         });
     }
-    let confirmation = crate::interaction::confirm_click_xy(page, baseline, dialog_runtime).await;
+    let confirmation = crate::interaction::confirm_click_xy(
+        page,
+        baseline,
+        dialog_runtime,
+        &fence.dialog_baseline,
+    )
+    .await;
     Ok(InteractionOutcome {
         semantic_class: InteractionSemanticClass::Activate,
         element_verified: false,
@@ -388,7 +438,13 @@ pub(crate) async fn dblclick(
         &expected_target_id,
     )
     .await?;
-    if let Some(confirmation) = dialog_confirmation(dialog_runtime, &expected_target_id).await {
+    if let Some(confirmation) = crate::interaction::dialog_confirmation(
+        dialog_runtime,
+        &expected_target_id,
+        &first_click_fence.dialog_baseline,
+    )
+    .await
+    {
         return Ok(InteractionOutcome {
             semantic_class: click_semantic_class(element.tag),
             element_verified: resolved.verified,
@@ -396,20 +452,20 @@ pub(crate) async fn dblclick(
             confirmation: Some(confirmation),
         });
     }
-    if matches!(first_click_fence, ActuationFence::DialogOpened) {
+    if matches!(first_click_fence.fence, ActuationFence::DialogOpened) {
         return Ok(InteractionOutcome {
             semantic_class: click_semantic_class(element.tag),
             element_verified: resolved.verified,
             actuation: Some(InteractionActuation::Pointer),
-            confirmation: Some(unconfirmed_dialog_opening()),
+            confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
         });
     }
-    if matches!(first_click_fence, ActuationFence::Indeterminate) {
+    if matches!(first_click_fence.fence, ActuationFence::Indeterminate) {
         return Ok(InteractionOutcome {
             semantic_class: click_semantic_class(element.tag),
             element_verified: resolved.verified,
             actuation: Some(InteractionActuation::Pointer),
-            confirmation: Some(indeterminate_actuation_confirmation(
+            confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
                 "pointer_dblclick_first",
             )),
         });
@@ -437,7 +493,13 @@ pub(crate) async fn dblclick(
         &expected_target_id,
     )
     .await?;
-    if let Some(confirmation) = dialog_confirmation(dialog_runtime, &expected_target_id).await {
+    if let Some(confirmation) = crate::interaction::dialog_confirmation(
+        dialog_runtime,
+        &expected_target_id,
+        &second_click_fence.dialog_baseline,
+    )
+    .await
+    {
         return Ok(InteractionOutcome {
             semantic_class: click_semantic_class(element.tag),
             element_verified: resolved.verified,
@@ -445,20 +507,20 @@ pub(crate) async fn dblclick(
             confirmation: Some(confirmation),
         });
     }
-    if matches!(second_click_fence, ActuationFence::DialogOpened) {
+    if matches!(second_click_fence.fence, ActuationFence::DialogOpened) {
         return Ok(InteractionOutcome {
             semantic_class: click_semantic_class(element.tag),
             element_verified: resolved.verified,
             actuation: Some(InteractionActuation::Pointer),
-            confirmation: Some(unconfirmed_dialog_opening()),
+            confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
         });
     }
-    if matches!(second_click_fence, ActuationFence::Indeterminate) {
+    if matches!(second_click_fence.fence, ActuationFence::Indeterminate) {
         return Ok(InteractionOutcome {
             semantic_class: click_semantic_class(element.tag),
             element_verified: resolved.verified,
             actuation: Some(InteractionActuation::Pointer),
-            confirmation: Some(indeterminate_actuation_confirmation(
+            confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
                 "pointer_dblclick_second",
             )),
         });
@@ -470,6 +532,7 @@ pub(crate) async fn dblclick(
         element.tag,
         baseline,
         dialog_runtime,
+        &second_click_fence.dialog_baseline,
     )
     .await;
 
@@ -489,6 +552,11 @@ pub(crate) async fn rightclick(
 ) -> Result<InteractionOutcome, RubError> {
     let resolved = crate::targeting::resolve_element(page, element).await?;
     let target = crate::targeting::resolve_activation_target(page, &resolved, element.tag).await?;
+    crate::interaction::ensure_activation_target_enabled(page, &resolved.remote_object_id).await?;
+    if target.remote_object_id != resolved.remote_object_id {
+        crate::interaction::ensure_activation_target_enabled(page, &target.remote_object_id)
+            .await?;
+    }
     let point = crate::targeting::resolve_pointer_point(page, &target).await?;
     let baseline =
         crate::interaction::capture_interaction_baseline(page, &resolved.remote_object_id).await;
@@ -506,7 +574,13 @@ pub(crate) async fn rightclick(
         &expected_target_id,
     )
     .await?;
-    if let Some(confirmation) = dialog_confirmation(dialog_runtime, &expected_target_id).await {
+    if let Some(confirmation) = crate::interaction::dialog_confirmation(
+        dialog_runtime,
+        &expected_target_id,
+        &fence.dialog_baseline,
+    )
+    .await
+    {
         return Ok(InteractionOutcome {
             semantic_class: click_semantic_class(element.tag),
             element_verified: resolved.verified,
@@ -514,20 +588,22 @@ pub(crate) async fn rightclick(
             confirmation: Some(confirmation),
         });
     }
-    if matches!(fence, ActuationFence::DialogOpened) {
+    if matches!(fence.fence, ActuationFence::DialogOpened) {
         return Ok(InteractionOutcome {
             semantic_class: click_semantic_class(element.tag),
             element_verified: resolved.verified,
             actuation: Some(InteractionActuation::Pointer),
-            confirmation: Some(unconfirmed_dialog_opening()),
+            confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
         });
     }
-    if matches!(fence, ActuationFence::Indeterminate) {
+    if matches!(fence.fence, ActuationFence::Indeterminate) {
         return Ok(InteractionOutcome {
             semantic_class: click_semantic_class(element.tag),
             element_verified: resolved.verified,
             actuation: Some(InteractionActuation::Pointer),
-            confirmation: Some(indeterminate_actuation_confirmation("pointer_rightclick")),
+            confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
+                "pointer_rightclick",
+            )),
         });
     }
 
@@ -537,6 +613,7 @@ pub(crate) async fn rightclick(
         element.tag,
         baseline,
         dialog_runtime,
+        &fence.dialog_baseline,
     )
     .await;
 
@@ -563,99 +640,6 @@ fn click_semantic_class(tag: ElementTag) -> InteractionSemanticClass {
     match tag {
         ElementTag::Checkbox | ElementTag::Radio => InteractionSemanticClass::ToggleState,
         _ => InteractionSemanticClass::Activate,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActuationFence {
-    Completed,
-    DialogOpened,
-    Indeterminate,
-}
-
-async fn await_actuation_or_dialog<F>(
-    actuation: F,
-    dialog_runtime: SharedDialogRuntime,
-    label: &'static str,
-    expected_target_id: &str,
-) -> Result<ActuationFence, RubError>
-where
-    F: std::future::Future<Output = Result<(), RubError>> + Send + 'static,
-{
-    let mut handle = tokio::spawn(actuation);
-    match tokio::time::timeout(DIALOG_ACTUATION_TIMEOUT, &mut handle).await {
-        Ok(joined) => {
-            joined
-                .map_err(|error| RubError::Internal(format!("{label} task failed: {error}")))??;
-            Ok(ActuationFence::Completed)
-        }
-        Err(_) => {
-            info!(
-                actuation = label,
-                "Interaction actuation timed out; waiting for a truthful post-timeout fence instead of assuming rollback"
-            );
-            let deadline = Instant::now() + DIALOG_ACTUATION_GRACE_PERIOD;
-            loop {
-                if pending_dialog_for_target(&dialog_runtime, expected_target_id)
-                    .await
-                    .is_some()
-                {
-                    info!(
-                        actuation = label,
-                        "Dialog fallback became active after actuation timeout"
-                    );
-                    return Ok(ActuationFence::DialogOpened);
-                }
-                if handle.is_finished() {
-                    let joined = handle.await.map_err(|error| {
-                        RubError::Internal(format!("{label} task failed after timeout: {error}"))
-                    })?;
-                    joined?;
-                    return Ok(ActuationFence::Completed);
-                }
-                if Instant::now() >= deadline {
-                    return Ok(ActuationFence::Indeterminate);
-                }
-                tokio::time::sleep(DIALOG_ACTUATION_POLL_INTERVAL).await;
-            }
-        }
-    }
-}
-
-async fn dialog_confirmation(
-    dialog_runtime: &SharedDialogRuntime,
-    expected_target_id: &str,
-) -> Option<InteractionConfirmation> {
-    let dialog = pending_dialog_for_target(dialog_runtime, expected_target_id).await?;
-    Some(InteractionConfirmation {
-        status: InteractionConfirmationStatus::Confirmed,
-        kind: Some(InteractionConfirmationKind::DialogOpened),
-        details: Some(json!({
-            "kind": dialog.kind,
-            "message": dialog.message,
-            "url": dialog.url,
-            "frame_id": dialog.frame_id,
-            "default_prompt": dialog.default_prompt,
-        })),
-    })
-}
-
-fn unconfirmed_dialog_opening() -> InteractionConfirmation {
-    InteractionConfirmation {
-        status: InteractionConfirmationStatus::Unconfirmed,
-        kind: Some(InteractionConfirmationKind::DialogOpened),
-        details: None,
-    }
-}
-
-fn indeterminate_actuation_confirmation(label: &'static str) -> InteractionConfirmation {
-    InteractionConfirmation {
-        status: InteractionConfirmationStatus::Degraded,
-        kind: None,
-        details: Some(json!({
-            "reason": "actuation_commit_fence_indeterminate",
-            "actuation": label,
-        })),
     }
 }
 

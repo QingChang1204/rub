@@ -1,11 +1,11 @@
 use super::*;
+use crate::orchestration_executor::orchestration_non_authoritative_evidence_error;
+use crate::session::NetworkRequestBaseline;
 
 pub(super) fn reconcile_worker_state(
     worker_state: &mut HashMap<u32, OrchestrationWorkerEntry>,
     rules: &[OrchestrationRuleInfo],
-    active_request_cursor: u64,
-    observatory_drop_count: u64,
-    current_session_id: &str,
+    committed_baselines: &HashMap<u32, NetworkRequestBaseline>,
 ) {
     let live_ids = rules
         .iter()
@@ -14,33 +14,43 @@ pub(super) fn reconcile_worker_state(
     worker_state.retain(|id, _| live_ids.contains(id));
 
     for rule in rules {
-        let local_source = rule.source.session_id == current_session_id;
-        let network_cursor_primed =
-            !matches!(rule.condition.kind, TriggerConditionKind::NetworkRequest) || local_source;
+        let baseline_required = matches!(rule.condition.kind, TriggerConditionKind::NetworkRequest)
+            && matches!(rule.status, OrchestrationRuleStatus::Armed);
+        let committed_baseline = committed_baselines.get(&rule.id).copied();
+        let network_cursor_primed = committed_baseline
+            .map(|baseline| baseline.primed)
+            .unwrap_or(!baseline_required);
         let entry = worker_state
             .entry(rule.id)
             .or_insert(OrchestrationWorkerEntry {
                 last_status: rule.status,
-                network_cursor: if local_source {
-                    active_request_cursor
-                } else {
-                    0
-                },
+                network_cursor: committed_baseline
+                    .map(|baseline| baseline.cursor)
+                    .unwrap_or(0),
                 network_cursor_primed,
-                observatory_drop_count,
+                observatory_drop_count: committed_baseline
+                    .map(|baseline| baseline.observed_ingress_drop_count)
+                    .unwrap_or(0),
                 latched_evidence_key: persisted_latched_orchestration_evidence_key(rule),
             });
         if !matches!(entry.last_status, OrchestrationRuleStatus::Armed)
             && matches!(rule.status, OrchestrationRuleStatus::Armed)
         {
-            entry.network_cursor = if local_source {
-                active_request_cursor
+            if let Some(committed_baseline) = committed_baseline {
+                entry.network_cursor = committed_baseline.cursor;
+                entry.network_cursor_primed = committed_baseline.primed;
+                entry.observatory_drop_count = committed_baseline.observed_ingress_drop_count;
+            } else if baseline_required {
+                entry.network_cursor = 0;
+                entry.network_cursor_primed = false;
+                entry.observatory_drop_count = 0;
             } else {
-                0
-            };
-            entry.network_cursor_primed = network_cursor_primed;
-            entry.observatory_drop_count = observatory_drop_count;
+                entry.network_cursor_primed = true;
+            }
             entry.latched_evidence_key = persisted_latched_orchestration_evidence_key(rule);
+        }
+        if baseline_required && committed_baseline.is_none() {
+            entry.network_cursor_primed = false;
         }
         entry.last_status = rule.status;
         if entry.latched_evidence_key.is_none() {
@@ -86,6 +96,22 @@ async fn evaluate_orchestration_condition(
     rule: &OrchestrationRuleInfo,
     worker: &mut OrchestrationWorkerEntry,
 ) -> Result<OrchestrationConditionEvaluation, ErrorEnvelope> {
+    if matches!(rule.condition.kind, TriggerConditionKind::NetworkRequest)
+        && !worker.network_cursor_primed
+    {
+        return Err(
+            ErrorEnvelope::new(
+                ErrorCode::SessionBusy,
+                "orchestration network_request evaluation is not authoritative because its committed observatory baseline is missing",
+            )
+            .with_context(serde_json::json!({
+                "reason": "orchestration_network_request_baseline_missing",
+                "next_network_cursor": worker.network_cursor,
+                "dropped_event_count": worker.observatory_drop_count,
+            })),
+        );
+    }
+
     let tab_target_id = rule.source.tab_target_id.as_deref().ok_or_else(|| {
         ErrorEnvelope::new(
             ErrorCode::InvalidInput,
@@ -111,23 +137,6 @@ async fn evaluate_orchestration_condition(
         .await
         .map_err(|error| error.into_envelope())?
     } else {
-        if matches!(rule.condition.kind, TriggerConditionKind::NetworkRequest)
-            && !worker.network_cursor_primed
-        {
-            worker.network_cursor = prime_remote_orchestration_network_cursor(
-                runtime,
-                rule,
-                tab_target_id,
-                rule.source.frame_id.as_deref(),
-                &rule.condition,
-            )
-            .await?;
-            worker.network_cursor_primed = true;
-            return Ok(OrchestrationConditionEvaluation {
-                evidence: None,
-                network_progress: None,
-            });
-        }
         let source_session = runtime
             .known_sessions
             .iter()
@@ -146,6 +155,26 @@ async fn evaluate_orchestration_condition(
                     "source_session_name": rule.source.session_name,
                 }))
             })?;
+        if let Some(reason) =
+            crate::orchestration_runtime::orchestration_session_addressability_reason(
+                source_session,
+            )
+        {
+            let _ = reason;
+            return Err(
+                crate::orchestration_runtime::orchestration_session_not_addressable_error(
+                    source_session,
+                    ErrorCode::SessionBusy,
+                    format!(
+                        "Source session '{}' is still present but not addressable for orchestration condition evaluation",
+                        rule.source.session_name
+                    ),
+                    "orchestration_source_session_not_addressable",
+                    "source_session_id",
+                    "source_session_name",
+                ),
+            );
+        }
         dispatch_remote_orchestration_probe(
             source_session,
             tab_target_id,
@@ -153,6 +182,7 @@ async fn evaluate_orchestration_condition(
             &rule.condition,
             worker.network_cursor,
             worker.observatory_drop_count,
+            None,
         )
         .await?
     };
@@ -161,18 +191,14 @@ async fn evaluate_orchestration_condition(
         worker.network_cursor = result.next_network_cursor;
         worker.network_cursor_primed = true;
         worker.observatory_drop_count = result.observed_drop_count;
-        return Err(
-            ErrorEnvelope::new(
-                ErrorCode::BrowserCrashed,
-                "orchestration network_request evaluation is not authoritative because observatory evidence was dropped",
-            )
-            .with_context(serde_json::json!({
-                "reason": "runtime_observatory_not_authoritative",
-                "degraded_reason": reason,
+        return Err(orchestration_non_authoritative_evidence_error(
+            "orchestration network_request evaluation is not authoritative because observatory evidence was dropped",
+            Some(reason),
+            serde_json::json!({
                 "next_network_cursor": worker.network_cursor,
                 "dropped_event_count": worker.observatory_drop_count,
-            })),
-        );
+            }),
+        ));
     }
     Ok(OrchestrationConditionEvaluation {
         evidence: if result.matched {
@@ -214,43 +240,6 @@ pub(super) fn skip_latched_orchestration_evidence(
     false
 }
 
-async fn prime_remote_orchestration_network_cursor(
-    runtime: &OrchestrationRuntimeInfo,
-    rule: &OrchestrationRuleInfo,
-    tab_target_id: &str,
-    frame_id: Option<&str>,
-    condition: &rub_core::model::TriggerConditionSpec,
-) -> Result<u64, ErrorEnvelope> {
-    let source_session = runtime
-        .known_sessions
-        .iter()
-        .find(|session| session.session_id == rule.source.session_id)
-        .ok_or_else(|| {
-            ErrorEnvelope::new(
-                ErrorCode::DaemonNotRunning,
-                format!(
-                    "Source session '{}' is not available for orchestration condition evaluation",
-                    rule.source.session_name
-                ),
-            )
-            .with_context(serde_json::json!({
-                "reason": "orchestration_source_session_missing",
-                "source_session_id": rule.source.session_id,
-                "source_session_name": rule.source.session_name,
-            }))
-        })?;
-    Ok(dispatch_remote_orchestration_probe(
-        source_session,
-        tab_target_id,
-        frame_id,
-        condition,
-        u64::MAX,
-        0,
-    )
-    .await?
-    .next_network_cursor)
-}
-
 pub(super) fn orchestration_rule_in_cooldown(rule: &OrchestrationRuleInfo) -> bool {
     rule.execution_policy
         .cooldown_until_ms
@@ -278,10 +267,7 @@ pub(super) fn persisted_latched_orchestration_evidence_key(
         return None;
     }
     let result = rule.last_result.as_ref()?;
-    let preserved_latch = matches!(result.status, OrchestrationRuleStatus::Fired)
-        || (matches!(result.status, OrchestrationRuleStatus::Blocked)
-            && result.reason.as_deref() == Some("orchestration_cooldown_active"));
-    if !preserved_latch || !matches!(result.next_status, OrchestrationRuleStatus::Armed) {
+    if !should_retain_orchestration_evidence_latch(rule, result) {
         return None;
     }
     rule.last_condition_evidence
@@ -289,10 +275,30 @@ pub(super) fn persisted_latched_orchestration_evidence_key(
         .map(orchestration_evidence_key)
 }
 
+pub(super) fn should_retain_orchestration_evidence_latch(
+    rule: &OrchestrationRuleInfo,
+    result: &rub_core::model::OrchestrationResultInfo,
+) -> bool {
+    should_persist_orchestration_evidence_latch(rule)
+        && matches!(result.next_status, OrchestrationRuleStatus::Armed)
+        && (matches!(result.status, OrchestrationRuleStatus::Fired)
+            || (matches!(result.status, OrchestrationRuleStatus::Blocked)
+                && result.reason.as_deref() == Some("orchestration_cooldown_active")))
+}
+
 pub(super) async fn record_orchestration_probe_failure(
     state: &Arc<SessionState>,
     rule: &OrchestrationRuleInfo,
     envelope: ErrorEnvelope,
+) {
+    record_orchestration_failure_with_fallback(state, rule, envelope, None).await;
+}
+
+pub(super) async fn record_orchestration_failure_with_fallback(
+    state: &Arc<SessionState>,
+    rule: &OrchestrationRuleInfo,
+    envelope: ErrorEnvelope,
+    evidence: Option<TriggerEvidenceInfo>,
 ) {
     let result_status = classify_orchestration_error_status(envelope.code);
     let reason = envelope
@@ -301,6 +307,7 @@ pub(super) async fn record_orchestration_probe_failure(
         .and_then(|context| context.get("reason"))
         .and_then(|value| value.as_str())
         .map(|value| value.to_string());
+    let error_context = envelope.context.clone();
     let result = rub_core::model::OrchestrationResultInfo {
         rule_id: rule.id,
         status: result_status,
@@ -315,6 +322,7 @@ pub(super) async fn record_orchestration_probe_failure(
         cooldown_until_ms: None,
         error_code: Some(envelope.code),
         reason,
+        error_context,
     };
     warn!(
         rule_id = rule.id,
@@ -323,6 +331,11 @@ pub(super) async fn record_orchestration_probe_failure(
         "Reactive orchestration condition probe failed"
     );
     state
-        .record_orchestration_outcome_with_fallback(rule, None, None, result)
+        .record_orchestration_outcome_with_fallback(
+            rule,
+            Some(rule.lifecycle_generation),
+            evidence,
+            result,
+        )
         .await;
 }

@@ -2,10 +2,13 @@ use std::path::Path;
 
 use rub_core::error::{ErrorCode, RubError};
 
-use super::process_identity::process_matches_registry_entry;
+use super::process_identity::process_matches_registry_entry_for_termination;
 use super::{DaemonCtlPathContext, daemon_ctl_path_error};
 
 pub(crate) fn cleanup_stale(rub_home: &Path, entry: &rub_daemon::session::RegistryEntry) {
+    if rub_daemon::session::hard_cut_release_pending_blocks_entry(rub_home, entry) {
+        return;
+    }
     rub_daemon::session::cleanup_projections(rub_home, entry);
 }
 
@@ -46,7 +49,7 @@ pub(crate) fn terminate_registry_entry_process(
     rub_home: &Path,
     entry: &rub_daemon::session::RegistryEntry,
 ) -> std::io::Result<()> {
-    if !process_matches_registry_entry(rub_home, entry)? {
+    if !process_matches_registry_entry_for_termination(rub_home, entry)? {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(

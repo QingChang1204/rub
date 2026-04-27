@@ -75,7 +75,8 @@ pub(super) async fn cmd_history(
 #[cfg(test)]
 mod tests {
     use super::cmd_history;
-    use super::export::{export_pipe_history, export_script_history};
+    use super::export::{WorkflowExportProjection, export_pipe_history, export_script_history};
+    use super::projection::workflow_export_projection_state_json;
     use crate::session::SessionState;
     use crate::workflow_capture::WorkflowCaptureDeliveryState;
     use rub_ipc::protocol::IpcRequest;
@@ -245,6 +246,110 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["sequence"], serde_json::json!(2));
         assert_eq!(items[1]["sequence"], serde_json::json!(3));
+    }
+
+    #[tokio::test]
+    async fn command_history_projection_state_ignores_global_projection_loss_when_last_window_is_complete()
+     {
+        let home = std::env::temp_dir().join(format!(
+            "rub-history-export-{}-non-export-last-projection-loss",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+        let state = Arc::new(SessionState::new("default", home, None));
+
+        for index in 0..300 {
+            let request = IpcRequest::new(
+                "open",
+                serde_json::json!({
+                    "url": format!("https://example.test/{index}")
+                }),
+                30_000,
+            );
+            let response = rub_ipc::protocol::IpcResponse::success(
+                format!("req-{index}"),
+                serde_json::json!({}),
+            );
+            state.submit_post_commit_projection(&request, &response);
+        }
+
+        let history = cmd_history(&serde_json::json!({ "last": 5 }), &state)
+            .await
+            .expect("history command succeeds");
+
+        assert!(
+            history["result"]["dropped_before_projection"]
+                .as_u64()
+                .expect("projection drop count must be present")
+                > 0
+        );
+        assert_eq!(
+            history["result"]["projection_state"]["lossy"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            history["result"]["projection_state"]["lossy_reasons"],
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn command_history_projection_state_ignores_global_projection_loss_when_range_window_is_complete()
+     {
+        let home = std::env::temp_dir().join(format!(
+            "rub-history-export-{}-non-export-range-projection-loss",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+        let state = Arc::new(SessionState::new("default", home, None));
+
+        for index in 0..300 {
+            let request = IpcRequest::new(
+                "open",
+                serde_json::json!({
+                    "url": format!("https://example.test/{index}")
+                }),
+                30_000,
+            );
+            let response = rub_ipc::protocol::IpcResponse::success(
+                format!("req-{index}"),
+                serde_json::json!({}),
+            );
+            state.submit_post_commit_projection(&request, &response);
+        }
+
+        let retained = state.command_history(5).await;
+        let from = retained
+            .entries
+            .first()
+            .map(|entry| entry.sequence)
+            .expect("retained history should not be empty");
+        let to = retained
+            .entries
+            .last()
+            .map(|entry| entry.sequence)
+            .expect("retained history should not be empty");
+
+        let history = cmd_history(&serde_json::json!({ "from": from, "to": to }), &state)
+            .await
+            .expect("history command succeeds");
+
+        assert!(
+            history["result"]["dropped_before_projection"]
+                .as_u64()
+                .expect("projection drop count must be present")
+                > 0
+        );
+        assert_eq!(
+            history["result"]["projection_state"]["lossy"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            history["result"]["projection_state"]["lossy_reasons"],
+            serde_json::json!([])
+        );
     }
 
     #[tokio::test]
@@ -426,7 +531,7 @@ mod tests {
         );
         assert_eq!(
             exported["result"]["projection_state"]["lossy_reasons"],
-            serde_json::json!(["dropped_before_retention", "retention_truncated"])
+            serde_json::json!(["retention_truncated"])
         );
         assert_eq!(exported["result"]["complete"], serde_json::json!(false));
         assert_eq!(
@@ -440,6 +545,158 @@ mod tests {
         assert_eq!(
             exported["result"]["capture_window"]["truncated"],
             serde_json::json!(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn export_history_marks_projection_loss_as_incomplete() {
+        let home = std::env::temp_dir().join(format!(
+            "rub-history-export-{}-projection-loss",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+        let state = Arc::new(SessionState::new("default", home, None));
+
+        for index in 0..300 {
+            let request = IpcRequest::new(
+                "open",
+                serde_json::json!({
+                    "url": format!("https://example.test/{index}")
+                }),
+                30_000,
+            );
+            let response = rub_ipc::protocol::IpcResponse::success(
+                format!("req-{index}"),
+                serde_json::json!({}),
+            );
+            state.submit_post_commit_projection(&request, &response);
+        }
+
+        let exported = export_pipe_history(&state, 5, None, None, false)
+            .await
+            .expect("export succeeds");
+
+        assert_eq!(exported["result"]["complete"], serde_json::json!(true));
+        assert!(
+            exported["result"]["capture_window"]["dropped_before_projection"]
+                .as_u64()
+                .expect("projection drop count must be present")
+                > 0
+        );
+        assert_eq!(
+            exported["result"]["capture_window"]["truncated"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            exported["result"]["projection_state"]["lossy_reasons"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn workflow_export_projection_state_distinguishes_projection_loss_from_retention_truncation() {
+        let projection = WorkflowExportProjection {
+            steps: Vec::new(),
+            source_count: 0,
+            included_observation: false,
+            skipped_administrative: 0,
+            skipped_observation: 0,
+            skipped_ineligible: 0,
+            complete: false,
+            selection_dropped_before_projection: false,
+            capture_oldest_retained_sequence: Some(42),
+            capture_newest_retained_sequence: Some(99),
+            capture_dropped_before_retention: 0,
+            capture_dropped_before_projection: 3,
+            selection_truncated_by_retention: false,
+        };
+
+        assert_eq!(
+            workflow_export_projection_state_json(&projection)["lossy_reasons"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            workflow_export_projection_state_json(&projection)["global_projection_drop_count"],
+            serde_json::json!(3)
+        );
+    }
+
+    #[test]
+    fn workflow_export_projection_state_marks_retention_truncation_only_when_retained_window_is_short()
+     {
+        let projection = WorkflowExportProjection {
+            steps: Vec::new(),
+            source_count: 0,
+            included_observation: false,
+            skipped_administrative: 0,
+            skipped_observation: 0,
+            skipped_ineligible: 0,
+            complete: false,
+            selection_dropped_before_projection: false,
+            capture_oldest_retained_sequence: Some(6),
+            capture_newest_retained_sequence: Some(12),
+            capture_dropped_before_retention: 5,
+            capture_dropped_before_projection: 0,
+            selection_truncated_by_retention: true,
+        };
+
+        assert_eq!(
+            workflow_export_projection_state_json(&projection)["lossy_reasons"],
+            serde_json::json!(["retention_truncated"])
+        );
+    }
+
+    #[test]
+    fn workflow_export_projection_state_ignores_global_retention_loss_when_selection_is_complete() {
+        let projection = WorkflowExportProjection {
+            steps: Vec::new(),
+            source_count: 0,
+            included_observation: false,
+            skipped_administrative: 0,
+            skipped_observation: 0,
+            skipped_ineligible: 0,
+            complete: true,
+            selection_dropped_before_projection: false,
+            capture_oldest_retained_sequence: Some(6),
+            capture_newest_retained_sequence: Some(12),
+            capture_dropped_before_retention: 5,
+            capture_dropped_before_projection: 0,
+            selection_truncated_by_retention: false,
+        };
+
+        assert_eq!(
+            workflow_export_projection_state_json(&projection)["lossy_reasons"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn workflow_export_projection_state_marks_selection_relative_projection_loss_only_when_selected_window_is_short()
+     {
+        let projection = WorkflowExportProjection {
+            steps: Vec::new(),
+            source_count: 0,
+            included_observation: false,
+            skipped_administrative: 0,
+            skipped_observation: 0,
+            skipped_ineligible: 0,
+            complete: false,
+            selection_dropped_before_projection: true,
+            capture_oldest_retained_sequence: Some(42),
+            capture_newest_retained_sequence: Some(99),
+            capture_dropped_before_retention: 0,
+            capture_dropped_before_projection: 3,
+            selection_truncated_by_retention: false,
+        };
+
+        assert_eq!(
+            workflow_export_projection_state_json(&projection)["lossy_reasons"],
+            serde_json::json!(["dropped_before_projection"])
+        );
+        assert_eq!(
+            workflow_export_projection_state_json(&projection)["global_projection_drop_count"],
+            serde_json::json!(3)
         );
     }
 }

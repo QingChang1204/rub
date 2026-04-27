@@ -18,7 +18,10 @@ use crate::orchestration_executor::{
 use crate::orchestration_probe::{
     dispatch_remote_orchestration_probe, evaluate_orchestration_probe_for_tab,
 };
-use crate::router::{DaemonRouter, OwnedRouterTransactionGuard};
+use crate::router::{
+    DaemonRouter, OwnedRouterTransactionGuard, RouterFenceDisposition,
+    handoff_blocked_error_for_command,
+};
 use crate::runtime_refresh::refresh_orchestration_runtime;
 use crate::scheduler_policy::AUTOMATION_WORKER_POLL_INTERVAL;
 use crate::session::SessionState;
@@ -28,8 +31,10 @@ mod condition;
 pub(crate) use condition::orchestration_evidence_key;
 use condition::{
     commit_orchestration_network_progress, load_orchestration_condition_state,
-    orchestration_rule_in_cooldown, reconcile_worker_state, record_orchestration_probe_failure,
-    should_persist_orchestration_evidence_latch, skip_latched_orchestration_evidence,
+    orchestration_rule_in_cooldown, reconcile_worker_state,
+    record_orchestration_failure_with_fallback, record_orchestration_probe_failure,
+    should_persist_orchestration_evidence_latch, should_retain_orchestration_evidence_latch,
+    skip_latched_orchestration_evidence,
 };
 
 const ORCHESTRATION_WORKER_INTERVAL: Duration = AUTOMATION_WORKER_POLL_INTERVAL;
@@ -175,15 +180,8 @@ async fn run_orchestration_cycle(
         return;
     }
 
-    let active_request_cursor = state.network_request_cursor().await;
-    let observatory_drop_count = state.network_request_drop_count().await;
-    reconcile_worker_state(
-        worker_state,
-        &runtime.rules,
-        active_request_cursor,
-        observatory_drop_count,
-        &state.session_id,
-    );
+    let committed_baselines = state.orchestration_network_request_baselines().await;
+    reconcile_worker_state(worker_state, &runtime.rules, &committed_baselines);
     reconcile_pending_orchestration_reservations(&runtime.rules, pending_reservations);
     drain_orchestration_reservation_completions(
         router,
@@ -311,7 +309,6 @@ async fn process_orchestration_rule(
             Ok(condition) => condition,
             Err(envelope) => {
                 record_orchestration_probe_failure(state, &rule, envelope).await;
-                refresh_orchestration_runtime(state).await;
                 return;
             }
         };
@@ -323,7 +320,11 @@ async fn process_orchestration_rule(
                 && rule.last_condition_evidence.is_some()
             {
                 state
-                    .set_orchestration_condition_evidence(rule.id, None)
+                    .set_orchestration_condition_evidence(
+                        rule.id,
+                        Some(rule.lifecycle_generation),
+                        None,
+                    )
                     .await;
             }
             commit_orchestration_network_progress(worker_entry, network_progress);
@@ -442,7 +443,6 @@ async fn handle_orchestration_reservation_completion(
                     .find(|candidate| candidate.id == completion.rule_id)
                 {
                     record_orchestration_probe_failure(state, &rule, envelope).await;
-                    refresh_orchestration_runtime(state).await;
                 }
                 return;
             }
@@ -459,11 +459,26 @@ async fn handle_orchestration_reservation_completion(
                 .find(|candidate| candidate.id == completion.rule_id)
             {
                 record_orchestration_probe_failure(state, &rule, envelope).await;
-                refresh_orchestration_runtime(state).await;
             }
             return;
         }
     };
+
+    if state.is_shutdown_requested() {
+        commit_orchestration_network_progress(worker_entry, reserved.network_progress);
+        return;
+    }
+    if let Some(error) = handoff_blocked_error_for_command("orchestration_worker", state).await {
+        record_orchestration_failure_with_fallback(
+            state,
+            &reserved.rule,
+            error,
+            Some(reserved.evidence.clone()),
+        )
+        .await;
+        commit_orchestration_network_progress(worker_entry, reserved.network_progress);
+        return;
+    }
 
     let result = execute_orchestration_rule(
         router,
@@ -471,6 +486,8 @@ async fn handle_orchestration_reservation_completion(
         &reserved.runtime,
         &reserved.rule,
         Some(reserved.evidence_key.as_str()),
+        None,
+        RouterFenceDisposition::ReuseCurrentTransaction,
     )
     .await;
     commit_orchestration_execution(state, worker_entry, reserved, result).await;
@@ -542,14 +559,13 @@ async fn complete_orchestration_reservation(
         preserved_triggered
     };
 
-    let target_is_local = latest_rule.target.session_id == state.session_id;
     Ok(Some(ReservedOrchestrationExecution {
         runtime: latest_runtime,
         rule: latest_rule,
         evidence: triggered.evidence,
         evidence_key: triggered.evidence_key,
         network_progress: triggered.network_progress.or(fallback_network_progress),
-        _transaction: target_is_local.then_some(transaction),
+        _transaction: Some(transaction),
     }))
 }
 
@@ -568,11 +584,9 @@ async fn commit_orchestration_execution(
         )
         .await;
     commit_orchestration_network_progress(worker_entry, reserved.network_progress);
-    worker_entry.latched_evidence_key = match result.next_status {
-        OrchestrationRuleStatus::Armed => Some(reserved.evidence_key),
-        _ => None,
-    };
-    refresh_orchestration_runtime(state).await;
+    worker_entry.latched_evidence_key =
+        should_retain_orchestration_evidence_latch(&reserved.rule, &result)
+            .then_some(reserved.evidence_key);
 }
 
 fn cancel_pending_orchestration_reservation(

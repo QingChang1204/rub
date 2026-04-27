@@ -9,10 +9,11 @@ use rub_core::model::{
 };
 use rub_core::storage::{StorageArea, StorageSnapshot};
 
+use crate::session::NetworkRequestBaseline;
 use crate::session::SessionState;
 
-use super::TriggerWorkerEntry;
 use super::action::resolve_bound_tab;
+use super::{TriggerWorkerEntry, trigger_degraded_authority_error};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct TriggerNetworkProgress {
@@ -62,8 +63,7 @@ pub(super) async fn load_trigger_condition_state(
 pub(super) fn reconcile_worker_state(
     worker_state: &mut HashMap<u32, TriggerWorkerEntry>,
     triggers: &[TriggerInfo],
-    active_request_cursor: u64,
-    observatory_drop_count: u64,
+    committed_baselines: &HashMap<u32, NetworkRequestBaseline>,
 ) {
     let live_ids = triggers
         .iter()
@@ -72,18 +72,41 @@ pub(super) fn reconcile_worker_state(
     worker_state.retain(|id, _| live_ids.contains(id));
 
     for trigger in triggers {
+        let baseline_required =
+            matches!(trigger.condition.kind, TriggerConditionKind::NetworkRequest)
+                && matches!(trigger.status, TriggerStatus::Armed);
+        let committed_baseline = committed_baselines.get(&trigger.id).copied();
         let entry = worker_state
             .entry(trigger.id)
             .or_insert(TriggerWorkerEntry {
                 last_status: trigger.status,
-                network_cursor: active_request_cursor,
-                observatory_drop_count,
+                network_cursor: committed_baseline
+                    .map(|baseline| baseline.cursor)
+                    .unwrap_or(0),
+                network_cursor_primed: committed_baseline
+                    .map(|baseline| baseline.primed)
+                    .unwrap_or(!baseline_required),
+                observatory_drop_count: committed_baseline
+                    .map(|baseline| baseline.observed_ingress_drop_count)
+                    .unwrap_or(0),
             });
         if !matches!(entry.last_status, TriggerStatus::Armed)
             && matches!(trigger.status, TriggerStatus::Armed)
         {
-            entry.network_cursor = active_request_cursor;
-            entry.observatory_drop_count = observatory_drop_count;
+            if let Some(committed_baseline) = committed_baselines.get(&trigger.id).copied() {
+                entry.network_cursor = committed_baseline.cursor;
+                entry.network_cursor_primed = committed_baseline.primed;
+                entry.observatory_drop_count = committed_baseline.observed_ingress_drop_count;
+            } else if baseline_required {
+                entry.network_cursor = 0;
+                entry.network_cursor_primed = false;
+                entry.observatory_drop_count = 0;
+            } else {
+                entry.network_cursor_primed = true;
+            }
+        }
+        if baseline_required && committed_baseline.is_none() {
+            entry.network_cursor_primed = false;
         }
         entry.last_status = trigger.status;
     }
@@ -105,6 +128,16 @@ pub(super) async fn evaluate_trigger_condition(
                 .unwrap_or_default()
                 .trim();
             let source_tab = resolve_bound_tab(tabs, &trigger.source_tab.target_id)?;
+            if let Some(degraded_reason) = source_tab.degraded_reason.as_deref() {
+                return Err(RubError::Domain(trigger_degraded_authority_error(
+                    "trigger url_match condition is not authoritative because source tab page identity is degraded",
+                    "trigger_source_tab_projection_degraded",
+                    serde_json::json!({
+                        "tab_target_id": source_tab.target_id,
+                        "degraded_reason": degraded_reason,
+                    }),
+                )));
+            }
             if !source_tab.url.contains(pattern) {
                 return Ok(TriggerConditionEvaluation {
                     evidence: None,
@@ -127,7 +160,10 @@ pub(super) async fn evaluate_trigger_condition(
                     trigger.source_tab.frame_id.as_deref(),
                     text,
                 )
-                .await?
+                .await
+                .map_err(|error| {
+                    normalize_source_frame_continuity_error(error, trigger, "text_present")
+                })?
             {
                 return Ok(TriggerConditionEvaluation {
                     evidence: None,
@@ -165,7 +201,10 @@ pub(super) async fn evaluate_trigger_condition(
                     trigger.source_tab.frame_id.as_deref(),
                     &locator,
                 )
-                .await?;
+                .await
+                .map_err(|error| {
+                    normalize_source_frame_continuity_error(error, trigger, "locator_present")
+                })?;
             if matches.is_empty() {
                 return Ok(TriggerConditionEvaluation {
                     evidence: None,
@@ -196,7 +235,10 @@ pub(super) async fn evaluate_trigger_condition(
                     &trigger.source_tab.target_id,
                     trigger.source_tab.frame_id.as_deref(),
                 )
-                .await?
+                .await
+                .map_err(|error| {
+                    normalize_source_frame_continuity_error(error, trigger, "readiness")
+                })?
                 .readiness_state;
             let requested = trigger
                 .condition
@@ -220,23 +262,32 @@ pub(super) async fn evaluate_trigger_condition(
             })
         }
         TriggerConditionKind::NetworkRequest => {
+            if !worker.network_cursor_primed {
+                return Err(RubError::Domain(trigger_degraded_authority_error(
+                    "trigger network_request evaluation is not authoritative because its committed observatory baseline is missing",
+                    "trigger_network_request_baseline_missing",
+                    serde_json::json!({
+                        "next_network_cursor": worker.network_cursor,
+                        "dropped_event_count": worker.observatory_drop_count,
+                    }),
+                )));
+            }
             let window = state
                 .network_request_window_after(worker.network_cursor, worker.observatory_drop_count)
                 .await;
-            let observed_drop_count = state.network_request_drop_count().await;
+            let observed_drop_count = state.network_request_ingress_drop_count();
             if !window.authoritative {
                 worker.network_cursor = window.next_cursor;
                 worker.observatory_drop_count = observed_drop_count;
-                return Err(RubError::domain_with_context(
-                    ErrorCode::BrowserCrashed,
+                return Err(RubError::Domain(trigger_degraded_authority_error(
                     "trigger network_request evaluation is not authoritative because observatory evidence was dropped",
+                    "runtime_observatory_not_authoritative",
                     serde_json::json!({
-                        "reason": "runtime_observatory_not_authoritative",
                         "degraded_reason": window.degraded_reason,
                         "next_network_cursor": worker.network_cursor,
                         "dropped_event_count": worker.observatory_drop_count,
                     }),
-                ));
+                )));
             }
             let network_progress = Some(TriggerNetworkProgress {
                 next_cursor: window.next_cursor,
@@ -267,7 +318,10 @@ pub(super) async fn evaluate_trigger_condition(
                     &trigger.source_tab.target_id,
                     trigger.source_tab.frame_id.as_deref(),
                 )
-                .await?;
+                .await
+                .map_err(|error| {
+                    normalize_source_frame_continuity_error(error, trigger, "storage_value")
+                })?;
             if !storage_snapshot_matches(&snapshot, trigger)? {
                 return Ok(TriggerConditionEvaluation {
                     evidence: None,
@@ -286,12 +340,57 @@ pub(super) async fn evaluate_trigger_condition(
     }
 }
 
+fn normalize_source_frame_continuity_error(
+    error: RubError,
+    trigger: &TriggerInfo,
+    condition_kind: &'static str,
+) -> RubError {
+    let RubError::Domain(envelope) = error else {
+        return error;
+    };
+    let Some(source_frame_id) = trigger.source_tab.frame_id.as_deref() else {
+        return RubError::Domain(envelope);
+    };
+    let frame_authority_reason = envelope
+        .context
+        .as_ref()
+        .and_then(|context| context.get("reason"))
+        .and_then(|value| value.as_str());
+    if envelope.code != ErrorCode::InvalidInput
+        || !matches!(
+            frame_authority_reason,
+            Some(
+                "frame_inventory_missing"
+                    | "frame_not_same_origin_accessible"
+                    | "frame_execution_context_missing"
+            )
+        )
+    {
+        return RubError::Domain(envelope);
+    }
+
+    RubError::Domain(trigger_degraded_authority_error(
+        "trigger source-frame continuity fence failed before authoritative condition evaluation could complete",
+        "continuity_frame_unavailable",
+        serde_json::json!({
+            "source_tab_target_id": trigger.source_tab.target_id,
+            "source_frame_id": source_frame_id,
+            "condition_kind": condition_kind,
+            "frame_authority_reason": frame_authority_reason,
+            "upstream_error_code": envelope.code,
+            "upstream_error_message": envelope.message,
+            "upstream_error_context": envelope.context,
+        }),
+    ))
+}
+
 pub(super) fn commit_trigger_network_progress(
     worker: &mut TriggerWorkerEntry,
     progress: Option<TriggerNetworkProgress>,
 ) {
     if let Some(progress) = progress {
         worker.network_cursor = progress.next_cursor;
+        worker.network_cursor_primed = true;
         worker.observatory_drop_count = progress.observed_drop_count;
     }
 }
@@ -309,9 +408,12 @@ pub(super) fn readiness_matches(readiness: &ReadinessInfo, requested: &str) -> b
         return false;
     }
 
+    if readiness.degraded_reason.is_some() {
+        return false;
+    }
+
     if requested == "ready" {
-        return matches!(readiness.route_stability, RouteStability::Stable)
-            && readiness.degraded_reason.is_none();
+        return matches!(readiness.route_stability, RouteStability::Stable);
     }
 
     requested == format!("{:?}", readiness.status).to_ascii_lowercase()
@@ -388,4 +490,94 @@ pub(super) fn storage_snapshot_matches(
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_source_frame_continuity_error;
+    use rub_core::error::{ErrorCode, RubError};
+    use rub_core::model::{
+        TriggerActionKind, TriggerActionSpec, TriggerConditionKind, TriggerConditionSpec,
+        TriggerInfo, TriggerMode, TriggerStatus, TriggerTabBindingInfo,
+    };
+
+    fn trigger_with_source_frame() -> TriggerInfo {
+        TriggerInfo {
+            id: 7,
+            status: TriggerStatus::Armed,
+            lifecycle_generation: 1,
+            mode: TriggerMode::Once,
+            source_tab: TriggerTabBindingInfo {
+                index: 0,
+                target_id: "source".to_string(),
+                frame_id: Some("frame-a".to_string()),
+                url: "https://source.example".to_string(),
+                title: "Source".to_string(),
+            },
+            target_tab: TriggerTabBindingInfo {
+                index: 1,
+                target_id: "target".to_string(),
+                frame_id: None,
+                url: "https://target.example".to_string(),
+                title: "Target".to_string(),
+            },
+            condition: TriggerConditionSpec {
+                kind: TriggerConditionKind::TextPresent,
+                locator: None,
+                text: Some("Ready".to_string()),
+                url_pattern: None,
+                readiness_state: None,
+                method: None,
+                status_code: None,
+                storage_area: None,
+                key: None,
+                value: None,
+            },
+            action: TriggerActionSpec {
+                kind: TriggerActionKind::BrowserCommand,
+                command: Some("click".to_string()),
+                payload: None,
+            },
+            last_condition_evidence: None,
+            consumed_evidence_fingerprint: None,
+            last_action_result: None,
+            unavailable_reason: None,
+        }
+    }
+
+    #[test]
+    fn source_frame_continuity_error_uses_degraded_authority_family() {
+        let trigger = trigger_with_source_frame();
+        let error = normalize_source_frame_continuity_error(
+            RubError::domain_with_context(
+                ErrorCode::InvalidInput,
+                "Frame 'frame-a' is not present in the current frame inventory",
+                serde_json::json!({
+                    "reason": "frame_inventory_missing",
+                    "frame_id": "frame-a",
+                }),
+            ),
+            &trigger,
+            "text_present",
+        )
+        .into_envelope();
+
+        assert_eq!(error.code, ErrorCode::SessionBusy);
+        assert_eq!(
+            error
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("continuity_frame_unavailable")
+        );
+        assert_eq!(
+            error
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("frame_authority_reason"))
+                .and_then(|value| value.as_str()),
+            Some("frame_inventory_missing")
+        );
+    }
 }

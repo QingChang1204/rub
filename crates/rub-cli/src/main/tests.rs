@@ -4,7 +4,9 @@ use crate::binding_execution_ctl::resolve_command_execution_binding;
 use crate::binding_memory_ctl::remember_binding_alias;
 use crate::commands::EffectiveCli;
 use crate::commands::RememberedBindingAliasKindArg;
-use crate::main_dispatch::close_all_partial_failure_error;
+use crate::main_dispatch::{
+    cleanup_compatibility_degraded_owned_error, close_all_partial_failure_error,
+};
 use crate::main_support::project_sessions_result;
 use crate::session_policy::ConnectionRequest;
 use rub_core::error::ErrorCode;
@@ -13,7 +15,9 @@ use rub_core::model::{
     BindingRecord, BindingRegistryData, BindingScope, BindingSessionReference,
     BindingSessionReferenceKind,
 };
-use rub_daemon::session::RegistryEntry;
+use rub_daemon::session::{RegistryEntry, RegistryEntryLiveness, RegistryEntrySnapshot};
+use rub_ipc::protocol::IpcResponse;
+use serde_json::json;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -40,6 +44,7 @@ fn use_alias_doctor_cli(home: &std::path::Path) -> EffectiveCli {
         cdp_url: None,
         connect: false,
         profile: None,
+        profile_resolved_path: None,
         use_alias: Some("ops-admin".to_string()),
         no_stealth: false,
         humanize: false,
@@ -66,6 +71,149 @@ fn close_cli(home: &std::path::Path) -> EffectiveCli {
         cdp_url: None,
         connect: false,
         profile: None,
+        profile_resolved_path: None,
+        use_alias: None,
+        no_stealth: false,
+        humanize: false,
+        humanize_speed: "normal".to_string(),
+        requested_launch_policy: commands::RequestedLaunchPolicy::default(),
+        effective_launch_policy: commands::RequestedLaunchPolicy::default(),
+    }
+}
+
+fn explain_locator_cli(home: &std::path::Path) -> EffectiveCli {
+    EffectiveCli {
+        session: "default".to_string(),
+        session_id: None,
+        rub_home: home.to_path_buf(),
+        timeout: 30_000,
+        headed: false,
+        ignore_cert_errors: false,
+        user_data_dir: None,
+        hide_infobars: true,
+        json_pretty: false,
+        verbose: false,
+        trace: false,
+        command: Commands::Explain {
+            subcommand: commands::ExplainSubcommand::Locator {
+                target: commands::ElementAddressArgs::default(),
+            },
+        },
+        cdp_url: None,
+        connect: false,
+        profile: None,
+        profile_resolved_path: None,
+        use_alias: None,
+        no_stealth: false,
+        humanize: false,
+        humanize_speed: "normal".to_string(),
+        requested_launch_policy: commands::RequestedLaunchPolicy::default(),
+        effective_launch_policy: commands::RequestedLaunchPolicy::default(),
+    }
+}
+
+fn find_explain_cli(home: &std::path::Path) -> EffectiveCli {
+    EffectiveCli {
+        session: "default".to_string(),
+        session_id: None,
+        rub_home: home.to_path_buf(),
+        timeout: 30_000,
+        headed: false,
+        ignore_cert_errors: false,
+        user_data_dir: None,
+        hide_infobars: true,
+        json_pretty: false,
+        verbose: false,
+        trace: false,
+        command: Commands::Find {
+            target: commands::ElementAddressArgs::default(),
+            content: false,
+            explain: true,
+            limit: None,
+        },
+        cdp_url: None,
+        connect: false,
+        profile: None,
+        profile_resolved_path: None,
+        use_alias: None,
+        no_stealth: false,
+        humanize: false,
+        humanize_speed: "normal".to_string(),
+        requested_launch_policy: commands::RequestedLaunchPolicy::default(),
+        effective_launch_policy: commands::RequestedLaunchPolicy::default(),
+    }
+}
+
+fn exec_raw_cli(home: &std::path::Path) -> EffectiveCli {
+    let mut cli = close_cli(home);
+    cli.command = Commands::Exec {
+        code: "1 + 1".to_string(),
+        raw: true,
+        wait_after: commands::WaitAfterArgs::default(),
+    };
+    cli
+}
+
+fn history_export_cli(home: &std::path::Path, output: &std::path::Path) -> EffectiveCli {
+    EffectiveCli {
+        session: "default".to_string(),
+        session_id: None,
+        rub_home: home.to_path_buf(),
+        timeout: 30_000,
+        headed: false,
+        ignore_cert_errors: false,
+        user_data_dir: None,
+        hide_infobars: true,
+        json_pretty: false,
+        verbose: false,
+        trace: false,
+        command: Commands::History {
+            last: 2,
+            from: None,
+            to: None,
+            export_pipe: true,
+            export_script: false,
+            include_observation: false,
+            save_as: None,
+            output: Some(output.display().to_string()),
+        },
+        cdp_url: None,
+        connect: false,
+        profile: None,
+        profile_resolved_path: None,
+        use_alias: None,
+        no_stealth: false,
+        humanize: false,
+        humanize_speed: "normal".to_string(),
+        requested_launch_policy: commands::RequestedLaunchPolicy::default(),
+        effective_launch_policy: commands::RequestedLaunchPolicy::default(),
+    }
+}
+
+fn orchestration_export_cli(home: &std::path::Path, output: &std::path::Path) -> EffectiveCli {
+    EffectiveCli {
+        session: "default".to_string(),
+        session_id: None,
+        rub_home: home.to_path_buf(),
+        timeout: 30_000,
+        headed: false,
+        ignore_cert_errors: false,
+        user_data_dir: None,
+        hide_infobars: true,
+        json_pretty: false,
+        verbose: false,
+        trace: false,
+        command: Commands::Orchestration {
+            subcommand: commands::OrchestrationSubcommand::Export {
+                id: 1,
+                save_as: None,
+                output: Some(output.display().to_string()),
+            },
+        },
+        cdp_url: None,
+        connect: false,
+        profile: None,
+        profile_resolved_path: None,
         use_alias: None,
         no_stealth: false,
         humanize: false,
@@ -118,6 +266,345 @@ fn write_profile_binding(home: &std::path::Path) {
 }
 
 #[test]
+fn explain_locator_projection_failure_fails_closed_after_daemon_commit() {
+    let home = temp_home();
+    let cli = explain_locator_cli(&home);
+    let mut response = IpcResponse::success("req-explain", json!({ "result": { "matches": [] } }))
+        .with_command_id("cmd-explain")
+        .expect("static command_id must be valid")
+        .with_daemon_session_id("daemon-session")
+        .expect("static daemon_session_id must be valid");
+
+    let output = finalize_response_output(
+        &cli,
+        FinalizeResponseContext {
+            command_name: "explain",
+            session: "default",
+            rub_home: &home,
+            pretty: false,
+            command_deadline: Instant::now() + Duration::from_secs(30),
+            timeout_ms: 30_000,
+            binding_execution_projection: None,
+        },
+        &mut response,
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&output.output).expect("formatted output should be valid json");
+
+    assert!(!output.success);
+    assert_eq!(value["success"], false, "{value}");
+    assert!(value["data"].is_null(), "{value}");
+    assert_eq!(value["request_id"], "req-explain", "{value}");
+    assert_eq!(value["command_id"], "cmd-explain", "{value}");
+    assert_eq!(
+        value["error"]["context"]["reason"], "post_commit_locator_explain_failed",
+        "{value}"
+    );
+    assert_eq!(
+        value["error"]["context"]["daemon_request_committed"], true,
+        "{value}"
+    );
+    assert_eq!(
+        value["error"]["context"]["committed_response_projection"]["result"]["matches"],
+        json!([]),
+        "{value}"
+    );
+}
+
+#[test]
+fn find_explain_projection_failure_fails_closed_after_daemon_commit() {
+    let home = temp_home();
+    let cli = find_explain_cli(&home);
+    let mut response = IpcResponse::success("req-find", json!({ "result": { "matches": [] } }))
+        .with_command_id("cmd-find")
+        .expect("static command_id must be valid")
+        .with_daemon_session_id("daemon-session")
+        .expect("static daemon_session_id must be valid");
+
+    let output = finalize_response_output(
+        &cli,
+        FinalizeResponseContext {
+            command_name: "find",
+            session: "default",
+            rub_home: &home,
+            pretty: false,
+            command_deadline: Instant::now() + Duration::from_secs(30),
+            timeout_ms: 30_000,
+            binding_execution_projection: None,
+        },
+        &mut response,
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&output.output).expect("formatted output should be valid json");
+
+    assert!(!output.success);
+    assert_eq!(value["success"], false, "{value}");
+    assert!(value["data"].is_null(), "{value}");
+    assert_eq!(value["request_id"], "req-find", "{value}");
+    assert_eq!(value["command_id"], "cmd-find", "{value}");
+    assert_eq!(
+        value["error"]["context"]["reason"], "post_commit_find_locator_explain_failed",
+        "{value}"
+    );
+    assert_eq!(
+        value["error"]["context"]["daemon_request_committed"], true,
+        "{value}"
+    );
+    assert_eq!(
+        value["error"]["context"]["committed_response_projection"]["result"]["matches"],
+        json!([]),
+        "{value}"
+    );
+}
+
+#[test]
+fn exec_raw_missing_result_fails_closed_after_daemon_commit() {
+    let home = temp_home();
+    let cli = exec_raw_cli(&home);
+    let mut response = IpcResponse::success("req-raw", json!({ "ok": true }))
+        .with_command_id("cmd-raw")
+        .expect("static command_id must be valid")
+        .with_daemon_session_id("daemon-session")
+        .expect("static daemon_session_id must be valid");
+
+    let output = finalize_response_output(
+        &cli,
+        FinalizeResponseContext {
+            command_name: "exec",
+            session: "default",
+            rub_home: &home,
+            pretty: false,
+            command_deadline: Instant::now() + Duration::from_secs(30),
+            timeout_ms: 30_000,
+            binding_execution_projection: None,
+        },
+        &mut response,
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&output.output).expect("raw failure should use JSON error envelope");
+
+    assert!(!output.success);
+    assert_eq!(value["success"], false, "{value}");
+    assert_eq!(value["request_id"], "req-raw", "{value}");
+    assert_eq!(value["command_id"], "cmd-raw", "{value}");
+    assert_eq!(
+        value["error"]["context"]["reason"], "post_commit_exec_raw_projection_failed",
+        "{value}"
+    );
+    assert_eq!(
+        value["error"]["context"]["daemon_request_committed"], true,
+        "{value}"
+    );
+}
+
+#[test]
+fn finalize_response_output_uses_effect_truth_for_interaction_exit_surface() {
+    let home = temp_home();
+    let cli = EffectiveCli {
+        session: "default".to_string(),
+        session_id: None,
+        rub_home: home.clone(),
+        timeout: 30_000,
+        headed: false,
+        ignore_cert_errors: false,
+        user_data_dir: None,
+        hide_infobars: true,
+        json_pretty: false,
+        verbose: false,
+        trace: false,
+        command: Commands::Click {
+            index: None,
+            target: commands::ElementAddressArgs::default(),
+            xy: None,
+            double: false,
+            right: false,
+            wait_after: commands::WaitAfterArgs::default(),
+        },
+        cdp_url: None,
+        connect: false,
+        profile: None,
+        profile_resolved_path: None,
+        use_alias: None,
+        no_stealth: false,
+        humanize: false,
+        humanize_speed: "normal".to_string(),
+        requested_launch_policy: commands::RequestedLaunchPolicy::default(),
+        effective_launch_policy: commands::RequestedLaunchPolicy::default(),
+    };
+    let mut response = IpcResponse::success(
+        "req-click",
+        json!({
+            "interaction": {
+                "semantic_class": "activate",
+                "interaction_confirmed": false,
+                "confirmation_status": "degraded"
+            }
+        }),
+    )
+    .with_command_id("cmd-click")
+    .expect("static command_id must be valid");
+
+    let output = finalize_response_output(
+        &cli,
+        FinalizeResponseContext {
+            command_name: "click",
+            session: "default",
+            rub_home: &home,
+            pretty: false,
+            command_deadline: Instant::now() + Duration::from_secs(30),
+            timeout_ms: 30_000,
+            binding_execution_projection: None,
+        },
+        &mut response,
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&output.output).expect("formatted output should be valid json");
+
+    assert!(!output.success);
+    assert_eq!(value["success"], false, "{value}");
+    assert_eq!(
+        value["error"]["code"], "INTERACTION_NOT_CONFIRMED",
+        "{value}"
+    );
+    assert_eq!(
+        value["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_status"],
+        "degraded",
+        "{value}"
+    );
+}
+
+#[test]
+fn finalize_response_output_history_export_failure_uses_committed_top_level_error() {
+    let home = temp_home();
+    let blocked_output = home.join("blocked-output");
+    std::fs::create_dir_all(&blocked_output).expect("create blocked output directory");
+    let cli = history_export_cli(&home, &blocked_output);
+    let mut response = IpcResponse::success(
+        "req-history-export",
+        json!({
+            "result": {
+                "format": "pipe",
+                "projection_state": {
+                    "surface": "workflow_capture_export",
+                    "truth_level": "replayable_export_projection",
+                    "projection_kind": "durable_workflow_export",
+                    "projection_authority": "session.workflow_capture_export",
+                    "upstream_commit_truth": "daemon_response_committed",
+                    "control_role": "workflow_asset_source",
+                    "durability": "durable",
+                    "lossy": false,
+                    "lossy_reasons": []
+                },
+                "complete": true,
+                "entries": [
+                    {
+                        "command": "open",
+                        "args": { "url": "https://example.com" }
+                    }
+                ]
+            }
+        }),
+    )
+    .with_command_id("cmd-history-export")
+    .expect("static command_id must be valid");
+
+    let output = finalize_response_output(
+        &cli,
+        FinalizeResponseContext {
+            command_name: "history",
+            session: "default",
+            rub_home: &home,
+            pretty: false,
+            command_deadline: Instant::now() + Duration::from_secs(30),
+            timeout_ms: 30_000,
+            binding_execution_projection: None,
+        },
+        &mut response,
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&output.output).expect("formatted output should be valid json");
+
+    assert!(!output.success);
+    assert_eq!(value["success"], false, "{value}");
+    assert_eq!(
+        value["error"]["context"]["reason"],
+        "post_commit_history_export_failed"
+    );
+    assert_eq!(
+        value["error"]["context"]["daemon_request_committed"], true,
+        "{value}"
+    );
+    assert_eq!(
+        value["error"]["context"]["committed_response_projection"]["result"]["format"], "pipe",
+        "{value}"
+    );
+    assert!(
+        value.get("data").is_none() || value["data"].is_null(),
+        "{value}"
+    );
+}
+
+#[test]
+fn finalize_response_output_orchestration_export_failure_uses_committed_top_level_error() {
+    let home = temp_home();
+    let blocked_output = home.join("blocked-output");
+    std::fs::create_dir_all(&blocked_output).expect("create blocked output directory");
+    let cli = orchestration_export_cli(&home, &blocked_output);
+    let mut response = IpcResponse::success(
+        "req-orchestration-export",
+        json!({
+            "result": {
+                "format": "orchestration",
+                "spec": {
+                    "source": { "session_id": "source" },
+                    "target": { "session_id": "target" },
+                    "condition": { "kind": "url_match", "url": "https://example.com" },
+                    "actions": [{ "kind": "browser_command", "command": "reload" }]
+                }
+            }
+        }),
+    )
+    .with_command_id("cmd-orchestration-export")
+    .expect("static command_id must be valid");
+
+    let output = finalize_response_output(
+        &cli,
+        FinalizeResponseContext {
+            command_name: "orchestration",
+            session: "default",
+            rub_home: &home,
+            pretty: false,
+            command_deadline: Instant::now() + Duration::from_secs(30),
+            timeout_ms: 30_000,
+            binding_execution_projection: None,
+        },
+        &mut response,
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&output.output).expect("formatted output should be valid json");
+
+    assert!(!output.success);
+    assert_eq!(value["success"], false, "{value}");
+    assert_eq!(
+        value["error"]["context"]["reason"], "post_commit_orchestration_export_failed",
+        "{value}"
+    );
+    assert_eq!(
+        value["error"]["context"]["daemon_request_committed"], true,
+        "{value}"
+    );
+    assert_eq!(
+        value["error"]["context"]["committed_response_projection"]["result"]["format"],
+        "orchestration",
+        "{value}"
+    );
+    assert!(
+        value.get("data").is_none() || value["data"].is_null(),
+        "{value}"
+    );
+}
+
+#[test]
 fn daemon_args_forward_v14_policy_flags() {
     let mut cli = EffectiveCli {
         session: "default".to_string(),
@@ -135,6 +622,7 @@ fn daemon_args_forward_v14_policy_flags() {
         cdp_url: None,
         connect: false,
         profile: None,
+        profile_resolved_path: None,
         use_alias: None,
         no_stealth: false,
         humanize: false,
@@ -171,6 +659,7 @@ fn daemon_args_skip_config_default_user_data_dir_for_profile_request() {
         cdp_url: None,
         connect: false,
         profile: Some("Default".to_string()),
+        profile_resolved_path: None,
         use_alias: None,
         no_stealth: false,
         humanize: false,
@@ -213,6 +702,7 @@ fn daemon_args_forward_materialized_auto_discover_as_explicit_cdp_url() {
         cdp_url: None,
         connect: true,
         profile: None,
+        profile_resolved_path: None,
         use_alias: None,
         no_stealth: false,
         humanize: false,
@@ -250,6 +740,7 @@ fn daemon_args_forward_explicit_user_data_dir_request() {
         cdp_url: None,
         connect: false,
         profile: None,
+        profile_resolved_path: None,
         use_alias: None,
         no_stealth: false,
         humanize: false,
@@ -305,7 +796,21 @@ fn close_all_partial_failure_error_reports_failed_sessions_as_non_success() {
         &crate::daemon_ctl::BatchCloseResult {
             closed: vec!["default".to_string()],
             cleaned_stale: vec!["work".to_string()],
+            compatibility_degraded_owned_sessions: vec![],
             failed: vec!["broken".to_string()],
+            session_error_details: vec![crate::daemon_ctl::BatchCloseSessionError {
+                session: "broken".to_string(),
+                error: rub_core::error::ErrorEnvelope::new(
+                    ErrorCode::IpcProtocolError,
+                    "replay recovery failed",
+                )
+                .with_context(serde_json::json!({
+                    "reason": "ipc_replay_retry_failed",
+                    "recovery_contract": {
+                        "kind": "session_post_commit_journal",
+                    },
+                })),
+            }],
         },
     )
     .into_envelope();
@@ -320,6 +825,101 @@ fn close_all_partial_failure_error_reports_failed_sessions_as_non_success() {
             .as_ref()
             .and_then(|ctx| ctx.get("failed_sessions")),
         Some(&serde_json::json!(["broken"]))
+    );
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("session_error_details"))
+            .and_then(|value| value.get(0))
+            .and_then(|value| value.get("error"))
+            .and_then(|value| value.get("context"))
+            .and_then(|value| value.get("recovery_contract"))
+            .and_then(|value| value.get("kind")),
+        Some(&serde_json::json!("session_post_commit_journal"))
+    );
+}
+
+#[test]
+fn close_all_partial_failure_error_treats_compatibility_degraded_owned_sessions_as_non_success() {
+    let envelope = close_all_partial_failure_error(
+        std::path::Path::new("/tmp/rub-home"),
+        &crate::daemon_ctl::BatchCloseResult {
+            closed: vec!["default".to_string()],
+            cleaned_stale: vec![],
+            compatibility_degraded_owned_sessions: vec![
+                crate::daemon_ctl::CompatibilityDegradedOwnedSession {
+                    session: "legacy".to_string(),
+                    daemon_session_id: "sess-legacy".to_string(),
+                    reason:
+                        crate::daemon_ctl::CompatibilityDegradedOwnedReason::ProtocolIncompatible,
+                },
+            ],
+            failed: vec![],
+            session_error_details: vec![],
+        },
+    )
+    .into_envelope();
+    assert_eq!(envelope.code, ErrorCode::SessionBusy);
+    assert!(
+        envelope
+            .message
+            .contains("Failed to fully release 1 session"),
+        "{envelope:?}"
+    );
+    assert_eq!(
+        envelope.context.as_ref().and_then(|ctx| ctx.get("reason")),
+        Some(&serde_json::json!(
+            "close_all_compatibility_degraded_owned_sessions"
+        ))
+    );
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("compatibility_degraded_owned_sessions")),
+        Some(&serde_json::json!([{
+            "session": "legacy",
+            "daemon_session_id": "sess-legacy",
+            "reason": "protocol_incompatible"
+        }]))
+    );
+}
+
+#[test]
+fn cleanup_compatibility_degraded_owned_error_uses_shared_family_projection() {
+    let envelope = cleanup_compatibility_degraded_owned_error(
+        std::path::Path::new("/tmp/rub-home"),
+        &crate::cleanup_ctl::CleanupResult {
+            compatibility_degraded_owned_sessions: vec![
+                crate::daemon_ctl::CompatibilityDegradedOwnedSession {
+                    session: "legacy".to_string(),
+                    daemon_session_id: "sess-legacy".to_string(),
+                    reason:
+                        crate::daemon_ctl::CompatibilityDegradedOwnedReason::ProtocolIncompatible,
+                },
+            ],
+            ..Default::default()
+        },
+    )
+    .into_envelope();
+    assert_eq!(envelope.code, ErrorCode::SessionBusy);
+    assert_eq!(
+        envelope.context.as_ref().and_then(|ctx| ctx.get("reason")),
+        Some(&serde_json::json!(
+            "cleanup_compatibility_degraded_owned_sessions"
+        ))
+    );
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("compatibility_degraded_owned_sessions")),
+        Some(&serde_json::json!([{
+            "session": "legacy",
+            "daemon_session_id": "sess-legacy",
+            "reason": "protocol_incompatible"
+        }]))
     );
 }
 
@@ -411,16 +1011,20 @@ fn rub_home_create_error_marks_rub_home_state() {
 fn project_sessions_result_marks_local_runtime_paths() {
     let projected = project_sessions_result(
         std::path::Path::new("/tmp/rub-home"),
-        vec![RegistryEntry {
-            session_id: "sess-default".to_string(),
-            session_name: "default".to_string(),
-            pid: 4242,
-            socket_path: "/tmp/rub-home/default.sock".to_string(),
-            created_at: "2026-04-08T00:00:00Z".to_string(),
-            ipc_protocol_version: "1.0".to_string(),
-            user_data_dir: Some("/tmp/rub-home/browser/default".to_string()),
-            attachment_identity: None,
-            connection_target: None,
+        vec![RegistryEntrySnapshot {
+            entry: RegistryEntry {
+                session_id: "sess-default".to_string(),
+                session_name: "default".to_string(),
+                pid: 4242,
+                socket_path: "/tmp/rub-home/default.sock".to_string(),
+                created_at: "2026-04-08T00:00:00Z".to_string(),
+                ipc_protocol_version: "1.0".to_string(),
+                user_data_dir: Some("/tmp/rub-home/browser/default".to_string()),
+                attachment_identity: None,
+                connection_target: None,
+            },
+            liveness: RegistryEntryLiveness::ProtocolIncompatible,
+            pid_live: true,
         }],
     );
 
@@ -439,6 +1043,15 @@ fn project_sessions_result_marks_local_runtime_paths() {
     assert_eq!(
         projected["result"]["items"][0]["user_data_dir_state"]["path_authority"],
         "cli.sessions.result.items.user_data_dir"
+    );
+    assert_eq!(
+        projected["result"]["items"][0]["liveness"],
+        "protocol_incompatible"
+    );
+    assert_eq!(projected["result"]["items"][0]["attach_supported"], false);
+    assert_eq!(
+        projected["result"]["items"][0]["compatibility_degraded_owned_reason"],
+        "protocol_incompatible"
     );
 }
 
@@ -459,6 +1072,7 @@ fn local_surface_use_alias_cli(command: Commands) -> EffectiveCli {
         cdp_url: None,
         connect: false,
         profile: None,
+        profile_resolved_path: None,
         use_alias: Some("ops-admin".to_string()),
         no_stealth: false,
         humanize: false,
@@ -584,6 +1198,8 @@ fn use_alias_profile_binding_routes_to_daemon_profile_flag() {
     );
     assert!(args.contains(&"--profile".to_string()));
     assert!(args.contains(&"Profile 3".to_string()));
+    assert!(args.contains(&"--profile-resolved-path".to_string()));
+    assert!(args.contains(&"/tmp/work/Profile 3".to_string()));
     assert!(!args.contains(&"--user-data-dir".to_string()));
 
     let _ = std::fs::remove_dir_all(home);

@@ -9,6 +9,7 @@ use super::OrchestrationProbeResult;
 use super::matching::{
     network_request_matches, readiness_matches, resolve_tab, storage_snapshot_matches,
 };
+use crate::router::orchestration_degraded_authority_error;
 use crate::session::SessionState;
 
 pub(crate) async fn evaluate_orchestration_probe_for_tab(
@@ -25,6 +26,16 @@ pub(crate) async fn evaluate_orchestration_probe_for_tab(
             let pattern = condition.url_pattern.as_deref().unwrap_or_default().trim();
             let tabs = browser.list_tabs().await?;
             let source_tab = resolve_tab(&tabs, tab_target_id)?;
+            if let Some(degraded_reason) = source_tab.degraded_reason.as_deref() {
+                return Err(RubError::Domain(orchestration_degraded_authority_error(
+                    "orchestration url_match condition is not authoritative because source tab page identity is degraded",
+                    "orchestration_source_tab_projection_degraded",
+                    serde_json::json!({
+                        "tab_target_id": source_tab.target_id,
+                        "degraded_reason": degraded_reason,
+                    }),
+                )));
+            }
             if !source_tab.url.contains(pattern) {
                 return Ok(OrchestrationProbeResult {
                     matched: false,
@@ -149,7 +160,7 @@ pub(crate) async fn evaluate_orchestration_probe_for_tab(
             let window = state
                 .network_request_window_after(after_sequence, last_observed_drop_count)
                 .await;
-            let observed_drop_count = state.network_request_drop_count().await;
+            let observed_drop_count = state.network_request_ingress_drop_count();
             if !window.authoritative {
                 return Ok(OrchestrationProbeResult {
                     matched: false,

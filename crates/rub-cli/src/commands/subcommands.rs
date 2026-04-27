@@ -124,6 +124,8 @@ pub enum Commands {
         /// Print the result directly instead of the standard JSON envelope
         #[arg(long)]
         raw: bool,
+        #[command(flatten)]
+        wait_after: WaitAfterArgs,
     },
 
     /// Explain how canonical CLI surfaces will interpret a command shape

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use rub_core::error::{ErrorCode, RubError};
-use rub_core::model::{TriggerInfo, TriggerRegistrationSpec, TriggerStatus};
+use rub_core::model::{TriggerConditionKind, TriggerInfo, TriggerRegistrationSpec, TriggerStatus};
 
 use crate::runtime_refresh::refresh_live_trigger_runtime;
 use crate::session::SessionState;
@@ -51,26 +51,50 @@ pub(super) async fn cmd_trigger_add(
             trigger_registration_reusable(trigger, &source_tab, &target_tab, &spec)
         });
     let trigger = if let Some(existing) = existing_trigger {
-        existing
+        if matches!(
+            existing.condition.kind,
+            TriggerConditionKind::NetworkRequest
+        ) {
+            state
+                .ensure_trigger_network_request_baseline(
+                    existing.id,
+                    state.current_network_request_baseline().await,
+                )
+                .await
+                .unwrap_or(existing)
+        } else {
+            existing
+        }
     } else {
+        let network_baseline = if !args.paused
+            && matches!(spec.condition.kind, TriggerConditionKind::NetworkRequest)
+        {
+            Some(state.current_network_request_baseline().await)
+        } else {
+            None
+        };
         state
-            .register_trigger(TriggerInfo {
-                id: 0,
-                status: if args.paused {
-                    TriggerStatus::Paused
-                } else {
-                    TriggerStatus::Armed
+            .register_trigger_with_network_baseline(
+                TriggerInfo {
+                    id: 0,
+                    status: if args.paused {
+                        TriggerStatus::Paused
+                    } else {
+                        TriggerStatus::Armed
+                    },
+                    lifecycle_generation: 1,
+                    mode: spec.mode,
+                    source_tab,
+                    target_tab,
+                    condition: spec.condition,
+                    action: spec.action,
+                    last_condition_evidence: None,
+                    consumed_evidence_fingerprint: None,
+                    last_action_result: None,
+                    unavailable_reason: None,
                 },
-                mode: spec.mode,
-                source_tab,
-                target_tab,
-                condition: spec.condition,
-                action: spec.action,
-                last_condition_evidence: None,
-                consumed_evidence_fingerprint: None,
-                last_action_result: None,
-                unavailable_reason: None,
-            })
+                network_baseline,
+            )
             .await
     };
     state.reconcile_trigger_runtime(&tabs).await;
@@ -169,7 +193,17 @@ pub(super) async fn update_trigger_status(
     let trigger = match (current.status, next_status) {
         (TriggerStatus::Armed, TriggerStatus::Paused)
         | (TriggerStatus::Paused, TriggerStatus::Armed) => state
-            .set_trigger_status(id, next_status)
+            .set_trigger_status_with_network_baseline(
+                id,
+                next_status,
+                if matches!(next_status, TriggerStatus::Armed)
+                    && matches!(current.condition.kind, TriggerConditionKind::NetworkRequest)
+                {
+                    Some(state.current_network_request_baseline().await)
+                } else {
+                    None
+                },
+            )
             .await
             .ok_or_else(|| {
                 RubError::Internal(format!(

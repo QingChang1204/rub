@@ -1,9 +1,13 @@
 use std::sync::Arc;
 
 use super::super::timeout::execute_wait_command;
+use super::super::timeout_projection::{
+    post_wait_partial_commit_timeout_projection, record_post_wait_partial_commit_timeout_projection,
+};
+use super::super::wait_after::validate_wait_after_args_if_requested;
 use super::super::*;
 use rub_core::command::CommandName;
-use rub_core::error::ErrorCode;
+use rub_core::error::{ErrorCode, RubError};
 
 pub(super) async fn dispatch_named_command(
     router: &DaemonRouter,
@@ -33,22 +37,22 @@ pub(super) async fn dispatch_named_command(
                 .map(CommandDispatchOutcome::new)
         }
         Some(CommandName::OrchestrationProbe) => {
-            orchestration::cmd_orchestration_probe(router, args, state)
+            orchestration::cmd_orchestration_probe(router, args, deadline, state)
                 .await
                 .map(CommandDispatchOutcome::new)
         }
         Some(CommandName::OrchestrationTabFrames) => {
-            orchestration::cmd_orchestration_tab_frames(router, args, state)
+            orchestration::cmd_orchestration_tab_frames(router, args, deadline, state)
                 .await
                 .map(CommandDispatchOutcome::new)
         }
         Some(CommandName::OrchestrationTargetDispatch) => {
-            orchestration::cmd_orchestration_target_dispatch(router, args, state)
+            orchestration::cmd_orchestration_target_dispatch(router, args, deadline, state)
                 .await
                 .map(CommandDispatchOutcome::new)
         }
         Some(CommandName::OrchestrationWorkflowSourceVars) => {
-            orchestration::cmd_orchestration_workflow_source_vars(router, args, state)
+            orchestration::cmd_orchestration_workflow_source_vars(router, args, deadline, state)
                 .await
                 .map(CommandDispatchOutcome::new)
         }
@@ -65,9 +69,11 @@ pub(super) async fn dispatch_named_command(
         Some(CommandName::Observe) => observe::cmd_observe(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
-        Some(CommandName::Orchestration) => orchestration::cmd_orchestration(router, args, state)
-            .await
-            .map(CommandDispatchOutcome::new),
+        Some(CommandName::Orchestration) => {
+            orchestration::cmd_orchestration(router, args, deadline, state)
+                .await
+                .map(CommandDispatchOutcome::new)
+        }
         Some(CommandName::Inspect) => inspect::cmd_inspect(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
@@ -86,7 +92,7 @@ pub(super) async fn dispatch_named_command(
         Some(CommandName::Back) => navigation::cmd_back(router, deadline, state).await,
         Some(CommandName::Forward) => navigation::cmd_forward(router, deadline, state).await,
         Some(CommandName::Reload) => navigation::cmd_reload(router, args, deadline, state).await,
-        Some(CommandName::Screenshot) => navigation::cmd_screenshot(router, args)
+        Some(CommandName::Screenshot) => navigation::cmd_screenshot(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
         Some(CommandName::Doctor) => runtime::cmd_doctor(router, state)
@@ -110,7 +116,7 @@ pub(super) async fn dispatch_named_command(
         Some(CommandName::Download) => downloads::cmd_download(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
-        Some(CommandName::Storage) => storage::cmd_storage(router, args, state)
+        Some(CommandName::Storage) => storage::cmd_storage(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
         Some(CommandName::Handoff) => runtime::cmd_handoff(router, args, state)
@@ -197,28 +203,37 @@ pub(super) fn execute_named_command_with_fence<'a>(
     Box<dyn std::future::Future<Output = Result<serde_json::Value, RubError>> + Send + 'a>,
 > {
     Box::pin(async move {
+        validate_wait_after_args_if_requested(command, args)?;
         let outcome = dispatch_named_command(router, command, args, deadline, state).await?;
         let (data, pending_external_dom_commit) = outcome.into_parts();
-        let data = apply_post_dispatch_same_epoch_fence_before_post_wait(
-            command,
-            state,
-            apply_post_wait_if_requested(
-                router,
-                router.browser.clone(),
-                command,
-                args,
-                deadline,
-                data,
-                state,
-            ),
-        )
-        .await?;
         let response_epoch = response_dom_epoch(command, args, state, pending_external_dom_commit);
-        Ok(if let Some(epoch) = response_epoch {
-            attach_response_metadata(data, Some(epoch))
+        let committed_projection = if let Some(epoch) = response_epoch {
+            attach_response_metadata(data.clone(), Some(epoch))
         } else {
-            data
-        })
+            data.clone()
+        };
+        apply_same_epoch_snapshot_cache_fence(command, args, state).await;
+        if args.get("wait_after").is_some() {
+            record_post_wait_partial_commit_timeout_projection(
+                command,
+                committed_projection.clone(),
+                response_epoch,
+            );
+        }
+        let data = apply_post_wait_if_requested(
+            router,
+            router.browser.clone(),
+            command,
+            args,
+            deadline,
+            committed_projection.clone(),
+            state,
+        )
+        .await
+        .map_err(|error| {
+            post_wait_after_commit_error(error, command, committed_projection, response_epoch)
+        })?;
+        Ok(data)
     })
 }
 
@@ -234,30 +249,88 @@ fn response_dom_epoch(
 
 pub(super) async fn apply_same_epoch_snapshot_cache_fence(
     command: &str,
+    args: &serde_json::Value,
     state: &Arc<SessionState>,
 ) {
-    if super::super::policy::command_invalidates_cached_snapshots_without_epoch_bump(command) {
+    if super::super::policy::command_invalidates_cached_snapshots_without_epoch_bump(command, args)
+    {
         state.clear_all_snapshots().await;
     }
 }
 
+#[cfg(test)]
 async fn apply_post_dispatch_same_epoch_fence_before_post_wait<F>(
     command: &str,
+    args: &serde_json::Value,
     state: &Arc<SessionState>,
     post_wait: F,
 ) -> Result<serde_json::Value, RubError>
 where
     F: std::future::Future<Output = Result<serde_json::Value, RubError>>,
 {
-    apply_same_epoch_snapshot_cache_fence(command, state).await;
+    apply_same_epoch_snapshot_cache_fence(command, args, state).await;
     post_wait.await
+}
+
+fn post_wait_after_commit_error(
+    error: RubError,
+    command: &str,
+    committed_projection: serde_json::Value,
+    dom_epoch: Option<u64>,
+) -> RubError {
+    match error {
+        RubError::Domain(mut envelope) => {
+            envelope.context = merge_post_wait_partial_commit_context(
+                envelope.context.take(),
+                command,
+                committed_projection,
+                dom_epoch,
+            );
+            RubError::Domain(envelope)
+        }
+        other => {
+            let mut envelope = other.into_envelope();
+            envelope.context = merge_post_wait_partial_commit_context(
+                None,
+                command,
+                committed_projection,
+                dom_epoch,
+            );
+            RubError::Domain(envelope)
+        }
+    }
+}
+
+fn merge_post_wait_partial_commit_context(
+    base: Option<serde_json::Value>,
+    command: &str,
+    committed_projection: serde_json::Value,
+    dom_epoch: Option<u64>,
+) -> Option<serde_json::Value> {
+    let mut object = match base {
+        Some(serde_json::Value::Object(existing)) => existing,
+        Some(other) => {
+            let mut object = serde_json::Map::new();
+            object.insert("previous_context".to_string(), other);
+            object
+        }
+        None => serde_json::Map::new(),
+    };
+    if let serde_json::Value::Object(extra) =
+        post_wait_partial_commit_timeout_projection(command, committed_projection, dom_epoch)
+    {
+        for (key, value) in extra {
+            object.insert(key, value);
+        }
+    }
+    Some(serde_json::Value::Object(object))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         apply_post_dispatch_same_epoch_fence_before_post_wait,
-        apply_same_epoch_snapshot_cache_fence,
+        apply_same_epoch_snapshot_cache_fence, post_wait_after_commit_error,
     };
     use crate::session::SessionState;
     use rub_core::error::{ErrorCode, RubError};
@@ -322,7 +395,7 @@ mod tests {
                 "precondition: snapshot must be cached for {command}"
             );
 
-            apply_same_epoch_snapshot_cache_fence(command, &state).await;
+            apply_same_epoch_snapshot_cache_fence(command, &serde_json::json!({}), &state).await;
 
             assert!(
                 state.get_snapshot(&cached.snapshot_id).await.is_none(),
@@ -336,11 +409,54 @@ mod tests {
         let state = test_state("state-keeps");
         let cached = state.cache_snapshot(test_snapshot("snap-state")).await;
 
-        apply_same_epoch_snapshot_cache_fence("state", &state).await;
+        apply_same_epoch_snapshot_cache_fence("state", &serde_json::json!({}), &state).await;
 
         assert!(
             state.get_snapshot(&cached.snapshot_id).await.is_some(),
             "read-only commands must not clear cached snapshots"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_extract_preserves_cached_snapshots_but_scan_clears_them() {
+        let ordinary_state = test_state("extract-keeps");
+        let ordinary_cached = ordinary_state
+            .cache_snapshot(test_snapshot("snap-extract-ordinary"))
+            .await;
+
+        apply_same_epoch_snapshot_cache_fence(
+            "extract",
+            &serde_json::json!({"spec": {"title": "h1"}}),
+            &ordinary_state,
+        )
+        .await;
+
+        assert!(
+            ordinary_state
+                .get_snapshot(&ordinary_cached.snapshot_id)
+                .await
+                .is_some(),
+            "ordinary extract is read-only and must preserve cached snapshot authority"
+        );
+
+        let scan_state = test_state("extract-scan-clears");
+        let scan_cached = scan_state
+            .cache_snapshot(test_snapshot("snap-extract-scan"))
+            .await;
+
+        apply_same_epoch_snapshot_cache_fence(
+            "extract",
+            &serde_json::json!({"scan": {"limit": 3}}),
+            &scan_state,
+        )
+        .await;
+
+        assert!(
+            scan_state
+                .get_snapshot(&scan_cached.snapshot_id)
+                .await
+                .is_none(),
+            "extract scan scrolls and must clear cached snapshot authority"
         );
     }
 
@@ -351,15 +467,19 @@ mod tests {
             .cache_snapshot(test_snapshot("snap-scroll-post-wait"))
             .await;
 
-        let error =
-            apply_post_dispatch_same_epoch_fence_before_post_wait("scroll", &state, async {
+        let error = apply_post_dispatch_same_epoch_fence_before_post_wait(
+            "scroll",
+            &serde_json::json!({}),
+            &state,
+            async {
                 Err(RubError::domain(
                     ErrorCode::WaitTimeout,
                     "synthetic wait_after failure",
                 ))
-            })
-            .await
-            .expect_err("post-wait failure should still surface");
+            },
+        )
+        .await
+        .expect_err("post-wait failure should still surface");
 
         assert_eq!(error.into_envelope().code, ErrorCode::WaitTimeout);
         assert!(
@@ -375,12 +495,17 @@ mod tests {
             .cache_snapshot(test_snapshot("snap-state-post-wait"))
             .await;
 
-        let error = apply_post_dispatch_same_epoch_fence_before_post_wait("state", &state, async {
-            Err(RubError::domain(
-                ErrorCode::WaitTimeout,
-                "synthetic wait_after failure",
-            ))
-        })
+        let error = apply_post_dispatch_same_epoch_fence_before_post_wait(
+            "state",
+            &serde_json::json!({}),
+            &state,
+            async {
+                Err(RubError::domain(
+                    ErrorCode::WaitTimeout,
+                    "synthetic wait_after failure",
+                ))
+            },
+        )
         .await
         .expect_err("post-wait failure should still surface");
 
@@ -388,6 +513,38 @@ mod tests {
         assert!(
             state.get_snapshot(&cached.snapshot_id).await.is_some(),
             "read-only commands must not clear cached snapshots when post-wait fails"
+        );
+    }
+
+    #[test]
+    fn post_wait_failure_preserves_committed_projection_truth() {
+        let committed_projection = serde_json::json!({
+            "interaction": {
+                "semantic_class": "click",
+            },
+            "dom_epoch": 7,
+        });
+        let envelope = post_wait_after_commit_error(
+            RubError::domain(ErrorCode::WaitTimeout, "wait_after timed out"),
+            "click",
+            committed_projection.clone(),
+            Some(7),
+        )
+        .into_envelope();
+
+        assert_eq!(envelope.code, ErrorCode::WaitTimeout);
+        let context = envelope.context.expect("context");
+        assert_eq!(
+            context["reason"],
+            serde_json::json!("post_wait_failed_after_partial_commit")
+        );
+        assert_eq!(
+            context["partial_commit"]["recovery_contract"]["kind"],
+            "partial_commit"
+        );
+        assert_eq!(
+            context["committed_response_projection"],
+            committed_projection
         );
     }
 }

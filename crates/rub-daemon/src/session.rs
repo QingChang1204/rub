@@ -22,7 +22,7 @@ use crate::locator_memo::{LocatorMemoRegistry, LocatorMemoTarget};
 use crate::observatory::RuntimeObservatoryState;
 use crate::orchestration_runtime::OrchestrationRuntimeState;
 use crate::runtime_state_projection::RuntimeStateProjectionState;
-use crate::storage_runtime::StorageRuntimeState;
+use crate::storage_runtime::{StorageMutationRuntimeContext, StorageRuntimeState};
 use crate::takeover::TakeoverRuntimeState;
 use crate::trigger::TriggerRuntimeState;
 use crate::workflow_capture::{WorkflowCaptureProjection, WorkflowCaptureState};
@@ -39,15 +39,19 @@ use self::integration::{derive_integration_runtime_status, derive_integration_ru
 pub use self::protocol::{
     BrowserSessionEvent, BrowserSessionEventSink, ReplayCommandClaim, ReplayFenceState,
 };
+pub(crate) use self::registry::registry_authority_snapshot_async;
 /// Cross-crate re-exports: types needed by rub-cli callers and public registry operations.
 pub use self::registry::{
-    RegistryAuthoritySnapshot, RegistryData, RegistryEntry, RegistryEntryLiveness,
-    RegistryEntrySnapshot, RegistrySessionSnapshot, active_registry_entries,
-    authoritative_entry_by_session_name, check_profile_in_use, cleanup_projections,
-    deregister_session, latest_entry_by_session_name, new_session_id, promote_session_authority,
-    read_registry, register_pending_session, register_session, register_session_with_displaced,
+    HardCutReleasePendingProof, RegistryAuthoritySnapshot, RegistryData, RegistryEntry,
+    RegistryEntryLiveness, RegistryEntrySnapshot, RegistrySessionSnapshot, active_registry_entries,
+    active_registry_entry_snapshots, authoritative_entry_by_session_name, check_profile_in_use,
+    cleanup_projections, clear_hard_cut_release_pending_proof, deregister_session,
+    hard_cut_release_pending_blocks_entry, latest_entry_by_session_name, new_session_id,
+    promote_session_authority, read_hard_cut_release_pending_proof, read_registry,
+    register_pending_session, register_session, register_session_with_displaced,
     registry_authority_snapshot, registry_entry_is_live_for_home,
-    registry_entry_is_pending_startup_for_home, write_registry,
+    registry_entry_is_pending_startup_for_home, write_hard_cut_release_pending_proof,
+    write_registry,
 };
 use rub_core::model::{
     ConnectionTarget, ConsoleErrorEvent, DialogKind, DialogRuntimeInfo, DialogRuntimeStatus,
@@ -62,10 +66,19 @@ use rub_core::model::{
     RuntimeStateSnapshot, Snapshot, StateInspectorInfo, StateInspectorStatus, TabInfo,
     TakeoverRuntimeInfo, TakeoverTransitionKind, TakeoverTransitionResult,
 };
-use rub_core::storage::{StorageArea, StorageMutationKind, StorageRuntimeInfo, StorageSnapshot};
+use rub_core::storage::{StorageMutationKind, StorageRuntimeInfo, StorageSnapshot};
 
 /// Crate-internal re-exports: not part of the public API surface.
-pub(crate) use self::registry::{ensure_rub_home, rfc3339_now};
+pub(crate) use self::registry::{
+    ensure_rub_home, load_registry_for_home, registry_entry_has_runtime_authority_for_home,
+    rfc3339_now, store_registry_for_home, validate_registry_entry_for_home, with_registry_lock,
+};
+#[cfg(test)]
+pub(crate) use self::registry::{
+    force_busy_registry_socket_probe_once_for_test, force_live_registry_socket_probe_once_for_test,
+    force_probe_contract_failure_registry_socket_probe_once_for_test,
+    force_protocol_incompatible_registry_socket_probe_once_for_test,
+};
 const SNAPSHOT_CACHE_LIMIT: usize = 128;
 pub(crate) use self::protocol::{
     BROWSER_EVENT_PROGRESS_INGRESS_LIMIT, POST_COMMIT_PROJECTION_LIMIT,
@@ -81,6 +94,14 @@ pub(crate) use self::protocol::{
 pub(crate) struct SnapshotCache {
     pub(crate) map: HashMap<String, Arc<Snapshot>>,
     pub(crate) order: VecDeque<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NetworkRequestBaseline {
+    pub(crate) cursor: u64,
+    /// Ingress-only drop count used by authoritative request-window fences.
+    pub(crate) observed_ingress_drop_count: u64,
+    pub(crate) primed: bool,
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -171,12 +192,17 @@ pub struct SessionState {
     browser_event_ingress_telemetry: BrowserEventIngressTelemetry,
     replay: StdMutex<ReplayProtocolState>,
     post_commit_projections: StdMutex<PostCommitProjectionQueue>,
+    pub(crate) post_commit_followup_count: AtomicU32,
     post_commit_projection_drain: Mutex<()>,
     post_commit_projection_drain_scheduled: AtomicBool,
     post_commit_journal_append: Mutex<()>,
     post_commit_journal_failures: AtomicU64,
     #[cfg(test)]
     post_commit_journal_force_failure_once: AtomicBool,
+    #[cfg(test)]
+    post_commit_journal_blocked: AtomicBool,
+    #[cfg(test)]
+    post_commit_journal_block_notify: Arc<Notify>,
     #[cfg(test)]
     post_commit_projection_drain_spawn_count: AtomicU64,
     history: RwLock<CommandHistoryState>,
@@ -250,12 +276,17 @@ impl SessionState {
             browser_event_ingress_telemetry: BrowserEventIngressTelemetry::default(),
             replay: StdMutex::new(ReplayProtocolState::default()),
             post_commit_projections: StdMutex::new(PostCommitProjectionQueue::default()),
+            post_commit_followup_count: AtomicU32::new(0),
             post_commit_projection_drain: Mutex::new(()),
             post_commit_projection_drain_scheduled: AtomicBool::new(false),
             post_commit_journal_append: Mutex::new(()),
             post_commit_journal_failures: AtomicU64::new(0),
             #[cfg(test)]
             post_commit_journal_force_failure_once: AtomicBool::new(false),
+            #[cfg(test)]
+            post_commit_journal_blocked: AtomicBool::new(false),
+            #[cfg(test)]
+            post_commit_journal_block_notify: Arc::new(Notify::new()),
             #[cfg(test)]
             post_commit_projection_drain_spawn_count: AtomicU64::new(0),
             history: RwLock::new(CommandHistoryState::default()),

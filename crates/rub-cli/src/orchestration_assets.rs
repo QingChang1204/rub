@@ -2,11 +2,14 @@ use crate::commands::{Commands, EffectiveCli, OrchestrationSubcommand};
 use crate::local_asset_paths::LocalAssetPathIdentity;
 use crate::persisted_artifacts::annotate_local_persisted_artifact;
 use rub_core::error::{ErrorCode, RubError};
-use rub_core::fs::atomic_write_bytes;
+use rub_core::fs::{FileCommitOutcome, atomic_write_bytes, atomic_write_bytes_until};
 use rub_core::model::PathReferenceState;
 use rub_daemon::rub_paths::RubPaths;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+const ORCHESTRATION_EXPORT_PERSISTENCE_PHASE: &str = "post_commit_orchestration_export_persistence";
 
 struct PendingAssetWrite {
     path: PathBuf,
@@ -167,9 +170,27 @@ fn orchestration_listing_path_error(
     )
 }
 
+#[cfg(test)]
 pub fn persist_orchestration_export_asset(
     cli: &EffectiveCli,
     data: &mut Value,
+) -> Result<(), RubError> {
+    persist_orchestration_export_asset_with_deadline(cli, data, None)
+}
+
+pub fn persist_orchestration_export_asset_until(
+    cli: &EffectiveCli,
+    data: &mut Value,
+    deadline: Instant,
+    timeout_ms: u64,
+) -> Result<(), RubError> {
+    persist_orchestration_export_asset_with_deadline(cli, data, Some((deadline, timeout_ms)))
+}
+
+fn persist_orchestration_export_asset_with_deadline(
+    cli: &EffectiveCli,
+    data: &mut Value,
+    deadline: Option<(Instant, u64)>,
 ) -> Result<(), RubError> {
     let Commands::Orchestration { subcommand } = &cli.command else {
         return Ok(());
@@ -247,7 +268,16 @@ pub fn persist_orchestration_export_asset(
     }
 
     if !pending_writes.is_empty() {
-        persisted_artifacts.extend(commit_asset_writes(pending_writes)?);
+        let committed = match deadline {
+            Some((deadline, timeout_ms)) => commit_asset_writes_until(
+                pending_writes,
+                deadline,
+                timeout_ms,
+                ORCHESTRATION_EXPORT_PERSISTENCE_PHASE,
+            )?,
+            None => commit_asset_writes(pending_writes)?,
+        };
+        persisted_artifacts.extend(committed);
     }
 
     if !persisted_artifacts.is_empty() {
@@ -261,6 +291,22 @@ pub fn persist_orchestration_export_asset(
 }
 
 fn commit_asset_writes(writes: Vec<PendingAssetWrite>) -> Result<Vec<Value>, RubError> {
+    commit_asset_writes_with_deadline(writes, None)
+}
+
+fn commit_asset_writes_until(
+    writes: Vec<PendingAssetWrite>,
+    deadline: Instant,
+    timeout_ms: u64,
+    phase: &'static str,
+) -> Result<Vec<Value>, RubError> {
+    commit_asset_writes_with_deadline(writes, Some((deadline, timeout_ms, phase)))
+}
+
+fn commit_asset_writes_with_deadline(
+    writes: Vec<PendingAssetWrite>,
+    deadline: Option<(Instant, u64, &'static str)>,
+) -> Result<Vec<Value>, RubError> {
     let mut committed = Vec::new();
     let mut artifacts = Vec::new();
 
@@ -290,21 +336,26 @@ fn commit_asset_writes(writes: Vec<PendingAssetWrite>) -> Result<Vec<Value>, Rub
                 ));
             }
         };
-        let commit_outcome = match atomic_write_bytes(authority_path, &write.contents, 0o600) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return Err(asset_write_error_at_path(
-                    format!(
-                        "Failed to write orchestration asset {}: {error}",
-                        authority_path.display()
-                    ),
-                    &write.path,
-                    Some(authority_path),
-                    "orchestration_asset_write_failed",
-                    rollback_asset_writes(&committed).err(),
-                ));
-            }
-        };
+        let commit_outcome =
+            match commit_asset_write(authority_path, &write.contents, deadline.as_ref()) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let rollback_errors = rollback_asset_writes(&committed).err();
+                    if is_timeout_error(&error) {
+                        return Err(asset_write_error_from_source(error, rollback_errors));
+                    }
+                    return Err(asset_write_error_at_path(
+                        format!(
+                            "Failed to write orchestration asset {}: {error}",
+                            authority_path.display()
+                        ),
+                        &write.path,
+                        Some(authority_path),
+                        "orchestration_asset_write_failed",
+                        rollback_errors,
+                    ));
+                }
+            };
         let mut artifact = write.artifact;
         annotate_local_persisted_artifact(
             &mut artifact,
@@ -322,6 +373,37 @@ fn commit_asset_writes(writes: Vec<PendingAssetWrite>) -> Result<Vec<Value>, Rub
     }
 
     Ok(artifacts)
+}
+
+fn commit_asset_write(
+    authority_path: &Path,
+    contents: &[u8],
+    deadline: Option<&(Instant, u64, &'static str)>,
+) -> Result<FileCommitOutcome, RubError> {
+    match deadline {
+        Some((deadline, timeout_ms, phase)) => {
+            crate::timeout_budget::ensure_remaining_budget(*deadline, *timeout_ms, phase)?;
+            atomic_write_bytes_until(authority_path, contents, 0o600, *deadline)
+                .map_err(|error| timed_asset_write_error(error, *timeout_ms, phase))
+        }
+        None => atomic_write_bytes(authority_path, contents, 0o600).map_err(RubError::from),
+    }
+}
+
+fn timed_asset_write_error(
+    error: std::io::Error,
+    timeout_ms: u64,
+    phase: &'static str,
+) -> RubError {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        crate::main_support::command_timeout_error(timeout_ms, phase)
+    } else {
+        RubError::from(error)
+    }
+}
+
+fn is_timeout_error(error: &RubError) -> bool {
+    matches!(error, RubError::Domain(envelope) if envelope.code == ErrorCode::IpcTimeout)
 }
 
 fn read_previous_asset_state(path: &Path) -> Result<PreviousAssetState, RubError> {

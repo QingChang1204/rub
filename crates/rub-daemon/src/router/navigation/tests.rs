@@ -58,12 +58,14 @@ fn typed_open_payload_accepts_wait_after_compat_field() {
             "url": "https://example.com",
             "wait_after": {"text":"Ready"},
             "_trigger": {"kind": "trigger_action"},
+            "_orchestration": {"frame_id": "frame-1"},
         }),
         "open",
     )
     .expect("open payload should accept post-wait compatibility field");
     assert!(parsed._wait_after.is_some());
     assert!(parsed._trigger.is_some());
+    assert!(parsed._orchestration.is_some());
 }
 
 #[test]
@@ -72,12 +74,57 @@ fn typed_reload_payload_accepts_trigger_metadata() {
         &serde_json::json!({
             "load_strategy": "load",
             "_trigger": {"kind": "trigger_action"},
+            "_orchestration": {"frame_id": "frame-1"},
         }),
         "reload",
     )
     .expect("reload payload should accept trigger metadata");
     assert_eq!(parsed.load_strategy.as_deref(), Some("load"));
     assert!(parsed._trigger.is_some());
+    assert!(parsed._orchestration.is_some());
+}
+
+#[test]
+fn workflow_allowed_navigation_payloads_accept_hidden_orchestration_metadata() {
+    let scroll = parse_json_args::<ScrollArgs>(
+        &serde_json::json!({
+            "direction": "down",
+            "_orchestration": {"frame_id": "frame-1"},
+        }),
+        "scroll",
+    )
+    .expect("scroll payload should accept orchestration frame metadata");
+    assert!(scroll._orchestration.is_some());
+
+    let screenshot = parse_json_args::<ScreenshotArgs>(
+        &serde_json::json!({
+            "highlight": true,
+            "_orchestration": {"frame_id": "frame-1"},
+        }),
+        "screenshot",
+    )
+    .expect("screenshot payload should accept orchestration metadata");
+    assert!(screenshot._orchestration.is_some());
+
+    let switch = parse_json_args::<SwitchArgs>(
+        &serde_json::json!({
+            "index": 1,
+            "_orchestration": {"frame_id": "frame-1"},
+        }),
+        "switch",
+    )
+    .expect("switch payload should accept orchestration metadata");
+    assert!(switch._orchestration.is_some());
+
+    let close_tab = parse_json_args::<super::args::CloseTabArgs>(
+        &serde_json::json!({
+            "index": 1,
+            "_orchestration": {"frame_id": "frame-1"},
+        }),
+        "close-tab",
+    )
+    .expect("close-tab payload should accept orchestration metadata");
+    assert!(close_tab._orchestration.is_some());
 }
 
 #[test]
@@ -153,6 +200,7 @@ fn screenshot_artifact_marks_file_truth_boundary() {
         b"png",
         "router.screenshot_artifact",
         "page_screenshot_result",
+        crate::router::TransactionDeadline::new(1_000),
     )
     .expect("write screenshot artifact");
 

@@ -73,6 +73,20 @@ impl PendingRequestRegistry {
         }
     }
 
+    pub(super) fn peek_terminal_identity(
+        &self,
+        request_id: &str,
+    ) -> Option<TerminalRequestIdentity> {
+        self.terminal_identities
+            .get(request_id)
+            .cloned()
+            .or_else(|| {
+                self.pending_requests
+                    .get(request_id)
+                    .map(terminal_identity_from_pending)
+            })
+    }
+
     fn upsert_pending(
         &mut self,
         request_id: &str,
@@ -171,6 +185,7 @@ pub(crate) fn new_shared_pending_request_registry() -> SharedPendingRequestRegis
     Arc::new(Mutex::new(PendingRequestRegistry::default()))
 }
 
+#[cfg(test)]
 pub(crate) async fn prune_stale_pending_request_registries(
     registries: &Arc<Mutex<HashMap<String, SharedPendingRequestRegistry>>>,
     live_target_ids: &HashSet<String>,

@@ -30,10 +30,12 @@
 #[cfg(test)]
 use crate::connection_hardening::RetryAttribution;
 use rub_ipc::client::IpcClient;
+use std::path::PathBuf;
 
 mod bootstrap;
 mod close_all;
 mod close_existing;
+mod compatibility;
 mod connect;
 mod handshake;
 mod ipc;
@@ -45,26 +47,37 @@ mod replay;
 mod startup;
 
 #[cfg(test)]
-pub(crate) use self::bootstrap::cleanup_precommit_browser_authority_for_test;
-pub use self::bootstrap::{BootstrapClient, bootstrap_client};
+pub(crate) use self::bootstrap::cleanup_startup_fallback_browser_authority_for_test;
+pub use self::bootstrap::{BootstrapClient, StartupAuthorityRequest, bootstrap_client};
 #[cfg(test)]
 pub(crate) use self::close_all::{
     CloseAllDisposition, classify_close_all_result, close_all_session_targets,
+    requires_immediate_batch_shutdown_after_external_close,
     should_escalate_close_all_to_kill_fallback,
 };
 pub(crate) use self::close_all::{close_all_sessions, close_all_sessions_until};
-pub use self::close_existing::close_existing_session;
+#[cfg(test)]
+pub(crate) use self::close_existing::close_existing_session_until;
 pub(crate) use self::close_existing::{
-    close_existing_session_targeted, resolve_existing_close_target_by_attachment_identity,
+    close_existing_session_targeted_until,
+    resolve_existing_close_target_by_attachment_identity_until,
+};
+#[cfg(test)]
+pub(crate) use self::compatibility::CompatibilityDegradedOwnedReason;
+pub(crate) use self::compatibility::{
+    CompatibilityDegradedOwnedSession, compatibility_degraded_owned_from_snapshot,
 };
 pub(crate) use self::connect::{
-    ShutdownFenceStatus, TransientSocketPolicy, authority_bound_deferred_client, connect_ipc_once,
-    connect_ipc_with_retry, detect_or_connect_hardened_until, remaining_budget_duration,
-    remaining_budget_ms, wait_for_shutdown_until,
+    AttachBudget, AuthorityBoundConnectSpec, ShutdownFenceStatus, TransientSocketPolicy,
+    authority_bound_connected_client, connect_ipc_once, connect_ipc_with_retry_until,
+    current_socket_path_identity, detect_or_connect_hardened_until, remaining_budget_duration,
+    remaining_budget_ms, validate_handshake_attachment_identity, verify_socket_path_identity,
+    wait_for_shutdown_until,
 };
 #[cfg(test)]
 pub(crate) use self::connect::{
-    apply_hard_cut_shutdown_outcome, detect_or_connect_hardened, maybe_upgrade_if_needed,
+    apply_hard_cut_shutdown_outcome, detect_or_connect_hardened,
+    hard_cut_outdated_daemon_until_for_test, maybe_upgrade_if_needed,
     socket_candidates_for_session,
 };
 use self::handshake::handshake_attempt_error;
@@ -78,7 +91,9 @@ use self::ipc::{
 pub(crate) use self::ipc::{ipc_timeout_error, project_request_onto_deadline};
 #[cfg(test)]
 pub(crate) use self::process_identity::command_matches_daemon_identity;
-pub(crate) use self::process_lifecycle::terminate_spawned_daemon_force;
+pub(crate) use self::process_lifecycle::{
+    force_kill_process, terminate_spawned_daemon, wait_for_process_exit,
+};
 pub(crate) use self::projection::{
     DaemonCtlPathContext, daemon_ctl_path_error, daemon_ctl_path_state, daemon_ctl_socket_error,
     project_batch_close_result,
@@ -93,18 +108,20 @@ pub(crate) use self::replay::{
     ReplayRecoveryContext, send_existing_request_with_replay_recovery,
     send_request_with_replay_recovery,
 };
+#[cfg(test)]
+pub(crate) use self::startup::AuthoritativeStartupInputs;
 #[cfg(all(test, unix))]
 use self::startup::detach_daemon_session;
 pub use self::startup::startup_signal_paths;
 pub(crate) use self::startup::{
     StartupCleanupAuthorityKind, StartupCleanupProof, clear_startup_cleanup_proof,
-    startup_cleanup_signal_path, write_startup_cleanup_proof_at,
+    read_authoritative_startup_inputs, startup_cleanup_signal_path, write_startup_cleanup_proof_at,
 };
 #[cfg(test)]
 use self::startup::{
     StartupSignalFiles, acquire_startup_lock, read_startup_cleanup_proof, read_startup_error,
     startup_lock_scope_keys, startup_ready_retry_timeout_failure, try_lock_exclusive, unlock,
-    upgrade_startup_lock_to_canonical_attachment_until, wait_for_ready,
+    upgrade_startup_lock_to_canonical_attachment_until, wait_for_ready, wait_for_ready_until,
 };
 
 #[cfg(test)]
@@ -117,9 +134,16 @@ pub enum DaemonConnection {
     Connected {
         client: IpcClient,
         daemon_session_id: Option<String>,
+        authority_socket_path: PathBuf,
     },
     /// Need to start a new daemon.
     NeedStart,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BatchCloseSessionError {
+    pub session: String,
+    pub error: rub_core::error::ErrorEnvelope,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -127,7 +151,17 @@ pub struct BatchCloseResult {
     pub closed: Vec<String>,
     pub cleaned_stale: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub compatibility_degraded_owned_sessions: Vec<CompatibilityDegradedOwnedSession>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub failed: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub session_error_details: Vec<BatchCloseSessionError>,
+}
+
+impl BatchCloseResult {
+    pub(crate) fn has_compatibility_degraded_owned_sessions(&self) -> bool {
+        !self.compatibility_degraded_owned_sessions.is_empty()
+    }
 }
 
 #[derive(Debug)]

@@ -292,21 +292,20 @@ fn t117_browser_crash_recovery() {
             libc::kill(pid as i32, libc::SIGKILL);
         }
     }
-    // Wait for process to die
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    wait_until(Duration::from_secs(5), || {
+        browser_processes_for_daemon_pid(daemon_pid).is_empty()
+    });
 
-    // Next command should work (daemon auto-starts new browser)
+    // Next command should re-establish managed browser authority.
     let out = rub_cmd(home)
         .args(["open", &server.url()])
         .output()
         .unwrap();
     let json = parse_json(&out);
-    // May succeed or fail with restart, but should not panic
-    // A fresh open after crash should work
-    assert!(
-        json["success"] == true || json["error"]["code"] == "BROWSER_CRASHED",
-        "should either recover or report crash: {json}"
-    );
+    assert_eq!(json["success"], true, "{json}");
+    wait_until(Duration::from_secs(5), || {
+        !browser_processes_for_daemon_pid(daemon_pid).is_empty()
+    });
 }
 
 /// T109/T111: Multi-session: start named session, verify isolation.
@@ -514,6 +513,8 @@ fn t112_profile_in_use_error() {
     let json = parse_json(&out);
     assert_eq!(json["success"], false);
     assert_eq!(json["error"]["code"], "PROFILE_IN_USE");
+    let closed = parse_json(&rub_cmd(home).arg("close").output().unwrap());
+    assert_eq!(closed["success"], true, "{closed}");
     let _ = std::fs::remove_dir_all(&profile);
 }
 
@@ -544,15 +545,24 @@ fn t118_119_queue_and_busy_registry_grouped_scenario() {
         .spawn()
         .unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    let mut queue_timeout = None;
+    wait_until(Duration::from_secs(5), || {
+        let observed = parse_json(
+            &session
+                .cmd()
+                .args(["--timeout", "100", "state"])
+                .output()
+                .unwrap(),
+        );
+        let queue_timed_out = observed["success"] == false
+            && observed["error"]["code"] == "IPC_TIMEOUT"
+            && observed["error"]["context"]["command"] == "state"
+            && observed["error"]["context"]["phase"] == "queue";
+        queue_timeout = Some(observed.clone());
+        queue_timed_out
+    });
 
-    let queue_timeout = parse_json(
-        &session
-            .cmd()
-            .args(["--timeout", "100", "state"])
-            .output()
-            .unwrap(),
-    );
+    let queue_timeout = queue_timeout.expect("queue-timeout busy fence should be observed");
     assert_eq!(queue_timeout["success"], false, "{queue_timeout}");
     assert_eq!(
         queue_timeout["error"]["code"], "IPC_TIMEOUT",
@@ -611,7 +621,12 @@ fn t118_119_queue_and_busy_registry_grouped_scenario() {
         .spawn()
         .unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    let mut hold = hold;
+    wait_until(Duration::from_secs(5), || {
+        hold.try_wait()
+            .expect("queued busy command should stay observable")
+            .is_none()
+    });
 
     let state = parse_json(&session.cmd().arg("state").output().unwrap());
     assert_eq!(
@@ -619,7 +634,6 @@ fn t118_119_queue_and_busy_registry_grouped_scenario() {
         "live socket protocol authority should win over a stale registry projection: {state}"
     );
 
-    let mut hold = hold;
     let _ = hold.wait();
 }
 
@@ -972,14 +986,23 @@ fn t200_204_keyboard_and_type_grouped_scenario() {
             .output()
             .unwrap(),
     );
-    assert_eq!(type_formatter["success"], true, "{type_formatter}");
+    assert_eq!(type_formatter["success"], false, "{type_formatter}");
     assert_eq!(
-        type_formatter["data"]["interaction"]["confirmation_status"],
-        "contradicted"
+        type_formatter["error"]["code"],
+        "INTERACTION_NOT_CONFIRMED",
+        "{type_formatter}"
     );
     assert_eq!(
-        type_formatter["data"]["interaction"]["confirmation_kind"],
-        "value_applied"
+        type_formatter["error"]["context"]["committed_response_projection"]["interaction"]
+            ["confirmation_status"],
+        "contradicted",
+        "{type_formatter}"
+    );
+    assert_eq!(
+        type_formatter["error"]["context"]["committed_response_projection"]["interaction"]
+            ["confirmation_kind"],
+        "value_applied",
+        "{type_formatter}"
     );
     let type_formatter_verify = parse_json(
         &session
@@ -1512,14 +1535,20 @@ fn t210_216c_wait_and_click_grouped_scenario() {
             .output()
             .unwrap(),
     );
-    assert_eq!(click["success"], true, "{click}");
-    assert_eq!(click["data"]["interaction"]["interaction_confirmed"], false);
+    assert_eq!(click["success"], false, "{click}");
+    assert_eq!(click["error"]["code"], "INTERACTION_NOT_CONFIRMED", "{click}");
     assert_eq!(
-        click["data"]["interaction"]["confirmation_status"],
+        click["error"]["context"]["committed_response_projection"]["interaction"]["interaction_confirmed"],
+        false
+    );
+    assert_eq!(
+        click["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_status"],
         "unconfirmed"
     );
-    assert!(click["data"]["interaction"]["confirmation_kind"].is_null());
-    std::thread::sleep(std::time::Duration::from_millis(2200));
+    assert!(
+        click["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_kind"].is_null()
+    );
+    wait_for_text_in_session(session.home(), "default", "#status", "done", Duration::from_secs(5));
     let verify = parse_json(
         &session
             .cmd()
@@ -1631,6 +1660,10 @@ fn t220_222_tabs_grouped_scenario() {
     let tabs = json["data"]["result"]["items"].as_array().unwrap();
     assert_eq!(tabs.len(), 1);
     assert_ne!(tabs[0]["url"], "about:blank");
+    assert!(matches!(
+        tabs[0]["active_authority"].as_str(),
+        Some("browser_truth" | "local_fallback")
+    ));
 
     let out = rub_cmd(home).args(["switch", "99"]).output().unwrap();
     let json = parse_json(&out);
@@ -1644,6 +1677,10 @@ fn t220_222_tabs_grouped_scenario() {
     assert_eq!(json["data"]["subject"]["kind"], "tab");
     assert_eq!(json["data"]["result"]["remaining_tabs"], 1);
     assert_eq!(json["data"]["result"]["active_tab"]["url"], "about:blank");
+    assert!(matches!(
+        json["data"]["result"]["active_tab"]["active_authority"].as_str(),
+        Some("browser_truth" | "local_fallback")
+    ));
 }
 
 // ── v1.1: US4 DOM Information Retrieval ─────────────────────────────
@@ -3278,13 +3315,20 @@ fn t240_243b_extended_click_grouped_scenario() {
         .unwrap();
     let json = parse_json(&out);
     assert_eq!(
-        json["success"], true,
-        "click --xy on blank area should succeed"
+        json["success"], false,
+        "click --xy on blank area should fail closed when effect is unconfirmed"
     );
-    assert_eq!(json["data"]["interaction"]["semantic_class"], "activate");
-    assert_eq!(json["data"]["interaction"]["interaction_confirmed"], false);
+    assert_eq!(json["error"]["code"], "INTERACTION_NOT_CONFIRMED", "{json}");
     assert_eq!(
-        json["data"]["interaction"]["confirmation_status"],
+        json["error"]["context"]["committed_response_projection"]["interaction"]["semantic_class"],
+        "activate"
+    );
+    assert_eq!(
+        json["error"]["context"]["committed_response_projection"]["interaction"]["interaction_confirmed"],
+        false
+    );
+    assert_eq!(
+        json["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_status"],
         "unconfirmed"
     );
 

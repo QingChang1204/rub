@@ -3,17 +3,24 @@ mod observation;
 mod preflight;
 
 pub(crate) use confirmation::{
-    confirm_click, confirm_click_xy, confirm_hover, confirm_input, confirm_key_combo,
-    confirm_select, confirm_typed_text, confirm_typed_text_in_context, confirm_upload,
+    ActuationFence, ActuationResultFenceOutcome, DialogFenceBaseline, await_actuation_or_dialog,
+    await_actuation_result_or_dialog, confirm_click, confirm_click_xy, confirm_hover,
+    confirm_input, confirm_key_combo, confirm_key_combo_in_context, confirm_select,
+    confirm_typed_text, confirm_typed_text_in_context, confirm_upload, dialog_confirmation,
+    indeterminate_actuation_confirmation, unconfirmed_dialog_opening,
 };
+#[cfg(test)]
+pub(crate) use confirmation::{DIALOG_ACTUATION_GRACE_PERIOD, DIALOG_ACTUATION_TIMEOUT};
 pub(crate) use observation::{
     EditableProjectionKind, capture_active_interaction_baseline,
     capture_active_interaction_baseline_in_context, capture_interaction_baseline,
     capture_page_baseline, capture_related_page_baseline, observe_element,
+    observed_editable_content,
 };
 pub(crate) use preflight::{
     clear_text_input, ensure_activation_target_enabled, ensure_active_text_target_editable,
-    ensure_active_text_target_editable_in_context, prepare_text_input,
+    ensure_active_text_target_editable_in_context, ensure_frame_owns_page_global_keyboard_focus,
+    prepare_text_input,
 };
 
 #[cfg(test)]

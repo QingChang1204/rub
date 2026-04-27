@@ -19,8 +19,11 @@ pub(super) fn response_dom_epoch(
     epoch::response_dom_epoch(command, args, state, pending_external_dom_commit)
 }
 
-pub(super) fn command_invalidates_cached_snapshots_without_epoch_bump(command: &str) -> bool {
-    epoch::command_invalidates_cached_snapshots_without_epoch_bump(command)
+pub(super) fn command_invalidates_cached_snapshots_without_epoch_bump(
+    command: &str,
+    args: &serde_json::Value,
+) -> bool {
+    epoch::command_invalidates_cached_snapshots_without_epoch_bump(command, args)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

@@ -2,8 +2,52 @@ use super::*;
 
 pub(super) fn sync_binding(binding: &mut rub_core::model::TriggerTabBindingInfo, tab: &TabInfo) {
     binding.index = tab.index;
-    binding.url = tab.url.clone();
-    binding.title = tab.title.clone();
+    if tab.page_identity_authoritative() {
+        binding.url = tab.url.clone();
+        binding.title = tab.title.clone();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TriggerTabAuthority<'a> {
+    Available,
+    Missing,
+    PageIdentityDegraded(&'a str),
+}
+
+fn trigger_tab_authority(tab: Option<&TabInfo>) -> TriggerTabAuthority<'_> {
+    match tab {
+        None => TriggerTabAuthority::Missing,
+        Some(tab) => match tab.degraded_reason.as_deref() {
+            Some(reason) => TriggerTabAuthority::PageIdentityDegraded(reason),
+            None => TriggerTabAuthority::Available,
+        },
+    }
+}
+
+fn trigger_unavailable_reason(
+    source: TriggerTabAuthority<'_>,
+    target: TriggerTabAuthority<'_>,
+) -> Option<String> {
+    use TriggerTabAuthority::{Available, Missing, PageIdentityDegraded};
+
+    match (source, target) {
+        (Available, Available) => None,
+        (Missing, Missing) => Some("source_and_target_tabs_missing".to_string()),
+        (Missing, Available) => Some("source_tab_missing".to_string()),
+        (Available, Missing) => Some("target_tab_missing".to_string()),
+        (PageIdentityDegraded(_), Available) => Some("source_tab_projection_degraded".to_string()),
+        (Available, PageIdentityDegraded(_)) => Some("target_tab_projection_degraded".to_string()),
+        (PageIdentityDegraded(_), PageIdentityDegraded(_)) => {
+            Some("source_and_target_tabs_projection_degraded".to_string())
+        }
+        (Missing, PageIdentityDegraded(_)) => {
+            Some("source_tab_missing_and_target_projection_degraded".to_string())
+        }
+        (PageIdentityDegraded(_), Missing) => {
+            Some("source_tab_projection_degraded_and_target_missing".to_string())
+        }
+    }
 }
 
 impl TriggerRuntimeState {
@@ -25,12 +69,10 @@ impl TriggerRuntimeState {
                 sync_binding(&mut trigger.target_tab, tab);
             }
 
-            trigger.unavailable_reason = match (source.is_some(), target.is_some()) {
-                (true, true) => None,
-                (false, false) => Some("source_and_target_tabs_missing".to_string()),
-                (false, true) => Some("source_tab_missing".to_string()),
-                (true, false) => Some("target_tab_missing".to_string()),
-            };
+            trigger.unavailable_reason = trigger_unavailable_reason(
+                trigger_tab_authority(source),
+                trigger_tab_authority(target),
+            );
 
             if previous_unavailable_reason != trigger.unavailable_reason {
                 match (&previous_unavailable_reason, &trigger.unavailable_reason) {

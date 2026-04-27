@@ -4,7 +4,7 @@ use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::Snapshot;
 use std::sync::Arc;
 
-use super::super::snapshot::build_stable_snapshot;
+use super::super::snapshot::{DeferredSnapshotPublication, build_stable_snapshot};
 use super::super::{DaemonRouter, TransactionDeadline};
 
 pub(super) async fn load_snapshot(
@@ -30,6 +30,32 @@ pub(super) async fn load_snapshot(
         build_stable_snapshot(router, args, state, deadline, Some(0), prefer_a11y, false).await?;
     let snapshot = state.cache_snapshot(snapshot).await;
     Ok(snapshot)
+}
+
+pub(super) async fn load_snapshot_deferred(
+    router: &DaemonRouter,
+    args: &serde_json::Value,
+    state: &Arc<SessionState>,
+    deadline: TransactionDeadline,
+    prefer_a11y: bool,
+) -> Result<DeferredSnapshotPublication, RubError> {
+    if let Some(snapshot_id) = args.get("snapshot_id").and_then(|value| value.as_str()) {
+        let requested_frame_id =
+            if let Some(frame_id) = super::super::frame_scope::orchestration_frame_override(args) {
+                super::super::frame_scope::ensure_request_frame_available(router, frame_id).await?;
+                Some(frame_id.to_string())
+            } else {
+                None
+            };
+        refresh_live_frame_runtime(&router.browser, state).await;
+        let snapshot =
+            load_cached_snapshot(state, snapshot_id, requested_frame_id.as_deref()).await?;
+        return Ok(DeferredSnapshotPublication::cached(snapshot));
+    }
+
+    let snapshot =
+        build_stable_snapshot(router, args, state, deadline, Some(0), prefer_a11y, false).await?;
+    Ok(DeferredSnapshotPublication::fresh(snapshot))
 }
 
 async fn load_cached_snapshot(

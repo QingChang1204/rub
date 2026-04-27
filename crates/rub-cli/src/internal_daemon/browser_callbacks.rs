@@ -5,6 +5,11 @@ use super::observatory_ingress::{
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+const OBSERVATORY_CALLBACK_INSTALL_FAILED_REASON: &str = "observatory_callback_install_failed";
+const RUNTIME_STATE_CALLBACK_INSTALL_FAILED_REASON: &str = "runtime_state_callback_install_failed";
+const DIALOG_CALLBACK_INSTALL_FAILED_REASON: &str = "dialog_callback_install_failed";
+const DOWNLOAD_CALLBACK_INSTALL_FAILED_REASON: &str = "download_callback_install_failed";
+
 pub(super) async fn install_browser_callbacks(
     browser_manager: &Arc<rub_cdp::browser::BrowserManager>,
     state: &Arc<rub_daemon::session::SessionState>,
@@ -137,11 +142,15 @@ async fn install_observatory_callbacks(
                     });
                 }
             })),
+            on_listener_ended: None,
         })
         .await
     {
         state
-            .mark_observatory_degraded(format!("observatory_callback_install_failed:{error}"))
+            .mark_observatory_degraded(callback_install_degraded_reason(
+                OBSERVATORY_CALLBACK_INSTALL_FAILED_REASON,
+                &error,
+            ))
             .await;
     }
 }
@@ -152,19 +161,35 @@ async fn install_runtime_state_callbacks(
 ) {
     let runtime_state = state.clone();
     let runtime_sequence_state = state.clone();
+    let runtime_state_browser_manager = browser_manager.clone();
     if let Err(error) = browser_manager
         .set_runtime_state_callbacks(rub_cdp::runtime_state::RuntimeStateCallbacks {
             allocate_sequence: Some(std::sync::Arc::new(move || {
                 runtime_sequence_state.allocate_runtime_state_sequence()
             })),
-            on_snapshot: Some(std::sync::Arc::new(move |sequence, snapshot| {
-                let state = runtime_state.clone();
-                tokio::spawn(async move {
-                    state
-                        .publish_runtime_state_snapshot(sequence, snapshot)
-                        .await;
-                });
-            })),
+            on_snapshot: Some(std::sync::Arc::new(
+                move |sequence, listener_generation, active_target_id, snapshot| {
+                    let state = runtime_state.clone();
+                    let browser_manager = runtime_state_browser_manager.clone();
+                    tokio::spawn(async move {
+                        browser_manager
+                            .publish_runtime_state_callback_if_active_target(
+                                listener_generation,
+                                active_target_id.as_deref(),
+                                || async move {
+                                    state
+                                        .publish_runtime_state_snapshot_if(
+                                            sequence,
+                                            snapshot,
+                                            || true,
+                                        )
+                                        .await
+                                },
+                            )
+                            .await;
+                    });
+                },
+            )),
         })
         .await
     {
@@ -172,7 +197,10 @@ async fn install_runtime_state_callbacks(
         state
             .mark_runtime_state_probe_degraded(
                 sequence,
-                format!("runtime_state_callback_install_failed:{error}"),
+                callback_install_degraded_reason(
+                    RUNTIME_STATE_CALLBACK_INSTALL_FAILED_REASON,
+                    &error,
+                ),
             )
             .await;
     }
@@ -197,8 +225,7 @@ async fn install_dialog_callbacks(
                     rub_daemon::session::BrowserSessionEvent::DialogRuntime {
                         browser_sequence,
                         generation: runtime.generation,
-                        status: runtime.runtime.status,
-                        degraded_reason: runtime.runtime.degraded_reason,
+                        runtime: Box::new(runtime.runtime),
                     },
                 );
             })),
@@ -225,13 +252,14 @@ async fn install_dialog_callbacks(
                     user_input: event.user_input,
                 });
             })),
+            on_listener_ended: None,
         })
         .await
     {
         state
             .mark_dialog_runtime_degraded(
                 browser_manager.current_listener_generation(),
-                format!("dialog_callback_install_failed:{error}"),
+                callback_install_degraded_reason(DIALOG_CALLBACK_INSTALL_FAILED_REASON, &error),
             )
             .await;
     }
@@ -248,13 +276,7 @@ async fn install_download_callbacks(
     if let Err(error) = browser_manager
         .set_download_callbacks(rub_cdp::downloads::DownloadCallbacks {
             on_runtime: Some(std::sync::Arc::new(move |runtime| {
-                runtime_event_sink.enqueue_download_runtime(
-                    runtime.generation,
-                    runtime.runtime.status,
-                    runtime.runtime.mode,
-                    runtime.runtime.download_dir,
-                    runtime.runtime.degraded_reason,
-                );
+                runtime_event_sink.enqueue_download_runtime(runtime.generation, runtime.runtime);
             })),
             on_started: Some(std::sync::Arc::new(move |event| {
                 started_event_sink.enqueue_download_started(
@@ -281,8 +303,42 @@ async fn install_download_callbacks(
         state
             .mark_download_runtime_degraded(
                 browser_manager.current_listener_generation(),
-                format!("download_callback_install_failed:{error}"),
+                callback_install_degraded_reason(DOWNLOAD_CALLBACK_INSTALL_FAILED_REASON, &error),
             )
             .await;
+    }
+}
+
+fn callback_install_degraded_reason(
+    default_reason: &'static str,
+    _error: &rub_core::error::RubError,
+) -> &'static str {
+    default_reason
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_install_degraded_reason_is_stable() {
+        let error = rub_core::error::RubError::Internal("callback hook rebuild failed".to_string());
+
+        assert_eq!(
+            callback_install_degraded_reason(OBSERVATORY_CALLBACK_INSTALL_FAILED_REASON, &error),
+            OBSERVATORY_CALLBACK_INSTALL_FAILED_REASON
+        );
+        assert_eq!(
+            callback_install_degraded_reason(RUNTIME_STATE_CALLBACK_INSTALL_FAILED_REASON, &error),
+            RUNTIME_STATE_CALLBACK_INSTALL_FAILED_REASON
+        );
+        assert_eq!(
+            callback_install_degraded_reason(DIALOG_CALLBACK_INSTALL_FAILED_REASON, &error),
+            DIALOG_CALLBACK_INSTALL_FAILED_REASON
+        );
+        assert_eq!(
+            callback_install_degraded_reason(DOWNLOAD_CALLBACK_INSTALL_FAILED_REASON, &error),
+            DOWNLOAD_CALLBACK_INSTALL_FAILED_REASON
+        );
     }
 }

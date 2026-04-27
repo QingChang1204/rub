@@ -6,7 +6,11 @@ use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{
     DialogInterceptPolicy, DialogKind, DialogRuntimeInfo, DialogRuntimeStatus, PendingDialogInfo,
 };
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::RwLock;
@@ -48,6 +52,7 @@ pub struct BrowserDialogClosed {
 type RuntimeCallback = Arc<dyn Fn(DialogRuntimeUpdate) + Send + Sync>;
 type OpeningCallback = Arc<dyn Fn(BrowserDialogOpening) + Send + Sync>;
 type ClosedCallback = Arc<dyn Fn(BrowserDialogClosed) + Send + Sync>;
+pub(crate) type DialogListenerEndedCallback = Arc<dyn Fn(&'static str) + Send + Sync>;
 pub type SharedDialogRuntime = Arc<RwLock<DialogRuntimeInfo>>;
 
 #[derive(Clone, Default)]
@@ -55,11 +60,15 @@ pub struct DialogCallbacks {
     pub on_runtime: Option<RuntimeCallback>,
     pub on_opened: Option<OpeningCallback>,
     pub on_closed: Option<ClosedCallback>,
+    pub on_listener_ended: Option<DialogListenerEndedCallback>,
 }
 
 impl DialogCallbacks {
     pub fn is_empty(&self) -> bool {
-        self.on_runtime.is_none() && self.on_opened.is_none() && self.on_closed.is_none()
+        self.on_runtime.is_none()
+            && self.on_opened.is_none()
+            && self.on_closed.is_none()
+            && self.on_listener_ended.is_none()
     }
 }
 
@@ -81,6 +90,39 @@ pub async fn pending_dialog_for_target(
 ) -> Option<PendingDialogInfo> {
     let dialog = pending_dialog(runtime).await?;
     pending_dialog_matches_target(&dialog, target_id).then_some(dialog)
+}
+
+pub async fn clear_stale_pending_dialog_for_live_targets(
+    runtime: &SharedDialogRuntime,
+    live_target_ids: &HashSet<String>,
+) -> Option<DialogRuntimeInfo> {
+    clear_stale_pending_dialog_for_live_targets_if(runtime, live_target_ids, || true).await
+}
+
+pub(crate) async fn clear_stale_pending_dialog_for_live_targets_if<F>(
+    runtime: &SharedDialogRuntime,
+    live_target_ids: &HashSet<String>,
+    should_commit: F,
+) -> Option<DialogRuntimeInfo>
+where
+    F: Fn() -> bool,
+{
+    let mut state = runtime.write().await;
+    let target_id = state
+        .pending_dialog
+        .as_ref()
+        .and_then(|dialog| dialog.tab_target_id.clone())?;
+    if live_target_ids.contains(&target_id) {
+        return None;
+    }
+    if !should_commit() {
+        return None;
+    }
+
+    state.pending_dialog = None;
+    state.degraded_reason = Some("pending_dialog_target_lost".to_string());
+    apply_dialog_runtime_status(&mut state, DialogRuntimeStatus::Degraded);
+    Some(state.clone())
 }
 
 /// Whether a pre-registered intercept policy should be consumed by the
@@ -134,9 +176,17 @@ async fn publish_dialog_opening(
     runtime_state: &SharedDialogRuntime,
     opened_callback: Option<&OpeningCallback>,
     opened: &BrowserDialogOpening,
-) {
+    authority_release_in_progress: &AtomicBool,
+) -> bool {
+    if authority_release_in_progress.load(Ordering::SeqCst) {
+        return false;
+    }
+
     {
         let mut state = runtime_state.write().await;
+        if authority_release_in_progress.load(Ordering::SeqCst) {
+            return false;
+        }
         apply_dialog_runtime_status(&mut state, DialogRuntimeStatus::Active);
         state.pending_dialog = Some(PendingDialogInfo {
             kind: opened.kind,
@@ -151,9 +201,91 @@ async fn publish_dialog_opening(
         state.last_dialog = state.pending_dialog.clone();
     }
 
+    if authority_release_in_progress.load(Ordering::SeqCst) {
+        return false;
+    }
+
     if let Some(callback) = opened_callback {
         callback(opened.clone());
     }
+    true
+}
+
+async fn publish_dialog_closed(
+    runtime_state: &SharedDialogRuntime,
+    closed_callback: Option<&ClosedCallback>,
+    listener_generation: ListenerGeneration,
+    accepted: bool,
+    user_input: String,
+    authority_release_in_progress: &AtomicBool,
+) -> bool {
+    if authority_release_in_progress.load(Ordering::SeqCst) {
+        return false;
+    }
+
+    {
+        let mut state = runtime_state.write().await;
+        if authority_release_in_progress.load(Ordering::SeqCst) {
+            return false;
+        }
+        let prompt_input = state
+            .last_dialog
+            .as_ref()
+            .filter(|dialog| matches!(dialog.kind, DialogKind::Prompt))
+            .map(|_| user_input.clone());
+        apply_dialog_runtime_status(&mut state, DialogRuntimeStatus::Inactive);
+        state.pending_dialog = None;
+        state.last_result = Some(rub_core::model::DialogResolutionInfo {
+            accepted,
+            user_input: prompt_input,
+            closed_at: rfc3339_now(),
+        });
+    }
+
+    if authority_release_in_progress.load(Ordering::SeqCst) {
+        return false;
+    }
+    if let Some(callback) = closed_callback {
+        callback(BrowserDialogClosed {
+            generation: listener_generation,
+            accepted,
+            user_input,
+        });
+    }
+    true
+}
+
+async fn publish_dialog_intercept_failure(
+    runtime_state: &SharedDialogRuntime,
+    runtime_callback: Option<&RuntimeCallback>,
+    listener_generation: ListenerGeneration,
+    error: &RubError,
+    authority_release_in_progress: &AtomicBool,
+) -> bool {
+    if authority_release_in_progress.load(Ordering::SeqCst) {
+        return false;
+    }
+
+    let projection = {
+        let mut state = runtime_state.write().await;
+        if authority_release_in_progress.load(Ordering::SeqCst) {
+            return false;
+        }
+        state.degraded_reason = Some(format!("dialog_intercept_handle_failed:{error}"));
+        apply_dialog_runtime_status(&mut state, DialogRuntimeStatus::Degraded);
+        state.clone()
+    };
+
+    if authority_release_in_progress.load(Ordering::SeqCst) {
+        return false;
+    }
+    if let Some(callback) = runtime_callback {
+        callback(DialogRuntimeUpdate {
+            generation: listener_generation,
+            runtime: projection,
+        });
+    }
+    true
 }
 
 pub async fn ensure_page_dialog_runtime(
@@ -163,112 +295,29 @@ pub async fn ensure_page_dialog_runtime(
     intercept: SharedDialogIntercept,
     listener_generation: ListenerGeneration,
     listener_generation_rx: ListenerGenerationRx,
+    authority_release_in_progress: Arc<AtomicBool>,
 ) -> Result<(), RubError> {
     let mut degraded_reason = None;
     let tab_target_id = page.target_id().as_ref().to_string();
 
-    let opened_callback = callbacks.on_opened.clone();
-    let runtime_state = runtime.clone();
-    match page.event_listener::<EventJavascriptDialogOpening>().await {
-        Ok(mut listener) => {
-            let generation_rx = listener_generation_rx.clone();
-            let intercept = intercept.clone();
-            let page_for_intercept = page.clone();
-            tokio::spawn(async move {
-                let mut generation_rx = generation_rx;
-                while let Some(event) =
-                    next_listener_event(&mut listener, listener_generation, &mut generation_rx)
-                        .await
-                {
-                    let opened = BrowserDialogOpening {
-                        generation: listener_generation,
-                        kind: normalize_dialog_kind(&event),
-                        message: event.message.clone(),
-                        url: event.url.clone(),
-                        tab_target_id: Some(tab_target_id.clone()),
-                        frame_id: Some(event.frame_id.as_ref().to_string()),
-                        default_prompt: event.default_prompt.clone(),
-                        has_browser_handler: event.has_browser_handler,
-                    };
-
-                    // ── Dialog Intercept (one-shot, page-scoped) ─────────────
-                    // Consume the pre-registered intercept policy and call
-                    // Page.handleJavaScriptDialog *directly* (no extra spawn) so
-                    // the CDP command races in the same task slice as the opening
-                    // event — before Chrome's built-in handler can auto-dismiss.
-                    //
-                    // Policy matching rules:
-                    //   target_tab_id = None   → wildcard, consumed by any tab
-                    //   target_tab_id = Some(t) → consumed only when t == this tab
-                    //
-                    // The MutexGuard is scoped to the inner block below so it is
-                    // guaranteed dropped before the .await (std::sync::MutexGuard
-                    // is !Send and must not be held across an await point).
-                    let intercept_policy =
-                        take_matching_intercept_policy(&intercept, &tab_target_id);
-
-                    publish_dialog_opening(&runtime_state, opened_callback.as_ref(), &opened).await;
-
-                    if let Some(policy) = intercept_policy {
-                        // Opening has already committed to the shared runtime and
-                        // downstream callbacks before the browser handler runs, so
-                        // a fast intercepted close cannot overtake the opening
-                        // authority at the projection seam.
-                        let _ =
-                            handle_dialog(&page_for_intercept, policy.accept, policy.prompt_text)
-                                .await;
-                    }
-                }
-            });
-        }
+    let opening_listener = match page.event_listener::<EventJavascriptDialogOpening>().await {
+        Ok(listener) => Some(listener),
         Err(error) => {
             degraded_reason = Some(format!("dialog_open_listener_failed:{error}"));
+            None
         }
-    }
+    };
 
-    let closed_callback = callbacks.on_closed.clone();
-    let runtime_state = runtime.clone();
-    match page.event_listener::<EventJavascriptDialogClosed>().await {
-        Ok(mut listener) => {
-            let generation_rx = listener_generation_rx.clone();
-            tokio::spawn(async move {
-                let mut generation_rx = generation_rx;
-                while let Some(event) =
-                    next_listener_event(&mut listener, listener_generation, &mut generation_rx)
-                        .await
-                {
-                    {
-                        let mut state = runtime_state.write().await;
-                        let prompt_input = state
-                            .last_dialog
-                            .as_ref()
-                            .filter(|dialog| matches!(dialog.kind, DialogKind::Prompt))
-                            .map(|_| event.user_input.clone());
-                        apply_dialog_runtime_status(&mut state, DialogRuntimeStatus::Inactive);
-                        state.pending_dialog = None;
-                        state.last_result = Some(rub_core::model::DialogResolutionInfo {
-                            accepted: event.result,
-                            user_input: prompt_input,
-                            closed_at: rfc3339_now(),
-                        });
-                    }
-                    if let Some(callback) = &closed_callback {
-                        callback(BrowserDialogClosed {
-                            generation: listener_generation,
-                            accepted: event.result,
-                            user_input: event.user_input.clone(),
-                        });
-                    }
-                }
-            });
-        }
+    let closed_listener = match page.event_listener::<EventJavascriptDialogClosed>().await {
+        Ok(listener) => Some(listener),
         Err(error) => {
             degraded_reason.get_or_insert_with(|| format!("dialog_closed_listener_failed:{error}"));
+            None
         }
-    }
+    };
 
     let projection = commit_dialog_hook_install_projection(&runtime, degraded_reason.clone()).await;
-    if let Some(callback) = callbacks.on_runtime {
+    if let Some(callback) = callbacks.on_runtime.as_ref() {
         callback(DialogRuntimeUpdate {
             generation: listener_generation,
             runtime: projection,
@@ -280,6 +329,102 @@ pub async fn ensure_page_dialog_runtime(
             ErrorCode::BrowserCrashed,
             format!("Dialog hook install degraded before commit: {reason}"),
         ));
+    }
+
+    // All fallible/awaiting install work is complete before listener tasks are
+    // spawned. This keeps a cancelled page-hook install from leaking live
+    // listeners for a hook state that was never committed by the caller.
+    if let Some(mut listener) = opening_listener {
+        let opened_callback = callbacks.on_opened.clone();
+        let runtime_callback = callbacks.on_runtime.clone();
+        let runtime_state = runtime.clone();
+        let generation_rx = listener_generation_rx.clone();
+        let intercept = intercept.clone();
+        let page_for_intercept = page.clone();
+        let opening_authority_release = authority_release_in_progress.clone();
+        let listener_ended = callbacks.on_listener_ended.clone();
+        tokio::spawn(async move {
+            let mut generation_rx = generation_rx;
+            while let Some(event) =
+                next_listener_event(&mut listener, listener_generation, &mut generation_rx).await
+            {
+                if opening_authority_release.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let opened = BrowserDialogOpening {
+                    generation: listener_generation,
+                    kind: normalize_dialog_kind(&event),
+                    message: event.message.clone(),
+                    url: event.url.clone(),
+                    tab_target_id: Some(tab_target_id.clone()),
+                    frame_id: Some(event.frame_id.as_ref().to_string()),
+                    default_prompt: event.default_prompt.clone(),
+                    has_browser_handler: event.has_browser_handler,
+                };
+
+                if !publish_dialog_opening(
+                    &runtime_state,
+                    opened_callback.as_ref(),
+                    &opened,
+                    &opening_authority_release,
+                )
+                .await
+                {
+                    continue;
+                }
+
+                let intercept_policy = take_matching_intercept_policy(&intercept, &tab_target_id);
+                if let Some(policy) = intercept_policy
+                    && let Err(error) =
+                        handle_dialog(&page_for_intercept, policy.accept, policy.prompt_text).await
+                {
+                    tracing::warn!(
+                        generation = listener_generation,
+                        tab_target_id = %tab_target_id,
+                        error = %error,
+                        "Dialog intercept actuation failed after policy consumption"
+                    );
+                    publish_dialog_intercept_failure(
+                        &runtime_state,
+                        runtime_callback.as_ref(),
+                        listener_generation,
+                        &error,
+                        &opening_authority_release,
+                    )
+                    .await;
+                }
+            }
+            if let Some(callback) = listener_ended {
+                callback("dialog.opening");
+            }
+        });
+    }
+
+    if let Some(mut listener) = closed_listener {
+        let closed_callback = callbacks.on_closed.clone();
+        let runtime_state = runtime.clone();
+        let generation_rx = listener_generation_rx.clone();
+        let closed_authority_release = authority_release_in_progress.clone();
+        let listener_ended = callbacks.on_listener_ended.clone();
+        tokio::spawn(async move {
+            let mut generation_rx = generation_rx;
+            while let Some(event) =
+                next_listener_event(&mut listener, listener_generation, &mut generation_rx).await
+            {
+                publish_dialog_closed(
+                    &runtime_state,
+                    closed_callback.as_ref(),
+                    listener_generation,
+                    event.result,
+                    event.user_input.clone(),
+                    &closed_authority_release,
+                )
+                .await;
+            }
+            if let Some(callback) = listener_ended {
+                callback("dialog.closed");
+            }
+        });
     }
 
     Ok(())
@@ -361,13 +506,20 @@ fn normalize_dialog_kind(event: &EventJavascriptDialogOpening) -> DialogKind {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserDialogOpening, DialogCallbacks, DialogRuntimeInfo, DialogRuntimeStatus,
-        OpeningCallback, apply_dialog_runtime_status, commit_dialog_hook_install_projection,
+        BrowserDialogOpening, ClosedCallback, DialogCallbacks, DialogRuntimeInfo,
+        DialogRuntimeStatus, OpeningCallback, RuntimeCallback, apply_dialog_runtime_status,
+        clear_stale_pending_dialog_for_live_targets,
+        clear_stale_pending_dialog_for_live_targets_if, commit_dialog_hook_install_projection,
         new_shared_dialog_runtime, pending_dialog_for_target, pending_dialog_matches_target,
-        publish_dialog_opening,
+        publish_dialog_closed, publish_dialog_intercept_failure, publish_dialog_opening,
     };
-    use rub_core::model::DialogKind;
-    use std::sync::{Arc, Mutex};
+    use rub_core::error::{ErrorCode, RubError};
+    use rub_core::model::{DialogKind, PendingDialogInfo};
+    use std::collections::HashSet;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     #[test]
     fn empty_callbacks_report_empty() {
@@ -467,6 +619,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_pending_dialog_target_is_cleared_and_degraded_when_tab_authority_is_gone() {
+        let runtime = new_shared_dialog_runtime();
+        {
+            let mut state = runtime.write().await;
+            state.status = DialogRuntimeStatus::Active;
+            state.pending_dialog = Some(rub_core::model::PendingDialogInfo {
+                kind: DialogKind::Alert,
+                message: "Detached dialog".to_string(),
+                url: "https://example.com".to_string(),
+                tab_target_id: Some("target-1".to_string()),
+                frame_id: None,
+                default_prompt: None,
+                has_browser_handler: true,
+                opened_at: "2026-01-01T00:00:00Z".to_string(),
+            });
+            state.last_dialog = state.pending_dialog.clone();
+        }
+
+        let live_target_ids = HashSet::from(["target-2".to_string()]);
+        let projection = clear_stale_pending_dialog_for_live_targets(&runtime, &live_target_ids)
+            .await
+            .expect("lost tab authority must degrade stale pending dialog truth");
+
+        assert_eq!(projection.status, DialogRuntimeStatus::Degraded);
+        assert!(projection.pending_dialog.is_none());
+        assert_eq!(
+            projection.degraded_reason.as_deref(),
+            Some("pending_dialog_target_lost")
+        );
+        assert_eq!(
+            projection
+                .last_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.tab_target_id.as_deref()),
+            Some("target-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_pending_dialog_cleanup_respects_commit_fence_before_mutation() {
+        let runtime = new_shared_dialog_runtime();
+        {
+            let mut state = runtime.write().await;
+            state.status = DialogRuntimeStatus::Active;
+            state.pending_dialog = Some(rub_core::model::PendingDialogInfo {
+                kind: DialogKind::Alert,
+                message: "Detached dialog".to_string(),
+                url: "https://example.com".to_string(),
+                tab_target_id: Some("target-1".to_string()),
+                frame_id: None,
+                default_prompt: None,
+                has_browser_handler: true,
+                opened_at: "2026-01-01T00:00:00Z".to_string(),
+            });
+            state.last_dialog = state.pending_dialog.clone();
+        }
+
+        let live_target_ids = HashSet::from(["target-2".to_string()]);
+        assert!(
+            clear_stale_pending_dialog_for_live_targets_if(&runtime, &live_target_ids, || false)
+                .await
+                .is_none(),
+            "stale projection must not mutate dialog authority after its commit fence closes"
+        );
+        let state = runtime.read().await;
+        assert_eq!(state.status, DialogRuntimeStatus::Active);
+        assert_eq!(
+            state
+                .pending_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.tab_target_id.as_deref()),
+            Some("target-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn live_target_keeps_pending_dialog_authority() {
+        let runtime = new_shared_dialog_runtime();
+        {
+            let mut state = runtime.write().await;
+            state.status = DialogRuntimeStatus::Active;
+            state.pending_dialog = Some(rub_core::model::PendingDialogInfo {
+                kind: DialogKind::Alert,
+                message: "Still live".to_string(),
+                url: "https://example.com".to_string(),
+                tab_target_id: Some("target-1".to_string()),
+                frame_id: None,
+                default_prompt: None,
+                has_browser_handler: true,
+                opened_at: "2026-01-01T00:00:00Z".to_string(),
+            });
+        }
+
+        let live_target_ids = HashSet::from(["target-1".to_string()]);
+        assert!(
+            clear_stale_pending_dialog_for_live_targets(&runtime, &live_target_ids)
+                .await
+                .is_none(),
+            "matching live target must preserve pending dialog authority"
+        );
+        let state = runtime.read().await;
+        assert_eq!(state.status, DialogRuntimeStatus::Active);
+        assert_eq!(
+            state
+                .pending_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.tab_target_id.as_deref()),
+            Some("target-1")
+        );
+    }
+
+    #[tokio::test]
     async fn publish_dialog_opening_commits_runtime_before_callback() {
         let runtime = new_shared_dialog_runtime();
         let observed_message = Arc::new(Mutex::new(None::<String>));
@@ -496,8 +760,11 @@ mod tests {
             default_prompt: None,
             has_browser_handler: true,
         };
+        let release_in_progress = AtomicBool::new(false);
 
-        publish_dialog_opening(&runtime, Some(&callback), &opened).await;
+        assert!(
+            publish_dialog_opening(&runtime, Some(&callback), &opened, &release_in_progress).await
+        );
 
         assert_eq!(
             observed_message.lock().expect("callback mutex").as_deref(),
@@ -512,6 +779,217 @@ mod tests {
                 .map(|dialog| dialog.message.as_str()),
             Some("Hello from callback")
         );
+    }
+
+    #[tokio::test]
+    async fn publish_dialog_opening_rechecks_release_fence_after_waiting_for_write_authority() {
+        let runtime = new_shared_dialog_runtime();
+        let write_guard = runtime.write().await;
+        let release_in_progress = Arc::new(AtomicBool::new(false));
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback_called_for_callback = callback_called.clone();
+        let callback: OpeningCallback = Arc::new(move |_| {
+            callback_called_for_callback.store(true, Ordering::SeqCst);
+        });
+        let opened = BrowserDialogOpening {
+            generation: 7,
+            kind: DialogKind::Alert,
+            message: "old authority dialog".to_string(),
+            url: "https://example.test/dialog".to_string(),
+            tab_target_id: Some("tab-1".to_string()),
+            frame_id: Some("frame-1".to_string()),
+            default_prompt: None,
+            has_browser_handler: true,
+        };
+        let runtime_for_task = runtime.clone();
+        let release_for_task = release_in_progress.clone();
+        let callback_for_task = callback.clone();
+        let publish_task = tokio::spawn(async move {
+            publish_dialog_opening(
+                &runtime_for_task,
+                Some(&callback_for_task),
+                &opened,
+                &release_for_task,
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        release_in_progress.store(true, Ordering::SeqCst);
+        drop(write_guard);
+
+        assert!(
+            !publish_task.await.expect("publish task should finish"),
+            "release fence must reject opening after waiting for write authority"
+        );
+        assert!(
+            !callback_called.load(Ordering::SeqCst),
+            "release fence must suppress opening callback"
+        );
+        let state = runtime.read().await;
+        assert_eq!(state.status, DialogRuntimeStatus::Inactive);
+        assert!(state.pending_dialog.is_none());
+        assert!(state.last_dialog.is_none());
+    }
+
+    #[tokio::test]
+    async fn publish_dialog_closed_is_suppressed_while_authority_release_is_in_progress() {
+        let runtime = new_shared_dialog_runtime();
+        {
+            let mut state = runtime.write().await;
+            state.status = DialogRuntimeStatus::Active;
+            state.pending_dialog = Some(PendingDialogInfo {
+                kind: DialogKind::Alert,
+                message: "old authority dialog".to_string(),
+                url: "https://example.test/dialog".to_string(),
+                tab_target_id: Some("tab-1".to_string()),
+                frame_id: None,
+                default_prompt: None,
+                has_browser_handler: true,
+                opened_at: "2026-04-24T00:00:00Z".to_string(),
+            });
+            state.last_dialog = state.pending_dialog.clone();
+        }
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback_called_for_callback = callback_called.clone();
+        let callback: ClosedCallback = Arc::new(move |_| {
+            callback_called_for_callback.store(true, Ordering::SeqCst);
+        });
+        let release_in_progress = AtomicBool::new(true);
+
+        let published = publish_dialog_closed(
+            &runtime,
+            Some(&callback),
+            7,
+            true,
+            "ignored".to_string(),
+            &release_in_progress,
+        )
+        .await;
+
+        assert!(!published, "release fence must reject old-authority close");
+        assert!(
+            !callback_called.load(Ordering::SeqCst),
+            "release fence must suppress close callback"
+        );
+        let state = runtime.read().await;
+        assert_eq!(state.status, DialogRuntimeStatus::Active);
+        assert!(
+            state.pending_dialog.is_some(),
+            "old-authority close must not rewrite dialog projection"
+        );
+        assert!(state.last_result.is_none());
+    }
+
+    #[tokio::test]
+    async fn publish_dialog_closed_rechecks_release_fence_after_waiting_for_write_authority() {
+        let runtime = new_shared_dialog_runtime();
+        {
+            let mut state = runtime.write().await;
+            state.status = DialogRuntimeStatus::Active;
+            state.pending_dialog = Some(PendingDialogInfo {
+                kind: DialogKind::Alert,
+                message: "old authority dialog".to_string(),
+                url: "https://example.test/dialog".to_string(),
+                tab_target_id: Some("tab-1".to_string()),
+                frame_id: None,
+                default_prompt: None,
+                has_browser_handler: true,
+                opened_at: "2026-04-24T00:00:00Z".to_string(),
+            });
+            state.last_dialog = state.pending_dialog.clone();
+        }
+        let write_guard = runtime.write().await;
+        let release_in_progress = Arc::new(AtomicBool::new(false));
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback_called_for_callback = callback_called.clone();
+        let callback: ClosedCallback = Arc::new(move |_| {
+            callback_called_for_callback.store(true, Ordering::SeqCst);
+        });
+        let runtime_for_task = runtime.clone();
+        let release_for_task = release_in_progress.clone();
+        let callback_for_task = callback.clone();
+        let publish_task = tokio::spawn(async move {
+            publish_dialog_closed(
+                &runtime_for_task,
+                Some(&callback_for_task),
+                7,
+                true,
+                "ignored".to_string(),
+                &release_for_task,
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        release_in_progress.store(true, Ordering::SeqCst);
+        drop(write_guard);
+
+        assert!(
+            !publish_task.await.expect("publish task should finish"),
+            "release fence must reject close after waiting for write authority"
+        );
+        assert!(
+            !callback_called.load(Ordering::SeqCst),
+            "release fence must suppress close callback"
+        );
+        let state = runtime.read().await;
+        assert_eq!(state.status, DialogRuntimeStatus::Active);
+        assert!(state.pending_dialog.is_some());
+        assert!(state.last_result.is_none());
+    }
+
+    #[tokio::test]
+    async fn intercept_handle_failure_degrades_runtime_and_notifies_callback() {
+        let runtime = new_shared_dialog_runtime();
+        {
+            let mut state = runtime.write().await;
+            state.status = DialogRuntimeStatus::Active;
+            state.pending_dialog = Some(PendingDialogInfo {
+                kind: DialogKind::Alert,
+                message: "blocked".to_string(),
+                url: "https://example.test/dialog".to_string(),
+                tab_target_id: Some("tab-1".to_string()),
+                frame_id: None,
+                default_prompt: None,
+                has_browser_handler: true,
+                opened_at: "2026-04-24T00:00:00Z".to_string(),
+            });
+        }
+        let delivered = Arc::new(Mutex::new(Vec::<DialogRuntimeInfo>::new()));
+        let delivered_for_callback = delivered.clone();
+        let callback: RuntimeCallback = Arc::new(move |update| {
+            delivered_for_callback
+                .lock()
+                .expect("runtime callback mutex")
+                .push(update.runtime);
+        });
+        let release_in_progress = AtomicBool::new(false);
+        let error = RubError::domain(ErrorCode::InvalidInput, "cdp dialog handle failed");
+
+        assert!(
+            publish_dialog_intercept_failure(
+                &runtime,
+                Some(&callback),
+                11,
+                &error,
+                &release_in_progress,
+            )
+            .await
+        );
+
+        let state = runtime.read().await;
+        assert_eq!(state.status, DialogRuntimeStatus::Degraded);
+        assert!(state.pending_dialog.is_some());
+        assert!(
+            state
+                .degraded_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("dialog_intercept_handle_failed:"))
+        );
+        let delivered = delivered.lock().expect("runtime callback mutex");
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].status, DialogRuntimeStatus::Degraded);
     }
 }
 

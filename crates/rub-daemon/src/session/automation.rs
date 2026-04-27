@@ -22,6 +22,8 @@ impl SessionState {
         &self,
         sequence: u64,
         known_sessions: Vec<rub_core::model::OrchestrationSessionInfo>,
+        addressing_supported: bool,
+        execution_supported: bool,
         degraded_reason: Option<String>,
     ) -> rub_core::model::OrchestrationRuntimeInfo {
         self.orchestration_runtime.write().await.replace(
@@ -29,6 +31,8 @@ impl SessionState {
             self.session_id.clone(),
             self.session_name.clone(),
             known_sessions,
+            addressing_supported,
+            execution_supported,
             degraded_reason,
         )
     }
@@ -71,6 +75,18 @@ impl SessionState {
         self.orchestration_runtime.write().await.register(rule)
     }
 
+    pub(crate) async fn register_orchestration_rule_with_network_baseline(
+        &self,
+        mut rule: OrchestrationRuleInfo,
+        network_baseline: Option<NetworkRequestBaseline>,
+    ) -> Result<OrchestrationRuleInfo, u32> {
+        rule.id = self.next_orchestration_id.fetch_add(1, Ordering::SeqCst);
+        self.orchestration_runtime
+            .write()
+            .await
+            .register_with_network_baseline(rule, network_baseline)
+    }
+
     pub async fn set_orchestration_rule_status(
         &self,
         id: u32,
@@ -80,6 +96,18 @@ impl SessionState {
             .write()
             .await
             .update_status(id, status)
+    }
+
+    pub(crate) async fn set_orchestration_rule_status_with_network_baseline(
+        &self,
+        id: u32,
+        status: OrchestrationRuleStatus,
+        network_baseline: Option<NetworkRequestBaseline>,
+    ) -> Option<OrchestrationRuleInfo> {
+        self.orchestration_runtime
+            .write()
+            .await
+            .update_status_with_network_baseline(id, status, network_baseline)
     }
 
     pub async fn remove_orchestration_rule(&self, id: u32) -> Option<OrchestrationRuleInfo> {
@@ -104,12 +132,13 @@ impl SessionState {
     pub async fn set_orchestration_condition_evidence(
         &self,
         id: u32,
+        expected_generation: Option<u64>,
         evidence: Option<rub_core::model::TriggerEvidenceInfo>,
     ) -> Option<rub_core::model::OrchestrationRuleInfo> {
         self.orchestration_runtime
             .write()
             .await
-            .set_condition_evidence(id, evidence)
+            .set_condition_evidence(id, expected_generation, evidence)
     }
 
     pub async fn record_orchestration_outcome_with_fallback(
@@ -189,6 +218,19 @@ impl SessionState {
         trigger
     }
 
+    pub(crate) async fn register_trigger_with_network_baseline(
+        &self,
+        mut trigger: rub_core::model::TriggerInfo,
+        network_baseline: Option<NetworkRequestBaseline>,
+    ) -> rub_core::model::TriggerInfo {
+        trigger.id = self.next_trigger_id.fetch_add(1, Ordering::SeqCst);
+        self.trigger_runtime
+            .write()
+            .await
+            .register_with_network_baseline(trigger.clone(), network_baseline);
+        trigger
+    }
+
     /// List configured trigger rules in stable registration order.
     pub async fn triggers(&self) -> Vec<rub_core::model::TriggerInfo> {
         self.trigger_runtime.read().await.triggers()
@@ -217,17 +259,41 @@ impl SessionState {
         self.trigger_runtime.write().await.update_status(id, status)
     }
 
+    pub(crate) async fn set_trigger_status_with_network_baseline(
+        &self,
+        id: u32,
+        status: rub_core::model::TriggerStatus,
+        network_baseline: Option<NetworkRequestBaseline>,
+    ) -> Option<rub_core::model::TriggerInfo> {
+        self.trigger_runtime
+            .write()
+            .await
+            .update_status_with_network_baseline(id, status, network_baseline)
+    }
+
+    pub(crate) async fn ensure_trigger_network_request_baseline(
+        &self,
+        id: u32,
+        network_baseline: NetworkRequestBaseline,
+    ) -> Option<rub_core::model::TriggerInfo> {
+        self.trigger_runtime
+            .write()
+            .await
+            .ensure_network_request_baseline(id, network_baseline)
+    }
+
     /// Record the most recent condition evidence for one trigger entry while
     /// keeping its current lifecycle status intact.
     pub async fn set_trigger_condition_evidence(
         &self,
         id: u32,
+        expected_generation: u64,
         evidence: Option<rub_core::model::TriggerEvidenceInfo>,
     ) -> Option<rub_core::model::TriggerInfo> {
         self.trigger_runtime
             .write()
             .await
-            .set_condition_evidence(id, evidence)
+            .set_condition_evidence(id, expected_generation, evidence)
     }
 
     /// Record the most recent trigger execution outcome and update the
@@ -235,18 +301,50 @@ impl SessionState {
     pub async fn record_trigger_outcome(
         &self,
         id: u32,
+        expected_generation: u64,
         evidence: Option<rub_core::model::TriggerEvidenceInfo>,
         result: rub_core::model::TriggerResultInfo,
     ) -> Option<rub_core::model::TriggerInfo> {
         self.trigger_runtime
             .write()
             .await
-            .record_outcome(id, evidence, result)
+            .record_outcome(id, expected_generation, evidence, result)
+    }
+
+    pub async fn record_trigger_outcome_with_fallback(
+        &self,
+        trigger_snapshot: &rub_core::model::TriggerInfo,
+        expected_generation: u64,
+        evidence: Option<rub_core::model::TriggerEvidenceInfo>,
+        result: rub_core::model::TriggerResultInfo,
+    ) -> crate::trigger::TriggerOutcomeCommit {
+        self.trigger_runtime
+            .write()
+            .await
+            .record_outcome_with_fallback(trigger_snapshot, expected_generation, evidence, result)
     }
 
     /// Remove one configured trigger rule.
     pub async fn remove_trigger(&self, id: u32) -> Option<rub_core::model::TriggerInfo> {
         self.trigger_runtime.write().await.remove(id)
+    }
+
+    pub(crate) async fn trigger_network_request_baselines(
+        &self,
+    ) -> std::collections::HashMap<u32, NetworkRequestBaseline> {
+        self.trigger_runtime
+            .read()
+            .await
+            .network_request_baselines()
+    }
+
+    pub(crate) async fn orchestration_network_request_baselines(
+        &self,
+    ) -> std::collections::HashMap<u32, NetworkRequestBaseline> {
+        self.orchestration_runtime
+            .read()
+            .await
+            .network_request_baselines()
     }
 
     /// Reconcile stable trigger tab bindings against the current live tab inventory.

@@ -12,68 +12,96 @@ use super::binding_path_state;
 
 pub(crate) fn read_binding_registry(rub_home: &Path) -> Result<BindingRegistryData, RubError> {
     with_bindings_lock(rub_home, false, |path| {
-        let registry = load_json_file_with_create(
-            path,
-            |path, reason, error| {
-                binding_registry_io_error(
-                    rub_home,
-                    path,
-                    match reason {
-                        "open_failed" => "binding_registry_open_failed",
-                        "read_failed" => "binding_registry_read_failed",
-                        _ => "binding_registry_io_failed",
-                    },
-                    error,
-                )
-            },
-            |path, error| {
-                RubError::domain_with_context(
-                    ErrorCode::JsonError,
-                    format!(
-                        "Failed to parse binding registry {}: {error}",
-                        path.display()
-                    ),
-                    json!({
-                    "registry_path": path.display().to_string(),
-                    "registry_path_state": binding_path_state(
-                        "cli.binding.subject.registry_path",
-                        "cli_binding_registry",
-                        "binding_registry_file",
-                    ),
-                    "reason": "binding_registry_parse_failed",
-                    }),
-                )
-            },
-        )?;
-        validate_binding_registry(rub_home, &registry)?;
-        Ok(registry)
+        load_binding_registry_unlocked(rub_home, path)
     })
 }
 
+#[cfg(test)]
 pub(crate) fn write_binding_registry(
     rub_home: &Path,
     registry: &BindingRegistryData,
 ) -> Result<(), RubError> {
     with_bindings_lock(rub_home, true, |path| {
-        let mut normalized = registry.clone();
-        normalized
-            .bindings
-            .sort_by(|left, right| left.alias.cmp(&right.alias));
-        validate_binding_registry(rub_home, &normalized)?;
-        write_pretty_json_file(path, &normalized, 0o600, |path, reason, error| {
+        write_binding_registry_unlocked(rub_home, path, registry)
+    })
+}
+
+pub(crate) fn mutate_binding_registry<T>(
+    rub_home: &Path,
+    mutation: impl FnOnce(&mut BindingRegistryData) -> Result<T, RubError>,
+) -> Result<T, RubError> {
+    with_bindings_lock(rub_home, true, |path| {
+        let mut registry = load_binding_registry_unlocked(rub_home, path)?;
+        let result = mutation(&mut registry)?;
+        write_binding_registry_unlocked(rub_home, path, &registry)?;
+        Ok(result)
+    })
+}
+
+pub(crate) fn load_binding_registry_unlocked(
+    rub_home: &Path,
+    path: &Path,
+) -> Result<BindingRegistryData, RubError> {
+    let registry = load_json_file_with_create(
+        path,
+        |path, reason, error| {
             binding_registry_io_error(
                 rub_home,
                 path,
                 match reason {
-                    "serialize_failed" => "binding_registry_serialize_failed",
-                    "write_failed" => "binding_registry_write_failed",
+                    "open_failed" => "binding_registry_open_failed",
+                    "read_failed" => "binding_registry_read_failed",
                     _ => "binding_registry_io_failed",
                 },
                 error,
             )
-        })?;
-        Ok(())
-    })
+        },
+        |path, error| {
+            RubError::domain_with_context(
+                ErrorCode::JsonError,
+                format!(
+                    "Failed to parse binding registry {}: {error}",
+                    path.display()
+                ),
+                json!({
+                "registry_path": path.display().to_string(),
+                "registry_path_state": binding_path_state(
+                    "cli.binding.subject.registry_path",
+                    "cli_binding_registry",
+                    "binding_registry_file",
+                ),
+                "reason": "binding_registry_parse_failed",
+                }),
+            )
+        },
+    )?;
+    validate_binding_registry(rub_home, &registry)?;
+    Ok(registry)
+}
+
+pub(crate) fn write_binding_registry_unlocked(
+    rub_home: &Path,
+    path: &Path,
+    registry: &BindingRegistryData,
+) -> Result<(), RubError> {
+    let mut normalized = registry.clone();
+    normalized
+        .bindings
+        .sort_by(|left, right| left.alias.cmp(&right.alias));
+    validate_binding_registry(rub_home, &normalized)?;
+    write_pretty_json_file(path, &normalized, 0o600, |path, reason, error| {
+        binding_registry_io_error(
+            rub_home,
+            path,
+            match reason {
+                "serialize_failed" => "binding_registry_serialize_failed",
+                "write_failed" => "binding_registry_write_failed",
+                _ => "binding_registry_io_failed",
+            },
+            error,
+        )
+    })?;
+    Ok(())
 }
 
 fn validate_binding_registry(
@@ -177,7 +205,7 @@ fn validate_binding_record(
     Ok(())
 }
 
-fn with_bindings_lock<T>(
+pub(crate) fn with_bindings_lock<T>(
     rub_home: &Path,
     exclusive: bool,
     f: impl FnOnce(&Path) -> Result<T, RubError>,

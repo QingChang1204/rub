@@ -60,6 +60,7 @@ impl Commands {
     pub(crate) fn wait_after_args(&self) -> Option<&WaitAfterArgs> {
         match self {
             Self::Open { wait_after, .. }
+            | Self::Exec { wait_after, .. }
             | Self::Back { wait_after }
             | Self::Forward { wait_after }
             | Self::Reload { wait_after, .. }

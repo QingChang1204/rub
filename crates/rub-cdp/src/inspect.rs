@@ -37,46 +37,123 @@ JSON.stringify((() => {
         }
     }
 
+    function getTag(el) {
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'a') return 'link';
+        if (tag === 'textarea') return 'textarea';
+        if (tag === 'select') return 'select';
+        if (tag === 'option') return 'option';
+        if (tag === 'input') {
+            const type = el.type || 'text';
+            if (type === 'checkbox') return 'checkbox';
+            if (type === 'radio') return 'radio';
+            return 'input';
+        }
+        if (tag === 'button') return 'button';
+        return 'other';
+    }
+
+    function getText(el) {
+        return (el.textContent || '').trim().substring(0, 200);
+    }
+
+    function getAttrs(el) {
+        const attrs = {};
+        for (const name of ['href', 'placeholder', 'aria-label', 'aria-readonly', 'type', 'name', 'value', 'role', 'title', 'alt', 'id', 'data-testid', 'data-test-id', 'data-test', 'contenteditable']) {
+            const val = el.getAttribute(name);
+            if (val != null && val !== '') attrs[name] = val;
+        }
+        if (el.isContentEditable && !('contenteditable' in attrs)) {
+            attrs.contenteditable = 'true';
+        }
+        if (el.hasAttribute && el.hasAttribute('disabled')) {
+            attrs.disabled = '';
+        }
+        if (el.hasAttribute && el.hasAttribute('readonly')) {
+            attrs.readonly = '';
+        }
+        return attrs;
+    }
+
+    function getRect(el) {
+        const r = el.getBoundingClientRect();
+        let x = r.x;
+        let y = r.y;
+        let current = window;
+        while (current !== current.top) {
+            try {
+                const frameEl = current.frameElement;
+                if (!frameEl) break;
+                const fr = frameEl.getBoundingClientRect();
+                x += fr.x;
+                y += fr.y;
+                current = current.parent;
+            } catch (_) {
+                break;
+            }
+        }
+        return { x, y, width: r.width, height: r.height };
+    }
+
     try {
         document.querySelector(selector);
     } catch (error) {
         return {
             selector_error: String((error && error.message) || error || 'invalid selector'),
-            match_indices: []
+            match_entries: []
         };
     }
 
-    const matchIndices = [];
+    const matchEntries = [];
     const walker = document.createTreeWalker(
         document.body || document.documentElement,
         NodeFilter.SHOW_ELEMENT,
         null
     );
 
-    let node = walker.currentNode;
-    let interactiveIndex = 0;
-    while (node) {
-        const listeners = node && node.nodeType === 1 ? getListeners(node) : [];
-        if (node.nodeType === 1 && (isInteractive(node) || listeners.length > 0)) {
-            if (node.matches(selector)) {
-                matchIndices.push(interactiveIndex);
+        let node = walker.currentNode;
+        let interactiveIndex = 0;
+        while (node) {
+            const listeners = node && node.nodeType === 1 ? getListeners(node) : [];
+            if (node.nodeType === 1 && (isInteractive(node) || listeners.length > 0)) {
+                if (node.matches(selector)) {
+                    matchEntries.push({
+                        index: interactiveIndex,
+                        element: {
+                            index: interactiveIndex,
+                            tag: getTag(node),
+                            text: getText(node),
+                            attributes: getAttrs(node),
+                            element_ref: null,
+                            bounding_box: getRect(node),
+                            ax_info: null,
+                            listeners: includeListeners ? listeners : null,
+                            depth: null
+                        }
+                    });
+                }
+                interactiveIndex++;
             }
-            interactiveIndex++;
+            node = walker.nextNode();
         }
-        node = walker.nextNode();
-    }
 
     return {
         selector_error: null,
-        match_indices: matchIndices
+        match_entries: matchEntries
     };
 })())
 "##;
 
 #[derive(Debug, serde::Deserialize)]
+struct SelectorMatchEntry {
+    index: u32,
+    element: Element,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct SelectorMatchPayload {
     selector_error: Option<String>,
-    match_indices: Vec<u32>,
+    match_entries: Vec<SelectorMatchEntry>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -217,7 +294,15 @@ pub(crate) async fn get_bbox(page: &Arc<Page>, element: &Element) -> Result<Boun
         &resolved.remote_object_id,
         crate::targeting::TOP_LEVEL_BOUNDING_BOX_FUNCTION,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        let message = error.to_string();
+        if crate::targeting::top_level_geometry_error_reason(&message).is_some() {
+            crate::targeting::top_level_geometry_authority_error(&message)
+        } else {
+            error
+        }
+    })?;
     serde_json::from_value::<BoundingBox>(bbox_json)
         .map_err(|e| RubError::Internal(format!("Parse bbox failed: {e}")))
 }
@@ -252,21 +337,36 @@ async fn resolve_selector_matches(
         Some(snapshot.frame_context.frame_id.as_str()),
     )
     .await?;
+    let document_before = crate::runtime_state::probe_live_read_document_fence(
+        page,
+        frame_context.execution_context_id,
+    )
+    .await;
     let selector_json = serde_json::to_string(selector)
         .map_err(|e| RubError::Internal(format!("Selector serialization failed: {e}")))?;
     let script = template.replace("__SELECTOR__", &selector_json).replace(
         "__INCLUDE_LISTENERS__",
         if include_listeners { "true" } else { "false" },
     );
-    let payload: SelectorMatchPayload = serde_json::from_str(
-        &crate::js::evaluate_returning_string_in_context(
-            page,
-            frame_context.execution_context_id,
-            &script,
-        )
-        .await?,
+    let raw = crate::js::evaluate_returning_string_in_context(
+        page,
+        frame_context.execution_context_id,
+        &script,
     )
-    .map_err(|e| RubError::Internal(format!("Selector payload parse failed: {e}")))?;
+    .await?;
+    let document_after = crate::runtime_state::probe_live_read_document_fence(
+        page,
+        frame_context.execution_context_id,
+    )
+    .await;
+    crate::runtime_state::ensure_live_read_document_fence(
+        error_label,
+        snapshot.frame_context.frame_id.as_str(),
+        document_before.as_ref(),
+        document_after.as_ref(),
+    )?;
+    let payload: SelectorMatchPayload = serde_json::from_str(&raw)
+        .map_err(|e| RubError::Internal(format!("Selector payload parse failed: {e}")))?;
 
     if let Some(selector_error) = payload.selector_error {
         return Err(RubError::domain_with_context_and_suggestion(
@@ -280,7 +380,7 @@ async fn resolve_selector_matches(
         ));
     }
 
-    resolve_snapshot_selector_matches(snapshot, selector, error_label, payload.match_indices)
+    resolve_snapshot_selector_matches(snapshot, selector, error_label, payload.match_entries)
 }
 
 fn snapshot_uses_listener_promoted_classifier(snapshot: &Snapshot) -> bool {
@@ -296,26 +396,40 @@ fn resolve_snapshot_selector_matches(
     snapshot: &Snapshot,
     selector: &str,
     error_label: &str,
-    match_indices: Vec<u32>,
+    match_entries: Vec<SelectorMatchEntry>,
 ) -> Result<Vec<Element>, RubError> {
     let snapshot_by_index = crate::snapshot_lookup::build_snapshot_index_lookup(snapshot);
-    let missing_indices = match_indices
+    let missing_indices = match_entries
         .iter()
-        .copied()
+        .map(|matched| matched.index)
         .filter(|index| !snapshot_by_index.contains_key(index))
         .collect::<Vec<_>>();
+    let mismatched_indices = match_entries
+        .iter()
+        .filter_map(|matched| {
+            let expected = snapshot_by_index.get(&matched.index)?;
+            (!crate::targeting::snapshot_element_replay_matches_authority(
+                expected,
+                &matched.element,
+            ))
+            .then_some(matched.index)
+        })
+        .collect::<Vec<_>>();
 
-    if !missing_indices.is_empty() {
+    if !missing_indices.is_empty() || !mismatched_indices.is_empty() {
         return Err(snapshot_selector_replay_error(
             snapshot,
             selector,
             error_label,
             &missing_indices,
+            &mismatched_indices,
         ));
     }
 
-    let mut resolved =
-        crate::snapshot_lookup::clone_snapshot_elements_by_index(&snapshot_by_index, match_indices);
+    let mut resolved = crate::snapshot_lookup::clone_snapshot_elements_by_index(
+        &snapshot_by_index,
+        match_entries.iter().map(|matched| matched.index),
+    );
 
     if resolved.is_empty() {
         return Err(RubError::domain_with_context_and_suggestion(
@@ -340,6 +454,7 @@ fn snapshot_selector_replay_error(
     selector: &str,
     error_label: &str,
     missing_indices: &[u32],
+    mismatched_indices: &[u32],
 ) -> RubError {
     let authority_state = if snapshot.truncated {
         "snapshot_selector_replay_truncated_cached_inventory"
@@ -365,6 +480,7 @@ fn snapshot_selector_replay_error(
             "snapshot_id": snapshot.snapshot_id,
             "snapshot_truncated": snapshot.truncated,
             "missing_snapshot_indices": missing_indices,
+            "mismatched_snapshot_indices": mismatched_indices,
         }),
         "Refresh state to rebuild the snapshot inventory before using selector-backed snapshot addressing again",
     )
@@ -378,7 +494,7 @@ fn parse_attributes_json(raw: &str) -> Result<HashMap<String, String>, RubError>
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_attributes_json, resolve_snapshot_selector_matches,
+        SelectorMatchEntry, parse_attributes_json, resolve_snapshot_selector_matches,
         snapshot_uses_listener_promoted_classifier,
     };
     use rub_core::error::ErrorCode;
@@ -398,8 +514,16 @@ mod tests {
         let mut snapshot = sample_snapshot();
         snapshot.truncated = true;
 
-        let error = resolve_snapshot_selector_matches(&snapshot, ".cta", "Selector", vec![0, 9])
-            .expect_err("missing selector replay indexes on truncated snapshots must fail closed");
+        let error = resolve_snapshot_selector_matches(
+            &snapshot,
+            ".cta",
+            "Selector",
+            vec![
+                sample_match_entry(0, "First"),
+                sample_match_entry(9, "Ghost"),
+            ],
+        )
+        .expect_err("missing selector replay indexes on truncated snapshots must fail closed");
         let envelope = error.into_envelope();
         assert_eq!(envelope.code, ErrorCode::StaleSnapshot);
         assert_eq!(
@@ -412,16 +536,37 @@ mod tests {
     fn snapshot_selector_replay_rejects_classifier_mismatch_without_truncation() {
         let snapshot = sample_snapshot();
 
-        let error =
-            resolve_snapshot_selector_matches(&snapshot, "[contenteditable]", "Selector", vec![7])
-                .expect_err(
-                    "missing selector replay indexes must fail closed even on full snapshots",
-                );
+        let error = resolve_snapshot_selector_matches(
+            &snapshot,
+            "[contenteditable]",
+            "Selector",
+            vec![sample_match_entry(7, "Missing")],
+        )
+        .expect_err("missing selector replay indexes must fail closed even on full snapshots");
         let envelope = error.into_envelope();
         assert_eq!(envelope.code, ErrorCode::StaleSnapshot);
         assert_eq!(
             envelope.context.expect("selector context")["authority_state"],
             "snapshot_selector_replay_classifier_mismatch"
+        );
+    }
+
+    #[test]
+    fn snapshot_selector_replay_rejects_in_range_identity_mismatch() {
+        let snapshot = sample_snapshot();
+
+        let error = resolve_snapshot_selector_matches(
+            &snapshot,
+            ".cta",
+            "Selector",
+            vec![sample_match_entry(0, "Inserted")],
+        )
+        .expect_err("in-range selector replay mismatch must fail closed");
+        let envelope = error.into_envelope();
+        assert_eq!(envelope.code, ErrorCode::StaleSnapshot);
+        assert_eq!(
+            envelope.context.expect("selector context")["mismatched_snapshot_indices"],
+            serde_json::json!([0])
         );
     }
 
@@ -496,10 +641,18 @@ mod tests {
             text: text.to_string(),
             attributes: HashMap::new(),
             element_ref: Some(format!("frame-main:{index}")),
+            target_id: None,
             bounding_box: None,
             ax_info: None,
             listeners: None,
             depth: Some(0),
+        }
+    }
+
+    fn sample_match_entry(index: u32, text: &str) -> SelectorMatchEntry {
+        SelectorMatchEntry {
+            index,
+            element: sample_element(index, text),
         }
     }
 }

@@ -3,6 +3,7 @@ pub struct CommandMetadata {
     pub internal: bool,
     pub supports_post_wait: bool,
     pub in_process_only: bool,
+    pub transport_protocol_compat_exempt: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -125,10 +126,13 @@ impl CommandName {
 
     pub const fn metadata(self) -> CommandMetadata {
         match self {
-            Self::Handshake
-            | Self::UpgradeCheck
-            | Self::BlockerDiagnose
-            | Self::InteractabilityProbe
+            Self::Handshake | Self::UpgradeCheck | Self::BlockerDiagnose => CommandMetadata {
+                internal: true,
+                supports_post_wait: false,
+                in_process_only: false,
+                transport_protocol_compat_exempt: true,
+            },
+            Self::InteractabilityProbe
             | Self::FillValidate
             | Self::OrchestrationProbe
             | Self::OrchestrationTabFrames
@@ -137,13 +141,16 @@ impl CommandName {
                 internal: true,
                 supports_post_wait: false,
                 in_process_only: false,
+                transport_protocol_compat_exempt: false,
             },
             Self::TriggerFill | Self::TriggerPipe => CommandMetadata {
                 internal: true,
                 supports_post_wait: true,
                 in_process_only: true,
+                transport_protocol_compat_exempt: false,
             },
             Self::Open
+            | Self::Exec
             | Self::Back
             | Self::Forward
             | Self::Reload
@@ -159,11 +166,13 @@ impl CommandName {
                 internal: false,
                 supports_post_wait: true,
                 in_process_only: false,
+                transport_protocol_compat_exempt: false,
             },
             _ => CommandMetadata {
                 internal: false,
                 supports_post_wait: false,
                 in_process_only: false,
+                transport_protocol_compat_exempt: false,
             },
         }
     }
@@ -235,9 +244,29 @@ pub fn command_metadata(command: &str) -> CommandMetadata {
         .unwrap_or_default()
 }
 
+pub fn is_transport_exposed_internal_command(command: &str) -> bool {
+    let metadata = command_metadata(command);
+    metadata.internal && !metadata.in_process_only
+}
+
+pub fn allows_transport_protocol_compat_exemption(command: &str) -> bool {
+    let metadata = command_metadata(command);
+    metadata.internal && !metadata.in_process_only && metadata.transport_protocol_compat_exempt
+}
+
+pub fn allows_missing_request_command_id(command: &str) -> bool {
+    matches!(
+        CommandName::parse(command),
+        Some(CommandName::Handshake | CommandName::UpgradeCheck | CommandName::BlockerDiagnose)
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CommandName, command_metadata};
+    use super::{
+        CommandName, allows_missing_request_command_id, allows_transport_protocol_compat_exemption,
+        command_metadata, is_transport_exposed_internal_command,
+    };
 
     /// Every CommandName variant must round-trip through parse(as_str()).
     /// This is a regression guard: adding a new command requires updating
@@ -325,29 +354,59 @@ mod tests {
         assert!(handshake.internal);
         assert!(!handshake.supports_post_wait);
         assert!(!handshake.in_process_only);
+        assert!(handshake.transport_protocol_compat_exempt);
 
         let open = command_metadata(CommandName::Open.as_str());
         assert!(!open.internal);
         assert!(open.supports_post_wait);
         assert!(!open.in_process_only);
+        assert!(!open.transport_protocol_compat_exempt);
 
         let click = command_metadata(CommandName::Click.as_str());
         assert!(!click.internal);
         assert!(click.supports_post_wait);
         assert!(!click.in_process_only);
+        assert!(!click.transport_protocol_compat_exempt);
+
+        let exec = command_metadata(CommandName::Exec.as_str());
+        assert!(!exec.internal);
+        assert!(exec.supports_post_wait);
+        assert!(!exec.in_process_only);
+        assert!(!exec.transport_protocol_compat_exempt);
 
         let history = command_metadata(CommandName::History.as_str());
         assert!(!history.internal);
         assert!(!history.supports_post_wait);
         assert!(!history.in_process_only);
+        assert!(!history.transport_protocol_compat_exempt);
 
         // Management-plane internal commands are never post-wait capable.
         for cmd in [
             CommandName::Handshake,
             CommandName::UpgradeCheck,
             CommandName::BlockerDiagnose,
+        ] {
+            let meta = cmd.metadata();
+            assert!(meta.internal, "{cmd:?} should be internal");
+            assert!(
+                !meta.supports_post_wait,
+                "{cmd:?} should not support post-wait"
+            );
+            assert!(
+                !meta.in_process_only,
+                "{cmd:?} should remain transport-exposed internal"
+            );
+            assert!(
+                meta.transport_protocol_compat_exempt,
+                "{cmd:?} should remain transport protocol compatibility exempt"
+            );
+        }
+
+        for cmd in [
             CommandName::InteractabilityProbe,
+            CommandName::FillValidate,
             CommandName::OrchestrationProbe,
+            CommandName::OrchestrationTabFrames,
             CommandName::OrchestrationTargetDispatch,
             CommandName::OrchestrationWorkflowSourceVars,
         ] {
@@ -361,6 +420,10 @@ mod tests {
                 !meta.in_process_only,
                 "{cmd:?} should remain transport-exposed internal"
             );
+            assert!(
+                !meta.transport_protocol_compat_exempt,
+                "{cmd:?} must not inherit control-plane protocol compatibility exemption"
+            );
         }
 
         for cmd in [CommandName::TriggerFill, CommandName::TriggerPipe] {
@@ -368,6 +431,141 @@ mod tests {
             assert!(meta.internal, "{cmd:?} should be internal");
             assert!(meta.supports_post_wait, "{cmd:?} should support post-wait");
             assert!(meta.in_process_only, "{cmd:?} should be in-process only");
+        }
+    }
+
+    #[test]
+    fn transport_exposed_internal_command_helper_matches_metadata_contract() {
+        assert!(is_transport_exposed_internal_command(
+            CommandName::Handshake.as_str()
+        ));
+        assert!(is_transport_exposed_internal_command(
+            CommandName::UpgradeCheck.as_str()
+        ));
+        assert!(!is_transport_exposed_internal_command(
+            CommandName::TriggerFill.as_str()
+        ));
+        assert!(!is_transport_exposed_internal_command(
+            CommandName::Open.as_str()
+        ));
+    }
+
+    #[test]
+    fn transport_protocol_compat_exemption_is_narrowed_to_control_plane_internal_commands() {
+        assert!(allows_transport_protocol_compat_exemption(
+            CommandName::Handshake.as_str()
+        ));
+        assert!(allows_transport_protocol_compat_exemption(
+            CommandName::UpgradeCheck.as_str()
+        ));
+        assert!(allows_transport_protocol_compat_exemption(
+            CommandName::BlockerDiagnose.as_str()
+        ));
+        assert!(!allows_transport_protocol_compat_exemption(
+            CommandName::FillValidate.as_str()
+        ));
+        assert!(!allows_transport_protocol_compat_exemption(
+            CommandName::OrchestrationTargetDispatch.as_str()
+        ));
+        assert!(!allows_transport_protocol_compat_exemption(
+            CommandName::TriggerFill.as_str()
+        ));
+    }
+
+    #[test]
+    fn missing_request_command_id_is_allowed_only_for_control_plane_compat_commands() {
+        assert!(allows_missing_request_command_id(
+            CommandName::Handshake.as_str()
+        ));
+        assert!(allows_missing_request_command_id(
+            CommandName::UpgradeCheck.as_str()
+        ));
+        assert!(allows_missing_request_command_id(
+            CommandName::BlockerDiagnose.as_str()
+        ));
+        assert!(!allows_missing_request_command_id(
+            CommandName::FillValidate.as_str()
+        ));
+        assert!(!allows_missing_request_command_id(
+            CommandName::OrchestrationTabFrames.as_str()
+        ));
+        assert!(!allows_missing_request_command_id(
+            CommandName::OrchestrationTargetDispatch.as_str()
+        ));
+        assert!(!allows_missing_request_command_id(
+            CommandName::Open.as_str()
+        ));
+    }
+
+    #[test]
+    fn missing_request_command_id_allowlist_matches_transport_protocol_compat_metadata() {
+        let all_commands = [
+            CommandName::Handshake,
+            CommandName::UpgradeCheck,
+            CommandName::BlockerDiagnose,
+            CommandName::InteractabilityProbe,
+            CommandName::OrchestrationProbe,
+            CommandName::OrchestrationTabFrames,
+            CommandName::OrchestrationTargetDispatch,
+            CommandName::OrchestrationWorkflowSourceVars,
+            CommandName::TriggerFill,
+            CommandName::TriggerPipe,
+            CommandName::Open,
+            CommandName::State,
+            CommandName::Observe,
+            CommandName::Orchestration,
+            CommandName::Inspect,
+            CommandName::Find,
+            CommandName::Click,
+            CommandName::Exec,
+            CommandName::Scroll,
+            CommandName::Back,
+            CommandName::Forward,
+            CommandName::Reload,
+            CommandName::Screenshot,
+            CommandName::Doctor,
+            CommandName::Runtime,
+            CommandName::Frames,
+            CommandName::Frame,
+            CommandName::History,
+            CommandName::Downloads,
+            CommandName::Download,
+            CommandName::Storage,
+            CommandName::Handoff,
+            CommandName::Takeover,
+            CommandName::Dialog,
+            CommandName::Intercept,
+            CommandName::Interference,
+            CommandName::Close,
+            CommandName::Secret,
+            CommandName::Keys,
+            CommandName::Type,
+            CommandName::Wait,
+            CommandName::Tabs,
+            CommandName::Trigger,
+            CommandName::Switch,
+            CommandName::CloseTab,
+            CommandName::Get,
+            CommandName::Hover,
+            CommandName::Cookies,
+            CommandName::Upload,
+            CommandName::Select,
+            CommandName::Fill,
+            CommandName::Extract,
+            CommandName::Pipe,
+        ];
+
+        for command in all_commands {
+            let metadata = command.metadata();
+            let should_allow_missing_command_id = metadata.internal
+                && !metadata.in_process_only
+                && metadata.transport_protocol_compat_exempt;
+            assert_eq!(
+                allows_missing_request_command_id(command.as_str()),
+                should_allow_missing_command_id,
+                "missing request command_id allowlist drifted from transport compat metadata for {:?}",
+                command
+            );
         }
     }
 }

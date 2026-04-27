@@ -1,7 +1,8 @@
 use crate::commands::{Commands, EffectiveCli};
 use crate::main_support::command_timeout_error;
 use rub_cdp::humanize::HumanizeSpeed;
-use rub_core::error::RubError;
+use rub_core::error::{ErrorCode, RubError};
+use rub_ipc::protocol::MAX_IPC_TIMEOUT_MS;
 use serde_json::Value;
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -21,7 +22,27 @@ pub(crate) fn command_timeout_ms(cli: &EffectiveCli) -> u64 {
 }
 
 pub(crate) fn deadline_from_start(started_at: Instant, timeout_ms: u64) -> Instant {
-    started_at + Duration::from_millis(timeout_ms.max(1))
+    deadline_from_start_checked(started_at, timeout_ms).unwrap_or(started_at)
+}
+
+pub(crate) fn deadline_from_start_checked(started_at: Instant, timeout_ms: u64) -> Option<Instant> {
+    started_at.checked_add(Duration::from_millis(timeout_ms.max(1)))
+}
+
+pub(crate) fn validate_timeout_budget(timeout_ms: u64) -> Result<(), RubError> {
+    if timeout_ms == 0 || timeout_ms > MAX_IPC_TIMEOUT_MS {
+        return Err(RubError::domain_with_context(
+            ErrorCode::IpcProtocolError,
+            format!("IPC request timeout_ms must be between 1 and {MAX_IPC_TIMEOUT_MS}"),
+            serde_json::json!({
+                "reason": "invalid_ipc_request_contract",
+                "field": "timeout_ms",
+                "max_timeout_ms": MAX_IPC_TIMEOUT_MS,
+                "actual_timeout_ms": timeout_ms,
+            }),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn remaining_budget_duration(deadline: Instant) -> Option<Duration> {

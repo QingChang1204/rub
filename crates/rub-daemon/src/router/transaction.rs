@@ -3,26 +3,27 @@ use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
 
+use rub_core::command::allows_transport_protocol_compat_exemption;
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 use rub_ipc::protocol::{IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse};
 
 use crate::session::{ReplayCommandClaim, SessionState};
 use crate::workflow_capture::WorkflowCaptureDeliveryState;
 
-use super::TransactionDeadline;
 use super::dispatch;
 use super::policy::command_allowed_during_handoff;
+use super::{OwnedRouterTransactionGuard, TransactionDeadline};
 
 mod fingerprint;
 mod response;
 
 pub(crate) use self::response::{
-    attach_request_command_id, attach_response_metadata, daemon_authority_mismatch_response,
-    enforce_response_frame_limit, execution_timeout_error, execution_timeout_response,
-    finalize_post_commit_followups, finalize_replay_fence, protocol_version_mismatch_response,
-    queue_timeout_response, replay_fingerprint_conflict_response, replay_request_fingerprint,
+    PostCommitProjectionFence, attach_request_command_id, attach_response_metadata,
+    daemon_authority_mismatch_response, enforce_response_frame_limit, execution_timeout_error,
+    execution_timeout_response, finalize_post_commit_followups, finalize_replay_fence,
+    protocol_version_mismatch_response, queue_timeout_response,
+    replay_fingerprint_conflict_response, replay_request_fingerprint,
     replay_spent_response_evicted_response, replay_timeout_response,
-    response_delivery_failure_response,
 };
 
 #[derive(Debug, Clone)]
@@ -71,7 +72,60 @@ pub(crate) struct PendingResponseCommit {
     response: IpcResponse,
     internal_command: bool,
     execution_started: bool,
+    daemon_request_committed: bool,
     replay_owner: Option<ReplayFenceOwner>,
+    request_transaction: Option<OwnedRouterTransactionGuard>,
+}
+
+#[derive(Debug)]
+pub(super) struct ReplayPreparedResponse {
+    response: IpcResponse,
+    daemon_request_committed: bool,
+}
+
+impl ReplayPreparedResponse {
+    fn committed(response: IpcResponse) -> Self {
+        Self {
+            response,
+            daemon_request_committed: true,
+        }
+    }
+
+    fn not_committed(response: IpcResponse) -> Self {
+        Self {
+            response,
+            daemon_request_committed: false,
+        }
+    }
+}
+
+impl std::ops::Deref for ReplayPreparedResponse {
+    type Target = IpcResponse;
+
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
+}
+
+struct PostCommitFollowupGuard {
+    state: Arc<SessionState>,
+}
+
+impl PostCommitFollowupGuard {
+    fn new(state: Arc<SessionState>) -> Self {
+        state
+            .post_commit_followup_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self { state }
+    }
+}
+
+impl Drop for PostCommitFollowupGuard {
+    fn drop(&mut self) {
+        self.state
+            .post_commit_followup_count
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 pub(super) enum DispatchPreparation {
@@ -115,6 +169,34 @@ impl PreparedCommandDispatch {
 }
 
 impl PendingResponseCommit {
+    async fn finalize_committed_truth(
+        request: &IpcRequest,
+        response: &IpcResponse,
+        replay_owner: Option<&ReplayFenceOwner>,
+        post_commit_projection: Option<(WorkflowCaptureDeliveryState, PostCommitProjectionFence)>,
+        state: &Arc<SessionState>,
+    ) {
+        finalize_replay_fence(replay_owner, response, state).await;
+        if let Some((delivery_state, projection_fence)) = post_commit_projection {
+            finalize_post_commit_followups(
+                request,
+                response,
+                response,
+                delivery_state,
+                projection_fence,
+                state,
+            )
+            .await;
+        }
+    }
+
+    fn response_with_daemon_session_id(&self, daemon_session_id: &str) -> IpcResponse {
+        self.response
+            .clone()
+            .with_daemon_session_id(daemon_session_id.to_string())
+            .expect("validated daemon session_id must remain protocol-valid")
+    }
+
     pub(super) fn new(
         request: IpcRequest,
         mut response: IpcResponse,
@@ -132,19 +214,36 @@ impl PendingResponseCommit {
                 .expect("validated request command_id must remain protocol-valid");
         }
 
-        response = enforce_response_frame_limit(&request, response);
-
         Self {
             request,
             response,
             internal_command,
             execution_started,
+            daemon_request_committed: execution_started,
             replay_owner,
+            request_transaction: None,
         }
     }
 
-    pub(crate) fn response(&self) -> &IpcResponse {
-        &self.response
+    fn with_committed_daemon_request_authority(mut self) -> Self {
+        self.daemon_request_committed = true;
+        self
+    }
+
+    pub(crate) fn with_request_transaction(
+        mut self,
+        request_transaction: OwnedRouterTransactionGuard,
+    ) -> Self {
+        self.request_transaction = Some(request_transaction);
+        self
+    }
+
+    pub(crate) fn response_for_transport(&self, daemon_session_id: &str) -> IpcResponse {
+        enforce_response_frame_limit(
+            &self.request,
+            self.response_with_daemon_session_id(daemon_session_id),
+            self.daemon_request_committed,
+        )
     }
 
     pub(crate) async fn commit_locally(self, state: &Arc<SessionState>) -> IpcResponse {
@@ -153,19 +252,21 @@ impl PendingResponseCommit {
             response,
             internal_command,
             execution_started,
+            daemon_request_committed: _,
             replay_owner,
+            request_transaction: _request_transaction,
         } = self;
-        finalize_replay_fence(replay_owner.as_ref(), &response, state).await;
-        if execution_started && !internal_command {
-            finalize_post_commit_followups(
-                &request,
-                &response,
-                &response,
+        Self::finalize_committed_truth(
+            &request,
+            &response,
+            replay_owner.as_ref(),
+            (execution_started && !internal_command).then_some((
                 WorkflowCaptureDeliveryState::Delivered,
-                state,
-            )
-            .await;
-        }
+                PostCommitProjectionFence::Synchronous,
+            )),
+            state,
+        )
+        .await;
         response
     }
 
@@ -175,44 +276,68 @@ impl PendingResponseCommit {
             response,
             internal_command,
             execution_started,
+            daemon_request_committed: _,
             replay_owner,
+            request_transaction,
         } = self;
-        finalize_replay_fence(replay_owner.as_ref(), &response, state).await;
-        if execution_started && !internal_command {
-            finalize_post_commit_followups(
+        drop(request_transaction);
+        let response = response
+            .with_daemon_session_id(state.session_id.clone())
+            .expect("validated daemon session_id must remain protocol-valid");
+        let needs_followup = replay_owner.is_some() || (execution_started && !internal_command);
+        if !needs_followup {
+            return;
+        }
+        let state = Arc::clone(state);
+        let _followup_guard = PostCommitFollowupGuard::new(state.clone());
+        tokio::spawn(async move {
+            let _followup_guard = _followup_guard;
+            Self::finalize_committed_truth(
                 &request,
                 &response,
-                &response,
-                WorkflowCaptureDeliveryState::Delivered,
-                state,
+                replay_owner.as_ref(),
+                (execution_started && !internal_command).then_some((
+                    WorkflowCaptureDeliveryState::Delivered,
+                    PostCommitProjectionFence::Detached,
+                )),
+                &state,
             )
             .await;
-        }
+        });
     }
 
     pub(crate) async fn commit_after_delivery_failure(
         self,
         state: &Arc<SessionState>,
-        delivery_error: String,
+        _delivery_error: String,
     ) {
-        if !self.execution_started {
-            finalize_replay_fence(self.replay_owner.as_ref(), &self.response, state).await;
-            return;
-        }
-
-        let failure_response =
-            response_delivery_failure_response(&self.request, &self.response, &delivery_error);
-        finalize_replay_fence(self.replay_owner.as_ref(), &failure_response, state).await;
-        if !self.internal_command {
-            finalize_post_commit_followups(
-                &self.request,
-                &failure_response,
-                &self.response,
-                WorkflowCaptureDeliveryState::DeliveryFailedAfterCommit,
+        let PendingResponseCommit {
+            request,
+            response,
+            internal_command,
+            execution_started,
+            daemon_request_committed: _,
+            replay_owner,
+            request_transaction,
+        } = self;
+        let response = response
+            .with_daemon_session_id(state.session_id.clone())
+            .expect("validated daemon session_id must remain protocol-valid");
+        let needs_followup = replay_owner.is_some() || (execution_started && !internal_command);
+        if needs_followup {
+            Self::finalize_committed_truth(
+                &request,
+                &response,
+                replay_owner.as_ref(),
+                (execution_started && !internal_command).then_some((
+                    WorkflowCaptureDeliveryState::DeliveryFailedAfterCommit,
+                    PostCommitProjectionFence::Synchronous,
+                )),
                 state,
             )
             .await;
         }
+        drop(request_transaction);
     }
 }
 
@@ -221,7 +346,7 @@ pub(super) async fn prepare_replay_fence(
     state: &Arc<SessionState>,
     request_id: &str,
     deadline: TransactionDeadline,
-) -> Result<Option<ReplayFenceOwner>, IpcResponse> {
+) -> Result<Option<ReplayFenceOwner>, ReplayPreparedResponse> {
     let Some(command_id) = request.command_id.as_ref() else {
         return Ok(None);
     };
@@ -231,7 +356,9 @@ pub(super) async fn prepare_replay_fence(
         match state.claim_replay_command(command_id, fingerprint.clone()) {
             ReplayCommandClaim::Cached(cached) => {
                 info!(command_id = %command_id, "Returning cached response (at-most-once)");
-                return Err(attach_request_command_id(request, *cached));
+                return Err(ReplayPreparedResponse::committed(
+                    attach_request_command_id(request, *cached),
+                ));
             }
             ReplayCommandClaim::Owner => {
                 return Ok(Some(ReplayFenceOwner::new(
@@ -240,26 +367,32 @@ pub(super) async fn prepare_replay_fence(
                 )));
             }
             ReplayCommandClaim::Conflict => {
-                return Err(attach_request_command_id(
-                    request,
-                    replay_fingerprint_conflict_response(
-                        request_id,
-                        request.command.as_str(),
-                        command_id,
+                return Err(ReplayPreparedResponse::not_committed(
+                    attach_request_command_id(
+                        request,
+                        replay_fingerprint_conflict_response(
+                            request_id,
+                            request.command.as_str(),
+                            command_id,
+                        ),
                     ),
                 ));
             }
             ReplayCommandClaim::SpentWithoutCachedResponse => {
-                return Err(attach_request_command_id(
-                    request,
-                    replay_spent_response_evicted_response(request, request_id, command_id),
+                return Err(ReplayPreparedResponse::committed(
+                    attach_request_command_id(
+                        request,
+                        replay_spent_response_evicted_response(request, request_id, command_id),
+                    ),
                 ));
             }
             ReplayCommandClaim::Wait(mut receiver) => {
                 let Some(wait_timeout) = deadline.remaining_duration() else {
-                    return Err(attach_request_command_id(
-                        request,
-                        replay_timeout_response(request, request_id, command_id, deadline),
+                    return Err(ReplayPreparedResponse::not_committed(
+                        attach_request_command_id(
+                            request,
+                            replay_timeout_response(request, request_id, command_id, deadline),
+                        ),
                     ));
                 };
                 let wait = tokio::time::timeout(wait_timeout, async {
@@ -277,7 +410,7 @@ pub(super) async fn prepare_replay_fence(
                 match wait {
                     Ok(Ok(())) => continue,
                     Ok(Err(_)) => {
-                        return Err(attach_request_command_id(
+                        return Err(ReplayPreparedResponse::not_committed(attach_request_command_id(
                             request,
                             IpcResponse::error(
                                 request_id,
@@ -294,12 +427,14 @@ pub(super) async fn prepare_replay_fence(
                                     "reason": "replay_fence_channel_closed",
                                 })),
                             ),
-                        ));
+                        )));
                     }
                     Err(_) => {
-                        return Err(attach_request_command_id(
-                            request,
-                            replay_timeout_response(request, request_id, command_id, deadline),
+                        return Err(ReplayPreparedResponse::not_committed(
+                            attach_request_command_id(
+                                request,
+                                replay_timeout_response(request, request_id, command_id, deadline),
+                            ),
                         ));
                     }
                 }
@@ -308,9 +443,20 @@ pub(super) async fn prepare_replay_fence(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn prepare_request_preflight(request: &IpcRequest) -> RequestPreflight {
+    prepare_request_preflight_with_inherited_deadline(request, None)
+}
+
+pub(super) fn prepare_request_preflight_with_inherited_deadline(
+    request: &IpcRequest,
+    inherited_deadline: Option<TransactionDeadline>,
+) -> RequestPreflight {
     let request_id = Uuid::now_v7().to_string();
-    let deadline = TransactionDeadline::new(request.timeout_ms);
+    let timeout_ms = inherited_deadline
+        .map(|deadline| request.timeout_ms.min(deadline.remaining_ms()))
+        .unwrap_or(request.timeout_ms);
+    let deadline = TransactionDeadline::new(timeout_ms);
     let internal_command = dispatch::is_internal_command(request.command.as_str());
     RequestPreflight {
         request_id,
@@ -332,17 +478,24 @@ pub(super) async fn prepare_command_dispatch(
 
     let replay_owner = match prepare_replay_fence(request, state, &request_id, deadline).await {
         Ok(owner) => owner,
-        Err(response) => {
-            return Err(PendingResponseCommit::new(
+        Err(prepared) => {
+            let pending = PendingResponseCommit::new(
                 request.clone(),
-                response,
+                prepared.response,
                 internal_command,
                 false,
                 None,
-            ));
+            );
+            return Err(if prepared.daemon_request_committed {
+                pending.with_committed_daemon_request_authority()
+            } else {
+                pending
+            });
         }
     };
-    if let Some(response) = handoff_blocked_response(request, state, &request_id).await {
+    if let Some(response) =
+        handoff_blocked_response_for_command(request.command.as_str(), state, &request_id).await
+    {
         return Err(PreparedCommandDispatch {
             request_id,
             deadline,
@@ -368,7 +521,9 @@ pub(super) fn preflight_rejection_response(
     state: &Arc<SessionState>,
     in_process_dispatch: bool,
 ) -> Option<IpcResponse> {
-    if !preflight.internal_command && request.ipc_protocol_version != IPC_PROTOCOL_VERSION {
+    let protocol_mismatch_allowed = preflight.internal_command
+        && allows_transport_protocol_compat_exemption(request.command.as_str());
+    if !protocol_mismatch_allowed && request.ipc_protocol_version != IPC_PROTOCOL_VERSION {
         return Some(protocol_version_mismatch_response(
             &preflight.request_id,
             request,
@@ -393,8 +548,7 @@ pub(super) fn preflight_rejection_response(
             })),
         ));
     }
-    if !preflight.internal_command
-        && let Some(expected_daemon_session_id) = request.daemon_session_id.as_deref()
+    if let Some(expected_daemon_session_id) = request.daemon_session_id.as_deref()
         && expected_daemon_session_id != state.session_id
     {
         return Some(daemon_authority_mismatch_response(
@@ -422,30 +576,37 @@ pub(super) fn preflight_rejection_response(
     None
 }
 
-async fn handoff_blocked_response(
-    request: &IpcRequest,
+pub(super) async fn handoff_blocked_response_for_command(
+    command: &str,
     state: &Arc<SessionState>,
     request_id: &str,
 ) -> Option<IpcResponse> {
-    if !state.is_handoff_active().await || command_allowed_during_handoff(request.command.as_str())
-    {
+    handoff_blocked_error_for_command(command, state)
+        .await
+        .map(|error| IpcResponse::error(request_id, error))
+}
+
+pub(crate) async fn handoff_blocked_error_for_command(
+    command: &str,
+    state: &Arc<SessionState>,
+) -> Option<ErrorEnvelope> {
+    if !state.is_handoff_active().await || command_allowed_during_handoff(command) {
         return None;
     }
 
-    Some(IpcResponse::error(
-        request_id,
+    Some(
         ErrorEnvelope::new(
             ErrorCode::AutomationPaused,
             format!(
                 "Automation is paused for human verification handoff; command '{}' is temporarily blocked",
-                request.command,
+                command,
             ),
         )
         .with_context(serde_json::json!({
-            "command": request.command,
+            "command": command,
             "handoff": state.human_verification_handoff().await,
         })),
-    ))
+    )
 }
 
 #[cfg(test)]

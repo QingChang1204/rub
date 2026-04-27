@@ -19,7 +19,9 @@ impl InterferenceRuntimeState {
         };
         self.baseline = InterferenceBaseline {
             primary_target_id: Some(active_tab.target_id.clone()),
-            primary_url: Some(active_tab.url.clone()),
+            primary_url: active_tab
+                .page_identity_authoritative()
+                .then(|| active_tab.url.clone()),
             last_tab_count: tabs.len(),
         };
     }
@@ -30,7 +32,9 @@ impl InterferenceRuntimeState {
         };
         self.baseline = InterferenceBaseline {
             primary_target_id: Some(active_tab.target_id.clone()),
-            primary_url: Some(active_tab.url.clone()),
+            primary_url: active_tab
+                .page_identity_authoritative()
+                .then(|| active_tab.url.clone()),
             last_tab_count: tabs.len(),
         };
     }

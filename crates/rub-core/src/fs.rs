@@ -52,6 +52,35 @@ pub fn atomic_write_bytes(
     confirm_created_directory_chain(path, &created_directories, outcome)
 }
 
+pub fn atomic_write_bytes_until(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+    deadline: std::time::Instant,
+) -> io::Result<FileCommitOutcome> {
+    ensure_publish_deadline(deadline, path)?;
+    let created_directories = path
+        .parent()
+        .map(ensure_directory_chain)
+        .transpose()?
+        .unwrap_or_default();
+    ensure_publish_deadline(deadline, path)?;
+    let (temp_path, mut temp) = create_unique_temporary_file(path, mode)?;
+    ensure_publish_deadline(deadline, path)?;
+    temp.write_all(contents)?;
+    ensure_publish_deadline(deadline, path)?;
+    temp.sync_all()?;
+    ensure_publish_deadline(deadline, path)?;
+    let outcome = match commit_temporary_file_until(&temp, &temp_path, path, deadline) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
+    };
+    confirm_created_directory_chain(path, &created_directories, outcome)
+}
+
 pub fn commit_temporary_file(
     temp: &File,
     temp_path: &Path,
@@ -61,6 +90,18 @@ pub fn commit_temporary_file(
     commit_temporary_file_from_synced_handle(temp, temp_path, final_path)
 }
 
+pub fn commit_temporary_file_until(
+    temp: &File,
+    temp_path: &Path,
+    final_path: &Path,
+    deadline: std::time::Instant,
+) -> io::Result<FileCommitOutcome> {
+    ensure_publish_deadline(deadline, final_path)?;
+    temp.sync_all()?;
+    ensure_publish_deadline(deadline, final_path)?;
+    commit_temporary_file_from_synced_handle_until(temp, temp_path, final_path, deadline)
+}
+
 pub fn commit_temporary_file_no_clobber(
     temp: &File,
     temp_path: &Path,
@@ -68,6 +109,18 @@ pub fn commit_temporary_file_no_clobber(
 ) -> io::Result<FileCommitOutcome> {
     temp.sync_all()?;
     commit_temporary_file_from_synced_handle_no_clobber(temp, temp_path, final_path)
+}
+
+pub fn commit_temporary_file_no_clobber_until(
+    temp: &File,
+    temp_path: &Path,
+    final_path: &Path,
+    deadline: std::time::Instant,
+) -> io::Result<FileCommitOutcome> {
+    ensure_publish_deadline(deadline, final_path)?;
+    temp.sync_all()?;
+    ensure_publish_deadline(deadline, final_path)?;
+    commit_temporary_file_from_synced_handle_no_clobber_until(temp, temp_path, final_path, deadline)
 }
 
 pub fn remove_file_with_sync(path: &Path) -> io::Result<FileCommitOutcome> {
@@ -99,6 +152,24 @@ fn commit_temporary_file_from_synced_handle(
     Ok(outcome)
 }
 
+fn commit_temporary_file_from_synced_handle_until(
+    temp: &File,
+    temp_path: &Path,
+    final_path: &Path,
+    deadline: std::time::Instant,
+) -> io::Result<FileCommitOutcome> {
+    ensure_publish_deadline(deadline, final_path)?;
+    let (publish_path, publish_file) =
+        promote_synced_handle_to_publish_authority_until(temp, final_path, deadline)?;
+    if let Err(error) = ensure_publish_deadline(deadline, final_path) {
+        let _ = std::fs::remove_file(&publish_path);
+        return Err(error);
+    }
+    let outcome = commit_publish_path(&publish_file, &publish_path, final_path)?;
+    cleanup_source_temp_path_if_still_authoritative(temp, temp_path);
+    Ok(outcome)
+}
+
 fn commit_temporary_file_from_synced_handle_no_clobber(
     temp: &File,
     temp_path: &Path,
@@ -106,6 +177,24 @@ fn commit_temporary_file_from_synced_handle_no_clobber(
 ) -> io::Result<FileCommitOutcome> {
     let (publish_path, publish_file) =
         promote_synced_handle_to_publish_authority(temp, final_path)?;
+    let outcome = commit_publish_path_no_clobber(&publish_file, &publish_path, final_path)?;
+    cleanup_source_temp_path_if_still_authoritative(temp, temp_path);
+    Ok(outcome)
+}
+
+fn commit_temporary_file_from_synced_handle_no_clobber_until(
+    temp: &File,
+    temp_path: &Path,
+    final_path: &Path,
+    deadline: std::time::Instant,
+) -> io::Result<FileCommitOutcome> {
+    ensure_publish_deadline(deadline, final_path)?;
+    let (publish_path, publish_file) =
+        promote_synced_handle_to_publish_authority_until(temp, final_path, deadline)?;
+    if let Err(error) = ensure_publish_deadline(deadline, final_path) {
+        let _ = std::fs::remove_file(&publish_path);
+        return Err(error);
+    }
     let outcome = commit_publish_path_no_clobber(&publish_file, &publish_path, final_path)?;
     cleanup_source_temp_path_if_still_authoritative(temp, temp_path);
     Ok(outcome)
@@ -119,6 +208,38 @@ fn promote_synced_handle_to_publish_authority(
     let (publish_path, mut publish_file) = create_unique_temporary_file(final_path, mode)?;
     copy_file_data_from_synced_handle(temp, &mut publish_file)?;
     publish_file.sync_all()?;
+    Ok((publish_path, publish_file))
+}
+
+fn promote_synced_handle_to_publish_authority_until(
+    temp: &File,
+    final_path: &Path,
+    deadline: std::time::Instant,
+) -> io::Result<(PathBuf, File)> {
+    ensure_publish_deadline(deadline, final_path)?;
+    let mode = source_file_mode(temp)?;
+    ensure_publish_deadline(deadline, final_path)?;
+    let (publish_path, mut publish_file) = create_unique_temporary_file(final_path, mode)?;
+    if let Err(error) = ensure_publish_deadline(deadline, final_path) {
+        let _ = std::fs::remove_file(&publish_path);
+        return Err(error);
+    }
+    if let Err(error) = copy_file_data_from_synced_handle(temp, &mut publish_file) {
+        let _ = std::fs::remove_file(&publish_path);
+        return Err(error);
+    }
+    if let Err(error) = ensure_publish_deadline(deadline, final_path) {
+        let _ = std::fs::remove_file(&publish_path);
+        return Err(error);
+    }
+    if let Err(error) = publish_file.sync_all() {
+        let _ = std::fs::remove_file(&publish_path);
+        return Err(error);
+    }
+    if let Err(error) = ensure_publish_deadline(deadline, final_path) {
+        let _ = std::fs::remove_file(&publish_path);
+        return Err(error);
+    }
     Ok((publish_path, publish_file))
 }
 
@@ -175,6 +296,19 @@ fn commit_publish_path(
     ensure_temp_path_matches_file_authority(publish_file, publish_path)?;
     rename(publish_path, final_path)?;
     finalize_published_file(final_path)
+}
+
+fn ensure_publish_deadline(deadline: std::time::Instant, final_path: &Path) -> io::Result<()> {
+    if std::time::Instant::now() >= deadline {
+        return Err(io::Error::new(
+            ErrorKind::TimedOut,
+            format!(
+                "artifact publication deadline expired before publishing {}",
+                final_path.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn commit_publish_path_no_clobber(
@@ -426,14 +560,15 @@ fn force_sync_parent_dir_failure_once_for(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileCommitOutcome, atomic_write_bytes, commit_temporary_file,
-        commit_temporary_file_no_clobber, create_unique_temporary_file,
-        force_sync_parent_dir_failure_once_for, force_temp_path_collision_once_for,
-        remove_file_with_sync,
+        FileCommitOutcome, atomic_write_bytes, atomic_write_bytes_until, commit_temporary_file,
+        commit_temporary_file_no_clobber, commit_temporary_file_until,
+        create_unique_temporary_file, force_sync_parent_dir_failure_once_for,
+        force_temp_path_collision_once_for, remove_file_with_sync,
     };
     use std::fs::File;
     use std::io::ErrorKind;
     use std::io::Write;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn atomic_write_bytes_replaces_existing_file() {
@@ -661,6 +796,61 @@ mod tests {
         let outcome = remove_file_with_sync(&path).expect("remove should succeed");
         assert_eq!(outcome, FileCommitOutcome::Published);
         assert!(!path.exists(), "file should still be removed");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_temporary_file_until_refuses_publish_after_deadline() {
+        let root = std::env::temp_dir().join(format!(
+            "rub-core-commit-until-timeout-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let final_path = root.join("asset.json");
+        let temp_path = root.join(".asset.json.tmp");
+        std::fs::write(&temp_path, b"new").expect("seed temp");
+
+        let temp = File::open(&temp_path).expect("open temp");
+        let error = commit_temporary_file_until(
+            &temp,
+            &temp_path,
+            &final_path,
+            Instant::now() - Duration::from_millis(1),
+        )
+        .expect_err("expired deadline must block publish");
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(
+            !final_path.exists(),
+            "final path must stay absent when publish authority timed out"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn atomic_write_bytes_until_refuses_publish_after_deadline() {
+        let root = std::env::temp_dir().join(format!(
+            "rub-core-atomic-until-timeout-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let path = root.join("asset.json");
+
+        let error = atomic_write_bytes_until(
+            &path,
+            b"new",
+            0o600,
+            Instant::now() - Duration::from_millis(1),
+        )
+        .expect_err("expired deadline must block final publication");
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(
+            !path.exists(),
+            "final artifact must not appear after timeout-before-publish"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

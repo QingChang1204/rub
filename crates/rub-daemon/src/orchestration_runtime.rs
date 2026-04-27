@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rub_core::model::{
@@ -8,6 +8,8 @@ use rub_core::model::{
     TriggerEvidenceInfo,
 };
 
+use crate::session::NetworkRequestBaseline;
+
 mod events;
 mod mutation;
 mod projection;
@@ -15,7 +17,8 @@ mod sessions;
 
 use events::orchestration_outcome_event_kind;
 pub(crate) use sessions::{
-    extend_orchestration_session_path_context, projected_orchestration_session,
+    extend_orchestration_session_path_context, orchestration_session_addressability_reason,
+    orchestration_session_not_addressable_error, projected_orchestration_session,
 };
 
 const ORCHESTRATION_EVENT_LIMIT: usize = 64;
@@ -30,6 +33,7 @@ pub enum OrchestrationOutcomeCommit {
 #[derive(Debug, Default)]
 pub struct OrchestrationRuntimeState {
     projection: OrchestrationRuntimeInfo,
+    network_request_baselines: HashMap<u32, NetworkRequestBaseline>,
     last_refresh_sequence: u64,
     next_event_sequence: u64,
     recent_events: VecDeque<OrchestrationEventInfo>,
@@ -56,6 +60,10 @@ impl OrchestrationRuntimeState {
     pub fn rules(&self) -> Vec<OrchestrationRuleInfo> {
         self.projection.rules.clone()
     }
+
+    pub(crate) fn network_request_baselines(&self) -> HashMap<u32, NetworkRequestBaseline> {
+        self.network_request_baselines.clone()
+    }
 }
 
 #[cfg(test)]
@@ -68,8 +76,8 @@ mod tests {
     use rub_core::model::{
         OrchestrationAddressInfo, OrchestrationEventKind, OrchestrationExecutionPolicyInfo,
         OrchestrationMode, OrchestrationResultInfo, OrchestrationRuleInfo, OrchestrationRuleStatus,
-        OrchestrationRuntimeStatus, OrchestrationSessionInfo, TriggerActionKind, TriggerActionSpec,
-        TriggerConditionKind, TriggerConditionSpec,
+        OrchestrationRuntimeStatus, OrchestrationSessionAvailability, OrchestrationSessionInfo,
+        TriggerActionKind, TriggerActionSpec, TriggerConditionKind, TriggerConditionSpec,
     };
 
     fn session(id: &str, name: &str, current: bool) -> OrchestrationSessionInfo {
@@ -80,6 +88,7 @@ mod tests {
             format!("/tmp/{name}.sock"),
             current,
             "1.0".to_string(),
+            OrchestrationSessionAvailability::Addressable,
             None,
         )
     }
@@ -159,6 +168,8 @@ mod tests {
             "sess-current".to_string(),
             "default".to_string(),
             vec![session("sess-current", "default", true)],
+            true,
+            true,
             None,
         );
         assert_eq!(runtime.status, OrchestrationRuntimeStatus::Active);
@@ -184,6 +195,7 @@ mod tests {
             "/tmp/rub.sock".to_string(),
             true,
             "1.0".to_string(),
+            OrchestrationSessionAvailability::Addressable,
             Some("/tmp/rub-profile".to_string()),
         );
 
@@ -208,6 +220,43 @@ mod tests {
                 .map(|state| state.path_kind.as_str()),
             Some("managed_user_data_directory")
         );
+        assert_eq!(
+            session
+                .socket_path_state
+                .as_ref()
+                .map(|state| state.upstream_truth.as_str()),
+            Some("registry_authority_snapshot")
+        );
+    }
+
+    #[test]
+    fn projected_orchestration_session_marks_current_fallback_path_references_from_runtime_authority()
+     {
+        let session = projected_orchestration_session(
+            "sess-current".to_string(),
+            "default".to_string(),
+            42,
+            "/tmp/rub.sock".to_string(),
+            true,
+            "1.0".to_string(),
+            OrchestrationSessionAvailability::CurrentFallback,
+            Some("/tmp/rub-profile".to_string()),
+        );
+
+        assert_eq!(
+            session
+                .socket_path_state
+                .as_ref()
+                .map(|state| state.upstream_truth.as_str()),
+            Some("current_session_runtime_authority")
+        );
+        assert_eq!(
+            session
+                .user_data_dir_state
+                .as_ref()
+                .map(|state| state.upstream_truth.as_str()),
+            Some("current_session_runtime_authority")
+        );
     }
 
     #[test]
@@ -219,6 +268,7 @@ mod tests {
             "/tmp/rub.sock".to_string(),
             true,
             "1.0".to_string(),
+            OrchestrationSessionAvailability::Addressable,
             Some("/tmp/rub-profile".to_string()),
         );
         let mut context = serde_json::json!({
@@ -247,6 +297,8 @@ mod tests {
             "sess-current".to_string(),
             "default".to_string(),
             vec![session("sess-other", "other", false)],
+            false,
+            false,
             Some("current_session_missing_from_registry".to_string()),
         );
         assert_eq!(runtime.status, OrchestrationRuntimeStatus::Degraded);
@@ -269,6 +321,8 @@ mod tests {
                 session("sess-source", "source", true),
                 session("sess-target", "target", false),
             ],
+            true,
+            true,
             None,
         );
         state
@@ -300,6 +354,8 @@ mod tests {
                 session("sess-source", "source", true),
                 session("sess-target", "target", false),
             ],
+            true,
+            true,
             None,
         );
         state
@@ -320,6 +376,7 @@ mod tests {
                 cooldown_until_ms: None,
                 error_code: None,
                 reason: None,
+                error_context: None,
             },
         );
         let rule = applied_rule(rule).expect("outcome should record");
@@ -362,6 +419,8 @@ mod tests {
                 session("sess-source", "source", true),
                 session("sess-target", "target", false),
             ],
+            true,
+            true,
             None,
         );
         state
@@ -383,6 +442,7 @@ mod tests {
                 cooldown_until_ms: None,
                 error_code: Some(rub_core::error::ErrorCode::BrowserCrashed),
                 reason: Some("probe_failed".to_string()),
+                error_context: None,
             },
         );
         let rule = applied_rule(rule).expect("outcome should record");
@@ -407,6 +467,74 @@ mod tests {
     }
 
     #[test]
+    fn orchestration_runtime_preserves_structured_error_context_in_result_and_trace() {
+        let mut state = OrchestrationRuntimeState::default();
+        state.replace(
+            1,
+            "sess-source".to_string(),
+            "source".to_string(),
+            vec![
+                session("sess-source", "source", true),
+                session("sess-target", "target", false),
+            ],
+            true,
+            true,
+            None,
+        );
+        state
+            .register(rule("sess-source", "sess-target"))
+            .expect("orchestration rule should register");
+
+        let rule = state.record_outcome(
+            1,
+            Some(1),
+            None,
+            OrchestrationResultInfo {
+                rule_id: 1,
+                status: OrchestrationRuleStatus::Degraded,
+                next_status: OrchestrationRuleStatus::Armed,
+                summary: "orchestration continuity failed".to_string(),
+                committed_steps: 0,
+                total_steps: 1,
+                steps: Vec::new(),
+                cooldown_until_ms: None,
+                error_code: Some(rub_core::error::ErrorCode::SessionBusy),
+                reason: Some("continuity_runtime_degraded".to_string()),
+                error_context: Some(serde_json::json!({
+                    "reason": "continuity_runtime_degraded",
+                    "target_tab_target_id": "tab-target",
+                    "phase": "target_continuity",
+                })),
+            },
+        );
+        let rule = applied_rule(rule).expect("outcome should record");
+
+        assert_eq!(
+            rule.last_result
+                .as_ref()
+                .and_then(|result| result.error_context.as_ref())
+                .and_then(|context| context.get("phase"))
+                .and_then(|value| value.as_str()),
+            Some("target_continuity")
+        );
+
+        let trace = state.trace(5);
+        let event = trace
+            .events
+            .iter()
+            .find(|event| event.kind == OrchestrationEventKind::Degraded)
+            .expect("degraded trace event");
+        assert_eq!(
+            event
+                .error_context
+                .as_ref()
+                .and_then(|context| context.get("target_tab_target_id"))
+                .and_then(|value| value.as_str()),
+            Some("tab-target")
+        );
+    }
+
+    #[test]
     fn orchestration_runtime_records_orphan_outcome_trace_when_rule_is_missing() {
         let mut state = OrchestrationRuntimeState::default();
         state.replace(
@@ -417,6 +545,8 @@ mod tests {
                 session("sess-source", "source", true),
                 session("sess-target", "target", false),
             ],
+            true,
+            true,
             None,
         );
         let rule = rule("sess-source", "sess-target");
@@ -440,6 +570,7 @@ mod tests {
                 cooldown_until_ms: None,
                 error_code: None,
                 reason: None,
+                error_context: None,
             },
         );
 
@@ -476,6 +607,8 @@ mod tests {
                 session("sess-source", "source", true),
                 session("sess-target", "target", false),
             ],
+            true,
+            true,
             None,
         );
         state
@@ -501,6 +634,7 @@ mod tests {
                 cooldown_until_ms: None,
                 error_code: None,
                 reason: None,
+                error_context: None,
             },
         );
 
@@ -512,7 +646,20 @@ mod tests {
         let runtime = state.projection();
         assert_eq!(runtime.rules[0].status, OrchestrationRuleStatus::Paused);
         assert_eq!(runtime.rules[0].lifecycle_generation, 2);
-        assert!(runtime.rules[0].last_result.is_none());
+        assert_eq!(
+            runtime.rules[0]
+                .last_result
+                .as_ref()
+                .map(|result| result.summary.as_str()),
+            Some("orchestration rule 1 committed 1/1 action(s)")
+        );
+        assert_eq!(
+            runtime
+                .last_rule_result
+                .as_ref()
+                .map(|result| result.summary.as_str()),
+            Some("orchestration rule 1 committed 1/1 action(s)")
+        );
         let trace = state.trace(8);
         assert!(
             trace.events.iter().any(|event| {
@@ -534,6 +681,8 @@ mod tests {
                 session("sess-source", "source", true),
                 session("sess-target", "target", false),
             ],
+            true,
+            true,
             None,
         );
         let mut repeat_rule = rule("sess-source", "sess-target");
@@ -559,6 +708,7 @@ mod tests {
                 cooldown_until_ms: Some(cooldown_until_ms),
                 error_code: None,
                 reason: None,
+                error_context: None,
             },
         );
         let rule = applied_rule(rule).expect("repeat outcome should record");
@@ -593,6 +743,8 @@ mod tests {
                 session("sess-source", "source", true),
                 session("sess-target", "target", false),
             ],
+            true,
+            true,
             None,
         );
         state
@@ -603,6 +755,8 @@ mod tests {
             "sess-source".to_string(),
             "source".to_string(),
             vec![session("sess-source", "source", true)],
+            true,
+            true,
             None,
         );
         assert_eq!(runtime.unavailable_rule_count, 1);
@@ -621,6 +775,207 @@ mod tests {
     }
 
     #[test]
+    fn orchestration_runtime_marks_non_addressable_sessions_unavailable() {
+        let mut state = OrchestrationRuntimeState::default();
+        state.replace(
+            1,
+            "sess-source".to_string(),
+            "source".to_string(),
+            vec![
+                session("sess-source", "source", true),
+                projected_orchestration_session(
+                    "sess-target".to_string(),
+                    "target".to_string(),
+                    42,
+                    "/tmp/rub-target.sock".to_string(),
+                    false,
+                    "1.0".to_string(),
+                    OrchestrationSessionAvailability::ProtocolIncompatible,
+                    None,
+                ),
+            ],
+            true,
+            true,
+            Some("registry_contains_non_addressable_sessions".to_string()),
+        );
+        state
+            .register(rule("sess-source", "sess-target"))
+            .expect("orchestration rule should register");
+        let runtime = state.replace(
+            2,
+            "sess-source".to_string(),
+            "source".to_string(),
+            vec![
+                session("sess-source", "source", true),
+                projected_orchestration_session(
+                    "sess-target".to_string(),
+                    "target".to_string(),
+                    42,
+                    "/tmp/rub-target.sock".to_string(),
+                    false,
+                    "1.0".to_string(),
+                    OrchestrationSessionAvailability::ProtocolIncompatible,
+                    None,
+                ),
+            ],
+            true,
+            true,
+            Some("registry_contains_non_addressable_sessions".to_string()),
+        );
+        assert_eq!(runtime.unavailable_rule_count, 1);
+        assert_eq!(
+            runtime.rules[0].unavailable_reason.as_deref(),
+            Some("target_session_not_addressable")
+        );
+        let trace = state.trace(8);
+        assert!(
+            trace.events.iter().any(|event| {
+                event.kind == OrchestrationEventKind::Unavailable
+                    && event.unavailable_reason.as_deref() == Some("target_session_not_addressable")
+            }),
+            "{trace:?}"
+        );
+        assert_eq!(runtime.status, OrchestrationRuntimeStatus::Degraded);
+    }
+
+    #[test]
+    fn orchestration_runtime_degrades_when_all_rules_are_unavailable() {
+        let mut state = OrchestrationRuntimeState::default();
+        state.replace(
+            1,
+            "sess-source".to_string(),
+            "source".to_string(),
+            vec![
+                session("sess-source", "source", true),
+                session("sess-target", "target", false),
+            ],
+            true,
+            true,
+            None,
+        );
+        let mut first = rule("sess-source", "sess-target");
+        first.id = 3;
+        first.idempotency_key = "idem-3".to_string();
+        first.unavailable_reason = Some("target_session_missing".to_string());
+        let mut second = rule("sess-source", "sess-target");
+        second.id = 7;
+        second.idempotency_key = "idem-7".to_string();
+        second.unavailable_reason = Some("target_session_not_addressable".to_string());
+
+        state
+            .register(first)
+            .expect("first orchestration rule should register");
+        state
+            .register(second)
+            .expect("second orchestration rule should register");
+
+        let runtime = state.projection();
+        assert_eq!(runtime.unavailable_rule_count, 2);
+        assert_eq!(runtime.active_rule_count, 0);
+        assert_eq!(runtime.cooldown_rule_count, 0);
+        assert_eq!(runtime.status, OrchestrationRuntimeStatus::Degraded);
+    }
+
+    #[test]
+    fn orchestration_runtime_rejects_stale_condition_evidence_generation_after_pause() {
+        let mut state = OrchestrationRuntimeState::default();
+        state.replace(
+            1,
+            "sess-source".to_string(),
+            "source".to_string(),
+            vec![
+                session("sess-source", "source", true),
+                session("sess-target", "target", false),
+            ],
+            true,
+            true,
+            None,
+        );
+        state
+            .register(rule("sess-source", "sess-target"))
+            .expect("orchestration rule should register");
+        let paused = state
+            .update_status(1, OrchestrationRuleStatus::Paused)
+            .expect("pause should update rule");
+        assert_eq!(paused.lifecycle_generation, 2);
+
+        let stale = state.set_condition_evidence(
+            1,
+            Some(1),
+            Some(rub_core::model::TriggerEvidenceInfo {
+                summary: "text_present:Ready".to_string(),
+                fingerprint: Some("Ready".to_string()),
+            }),
+        );
+
+        assert!(stale.is_none());
+        let runtime = state.projection();
+        assert_eq!(runtime.rules[0].status, OrchestrationRuleStatus::Paused);
+        assert_eq!(runtime.rules[0].lifecycle_generation, 2);
+        assert!(runtime.rules[0].last_condition_evidence.is_none());
+    }
+
+    #[test]
+    fn orchestration_runtime_rejects_removed_rule_probe_failure_with_expected_generation() {
+        let mut state = OrchestrationRuntimeState::default();
+        state.replace(
+            1,
+            "sess-source".to_string(),
+            "source".to_string(),
+            vec![
+                session("sess-source", "source", true),
+                session("sess-target", "target", false),
+            ],
+            true,
+            true,
+            None,
+        );
+        let rule = rule("sess-source", "sess-target");
+        state
+            .register(rule.clone())
+            .expect("orchestration rule should register");
+        state.remove(rule.id).expect("rule should remove cleanly");
+
+        let stale = state.record_outcome_with_fallback(
+            &rule,
+            Some(rule.lifecycle_generation),
+            None,
+            OrchestrationResultInfo {
+                rule_id: rule.id,
+                status: OrchestrationRuleStatus::Degraded,
+                next_status: OrchestrationRuleStatus::Armed,
+                summary: "orchestration condition evaluation failed".to_string(),
+                committed_steps: 0,
+                total_steps: rule.actions.len() as u32,
+                steps: Vec::new(),
+                cooldown_until_ms: None,
+                error_code: Some(rub_core::error::ErrorCode::BrowserCrashed),
+                reason: Some("probe_failed".to_string()),
+                error_context: None,
+            },
+        );
+
+        assert!(matches!(stale, OrchestrationOutcomeCommit::Stale(None)));
+        let runtime = state.projection();
+        assert_eq!(runtime.last_rule_id, Some(rule.id));
+        assert_eq!(
+            runtime
+                .last_rule_result
+                .as_ref()
+                .and_then(|result| result.reason.as_deref()),
+            Some("probe_failed")
+        );
+        let trace = state.trace(8);
+        assert!(
+            trace.events.iter().any(|event| {
+                event.kind == OrchestrationEventKind::Degraded
+                    && event.reason.as_deref() == Some("orchestration_lifecycle_generation_stale")
+            }),
+            "{trace:?}"
+        );
+    }
+
+    #[test]
     fn orchestration_runtime_rejects_duplicate_idempotency_key() {
         let mut state = OrchestrationRuntimeState::default();
         state.replace(
@@ -631,6 +986,8 @@ mod tests {
                 session("sess-source", "source", true),
                 session("sess-target", "target", false),
             ],
+            true,
+            true,
             None,
         );
         state
@@ -655,6 +1012,8 @@ mod tests {
                 session("sess-target", "target", false),
                 session("sess-other", "other", false),
             ],
+            true,
+            true,
             None,
         );
         let mut first = rule("sess-source", "sess-target");
@@ -692,5 +1051,112 @@ mod tests {
         assert_eq!(runtime.groups[1].active_rule_count, 0);
         assert_eq!(runtime.groups[1].paused_rule_count, 0);
         assert_eq!(runtime.groups[1].unavailable_rule_count, 1);
+    }
+
+    #[test]
+    fn orchestration_runtime_commits_network_request_baseline_on_register_and_resume() {
+        let mut state = OrchestrationRuntimeState::default();
+        state.replace(
+            1,
+            "sess-source".to_string(),
+            "source".to_string(),
+            vec![
+                session("sess-source", "source", true),
+                session("sess-target", "target", false),
+            ],
+            true,
+            true,
+            None,
+        );
+        let mut network_rule = rule("sess-source", "sess-target");
+        network_rule.condition.kind = TriggerConditionKind::NetworkRequest;
+
+        state
+            .register_with_network_baseline(
+                network_rule.clone(),
+                Some(crate::session::NetworkRequestBaseline {
+                    cursor: 5,
+                    observed_ingress_drop_count: 1,
+                    primed: true,
+                }),
+            )
+            .expect("rule should register");
+        assert_eq!(
+            state
+                .network_request_baselines()
+                .get(&1)
+                .copied()
+                .map(|baseline| (baseline.cursor, baseline.observed_ingress_drop_count)),
+            Some((5, 1))
+        );
+
+        state
+            .update_status(1, OrchestrationRuleStatus::Paused)
+            .expect("pause should update rule");
+        assert!(
+            !state.network_request_baselines().contains_key(&1),
+            "paused network rule must not keep an armed baseline"
+        );
+
+        state
+            .update_status_with_network_baseline(
+                1,
+                OrchestrationRuleStatus::Armed,
+                Some(crate::session::NetworkRequestBaseline {
+                    cursor: 9,
+                    observed_ingress_drop_count: 3,
+                    primed: true,
+                }),
+            )
+            .expect("resume should update rule");
+        assert_eq!(
+            state
+                .network_request_baselines()
+                .get(&1)
+                .copied()
+                .map(|baseline| (baseline.cursor, baseline.observed_ingress_drop_count)),
+            Some((9, 3))
+        );
+    }
+
+    #[test]
+    fn orchestration_runtime_preserves_existing_armed_network_request_baseline() {
+        let mut state = OrchestrationRuntimeState::default();
+        state.replace(
+            1,
+            "sess-source".to_string(),
+            "source".to_string(),
+            vec![
+                session("sess-source", "source", true),
+                session("sess-target", "target", false),
+            ],
+            true,
+            true,
+            None,
+        );
+        let mut network_rule = rule("sess-source", "sess-target");
+        network_rule.condition.kind = TriggerConditionKind::NetworkRequest;
+
+        state
+            .register_with_network_baseline(
+                network_rule,
+                Some(crate::session::NetworkRequestBaseline {
+                    cursor: 21,
+                    observed_ingress_drop_count: 8,
+                    primed: true,
+                }),
+            )
+            .expect("rule should register");
+        state
+            .update_status(1, OrchestrationRuleStatus::Armed)
+            .expect("generic armed update should preserve baseline");
+        assert_eq!(
+            state
+                .network_request_baselines()
+                .get(&1)
+                .copied()
+                .map(|baseline| (baseline.cursor, baseline.observed_ingress_drop_count)),
+            Some((21, 8))
+        );
     }
 }

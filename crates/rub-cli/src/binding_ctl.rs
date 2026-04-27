@@ -1,26 +1,29 @@
 mod capture;
 mod projection;
-mod registry;
+pub(crate) mod registry;
 
 #[cfg(test)]
 pub(crate) use self::capture::build_binding_record_from_candidate;
 pub(crate) use self::capture::{BindingWriteMode, capture_binding_alias};
 pub(crate) use self::projection::{
-    binding_alias_not_found_error, load_binding_resolution_state, load_live_registry_snapshot,
-    project_binding_inspect, project_binding_list, project_live_status, resolve_binding_target,
-    resolve_binding_target_from_state,
+    BindingResolutionState, binding_alias_not_found_error,
+    load_binding_resolution_state_from_registry, load_live_registry_snapshot,
+    project_binding_inspect, project_binding_list, project_live_registry_error,
+    project_live_status, resolve_binding_target_from_state,
 };
+#[cfg(test)]
+pub(crate) use self::registry::write_binding_registry;
 pub(crate) use self::registry::{
-    normalize_binding_alias, read_binding_registry, write_binding_registry,
+    mutate_binding_registry, normalize_binding_alias, read_binding_registry,
 };
 
 use crate::commands::{BindingSubcommand, EffectiveCli};
+use crate::output::{self, InteractionTraceMode};
 use rub_core::error::{ErrorCode, RubError};
-use rub_core::model::{CommandResult, PathReferenceState};
+use rub_core::model::PathReferenceState;
 use rub_daemon::rub_paths::RubPaths;
 use serde_json::{Value, json};
 use std::path::Path;
-use uuid::Uuid;
 
 pub(crate) async fn handle_binding_command(
     cli: &EffectiveCli,
@@ -77,12 +80,14 @@ pub(crate) async fn handle_binding_command(
         }
     };
 
-    let result = CommandResult::success("binding", &cli.session, Uuid::now_v7().to_string(), data);
-    let output = if cli.json_pretty {
-        serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
-    } else {
-        serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
-    };
+    let output = output::format_cli_success(
+        "binding",
+        &cli.session,
+        &cli.rub_home,
+        data,
+        cli.json_pretty,
+        InteractionTraceMode::Compact,
+    );
     println!("{output}");
     Ok(())
 }
@@ -142,46 +147,54 @@ pub(crate) fn binding_path_state(
 fn rename_binding_alias(rub_home: &Path, alias: &str, new_alias: &str) -> Result<Value, RubError> {
     let alias = normalize_binding_alias(alias)?;
     let new_alias = normalize_binding_alias(new_alias)?;
-    let dependent_aliases =
-        crate::binding_memory_ctl::remembered_aliases_referencing_binding(rub_home, &alias)?;
-    if !dependent_aliases.is_empty() {
-        return Err(RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            format!(
-                "Binding alias '{alias}' is referenced by remembered aliases and cannot be renamed"
-            ),
-            json!({
-                "alias": alias,
-                "remembered_aliases": dependent_aliases,
-                "reason": "binding_alias_referenced_by_remembered_aliases",
-            }),
-        ));
-    }
-    let mut registry = read_binding_registry(rub_home)?;
+    crate::binding_memory_ctl::mutate_binding_and_remembered_alias_registries(
+        rub_home,
+        |registry, remembered_registry| {
+            let dependent_aliases = remembered_registry
+                .aliases
+                .iter()
+                .filter(|record| record.binding_alias == alias)
+                .map(|record| record.alias.clone())
+                .collect::<Vec<_>>();
+            if !dependent_aliases.is_empty() {
+                return Err(RubError::domain_with_context(
+                    ErrorCode::InvalidInput,
+                    format!(
+                        "Binding alias '{alias}' is referenced by remembered aliases and cannot be renamed"
+                    ),
+                    json!({
+                        "alias": alias,
+                        "remembered_aliases": dependent_aliases,
+                        "reason": "binding_alias_referenced_by_remembered_aliases",
+                    }),
+                ));
+            }
 
-    if registry
-        .bindings
-        .iter()
-        .any(|binding| binding.alias == new_alias)
-    {
-        return Err(RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            format!("Binding alias already exists: {new_alias}"),
-            json!({
-                "alias": alias,
-                "new_alias": new_alias,
-                "reason": "binding_alias_already_exists",
-            }),
-        ));
-    }
+            if registry
+                .bindings
+                .iter()
+                .any(|binding| binding.alias == new_alias)
+            {
+                return Err(RubError::domain_with_context(
+                    ErrorCode::InvalidInput,
+                    format!("Binding alias already exists: {new_alias}"),
+                    json!({
+                        "alias": alias,
+                        "new_alias": new_alias,
+                        "reason": "binding_alias_already_exists",
+                    }),
+                ));
+            }
 
-    let binding = registry
-        .bindings
-        .iter_mut()
-        .find(|binding| binding.alias == alias)
-        .ok_or_else(|| binding_alias_not_found_error(rub_home, &alias))?;
-    binding.alias = new_alias.clone();
-    write_binding_registry(rub_home, &registry)?;
+            let binding = registry
+                .bindings
+                .iter_mut()
+                .find(|binding| binding.alias == alias)
+                .ok_or_else(|| binding_alias_not_found_error(rub_home, &alias))?;
+            binding.alias = new_alias.clone();
+            Ok(())
+        },
+    )?;
 
     Ok(json!({
         "subject": binding_alias_subject(rub_home, &new_alias),
@@ -194,30 +207,38 @@ fn rename_binding_alias(rub_home: &Path, alias: &str, new_alias: &str) -> Result
 
 fn remove_binding_alias(rub_home: &Path, alias: &str) -> Result<Value, RubError> {
     let normalized = normalize_binding_alias(alias)?;
-    let dependent_aliases =
-        crate::binding_memory_ctl::remembered_aliases_referencing_binding(rub_home, &normalized)?;
-    if !dependent_aliases.is_empty() {
-        return Err(RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            format!(
-                "Binding alias '{normalized}' is referenced by remembered aliases and cannot be removed"
-            ),
-            json!({
-                "alias": normalized,
-                "remembered_aliases": dependent_aliases,
-                "reason": "binding_alias_referenced_by_remembered_aliases",
-            }),
-        ));
-    }
-    let mut registry = read_binding_registry(rub_home)?;
-    let original_len = registry.bindings.len();
-    registry
-        .bindings
-        .retain(|binding| binding.alias != normalized);
-    if registry.bindings.len() == original_len {
-        return Err(binding_alias_not_found_error(rub_home, &normalized));
-    }
-    write_binding_registry(rub_home, &registry)?;
+    crate::binding_memory_ctl::mutate_binding_and_remembered_alias_registries(
+        rub_home,
+        |registry, remembered_registry| {
+            let dependent_aliases = remembered_registry
+                .aliases
+                .iter()
+                .filter(|record| record.binding_alias == normalized)
+                .map(|record| record.alias.clone())
+                .collect::<Vec<_>>();
+            if !dependent_aliases.is_empty() {
+                return Err(RubError::domain_with_context(
+                    ErrorCode::InvalidInput,
+                    format!(
+                        "Binding alias '{normalized}' is referenced by remembered aliases and cannot be removed"
+                    ),
+                    json!({
+                        "alias": normalized,
+                        "remembered_aliases": dependent_aliases,
+                        "reason": "binding_alias_referenced_by_remembered_aliases",
+                    }),
+                ));
+            }
+            let original_len = registry.bindings.len();
+            registry
+                .bindings
+                .retain(|binding| binding.alias != normalized);
+            if registry.bindings.len() == original_len {
+                return Err(binding_alias_not_found_error(rub_home, &normalized));
+            }
+            Ok(())
+        },
+    )?;
 
     Ok(json!({
         "subject": binding_alias_subject(rub_home, &normalized),

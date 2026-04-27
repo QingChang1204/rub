@@ -8,7 +8,7 @@ use crate::daemon_ctl;
 use crate::session_policy::{
     materialize_connection_request_with_deadline, parse_connection_request,
     requested_attachment_identity, requires_existing_session_validation,
-    validate_existing_session_connection_request_with_deadline,
+    validate_existing_session_connection_request_via_authority_probe_with_deadline,
 };
 use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
 use rub_ipc::protocol::{IpcRequest, ResponseStatus};
@@ -313,24 +313,28 @@ impl HarvestDispatchContext {
             deadline,
             request.timeout_ms,
             &self.daemon_args,
-            self.attachment_identity.as_deref(),
+            daemon_ctl::StartupAuthorityRequest {
+                connection_request: &self.connection_request,
+                attachment_identity: self.attachment_identity.as_deref(),
+            },
         )
         .await
         .map_err(|error| error.into_envelope())?;
         let daemon_session_id = bootstrap.daemon_session_id;
+        let authority_socket_path = bootstrap.authority_socket_path;
         let mut client = bootstrap.client;
         if requires_existing_session_validation(
             bootstrap.connected_to_existing_daemon,
             &self.connection_request,
             cli,
         ) {
-            validate_existing_session_connection_request_with_deadline(
+            validate_existing_session_connection_request_via_authority_probe_with_deadline(
                 cli,
                 &self.connection_request,
-                &mut client,
+                authority_socket_path.as_path(),
                 cli.session_id.as_deref().or(daemon_session_id.as_deref()),
-                Some(deadline),
-                Some(cli.timeout.max(1)),
+                deadline,
+                cli.timeout.max(1),
             )
             .await
             .map_err(|error| error.into_envelope())?;
@@ -343,6 +347,7 @@ impl HarvestDispatchContext {
                 rub_home: &cli.rub_home,
                 session: &cli.session,
                 daemon_args: &self.daemon_args,
+                connection_request: &self.connection_request,
                 attachment_identity: self.attachment_identity.as_deref(),
                 original_daemon_session_id: daemon_session_id.as_deref(),
             },

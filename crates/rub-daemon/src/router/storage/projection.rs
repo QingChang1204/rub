@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use rub_core::error::{ErrorCode, RubError};
-use rub_core::fs::atomic_write_bytes;
+use rub_core::fs::atomic_write_bytes_until;
 use rub_core::storage::{StorageArea, StorageSnapshot};
 
 use crate::router::artifacts::{
@@ -76,6 +76,8 @@ pub(super) fn storage_subject(
     serde_json::json!({
         "kind": "storage",
         "origin": snapshot.origin,
+        "tab_target_id": snapshot.tab_target_id,
+        "frame_id": snapshot.frame_id,
         "area": area.map(storage_area_name),
         "key": key,
     })
@@ -116,12 +118,25 @@ pub(super) fn storage_artifact(path: &str, direction: &str, durability: &str) ->
 pub(super) fn write_snapshot_file(
     path: &str,
     snapshot: &StorageSnapshot,
+    deadline: std::time::Instant,
 ) -> Result<rub_core::fs::FileCommitOutcome, RubError> {
     let json = serde_json::to_string_pretty(snapshot).map_err(|error| {
         RubError::Internal(format!("Serialize storage snapshot failed: {error}"))
     })?;
-    atomic_write_bytes(Path::new(path), json.as_bytes(), 0o600)
-        .map_err(|error| RubError::Internal(format!("Cannot write file: {error}")))
+    atomic_write_bytes_until(Path::new(path), json.as_bytes(), 0o600, deadline).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            RubError::domain_with_context(
+                ErrorCode::IpcTimeout,
+                "storage export timed out before artifact publication could commit",
+                serde_json::json!({
+                    "reason": "storage_export_artifact_commit_timed_out",
+                    "path": path,
+                }),
+            )
+        } else {
+            RubError::Internal(format!("Cannot write file: {error}"))
+        }
+    })
 }
 
 fn lookup_storage_matches(
@@ -164,5 +179,53 @@ fn storage_area_name(area: StorageArea) -> &'static str {
     match area {
         StorageArea::Local => "local",
         StorageArea::Session => "session",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_snapshot_file;
+    use rub_core::error::ErrorCode;
+    use rub_core::storage::StorageSnapshot;
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+
+    fn snapshot() -> StorageSnapshot {
+        StorageSnapshot {
+            origin: "https://example.test".to_string(),
+            tab_target_id: Some("tab-1".to_string()),
+            frame_id: Some("frame-1".to_string()),
+            local_storage: BTreeMap::from([("token".to_string(), "abc".to_string())]),
+            session_storage: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn storage_export_fails_closed_before_artifact_publication_after_deadline() {
+        let root =
+            std::env::temp_dir().join(format!("rub-storage-export-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let path = root.join("storage.json");
+
+        let error = write_snapshot_file(
+            path.to_str().expect("utf8 path"),
+            &snapshot(),
+            Instant::now() - Duration::from_millis(1),
+        )
+        .expect_err("expired deadline must block storage artifact publication")
+        .into_envelope();
+        assert_eq!(error.code, ErrorCode::IpcTimeout);
+        let context = error.context.expect("timeout error context");
+        assert_eq!(
+            context["reason"],
+            "storage_export_artifact_commit_timed_out"
+        );
+        assert!(
+            !path.exists(),
+            "storage export must not publish a file after commit deadline expiry"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

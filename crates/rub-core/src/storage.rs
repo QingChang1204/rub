@@ -63,6 +63,10 @@ pub enum StorageMutationKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageSnapshot {
     pub origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_target_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<String>,
     #[serde(default)]
     pub local_storage: BTreeMap<String, String>,
     #[serde(default)]
@@ -75,10 +79,16 @@ pub struct StorageMutationRecord {
     pub sequence: u64,
     pub kind: StorageMutationKind,
     pub origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_target_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub area: Option<StorageArea>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_status: Option<String>,
 }
 
 /// Session-scoped storage runtime projection.
@@ -87,6 +97,10 @@ pub struct StorageRuntimeInfo {
     pub status: StorageRuntimeStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tab_target_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_frame_id: Option<String>,
     #[serde(default)]
     pub local_storage_keys: Vec<String>,
     #[serde(default)]
@@ -102,6 +116,8 @@ impl Default for StorageRuntimeInfo {
         Self {
             status: StorageRuntimeStatus::Inactive,
             current_origin: None,
+            current_tab_target_id: None,
+            current_frame_id: None,
             local_storage_keys: Vec::new(),
             session_storage_keys: Vec::new(),
             recent_mutations: Vec::new(),

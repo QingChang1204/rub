@@ -35,6 +35,57 @@ fn temp_home(label: &str) -> PathBuf {
 }
 
 #[tokio::test]
+async fn expired_execution_budget_releases_replay_without_committed_truth() {
+    let router = test_router();
+    let state = Arc::new(SessionState::new(
+        "default",
+        temp_home("expired-exec-budget"),
+        None,
+    ));
+    let request = IpcRequest::new("state", serde_json::json!({}), 1_000)
+        .with_command_id("cmd-expired-exec-budget")
+        .expect("static command_id must be valid");
+    let inherited_deadline = TransactionDeadline::new(1);
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    let preflight =
+        prepare_request_preflight_with_inherited_deadline(&request, Some(inherited_deadline));
+    let prepared = match prepare_command_dispatch(&request, &state, preflight).await {
+        Ok(prepared) => prepared,
+        Err(_) => panic!("replay owner should be prepared before execution timeout"),
+    };
+
+    let response = router
+        .execute_prepared_request(&request, &state, prepared)
+        .await;
+
+    assert_eq!(
+        response.status,
+        rub_ipc::protocol::ResponseStatus::Error,
+        "expired execution budget should fail before command dispatch"
+    );
+    assert_eq!(
+        response.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::IpcTimeout)
+    );
+    let context = response
+        .error
+        .as_ref()
+        .and_then(|error| error.context.as_ref())
+        .expect("timeout should include context");
+    assert_eq!(context["transaction_timeout_ms"], serde_json::json!(0));
+    let replay_owner = prepare_replay_fence(
+        &request,
+        &state,
+        "req-retry",
+        TransactionDeadline::new(request.timeout_ms),
+    )
+    .await
+    .expect("pre-execution timeout must release replay owner instead of caching")
+    .expect("same command_id should be reclaimable after no execution committed");
+    assert_eq!(replay_owner.command_id, "cmd-expired-exec-budget");
+}
+
+#[tokio::test]
 async fn automation_transactions_share_fifo_authority_with_default_budget() {
     let router = test_router();
     let state = Arc::new(SessionState::new("default", temp_home("fairness"), None));
@@ -123,6 +174,102 @@ async fn queued_automation_is_rejected_after_shutdown_request() {
         Some(serde_json::json!({
             "command": "queued_automation",
             "reason": "session_shutting_down_after_queue_wait",
+        }))
+    );
+}
+
+#[tokio::test]
+async fn foreground_request_is_rejected_when_handoff_activates_while_waiting_for_fifo() {
+    let router = test_router();
+    let state = Arc::new(SessionState::new(
+        "default",
+        temp_home("handoff-after-queue-wait"),
+        None,
+    ));
+
+    let held = router
+        .begin_automation_transaction_with_wait_budget(
+            &state,
+            "hold_foreground_slot",
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+        )
+        .await
+        .expect("first automation transaction should acquire immediately");
+
+    let queued = router.begin_request_transaction(
+        "click",
+        "req-handoff-after-queue-wait",
+        TransactionDeadline::new(1_000),
+        &state,
+    );
+    tokio::pin!(queued);
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    state.set_handoff_available(true).await;
+    state.activate_handoff().await;
+    drop(held);
+
+    let response = queued.await;
+    let response = match response {
+        Ok(_) => panic!("foreground request should fail closed once handoff activates"),
+        Err(response) => response,
+    };
+    let error = response
+        .error
+        .expect("handoff rejection should surface an error envelope");
+    assert_eq!(error.code, ErrorCode::AutomationPaused);
+    assert_eq!(
+        error.context,
+        Some(serde_json::json!({
+            "command": "click",
+            "handoff": state.human_verification_handoff().await,
+        }))
+    );
+}
+
+#[tokio::test]
+async fn automation_transaction_is_rejected_when_handoff_activates_while_waiting_for_fifo() {
+    let router = test_router();
+    let state = Arc::new(SessionState::new(
+        "default",
+        temp_home("automation-handoff-after-queue-wait"),
+        None,
+    ));
+
+    let held = router
+        .begin_automation_transaction_with_wait_budget(
+            &state,
+            "hold_foreground_slot",
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+        )
+        .await
+        .expect("first automation transaction should acquire immediately");
+
+    let queued = router.begin_automation_transaction_with_wait_budget(
+        &state,
+        "orchestration_worker",
+        AUTOMATION_QUEUE_WAIT_BUDGET,
+        Duration::from_millis(5),
+    );
+    tokio::pin!(queued);
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    state.set_handoff_available(true).await;
+    state.activate_handoff().await;
+    drop(held);
+
+    let error = match queued.await {
+        Ok(_) => panic!("automation transaction should fail closed once handoff activates"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::AutomationPaused);
+    assert_eq!(
+        error.context,
+        Some(serde_json::json!({
+            "command": "orchestration_worker",
+            "handoff": state.human_verification_handoff().await,
         }))
     );
 }
@@ -495,4 +642,154 @@ async fn bounded_automation_reservation_yields_fifo_priority_after_worker_cycle_
     foreground_task
         .await
         .expect("foreground task should complete cleanly");
+}
+
+#[tokio::test]
+async fn external_response_releases_fifo_authority_after_delivery_while_post_commit_followups_continue()
+ {
+    let router = test_router();
+    let state = Arc::new(SessionState::new(
+        "default",
+        temp_home("external-post-commit-fence"),
+        None,
+    ));
+    let request = rub_ipc::protocol::IpcRequest::new("sessions", serde_json::json!({}), 1_000);
+    state.block_post_commit_journal_for_tests();
+
+    let pending = router.dispatch_for_external_delivery(request, &state).await;
+    pending.commit_after_delivery(&state).await;
+
+    assert_eq!(
+        state
+            .in_flight_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "response delivery should release the live request transaction before downstream followups finish"
+    );
+    assert_eq!(
+        state.pending_post_commit_followup_count(),
+        1,
+        "post-commit followups should continue under explicit downstream recovery authority"
+    );
+
+    let (order_tx, mut order_rx) = mpsc::unbounded_channel();
+    let queued_router = router.clone();
+    let queued_state = state.clone();
+    let queued_task = tokio::spawn(async move {
+        let guard = queued_router
+            .begin_request_transaction(
+                "later_foreground",
+                "req-later-foreground",
+                TransactionDeadline::new(1_000),
+                &queued_state,
+            )
+            .await
+            .expect("later foreground request should eventually acquire");
+        order_tx
+            .send("foreground")
+            .expect("foreground acquisition order should send");
+        drop(guard);
+    });
+
+    let acquired = tokio::time::timeout(Duration::from_millis(100), order_rx.recv())
+        .await
+        .expect("queued foreground request should acquire once response delivery releases the live transaction")
+        .expect("queued foreground label should be present");
+    assert_eq!(acquired, "foreground");
+    state.unblock_post_commit_journal_for_tests();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if state.pending_post_commit_followup_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("blocked post-commit followup should drain after the journal fence is released");
+
+    queued_task
+        .await
+        .expect("queued foreground task should complete cleanly");
+}
+
+#[tokio::test]
+async fn delivery_failure_after_commit_keeps_fifo_authority_until_fallback_truth_commits() {
+    let router = test_router();
+    let state = Arc::new(SessionState::new(
+        "default",
+        temp_home("delivery-failure-fence"),
+        None,
+    ));
+    let request = rub_ipc::protocol::IpcRequest::new(
+        "open",
+        serde_json::json!({ "url": "https://example.com" }),
+        1_000,
+    )
+    .with_command_id("cmd-delivery-fence")
+    .expect("static command_id must be valid");
+    state.block_post_commit_journal_for_tests();
+
+    let pending = router.dispatch_for_external_delivery(request, &state).await;
+    let commit_state = state.clone();
+    let commit_task = tokio::spawn(async move {
+        pending
+            .commit_after_delivery_failure(&commit_state, "socket closed".to_string())
+            .await;
+    });
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+        state
+            .in_flight_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "delivery-failure fallback truth should keep the live request transaction authoritative until committed surfaces finish"
+    );
+    assert_eq!(
+        state.pending_post_commit_followup_count(),
+        0,
+        "delivery-failure fallback truth should complete synchronously instead of detaching a downstream followup task"
+    );
+
+    let (order_tx, mut order_rx) = mpsc::unbounded_channel();
+    let queued_router = router.clone();
+    let queued_state = state.clone();
+    let queued_task = tokio::spawn(async move {
+        let guard = queued_router
+            .begin_request_transaction(
+                "later_foreground",
+                "req-later-foreground",
+                TransactionDeadline::new(1_000),
+                &queued_state,
+            )
+            .await
+            .expect("later foreground request should eventually acquire");
+        order_tx
+            .send("foreground")
+            .expect("foreground acquisition order should send");
+        drop(guard);
+    });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), order_rx.recv())
+            .await
+            .is_err(),
+        "queued foreground request should remain fenced out until committed fallback truth finishes"
+    );
+
+    state.unblock_post_commit_journal_for_tests();
+    tokio::time::timeout(Duration::from_secs(1), commit_task)
+        .await
+        .expect("delivery-failure fallback should finish once journal unblocks")
+        .expect("commit task should complete cleanly");
+
+    let acquired = tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+        .await
+        .expect("queued foreground request should acquire after committed fallback truth completes")
+        .expect("queued foreground label should be present");
+    assert_eq!(acquired, "foreground");
+    queued_task
+        .await
+        .expect("queued foreground task should complete cleanly");
 }

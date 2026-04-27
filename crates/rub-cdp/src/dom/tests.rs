@@ -1,7 +1,8 @@
 use super::{
-    ExtractedElementsPayload, highlight_overlay_js, normalize_snapshot_limit,
-    scripts::extract_elements_script,
+    ExtractedElementsPayload, bind_snapshot_frame_context_to_document_fence, highlight_overlay_js,
+    normalize_snapshot_limit, projected_element_ref, scripts::extract_elements_script,
 };
+use crate::frame_runtime::{FrameDocumentFence, ResolvedFrameContext};
 use rub_core::model::{Element, ElementTag, FrameContextInfo, ScrollPosition, Snapshot};
 use rub_core::port::DEFAULT_SNAPSHOT_LIMIT;
 use std::collections::HashMap;
@@ -50,6 +51,35 @@ fn extracted_elements_payload_deserializes_all_three_fields() {
         .expect("scroll must be present when JS returns it");
     assert_eq!(scroll.y, 42.5, "scroll.y must round-trip through serde");
     assert!(!scroll.at_bottom);
+}
+
+#[test]
+fn snapshot_frame_context_url_is_bound_to_document_fence() {
+    let mut frame_context = ResolvedFrameContext {
+        frame: FrameContextInfo {
+            frame_id: "main".to_string(),
+            name: None,
+            parent_frame_id: None,
+            target_id: Some("target-1".to_string()),
+            url: Some("https://old.example/".to_string()),
+            depth: 0,
+            same_origin_accessible: Some(true),
+        },
+        lineage: vec!["main".to_string()],
+        execution_context_id: None,
+        frame_scoped: false,
+    };
+    let document_fence = FrameDocumentFence {
+        href: "https://new.example/".to_string(),
+        time_origin: Some(1.0),
+    };
+
+    bind_snapshot_frame_context_to_document_fence(&mut frame_context, &document_fence);
+
+    assert_eq!(
+        frame_context.frame.url.as_deref(),
+        Some("https://new.example/")
+    );
 }
 
 /// Backward-compatibility contract: payloads without `title` or `scroll` (e.g., from
@@ -136,6 +166,7 @@ fn highlight_overlay_script_avoids_inner_html_assignment() {
             text: "Example".to_string(),
             attributes: HashMap::new(),
             element_ref: None,
+            target_id: Some("target-1".to_string()),
             bounding_box: Some(rub_core::model::BoundingBox {
                 x: 10.0,
                 y: 20.0,
@@ -187,4 +218,39 @@ fn snapshot_limit_zero_remains_unbounded() {
 #[test]
 fn snapshot_limit_preserves_explicit_positive_value() {
     assert_eq!(normalize_snapshot_limit(Some(17)), 17);
+}
+
+#[test]
+fn unverified_projection_drops_element_ref_authority() {
+    let resolution = crate::projection::ProjectionResolution {
+        refs: vec![Some("frame-main:42".to_string())],
+        projection: rub_core::model::SnapshotProjection {
+            verified: false,
+            js_traversal_count: 2,
+            backend_traversal_count: 1,
+            resolved_ref_count: 1,
+            warning: Some("projection mismatch".to_string()),
+        },
+    };
+
+    assert_eq!(projected_element_ref(&resolution, 0), None);
+}
+
+#[test]
+fn verified_projection_preserves_element_ref_authority() {
+    let resolution = crate::projection::ProjectionResolution {
+        refs: vec![Some("frame-main:42".to_string())],
+        projection: rub_core::model::SnapshotProjection {
+            verified: true,
+            js_traversal_count: 1,
+            backend_traversal_count: 1,
+            resolved_ref_count: 1,
+            warning: None,
+        },
+    };
+
+    assert_eq!(
+        projected_element_ref(&resolution, 0).as_deref(),
+        Some("frame-main:42")
+    );
 }

@@ -43,16 +43,23 @@ impl OrchestrationCommand {
     pub(super) async fn execute(
         self,
         router: &super::DaemonRouter,
+        deadline: crate::router::TransactionDeadline,
         state: &std::sync::Arc<crate::session::SessionState>,
     ) -> Result<serde_json::Value, RubError> {
         match self {
-            Self::Add(args) => super::registry::cmd_orchestration_add(router, args, state).await,
+            Self::Add(args) => {
+                super::registry::cmd_orchestration_add(router, args, deadline, state).await
+            }
             Self::List => super::registry::cmd_orchestration_list(state).await,
             Self::Trace(args) => super::registry::cmd_orchestration_trace(args, state).await,
-            Self::Remove(args) => super::registry::cmd_orchestration_remove(args, state).await,
+            Self::Remove(args) => {
+                super::registry::cmd_orchestration_remove(router, args, deadline, state).await
+            }
             Self::Pause(args) => {
                 super::execution::update_orchestration_status(
+                    router,
                     args.id,
+                    deadline,
                     state,
                     rub_core::model::OrchestrationRuleStatus::Paused,
                 )
@@ -60,14 +67,16 @@ impl OrchestrationCommand {
             }
             Self::Resume(args) => {
                 super::execution::update_orchestration_status(
+                    router,
                     args.id,
+                    deadline,
                     state,
                     rub_core::model::OrchestrationRuleStatus::Armed,
                 )
                 .await
             }
             Self::Execute(args) => {
-                super::execution::cmd_orchestration_execute(router, args.id, state).await
+                super::execution::cmd_orchestration_execute(router, args.id, deadline, state).await
             }
             Self::Export(args) => super::registry::cmd_orchestration_export(args.id, state).await,
         }

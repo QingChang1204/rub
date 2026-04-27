@@ -8,6 +8,8 @@ use tokio::time::Duration;
 
 use crate::humanize::HumanizeConfig;
 
+const INPUT_RELEASE_GUARD_DELAY: Duration = Duration::from_millis(600);
+
 pub(crate) async fn dispatch_click(
     page: &Arc<Page>,
     x: f64,
@@ -23,23 +25,58 @@ pub(crate) async fn dispatch_click(
         .click_count(click_count)
         .build()
         .map_err(|e| RubError::Internal(format!("Build mousePressed failed: {e}")))?;
-    page.execute(params)
+    let release_params = mouse_release_params(x, y, button, click_count)?;
+    let press_result = page
+        .execute(params)
         .await
-        .map_err(|e| RubError::Internal(format!("mousePressed failed: {e}")))?;
+        .map_err(|e| RubError::Internal(format!("mousePressed failed: {e}")));
+    press_result?;
+    let release_guard =
+        spawn_best_effort_mouse_release(page.clone(), release_params.clone(), "pointer_click");
 
-    let params = DispatchMouseEventParams::builder()
+    let release_result = page
+        .execute(release_params)
+        .await
+        .map_err(|e| RubError::Internal(format!("mouseReleased failed: {e}")));
+    if release_result.is_ok() {
+        release_guard.abort();
+    }
+    release_result?;
+
+    Ok(())
+}
+
+fn mouse_release_params(
+    x: f64,
+    y: f64,
+    button: MouseButton,
+    click_count: i64,
+) -> Result<DispatchMouseEventParams, RubError> {
+    DispatchMouseEventParams::builder()
         .r#type(DispatchMouseEventType::MouseReleased)
         .x(x)
         .y(y)
         .button(button)
         .click_count(click_count)
         .build()
-        .map_err(|e| RubError::Internal(format!("Build mouseReleased failed: {e}")))?;
-    page.execute(params)
-        .await
-        .map_err(|e| RubError::Internal(format!("mouseReleased failed: {e}")))?;
+        .map_err(|e| RubError::Internal(format!("Build mouseReleased failed: {e}")))
+}
 
-    Ok(())
+fn spawn_best_effort_mouse_release(
+    page: Arc<Page>,
+    params: DispatchMouseEventParams,
+    label: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        tokio::time::sleep(INPUT_RELEASE_GUARD_DELAY).await;
+        if let Err(error) = page.execute(params).await {
+            tracing::warn!(
+                actuation = label,
+                error = %error,
+                "Best-effort pointer release failed after interrupted input transaction"
+            );
+        }
+    })
 }
 
 pub(crate) async fn move_to(

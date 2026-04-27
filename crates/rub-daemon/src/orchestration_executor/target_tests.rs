@@ -8,21 +8,31 @@ use rub_core::error::ErrorCode;
 use rub_core::model::{
     FrameContextInfo, FrameContextStatus, FrameRuntimeInfo, HumanVerificationHandoffInfo,
     HumanVerificationHandoffStatus, IntegrationMode, IntegrationRuntimeInfo,
-    IntegrationRuntimeStatus, IntegrationSurface, OrchestrationAddressInfo, OverlayState,
-    ReadinessInfo, ReadinessStatus, RouteStability, SessionAccessibility, TabInfo,
-    TakeoverRuntimeInfo, TakeoverRuntimeStatus, TakeoverVisibilityMode,
+    IntegrationRuntimeStatus, IntegrationSurface, OrchestrationAddressInfo,
+    OrchestrationSessionAvailability, OverlayState, ReadinessInfo, ReadinessStatus, RouteStability,
+    SessionAccessibility, TabInfo, TakeoverRuntimeInfo, TakeoverRuntimeStatus,
+    TakeoverVisibilityMode,
 };
 use rub_ipc::codec::NdJsonCodec;
 
 use super::{
     OrchestrationTargetRuntimeSummary, dispatch_action_to_target_session,
     orchestration_target_continuity_failure, orchestration_target_dispatch_command_id,
-    orchestration_target_dispatch_request,
+    orchestration_target_dispatch_request, resolve_target_session, target_continuity_phase_request,
 };
 use crate::router::DaemonRouter;
 use rub_ipc::protocol::IpcRequest;
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
+use tokio::net::UnixStream;
+
+fn queue_test_connection(socket_path: &std::path::Path) -> UnixStream {
+    let (client, server) = UnixStream::pair().expect("create in-memory unix stream pair");
+    crate::orchestration_executor::protocol::queue_remote_orchestration_connection_for_test(
+        socket_path,
+        client,
+    );
+    server
+}
 
 fn runtime_summary() -> OrchestrationTargetRuntimeSummary {
     OrchestrationTargetRuntimeSummary {
@@ -103,6 +113,42 @@ fn target_address() -> OrchestrationAddressInfo {
     }
 }
 
+fn target_rule() -> rub_core::model::OrchestrationRuleInfo {
+    rub_core::model::OrchestrationRuleInfo {
+        id: 1,
+        status: rub_core::model::OrchestrationRuleStatus::Armed,
+        lifecycle_generation: 1,
+        source: OrchestrationAddressInfo {
+            session_id: "sess-source".to_string(),
+            session_name: "source".to_string(),
+            tab_index: Some(0),
+            tab_target_id: Some("source-tab".to_string()),
+            frame_id: None,
+        },
+        target: target_address(),
+        mode: rub_core::model::OrchestrationMode::Once,
+        execution_policy: rub_core::model::OrchestrationExecutionPolicyInfo::default(),
+        condition: rub_core::model::TriggerConditionSpec {
+            kind: rub_core::model::TriggerConditionKind::TextPresent,
+            locator: None,
+            text: Some("ready".to_string()),
+            url_pattern: None,
+            readiness_state: None,
+            method: None,
+            status_code: None,
+            storage_area: None,
+            key: None,
+            value: None,
+        },
+        actions: Vec::new(),
+        correlation_key: "corr-target".to_string(),
+        idempotency_key: "idem-target".to_string(),
+        unavailable_reason: None,
+        last_condition_evidence: None,
+        last_result: None,
+    }
+}
+
 #[test]
 fn target_continuity_ignores_selected_frame_noise_for_explicit_frame_override() {
     let mut summary = runtime_summary();
@@ -116,6 +162,8 @@ fn target_continuity_ignores_selected_frame_noise_for_explicit_frame_override() 
         url: "https://example.test".to_string(),
         title: "Target".to_string(),
         active: true,
+        active_authority: None,
+        degraded_reason: None,
     };
 
     assert!(
@@ -135,10 +183,12 @@ fn target_continuity_blocks_when_target_runtime_required_surface_degrades() {
         url: "https://example.test".to_string(),
         title: "Target".to_string(),
         active: true,
+        active_authority: None,
+        degraded_reason: None,
     };
     let error = orchestration_target_continuity_failure(&target_address(), &target_tab, &summary)
         .expect("required runtime degradation should block orchestration continuity");
-    assert_eq!(error.code, ErrorCode::BrowserCrashed);
+    assert_eq!(error.code, ErrorCode::SessionBusy);
     assert_eq!(
         error
             .context
@@ -191,19 +241,108 @@ fn target_dispatch_wrapper_uses_dedicated_command_id_for_replay() {
 }
 
 #[test]
-fn target_dispatch_wrapper_stays_non_replayable_without_inner_command_id() {
+fn target_dispatch_wrapper_uses_auto_generated_command_id_for_default_requests() {
     let address = target_address();
     let inner = IpcRequest::new("click", serde_json::json!({ "selector": "#go" }), 1_000);
 
     let wrapped = orchestration_target_dispatch_request(&address, inner.clone());
 
-    assert_eq!(wrapped.command_id, None);
+    assert!(inner.command_id.is_some());
+    assert_eq!(
+        wrapped.command_id.as_deref(),
+        orchestration_target_dispatch_command_id(&address, &inner).as_deref()
+    );
     assert_eq!(
         wrapped
             .args
             .get("request")
-            .and_then(|value| value.get("command_id")),
-        None
+            .and_then(|value| value.get("command_id"))
+            .and_then(|value| value.as_str()),
+        inner.command_id.as_deref()
+    );
+}
+
+#[test]
+fn target_continuity_phase_request_uses_live_request_scoped_phase_command_id() {
+    let request_a = target_continuity_phase_request(
+        "tabs",
+        serde_json::json!({}),
+        None,
+        "orchestration_target_continuity_tabs",
+    )
+    .expect("phase request should bind live command_id");
+    let request_b = target_continuity_phase_request(
+        "tabs",
+        serde_json::json!({}),
+        None,
+        "orchestration_target_continuity_tabs",
+    )
+    .expect("phase request should bind live command_id");
+
+    assert!(request_a.command_id.is_some());
+    assert_ne!(request_a.command_id, request_b.command_id);
+    assert_eq!(request_a.command, "tabs");
+}
+
+#[test]
+fn resolve_target_session_rejects_visible_but_non_addressable_session() {
+    let session = projected_orchestration_session(
+        "sess-target".to_string(),
+        "target".to_string(),
+        42,
+        "/tmp/rub-target.sock".to_string(),
+        false,
+        rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        OrchestrationSessionAvailability::ProtocolIncompatible,
+        Some("/tmp/rub-target-profile".to_string()),
+    );
+    let runtime = rub_core::model::OrchestrationRuntimeInfo {
+        status: rub_core::model::OrchestrationRuntimeStatus::Degraded,
+        known_sessions: vec![session],
+        session_count: 1,
+        addressing_supported: true,
+        execution_supported: true,
+        current_session_id: Some("sess-local".to_string()),
+        current_session_name: Some("default".to_string()),
+        degraded_reason: Some("registry_contains_non_addressable_sessions".to_string()),
+        ..Default::default()
+    };
+
+    let error =
+        resolve_target_session(&runtime, &target_rule()).expect_err("non-addressable session");
+
+    assert_eq!(error.code, ErrorCode::SessionBusy);
+    assert_eq!(
+        error
+            .context
+            .as_ref()
+            .and_then(|value| value.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("orchestration_target_session_not_addressable")
+    );
+    assert_eq!(
+        error
+            .context
+            .as_ref()
+            .and_then(|value| value.get("availability")),
+        Some(&serde_json::json!("protocol_incompatible"))
+    );
+    assert_eq!(
+        error
+            .context
+            .as_ref()
+            .and_then(|value| value.get("user_data_dir"))
+            .and_then(|value| value.as_str()),
+        Some("/tmp/rub-target-profile")
+    );
+    assert_eq!(
+        error
+            .context
+            .as_ref()
+            .and_then(|value| value.get("user_data_dir_state"))
+            .and_then(|value| value.get("path_kind"))
+            .and_then(|value| value.as_str()),
+        Some("managed_user_data_directory")
     );
 }
 
@@ -237,13 +376,13 @@ async fn remote_target_dispatch_replays_partial_response_through_wrapper_command
         "/tmp/rub-orch-target-{}.sock",
         uuid::Uuid::now_v7()
     ));
-    let _ = std::fs::remove_file(&socket_path);
-    let listener = UnixListener::bind(&socket_path).expect("bind listener");
+    let first_stream = queue_test_connection(&socket_path);
+    let replay_stream = queue_test_connection(&socket_path);
 
     let server = tokio::spawn(async move {
         let expected_outer_command_id = "orchestration_target_dispatch:sess-target:step-cmd";
 
-        let (stream, _) = listener.accept().await.expect("accept first");
+        let stream = first_stream;
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         let request: IpcRequest = NdJsonCodec::read(&mut reader)
@@ -271,7 +410,7 @@ async fn remote_target_dispatch_replays_partial_response_through_wrapper_command
             .expect("write partial response");
         writer.shutdown().await.expect("shutdown partial writer");
 
-        let (stream, _) = listener.accept().await.expect("accept replay");
+        let stream = replay_stream;
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         let replay_request: IpcRequest = NdJsonCodec::read(&mut reader)
@@ -296,6 +435,8 @@ async fn remote_target_dispatch_replays_partial_response_through_wrapper_command
             "req-2",
             serde_json::json!({ "result": { "ok": true } }),
         )
+        .with_daemon_session_id("sess-target")
+        .expect("daemon_session_id must be valid")
         .with_command_id(expected_outer_command_id)
         .expect("static wrapper command_id must be valid");
         NdJsonCodec::write(&mut writer, &response)
@@ -317,6 +458,7 @@ async fn remote_target_dispatch_replays_partial_response_through_wrapper_command
         socket_path.display().to_string(),
         false,
         rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        OrchestrationSessionAvailability::Addressable,
         None,
     );
     let address = OrchestrationAddressInfo {
@@ -330,9 +472,10 @@ async fn remote_target_dispatch_replays_partial_response_through_wrapper_command
         .with_command_id("step-cmd")
         .expect("static step command_id must be valid");
 
-    let response = dispatch_action_to_target_session(&router, &state, &session, &address, request)
-        .await
-        .expect("wrapper replay should recover committed response");
+    let response =
+        dispatch_action_to_target_session(&router, &state, &session, &address, request, None)
+            .await
+            .expect("wrapper replay should recover committed response");
 
     assert_eq!(
         response.command_id.as_deref(),
@@ -340,5 +483,4 @@ async fn remote_target_dispatch_replays_partial_response_through_wrapper_command
     );
 
     server.await.expect("server join");
-    let _ = std::fs::remove_file(&socket_path);
 }

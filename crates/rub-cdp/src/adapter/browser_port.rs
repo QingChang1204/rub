@@ -17,6 +17,78 @@ use rub_core::storage::{StorageArea, StorageSnapshot};
 use super::ChromiumAdapter;
 use crate::dom;
 
+fn snapshot_target_authority_error(snapshot: &Snapshot, detail: &str) -> RubError {
+    RubError::domain_with_context(
+        rub_core::error::ErrorCode::StaleSnapshot,
+        "Snapshot-bound operations require the original snapshot tab authority",
+        serde_json::json!({
+            "reason": "snapshot_target_authority_unavailable",
+            "detail": detail,
+            "snapshot_id": snapshot.snapshot_id,
+            "frame_id": snapshot.frame_context.frame_id,
+            "target_id": snapshot.frame_context.target_id,
+        }),
+    )
+}
+
+fn element_target_authority_error(element: &Element, detail: &str) -> RubError {
+    RubError::domain_with_context(
+        rub_core::error::ErrorCode::StaleSnapshot,
+        "Snapshot-bound element operations require the original snapshot tab authority",
+        serde_json::json!({
+            "reason": "snapshot_element_target_authority_unavailable",
+            "detail": detail,
+            "element_index": element.index,
+            "element_ref": element.element_ref,
+            "target_id": element.target_id,
+        }),
+    )
+}
+
+async fn page_for_snapshot_authority(
+    adapter: &ChromiumAdapter,
+    snapshot: &Snapshot,
+) -> Result<std::sync::Arc<chromiumoxide::Page>, RubError> {
+    let Some(target_id) = snapshot.frame_context.target_id.as_deref() else {
+        return Err(snapshot_target_authority_error(
+            snapshot,
+            "snapshot does not carry tab target authority",
+        ));
+    };
+    adapter
+        .manager
+        .page_for_target_id(target_id)
+        .await
+        .map_err(|_| {
+            snapshot_target_authority_error(
+                snapshot,
+                "snapshot target id no longer resolves to a live tab",
+            )
+        })
+}
+
+async fn page_for_element_authority(
+    adapter: &ChromiumAdapter,
+    element: &Element,
+) -> Result<std::sync::Arc<chromiumoxide::Page>, RubError> {
+    let Some(target_id) = element.target_id.as_deref() else {
+        return Err(element_target_authority_error(
+            element,
+            "snapshot element does not carry tab target authority",
+        ));
+    };
+    adapter
+        .manager
+        .page_for_target_id(target_id)
+        .await
+        .map_err(|_| {
+            element_target_authority_error(
+                element,
+                "snapshot element target id no longer resolves to a live tab",
+            )
+        })
+}
+
 #[async_trait]
 impl BrowserPort for ChromiumAdapter {
     async fn navigate(
@@ -52,19 +124,9 @@ impl BrowserPort for ChromiumAdapter {
     }
 
     async fn click(&self, element: &Element) -> Result<InteractionOutcome, RubError> {
-        let page = self.manager.page().await?;
+        let page = page_for_element_authority(self, element).await?;
         let dialog_runtime = self.manager.dialog_runtime();
         crate::gestures::click(&page, element, &self.humanize, &dialog_runtime).await
-    }
-
-    async fn input(
-        &self,
-        element: &Element,
-        text: &str,
-        clear: bool,
-    ) -> Result<InteractionOutcome, RubError> {
-        let page = self.manager.page().await?;
-        crate::controls::input_text(&page, element, text, clear, &self.humanize).await
     }
 
     async fn execute_js(&self, code: &str) -> Result<serde_json::Value, RubError> {
@@ -147,7 +209,7 @@ impl BrowserPort for ChromiumAdapter {
     }
 
     async fn dialog_runtime(&self) -> Result<DialogRuntimeInfo, RubError> {
-        Ok(self.manager.dialog_runtime().read().await.clone())
+        self.manager.dialog_runtime_snapshot().await
     }
 
     fn set_dialog_intercept(
@@ -184,9 +246,148 @@ impl BrowserPort for ChromiumAdapter {
 
     async fn send_keys(&self, combo: &KeyCombo) -> Result<InteractionOutcome, RubError> {
         let page = self.manager.page().await?;
+        let dialog_runtime = self.manager.dialog_runtime();
+        let expected_target_id = page.target_id().as_ref().to_string();
         let baseline = crate::interaction::capture_active_interaction_baseline(&page).await;
-        crate::keyboard::send_keys(&page, combo).await?;
-        let confirmation = crate::interaction::confirm_key_combo(&page, baseline).await;
+        let page_for_keys = page.clone();
+        let combo_for_keys = combo.clone();
+        let fence = crate::interaction::await_actuation_or_dialog(
+            async move { crate::keyboard::send_keys(&page_for_keys, &combo_for_keys).await },
+            dialog_runtime.clone(),
+            "send_keys",
+            &expected_target_id,
+        )
+        .await?;
+        if let Some(confirmation) = crate::interaction::dialog_confirmation(
+            &dialog_runtime,
+            &expected_target_id,
+            &fence.dialog_baseline,
+        )
+        .await
+        {
+            return Ok(InteractionOutcome {
+                semantic_class: rub_core::model::InteractionSemanticClass::InvokeWorkflow,
+                element_verified: false,
+                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+                confirmation: Some(confirmation),
+            });
+        }
+        if matches!(
+            fence.fence,
+            crate::interaction::ActuationFence::DialogOpened
+        ) {
+            return Ok(InteractionOutcome {
+                semantic_class: rub_core::model::InteractionSemanticClass::InvokeWorkflow,
+                element_verified: false,
+                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+                confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
+            });
+        }
+        if matches!(
+            fence.fence,
+            crate::interaction::ActuationFence::Indeterminate
+        ) {
+            return Ok(InteractionOutcome {
+                semantic_class: rub_core::model::InteractionSemanticClass::InvokeWorkflow,
+                element_verified: false,
+                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+                confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
+                    "send_keys",
+                )),
+            });
+        }
+        let confirmation = crate::interaction::confirm_key_combo(
+            &page,
+            baseline,
+            &dialog_runtime,
+            &fence.dialog_baseline,
+        )
+        .await;
+        Ok(InteractionOutcome {
+            semantic_class: rub_core::model::InteractionSemanticClass::InvokeWorkflow,
+            element_verified: false,
+            actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+            confirmation: Some(confirmation),
+        })
+    }
+
+    async fn send_keys_in_frame(
+        &self,
+        frame_id: Option<&str>,
+        combo: &KeyCombo,
+    ) -> Result<InteractionOutcome, RubError> {
+        let page = self.manager.page().await?;
+        let dialog_runtime = self.manager.dialog_runtime();
+        let expected_target_id = page.target_id().as_ref().to_string();
+        let frame_context = crate::frame_runtime::resolve_frame_context(&page, frame_id).await?;
+        let context_id = frame_context.execution_context_id;
+        crate::interaction::ensure_frame_owns_page_global_keyboard_focus(&page, context_id).await?;
+        let baseline =
+            crate::interaction::capture_active_interaction_baseline_in_context(&page, context_id)
+                .await;
+        let page_for_keys = page.clone();
+        let combo_for_keys = combo.clone();
+        let context_id_for_keys = context_id;
+        let fence = crate::interaction::await_actuation_or_dialog(
+            async move {
+                crate::interaction::ensure_frame_owns_page_global_keyboard_focus(
+                    &page_for_keys,
+                    context_id_for_keys,
+                )
+                .await?;
+                crate::keyboard::send_keys(&page_for_keys, &combo_for_keys).await
+            },
+            dialog_runtime.clone(),
+            "send_keys_in_frame",
+            &expected_target_id,
+        )
+        .await?;
+        if let Some(confirmation) = crate::interaction::dialog_confirmation(
+            &dialog_runtime,
+            &expected_target_id,
+            &fence.dialog_baseline,
+        )
+        .await
+        {
+            return Ok(InteractionOutcome {
+                semantic_class: rub_core::model::InteractionSemanticClass::InvokeWorkflow,
+                element_verified: false,
+                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+                confirmation: Some(confirmation),
+            });
+        }
+        if matches!(
+            fence.fence,
+            crate::interaction::ActuationFence::DialogOpened
+        ) {
+            return Ok(InteractionOutcome {
+                semantic_class: rub_core::model::InteractionSemanticClass::InvokeWorkflow,
+                element_verified: false,
+                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+                confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
+            });
+        }
+        if matches!(
+            fence.fence,
+            crate::interaction::ActuationFence::Indeterminate
+        ) {
+            return Ok(InteractionOutcome {
+                semantic_class: rub_core::model::InteractionSemanticClass::InvokeWorkflow,
+                element_verified: false,
+                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+                confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
+                    "send_keys_in_frame",
+                )),
+            });
+        }
+        let confirmation = crate::interaction::confirm_key_combo_in_context(
+            &page,
+            baseline,
+            context_id,
+            &dialog_runtime,
+            &fence.dialog_baseline,
+        )
+        .await;
         Ok(InteractionOutcome {
             semantic_class: rub_core::model::InteractionSemanticClass::InvokeWorkflow,
             element_verified: false,
@@ -197,10 +398,68 @@ impl BrowserPort for ChromiumAdapter {
 
     async fn type_text(&self, text: &str) -> Result<InteractionOutcome, RubError> {
         let page = self.manager.page().await?;
+        let dialog_runtime = self.manager.dialog_runtime();
+        let expected_target_id = page.target_id().as_ref().to_string();
         crate::interaction::ensure_active_text_target_editable(&page).await?;
         let baseline = crate::interaction::capture_active_interaction_baseline(&page).await;
-        crate::keyboard::type_text(&page, text, &self.humanize).await?;
-        let confirmation = crate::interaction::confirm_typed_text(&page, text, baseline).await;
+        let page_for_typing = page.clone();
+        let text_for_typing = text.to_string();
+        let humanize = self.humanize.clone();
+        let fence = crate::interaction::await_actuation_or_dialog(
+            async move {
+                crate::keyboard::type_text(&page_for_typing, &text_for_typing, &humanize).await
+            },
+            dialog_runtime.clone(),
+            "type_text",
+            &expected_target_id,
+        )
+        .await?;
+        if let Some(confirmation) = crate::interaction::dialog_confirmation(
+            &dialog_runtime,
+            &expected_target_id,
+            &fence.dialog_baseline,
+        )
+        .await
+        {
+            return Ok(InteractionOutcome {
+                semantic_class: rub_core::model::InteractionSemanticClass::SetValue,
+                element_verified: false,
+                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+                confirmation: Some(confirmation),
+            });
+        }
+        if matches!(
+            fence.fence,
+            crate::interaction::ActuationFence::DialogOpened
+        ) {
+            return Ok(InteractionOutcome {
+                semantic_class: rub_core::model::InteractionSemanticClass::SetValue,
+                element_verified: false,
+                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+                confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
+            });
+        }
+        if matches!(
+            fence.fence,
+            crate::interaction::ActuationFence::Indeterminate
+        ) {
+            return Ok(InteractionOutcome {
+                semantic_class: rub_core::model::InteractionSemanticClass::SetValue,
+                element_verified: false,
+                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+                confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
+                    "type_text",
+                )),
+            });
+        }
+        let confirmation = crate::interaction::confirm_typed_text(
+            &page,
+            text,
+            baseline,
+            &dialog_runtime,
+            &fence.dialog_baseline,
+        )
+        .await;
         Ok(InteractionOutcome {
             semantic_class: rub_core::model::InteractionSemanticClass::SetValue,
             element_verified: false,
@@ -215,6 +474,8 @@ impl BrowserPort for ChromiumAdapter {
         text: &str,
     ) -> Result<InteractionOutcome, RubError> {
         let page = self.manager.page().await?;
+        let dialog_runtime = self.manager.dialog_runtime();
+        let expected_target_id = page.target_id().as_ref().to_string();
         let frame_context = crate::frame_runtime::resolve_frame_context(&page, frame_id).await?;
         let context_id = frame_context.execution_context_id;
         crate::interaction::ensure_active_text_target_editable_in_context(&page, context_id)
@@ -222,10 +483,79 @@ impl BrowserPort for ChromiumAdapter {
         let baseline =
             crate::interaction::capture_active_interaction_baseline_in_context(&page, context_id)
                 .await;
-        crate::keyboard::type_text(&page, text, &self.humanize).await?;
-        let confirmation =
-            crate::interaction::confirm_typed_text_in_context(&page, text, baseline, context_id)
-                .await;
+        let page_for_typing = page.clone();
+        let text_for_typing = text.to_string();
+        let humanize = self.humanize.clone();
+        let context_id_for_typing = context_id;
+        let fence = crate::interaction::await_actuation_or_dialog(
+            async move {
+                crate::keyboard::focus_pause(&humanize).await;
+                crate::keyboard::type_text_with_pre_dispatch_guard(
+                    &page_for_typing,
+                    &text_for_typing,
+                    &humanize,
+                    || async {
+                        crate::interaction::ensure_active_text_target_editable_in_context(
+                            &page_for_typing,
+                            context_id_for_typing,
+                        )
+                        .await
+                    },
+                )
+                .await
+            },
+            dialog_runtime.clone(),
+            "type_text_in_frame",
+            &expected_target_id,
+        )
+        .await?;
+        if let Some(confirmation) = crate::interaction::dialog_confirmation(
+            &dialog_runtime,
+            &expected_target_id,
+            &fence.dialog_baseline,
+        )
+        .await
+        {
+            return Ok(InteractionOutcome {
+                semantic_class: rub_core::model::InteractionSemanticClass::SetValue,
+                element_verified: false,
+                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+                confirmation: Some(confirmation),
+            });
+        }
+        if matches!(
+            fence.fence,
+            crate::interaction::ActuationFence::DialogOpened
+        ) {
+            return Ok(InteractionOutcome {
+                semantic_class: rub_core::model::InteractionSemanticClass::SetValue,
+                element_verified: false,
+                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+                confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
+            });
+        }
+        if matches!(
+            fence.fence,
+            crate::interaction::ActuationFence::Indeterminate
+        ) {
+            return Ok(InteractionOutcome {
+                semantic_class: rub_core::model::InteractionSemanticClass::SetValue,
+                element_verified: false,
+                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+                confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
+                    "type_text_in_frame",
+                )),
+            });
+        }
+        let confirmation = crate::interaction::confirm_typed_text_in_context(
+            &page,
+            text,
+            baseline,
+            context_id,
+            &dialog_runtime,
+            &fence.dialog_baseline,
+        )
+        .await;
         Ok(InteractionOutcome {
             semantic_class: rub_core::model::InteractionSemanticClass::SetValue,
             element_verified: false,
@@ -240,8 +570,10 @@ impl BrowserPort for ChromiumAdapter {
         text: &str,
         clear: bool,
     ) -> Result<InteractionOutcome, RubError> {
-        let page = self.manager.page().await?;
-        crate::controls::type_into(&page, element, text, clear, &self.humanize).await
+        let page = page_for_element_authority(self, element).await?;
+        let dialog_runtime = self.manager.dialog_runtime();
+        crate::controls::type_into(&page, element, text, clear, &self.humanize, &dialog_runtime)
+            .await
     }
 
     async fn wait_for(&self, condition: &WaitCondition) -> Result<(), RubError> {
@@ -272,17 +604,17 @@ impl BrowserPort for ChromiumAdapter {
     }
 
     async fn get_text(&self, element: &Element) -> Result<String, RubError> {
-        let page = self.manager.page().await?;
+        let page = page_for_element_authority(self, element).await?;
         crate::inspect::get_text(&page, element).await
     }
 
     async fn get_outer_html(&self, element: &Element) -> Result<String, RubError> {
-        let page = self.manager.page().await?;
+        let page = page_for_element_authority(self, element).await?;
         crate::inspect::get_outer_html(&page, element).await
     }
 
     async fn get_value(&self, element: &Element) -> Result<String, RubError> {
-        let page = self.manager.page().await?;
+        let page = page_for_element_authority(self, element).await?;
         crate::inspect::get_value(&page, element).await
     }
 
@@ -290,12 +622,12 @@ impl BrowserPort for ChromiumAdapter {
         &self,
         element: &Element,
     ) -> Result<std::collections::HashMap<String, String>, RubError> {
-        let page = self.manager.page().await?;
+        let page = page_for_element_authority(self, element).await?;
         crate::inspect::get_attributes(&page, element).await
     }
 
     async fn get_bbox(&self, element: &Element) -> Result<BoundingBox, RubError> {
-        let page = self.manager.page().await?;
+        let page = page_for_element_authority(self, element).await?;
         crate::inspect::get_bbox(&page, element).await
     }
 
@@ -393,7 +725,7 @@ impl BrowserPort for ChromiumAdapter {
         snapshot: &Snapshot,
         selector: &str,
     ) -> Result<Vec<Element>, RubError> {
-        let page = self.manager.page().await?;
+        let page = page_for_snapshot_authority(self, snapshot).await?;
         crate::inspect::find_snapshot_elements_by_selector(&page, snapshot, selector).await
     }
 
@@ -402,7 +734,7 @@ impl BrowserPort for ChromiumAdapter {
         snapshot: &Snapshot,
         elements: &[Element],
     ) -> Result<Vec<Element>, RubError> {
-        let page = self.manager.page().await?;
+        let page = page_for_snapshot_authority(self, snapshot).await?;
         crate::targeting::filter_snapshot_elements_by_hit_test(&page, snapshot, elements).await
     }
 
@@ -411,7 +743,7 @@ impl BrowserPort for ChromiumAdapter {
         snapshot: &Snapshot,
         scope: &ObservationScope,
     ) -> Result<(Vec<Element>, u32), RubError> {
-        let page = self.manager.page().await?;
+        let page = page_for_snapshot_authority(self, snapshot).await?;
         crate::observation_scope::find_snapshot_elements_in_observation_scope(
             &page, snapshot, scope,
         )
@@ -434,7 +766,7 @@ impl BrowserPort for ChromiumAdapter {
     }
 
     async fn hover(&self, element: &Element) -> Result<InteractionOutcome, RubError> {
-        let page = self.manager.page().await?;
+        let page = page_for_element_authority(self, element).await?;
         crate::gestures::hover(&page, element, &self.humanize).await
     }
 
@@ -451,13 +783,13 @@ impl BrowserPort for ChromiumAdapter {
     }
 
     async fn dblclick(&self, element: &Element) -> Result<InteractionOutcome, RubError> {
-        let page = self.manager.page().await?;
+        let page = page_for_element_authority(self, element).await?;
         let dialog_runtime = self.manager.dialog_runtime();
         crate::gestures::dblclick(&page, element, &self.humanize, &dialog_runtime).await
     }
 
     async fn rightclick(&self, element: &Element) -> Result<InteractionOutcome, RubError> {
-        let page = self.manager.page().await?;
+        let page = page_for_element_authority(self, element).await?;
         let dialog_runtime = self.manager.dialog_runtime();
         crate::gestures::rightclick(&page, element, &self.humanize, &dialog_runtime).await
     }
@@ -543,8 +875,9 @@ impl BrowserPort for ChromiumAdapter {
         element: &Element,
         path: &str,
     ) -> Result<InteractionOutcome, RubError> {
-        let page = self.manager.page().await?;
-        crate::controls::upload_file(&page, element, path).await
+        let page = page_for_element_authority(self, element).await?;
+        let dialog_runtime = self.manager.dialog_runtime();
+        crate::controls::upload_file(&page, element, path, &dialog_runtime).await
     }
 
     async fn select_option(
@@ -552,8 +885,9 @@ impl BrowserPort for ChromiumAdapter {
         element: &Element,
         value: &str,
     ) -> Result<SelectOutcome, RubError> {
-        let page = self.manager.page().await?;
-        crate::controls::select_option(&page, element, value).await
+        let page = page_for_element_authority(self, element).await?;
+        let dialog_runtime = self.manager.dialog_runtime();
+        crate::controls::select_option(&page, element, value, &dialog_runtime).await
     }
 
     async fn snapshot_with_a11y(&self, limit: Option<u32>) -> Result<Snapshot, RubError> {
@@ -578,7 +912,7 @@ impl BrowserPort for ChromiumAdapter {
     }
 
     async fn highlight_elements(&self, snapshot: &Snapshot) -> Result<u32, RubError> {
-        let page = self.manager.page().await?;
+        let page = page_for_snapshot_authority(self, snapshot).await?;
         crate::page::highlight_elements(&page, snapshot).await
     }
 
