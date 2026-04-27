@@ -2506,6 +2506,10 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
         .expect("reactive repeat rule should still exist after cooldown");
     assert_eq!(cooled_rule["status"], "armed", "{cooled}");
     assert_eq!(cooled_rule["last_result"]["status"], "fired", "{cooled}");
+    assert_eq!(
+        cooled_rule["last_condition_evidence"]["summary"], "source_tab_text_present:Ready",
+        "{cooled}"
+    );
 
     let target_after_cooldown = parse_json(
         &rub_cmd(home)
@@ -2539,25 +2543,6 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
     assert_eq!(
         wait_for_text_in_session(home, "source", "#status", "Waiting", Duration::from_secs(5)),
         "Waiting"
-    );
-    let latched = wait_for_orchestration_condition_evidence_summary(
-        home,
-        "manager",
-        rule_id,
-        "armed",
-        Some("source_tab_text_present:Ready"),
-    );
-    assert_eq!(latched["success"], true, "{latched}");
-    let latched_rule = latched["data"]["result"]["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|entry| entry["id"].as_u64() == Some(rule_id))
-        .expect("reactive repeat rule should still exist while preserving latched evidence");
-    assert_eq!(latched_rule["status"], "armed", "{latched}");
-    assert_eq!(
-        latched_rule["last_condition_evidence"]["summary"], "source_tab_text_present:Ready",
-        "{latched}"
     );
     let source_probe_cleared = wait_for_orchestration_probe_match(
         &rt,

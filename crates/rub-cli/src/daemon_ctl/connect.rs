@@ -781,12 +781,9 @@ async fn detect_or_connect_hardened_with_budget(
                         "session_socket_candidates",
                     )?;
                 }
-                if authority_entry.is_some()
+                if let Some(entry) = authority_entry.as_ref()
                     && handshake_requires_protocol_compatibility_fence(&handshake)
                 {
-                    let entry = authority_entry
-                        .as_ref()
-                        .expect("authority entry must exist for hard-cut upgrade fencing");
                     verify_socket_path_identity(
                         &socket_path,
                         handshake_socket_identity,

@@ -218,7 +218,7 @@ pub fn unique_home() -> String {
         .unwrap_or_else(|_| std::env::temp_dir());
     let home = temp_root
         .join(format!(
-            "rub-e2e-{}-{}",
+            "rub-temp-owned-e2e-{}-{}",
             std::process::id(),
             uuid::Uuid::now_v7()
         ))

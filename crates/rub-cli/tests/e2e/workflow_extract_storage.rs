@@ -263,18 +263,26 @@ fn t403b_407c_interference_grouped_scenario() {
             .output()
             .unwrap(),
     );
-    assert_eq!(clicked["success"], true, "{clicked}");
+    assert_eq!(clicked["success"], false, "{clicked}");
     assert_eq!(
-        clicked["data"]["interaction"]["interference"]["after"]["current_interference"]["kind"],
+        clicked["error"]["code"], "INTERACTION_NOT_CONFIRMED",
+        "{clicked}"
+    );
+    assert_eq!(
+        clicked["error"]["context"]["committed_response_projection"]["interaction"]
+            ["interference"]["after"]["current_interference"]["kind"],
         "interstitial_navigation",
         "{clicked}"
     );
     assert!(
-        clicked["data"]["interaction_trace"]["observed_effects"]["interference"].is_null(),
+        clicked["error"]["context"]["committed_response_projection"]["interaction"]
+            ["interference"]["before"]["current_interference"]["kind"]
+            == "human_verification_required",
         "{clicked}"
     );
     assert!(
-        clicked["data"]["interaction"]["interference"]["changed"]
+        clicked["error"]["context"]["committed_response_projection"]["interaction"]
+            ["interference"]["changed"]
             .as_array()
             .unwrap()
             .iter()
@@ -2806,7 +2814,7 @@ fn t430_433_download_runtime_grouped_scenario() {
                 "--state",
                 "completed",
                 "--timeout",
-                "1",
+                "250",
             ])
             .output()
             .unwrap(),

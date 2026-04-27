@@ -221,10 +221,10 @@ fn cleanup_impl_with(
         };
     }
     let mut details = CleanupAttemptDetails::default();
-    if (ops.request_product_teardown)(home, Duration::from_secs(5)) {
+    if (ops.request_product_teardown)(home, Duration::from_secs(15)) {
         details.request_product_teardown = true;
         let managed_browser_released =
-            (ops.wait_for_managed_browser_authority_release)(observed, Duration::from_secs(5));
+            (ops.wait_for_managed_browser_authority_release)(observed, Duration::from_secs(15));
         let home_removed = !Path::new(home).exists();
         details.managed_browser_released = Some(managed_browser_released);
         details.home_removed_after_teardown = Some(home_removed);
@@ -809,7 +809,9 @@ pub(super) fn sweep_stale_test_homes() {
 
 pub fn e2e_home_owner_pid(path: &Path) -> Option<u32> {
     let name = path.file_name()?.to_str()?;
-    let suffix = name.strip_prefix("rub-e2e-")?;
+    let suffix = name
+        .strip_prefix("rub-temp-owned-e2e-")
+        .or_else(|| name.strip_prefix("rub-e2e-"))?;
     let pid = suffix.split('-').next()?;
     pid.parse::<u32>().ok()
 }

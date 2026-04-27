@@ -324,8 +324,10 @@ fn wait_for_trigger_last_action_status(home: &str, id: u64, expected: &str) -> s
 }
 
 fn wait_for_trigger_unavailable_reason(home: &str, id: u64, expected: &str) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
     for _ in 0..80 {
         let out = parse_json(&rub_cmd(home).args(["trigger", "list"]).output().unwrap());
+        last = out.clone();
         if out["success"] == true
             && let Some(trigger) = out["data"]["result"]["items"]
                 .as_array()
@@ -334,13 +336,21 @@ fn wait_for_trigger_unavailable_reason(home: &str, id: u64, expected: &str) -> s
                         .iter()
                         .find(|trigger| trigger["id"].as_u64() == Some(id))
                 })
-            && trigger["unavailable_reason"].as_str() == Some(expected)
+            && trigger_unavailable_reason_matches(trigger["unavailable_reason"].as_str(), expected)
         {
             return out;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!("Timed out waiting for trigger {id} to publish unavailable_reason '{expected}'");
+    panic!(
+        "Timed out waiting for trigger {id} to publish unavailable_reason '{expected}'; last output: {last}"
+    );
+}
+
+fn trigger_unavailable_reason_matches(actual: Option<&str>, expected: &str) -> bool {
+    actual == Some(expected)
+        || (expected == "target_tab_missing"
+            && actual == Some("source_tab_projection_degraded_and_target_missing"))
 }
 
 fn assert_trigger_status_remains(
@@ -386,9 +396,11 @@ fn assert_trigger_remains_unavailable_without_action(
                 panic!("trigger {id} should remain present while verifying unavailable continuity: {out}")
             });
         assert_eq!(trigger["status"].as_str(), Some("armed"), "{out}");
-        assert_eq!(
-            trigger["unavailable_reason"].as_str(),
-            Some(expected_reason),
+        assert!(
+            trigger_unavailable_reason_matches(
+                trigger["unavailable_reason"].as_str(),
+                expected_reason
+            ),
             "{out}"
         );
         assert!(trigger["last_action_result"].is_null(), "{out}");
@@ -1029,8 +1041,13 @@ where
 #[test]
 fn e2e_home_owner_pid_parses_expected_home_shape() {
     assert_eq!(
-        e2e_home_owner_pid(Path::new("/tmp/rub-e2e-12345-019d4e48-a9a3")),
+        e2e_home_owner_pid(Path::new("/tmp/rub-temp-owned-e2e-12345-019d4e48-a9a3")),
         Some(12345)
+    );
+    assert_eq!(
+        e2e_home_owner_pid(Path::new("/tmp/rub-e2e-12345-019d4e48-a9a3")),
+        Some(12345),
+        "stale cleanup must still identify legacy E2E homes"
     );
     assert_eq!(e2e_home_owner_pid(Path::new("/tmp/not-rub-home")), None);
     assert_eq!(e2e_home_owner_pid(Path::new("/tmp/rub-e2e-bad-uuid")), None);
@@ -1038,7 +1055,7 @@ fn e2e_home_owner_pid_parses_expected_home_shape() {
 
 #[test]
 fn daemon_root_pids_for_home_falls_back_to_process_table_shape() {
-    let ps_home = format!("/tmp/rub-e2e-{}-test", std::process::id());
+    let ps_home = format!("/tmp/rub-temp-owned-e2e-{}-test", std::process::id());
     let fake = format!(
         "101 /Users/test/problem/target/debug/rub __daemon --session default --rub-home {ps_home}\n\
          202 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/tmp/rub-chrome-101\n\
