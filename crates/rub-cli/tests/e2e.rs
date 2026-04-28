@@ -142,9 +142,30 @@ fn wait_for_no_live_sessions_with_timeout(home: &str, timeout: Duration) -> serd
 }
 
 fn teardown_and_cleanup(home: &str) {
-    let torn_down = parse_json(&rub_cmd(home).arg("teardown").output().unwrap());
+    let torn_down = parse_json(
+        &rub_cmd(home)
+            .args(["--timeout", "90000", "teardown"])
+            .output()
+            .unwrap(),
+    );
     assert_eq!(torn_down["success"], true, "{torn_down}");
     cleanup(home);
+}
+
+fn remove_orchestration_rule(home: &str, session: &str, rule_id: u64) {
+    let removed = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                session,
+                "orchestration",
+                "remove",
+                &rule_id.to_string(),
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(removed["success"], true, "{removed}");
 }
 
 fn bind_current_and_remember_alias(

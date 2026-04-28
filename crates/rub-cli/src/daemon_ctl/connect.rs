@@ -31,6 +31,10 @@ pub(crate) struct SocketPathIdentity {
     dev: u64,
     #[cfg(unix)]
     ino: u64,
+    #[cfg(unix)]
+    ctime_sec: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
 }
 
 pub(crate) struct AuthorityBoundConnectSpec<'a> {
@@ -211,6 +215,8 @@ pub(crate) fn current_socket_path_identity(
     Ok(Some(SocketPathIdentity {
         dev: metadata.dev(),
         ino: metadata.ino(),
+        ctime_sec: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
     }))
 }
 

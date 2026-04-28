@@ -738,6 +738,7 @@ fn t437o_p_orchestration_execute_grouped_scenario() {
     let rule_id = added["data"]["result"]["rule"]["id"]
         .as_u64()
         .expect("orchestration rule id should be present");
+    let fired_rule_id = rule_id;
     let rule_id_arg = rule_id.to_string();
 
     let executed = parse_json(
@@ -987,6 +988,8 @@ fn t437o_p_orchestration_execute_grouped_scenario() {
         "{inspected_value}"
     );
 
+    remove_orchestration_rule(home, "source", fired_rule_id);
+    remove_orchestration_rule(home, "source", rule_id);
     teardown_and_cleanup(home);
 }
 
@@ -1025,7 +1028,7 @@ fn t437q_r_pipe_workflow_and_history_export_grouped_scenario() {
 <html>
 <head><title>Orchestration Source</title></head>
 <body>
-  <div id="status">Ready</div>
+  <div id="status">Idle</div>
 </body>
 </html>"#,
         ),
@@ -1199,7 +1202,7 @@ fn t437q_r_pipe_workflow_and_history_export_grouped_scenario() {
             "mode": "once",
             "condition": {
                 "kind": "text_present",
-                "text": "Ready"
+                "text": "ManualReady"
             },
             "actions": [
                 {
@@ -1947,6 +1950,8 @@ fn t437aa_ab_orchestration_assets_and_embedded_watch_grouped_scenario() {
         "{inspected}"
     );
 
+    remove_orchestration_rule(home, "source", 2);
+    remove_orchestration_rule(home, "source", rule_id.into());
     teardown_and_cleanup(home);
 }
 
@@ -2151,6 +2156,9 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
         .as_u64()
         .expect("repeat orchestration rule id should be present")
         .to_string();
+    let repeat_rule_id = rule_id
+        .parse::<u64>()
+        .expect("repeat orchestration rule id should stay numeric");
 
     let arm_source = parse_json(
         &rub_cmd(home)
@@ -2630,6 +2638,8 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
         .count();
     assert_eq!(fired_count, 2, "{trace}");
 
+    remove_orchestration_rule(home, "manager", rule_id);
+    remove_orchestration_rule(home, "repeat", repeat_rule_id);
     teardown_and_cleanup(home);
 }
 

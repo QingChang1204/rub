@@ -6,6 +6,95 @@ use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+fn external_cdp_http_request(cdp_origin: &str, method: &str, path: &str) -> Option<String> {
+    use std::io::{ErrorKind, Read};
+
+    let addr = cdp_origin.trim_start_matches("http://");
+    let mut stream = TcpStream::connect(addr).ok()?;
+    let timeout = Duration::from_secs(2);
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&chunk[..read]),
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                break;
+            }
+            Err(_) => return None,
+        }
+    }
+    let response = String::from_utf8_lossy(&response).into_owned();
+    if !response.contains(" 200 ") {
+        return None;
+    }
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+}
+
+fn external_cdp_page_target_id(cdp_origin: &str, title: &str) -> Option<String> {
+    let body = external_cdp_http_request(cdp_origin, "GET", "/json/list")?;
+    let targets: serde_json::Value = serde_json::from_str(&body).ok()?;
+    targets.as_array()?.iter().find_map(|target| {
+        (target["type"].as_str() == Some("page") && target["title"].as_str() == Some(title))
+            .then(|| target["id"].as_str().map(str::to_string))
+            .flatten()
+    })
+}
+
+fn open_external_cdp_page(cdp_origin: &str, url: &str) -> Option<String> {
+    let body = external_cdp_http_request(
+        cdp_origin,
+        "PUT",
+        &format!("/json/new?{}", percent_encode_url_component(url)),
+    )?;
+    let target: serde_json::Value = serde_json::from_str(&body).ok()?;
+    target["id"].as_str().map(str::to_string)
+}
+
+fn percent_encode_url_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn activate_external_cdp_page(cdp_origin: &str, target_id: &str) -> bool {
+    external_cdp_http_request(cdp_origin, "PUT", &format!("/json/activate/{target_id}")).is_some()
+}
+
+fn ensure_external_cdp_page_active(cdp_origin: &str, url: &str, title: &str, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_target_id = None;
+    while std::time::Instant::now() < deadline {
+        let target_id = external_cdp_page_target_id(cdp_origin, title)
+            .or_else(|| open_external_cdp_page(cdp_origin, url));
+        if let Some(target_id) = target_id {
+            last_target_id = Some(target_id.clone());
+            if activate_external_cdp_page(cdp_origin, &target_id) {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "Timed out preparing external CDP page authority for title {title}; last_target_id={last_target_id:?}"
+    );
+}
+
 fn inject_replay_failing_batch_close_session(
     home: &str,
     session_name: &str,
@@ -2528,6 +2617,13 @@ fn t310a_external_attach_accepts_multi_tab_browser_with_unique_active_tab_author
     };
     let home = unique_home();
     prepare_home(&home);
+    let external_two_url = server.url_for("/external-two");
+    ensure_external_cdp_page_active(
+        &cdp_origin,
+        &external_two_url,
+        "External Two",
+        Duration::from_secs(10),
+    );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let state = loop {

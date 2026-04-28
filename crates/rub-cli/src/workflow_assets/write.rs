@@ -243,7 +243,7 @@ fn asset_write_error_at_path(
         ("reason".to_string(), json!(reason)),
     ]);
     if let Some(authority_path) = authority_path
-        && authority_path != path
+        && (authority_path != path || reason == "workflow_asset_duplicate_export_path")
     {
         context.insert(
             "authority_path".to_string(),
