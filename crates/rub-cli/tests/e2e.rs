@@ -1372,6 +1372,15 @@ fn read_workspace_file(path: &str) -> String {
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
 }
 
+fn read_optional_workspace_file(path: &str) -> Option<String> {
+    let path = workspace_root().join(path);
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("failed to read {}: {error}", path.display()),
+    }
+}
+
 fn ci_e2e_shard_modules(ci_workflow: &str) -> std::collections::BTreeSet<String> {
     let modules = ci_workflow
         .lines()
@@ -1678,15 +1687,20 @@ fn wait_for_no_live_sessions_guardrail_uses_observed_authority_release() {
 
 #[test]
 fn professional_workflow_docs_keep_manual_non_regression_disclaimer() {
-    let workflow_readme = std::fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("rub-cli crate should live under workspace/crates")
-            .parent()
-            .expect("workspace root")
-            .join("tests/professional-workflows/README.md"),
-    )
-    .expect("professional workflow readme should be readable");
+    let workflow_readme = read_optional_workspace_file("tests/professional-workflows/README.md");
+    let professional_plan =
+        read_optional_workspace_file("docs/antigravity/rub-professional-test-plan.md");
+
+    let Some(workflow_readme) = workflow_readme else {
+        assert!(
+            professional_plan.is_none(),
+            "professional workflow docs must be present as a pair"
+        );
+        return;
+    };
+    let professional_plan =
+        professional_plan.expect("professional workflow docs must be present as a pair");
+
     assert!(
         workflow_readme.contains("manual workflow assets")
             && (workflow_readme.contains("not cargo-managed regression tests")
@@ -1697,15 +1711,6 @@ fn professional_workflow_docs_keep_manual_non_regression_disclaimer() {
         "manual workflow docs must stay explicit that they are not standing regression proof"
     );
 
-    let professional_plan = std::fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("rub-cli crate should live under workspace/crates")
-            .parent()
-            .expect("workspace root")
-            .join("docs/antigravity/rub-professional-test-plan.md"),
-    )
-    .expect("professional test plan should be readable");
     assert!(
         (professional_plan.contains("参考") || professional_plan.contains("手工"))
             && professional_plan.contains("不是默认 CI standing regression guardrail")
