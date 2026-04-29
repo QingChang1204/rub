@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 use rub_core::model::OrchestrationSessionInfo;
+use rub_core::recovery_contract::target_replay_or_spent_tombstone_contract;
 use rub_ipc::client::{IpcClient, IpcClientError};
 use rub_ipc::protocol::{IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse, ResponseStatus};
 use serde::de::DeserializeOwned;
@@ -604,12 +605,10 @@ fn orchestration_dispatch_context(
         "daemon_session_id": failure.daemon_session_id,
         "session_id": failure.session.session_id,
         "session_name": failure.session.session_name,
-        "possible_commit_recovery_contract": {
-            "kind": "target_replay_or_spent_tombstone",
-            "target_command_id": failure.command_id,
-            "target_daemon_session_id": failure.daemon_session_id,
-            "retry_requires_same_command_id": failure.command_id.is_some(),
-        },
+        "possible_commit_recovery_contract": target_replay_or_spent_tombstone_contract(
+            failure.command_id,
+            failure.daemon_session_id,
+        ),
     });
     extend_orchestration_session_path_context(&mut context, failure.session);
     if let Some(context_object) = context.as_object_mut() {

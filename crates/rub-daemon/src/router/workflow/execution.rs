@@ -23,6 +23,7 @@ use crate::router::timeout_projection::{
     record_workflow_pending_step_timeout_projection,
 };
 use rub_core::error::{ErrorEnvelope, RubError};
+use rub_core::recovery_contract::partial_commit_steps_contract;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OrchestrationMetadataInheritancePolicy {
@@ -272,12 +273,7 @@ fn fill_step_error(
             "rollback_attempted": false,
             "rollback_failed": false,
             "source_error": workflow_error_projection(&source),
-            "recovery_contract": {
-                "kind": "partial_commit",
-                "committed_steps_authoritative": true,
-                "rollback_available": false,
-                "resume_from_failed_step_supported": false,
-            },
+            "recovery_contract": partial_commit_steps_contract(),
         },
         "steps": steps,
     });

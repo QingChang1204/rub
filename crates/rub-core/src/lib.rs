@@ -9,6 +9,7 @@ pub mod model;
 pub mod observation;
 pub mod port;
 pub mod process;
+pub mod recovery_contract;
 pub mod secrets_env;
 pub mod storage;
 

@@ -8,6 +8,7 @@ use super::super::wait_after::validate_wait_after_args_if_requested;
 use super::super::*;
 use rub_core::command::CommandName;
 use rub_core::error::{ErrorCode, RubError};
+use rub_core::recovery_contract::same_epoch_viewport_side_effect_contract;
 
 pub(super) async fn dispatch_named_command(
     router: &DaemonRouter,
@@ -294,17 +295,7 @@ fn merge_same_epoch_viewport_side_effect_context(
     existing: Option<serde_json::Value>,
     command: &str,
 ) -> Option<serde_json::Value> {
-    let side_effect = serde_json::json!({
-        "command": command,
-        "effect_commit_state": "possible_commit",
-        "cache_fence": "snapshot_cache_cleared",
-        "fallback_authority": "live_viewport_state",
-        "recovery_contract": {
-            "kind": "viewport_side_effect_possible_commit",
-            "fresh_snapshot_required": true,
-            "fresh_command_retry_safe": false,
-        },
-    });
+    let side_effect = same_epoch_viewport_side_effect_contract(command);
     match existing {
         Some(serde_json::Value::Object(mut object)) => {
             object.insert("same_epoch_viewport_side_effect".to_string(), side_effect);

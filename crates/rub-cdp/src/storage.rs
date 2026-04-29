@@ -4,6 +4,9 @@ use std::sync::Arc;
 use chromiumoxide::Page;
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::FrameContextInfo;
+use rub_core::recovery_contract::{
+    STORAGE_RECENT_MUTATIONS_AUTHORITY, storage_mutation_partial_commit_projection,
+};
 use rub_core::storage::{StorageArea, StorageSnapshot};
 use serde::{Deserialize, Serialize};
 
@@ -198,13 +201,9 @@ fn storage_payload_error(
         "current_origin": current_origin,
         "operation_kind": operation_kind,
         "storage_mutation_committed": mutation_committed,
-        "partial_commit": mutation_committed.then(|| serde_json::json!({
-            "kind": "storage_mutation",
-            "recovery_contract": {
-                "kind": "partial_commit",
-                "authoritative_surface": "storage_runtime.recent_mutations",
-            },
-        })),
+        "partial_commit": mutation_committed.then(|| {
+            storage_mutation_partial_commit_projection(STORAGE_RECENT_MUTATIONS_AUTHORITY)
+        }),
         "storage_error": error,
     });
 
@@ -343,13 +342,9 @@ fn storage_frame_authority_drift_error(drift: StorageFrameAuthorityDrift<'_>) ->
             "current_origin": drift.current_origin,
             "operation_kind": drift.operation_kind,
             "storage_mutation_committed": drift.mutation_committed,
-            "partial_commit": drift.mutation_committed.then(|| serde_json::json!({
-                "kind": "storage_mutation",
-                "recovery_contract": {
-                    "kind": "partial_commit",
-                    "authoritative_surface": "storage_runtime.recent_mutations",
-                },
-            })),
+            "partial_commit": drift.mutation_committed.then(|| {
+                storage_mutation_partial_commit_projection(STORAGE_RECENT_MUTATIONS_AUTHORITY)
+            }),
             "authority_error": drift.authority_error.map(|error| error.into_envelope()),
         }),
     )

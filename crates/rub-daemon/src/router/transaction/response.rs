@@ -4,6 +4,7 @@ use tracing::warn;
 
 use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
 use rub_core::model::Timing;
+use rub_core::recovery_contract::already_executed_response_evicted_do_not_rerun_contract;
 use rub_ipc::codec::{MAX_FRAME_BYTES, encoded_frame_len};
 use rub_ipc::protocol::{IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse};
 
@@ -334,7 +335,7 @@ pub(crate) fn replay_spent_response_evicted_response(
             "reason": "replay_command_id_already_spent_original_response_evicted",
             "original_response_retained": false,
             "safe_to_rerun": false,
-            "recovery_contract": "already_executed_response_evicted_do_not_rerun",
+            "recovery_contract": already_executed_response_evicted_do_not_rerun_contract(),
         })),
     )
 }

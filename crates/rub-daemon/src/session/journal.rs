@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::os::unix::fs::OpenOptionsExt;
 
 use rub_core::fs::sync_parent_dir;
+use rub_core::recovery_contract::post_commit_journal_recovery_contract;
 use rub_ipc::protocol::{IpcRequest, IpcResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -272,16 +273,7 @@ impl SessionState {
             "authority": "session.post_commit_journal",
             "status": if failure_count == 0 { "active" } else { "degraded" },
             "failure_count": failure_count,
-            "recovery_contract": {
-                "kind": "post_commit_journal_recovery",
-                "daemon_commit_truth_preserved": true,
-                "journal_append_authoritative": failure_count == 0,
-                "operator_action": if failure_count == 0 {
-                    "none"
-                } else {
-                    "inspect daemon logs and runtime post_commit_journal surface before relying on local recovery journal completeness"
-                },
-            },
+            "recovery_contract": post_commit_journal_recovery_contract(failure_count),
         })
     }
 

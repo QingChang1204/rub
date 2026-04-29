@@ -1,8 +1,9 @@
 use rub_core::error::RubError;
+use rub_core::recovery_contract::session_post_commit_journal_recovery_contract;
 use rub_daemon::rub_paths::RubPaths;
 use rub_ipc::client::IpcClient;
 use rub_ipc::protocol::IpcRequest;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::path::Path;
 use std::time::Instant;
 
@@ -129,20 +130,15 @@ impl<'a> ReplaySendLifecycle<'a> {
     fn replay_recovery_context(self, original_daemon_session_id: Option<&str>) -> Option<Value> {
         let original_daemon_session_id = original_daemon_session_id?;
         let surface = self.recovery_surface();
-        Some(json!({
-            "kind": "session_post_commit_journal",
-            "scope": "daemon_rollover_recovery",
-            "session_name": surface.session,
-            "daemon_session_id": original_daemon_session_id,
-            "journal_path": RubPaths::new(surface.rub_home)
+        Some(session_post_commit_journal_recovery_contract(
+            surface.session,
+            original_daemon_session_id,
+            RubPaths::new(surface.rub_home)
                 .session_runtime(surface.session, original_daemon_session_id)
                 .post_commit_journal_path()
                 .display()
                 .to_string(),
-            "reader_contract": "ndjson_post_commit_journal",
-            "committed_truth_may_exist": true,
-            "safe_to_rerun_with_new_command_id": false,
-        }))
+        ))
     }
 
     async fn send(

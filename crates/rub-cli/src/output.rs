@@ -8,6 +8,7 @@ use rub_core::model::{
     CommandResult, InteractionConfirmationStatus, projected_interaction_confirmation_status,
     projected_interaction_effect_success,
 };
+use rub_core::recovery_contract::no_public_recovery_contract;
 use rub_ipc::protocol::IpcResponse;
 use serde_json::{Map, Value, json};
 use std::path::Path;
@@ -232,7 +233,7 @@ fn post_commit_followup_state_json() -> Value {
         "upstream_commit_truth": "daemon_response_committed",
         "control_role": "display_only",
         "durability": "best_effort",
-        "recovery_contract": "no_public_recovery_contract",
+        "recovery_contract": no_public_recovery_contract(),
     })
 }
 
@@ -352,7 +353,7 @@ fn interaction_effect_failure_state_json(
         "upstream_commit_truth": "daemon_response_committed",
         "control_role": "display_only",
         "durability": "best_effort",
-        "recovery_contract": "no_public_recovery_contract",
+        "recovery_contract": no_public_recovery_contract(),
         "confirmation_status": confirmation_status,
     })
 }

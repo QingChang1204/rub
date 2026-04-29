@@ -13,6 +13,9 @@ use crate::router::dispatch::execute_named_command_with_fence;
 use crate::router::request_args::{LocatorParseOptions, parse_canonical_locator};
 use crate::router::timeout_projection::record_mutating_possible_commit_timeout_projection;
 use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
+use rub_core::recovery_contract::{
+    atomic_fill_rollback_contract, fill_atomic_possible_commit_contract,
+};
 
 const ATOMIC_FILL_ROLLBACK_RESERVE_MS_PER_STEP: u64 = 1_000;
 
@@ -212,14 +215,12 @@ fn record_atomic_fill_possible_commit_timeout_projection(
 ) {
     record_mutating_possible_commit_timeout_projection(
         planned.forward_command,
-        serde_json::json!({
-            "kind": "fill_atomic_possible_commit",
-            "step_index": planned.step_index,
-            "committed_step_indices": committed_indices,
-            "rollback_required": true,
-            "rollback_command": planned.rollback_command,
-            "rollback_class": planned.rollback_class,
-        }),
+        fill_atomic_possible_commit_contract(
+            planned.step_index,
+            committed_indices,
+            planned.rollback_command,
+            planned.rollback_class,
+        ),
     );
 }
 
@@ -578,7 +579,7 @@ fn atomic_fill_failure_from_source(
                 "rollback_attempted": true,
                 "rollback_failed": rollback.is_err(),
                 "source_error": project_atomic_error(&envelope),
-                "recovery_contract": atomic_fill_recovery_contract(rollback.is_err()),
+                "recovery_contract": atomic_fill_rollback_contract(rollback.is_err()),
             }),
         ),
         (
@@ -590,19 +591,6 @@ fn atomic_fill_failure_from_source(
         context.insert("rollback_errors".to_string(), serde_json::json!(errors));
     }
     RubError::domain_with_context(envelope.code, message, serde_json::Value::Object(context))
-}
-
-fn atomic_fill_recovery_contract(rollback_failed: bool) -> serde_json::Value {
-    serde_json::json!({
-        "kind": "atomic_fill_rollback",
-        "rollback_authority": "fill_atomic",
-        "rollback_result_authoritative": true,
-        "rollback_committed": !rollback_failed,
-        "rollback_failed": rollback_failed,
-        "steps_authoritative": true,
-        "retry_same_command_safe": false,
-        "resume_from_failed_step_supported": false,
-    })
 }
 
 fn atomic_plan_requires_a11y(steps: &[FillStepSpec], submit: &SubmitLocatorArgs) -> bool {

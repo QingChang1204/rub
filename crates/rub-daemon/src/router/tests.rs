@@ -1324,6 +1324,15 @@ async fn replay_after_execution_started_and_response_eviction_fails_closed() {
             .and_then(|value| value.as_str()),
         Some("replay_command_id_already_spent_original_response_evicted")
     );
+    assert_eq!(
+        replay
+            .error
+            .as_ref()
+            .and_then(|error| error.context.as_ref())
+            .and_then(|context| context.get("recovery_contract"))
+            .and_then(|value| value.as_str()),
+        Some("already_executed_response_evicted_do_not_rerun")
+    );
 }
 
 #[tokio::test]

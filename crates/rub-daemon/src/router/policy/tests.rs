@@ -1,4 +1,4 @@
-use rub_core::command::CommandName;
+use rub_core::command::{CommandName, DomEpochPolicy};
 
 use super::{
     command_allowed_during_handoff, command_increments_epoch,
@@ -9,26 +9,43 @@ use super::{
 /// These are multi-step commands that need epoch context for
 /// downstream snapshot association but do not themselves mutate the DOM.
 fn command_reads_epoch(command: &str) -> bool {
-    matches!(command, "scroll" | "fill" | "_trigger_fill")
+    CommandName::parse(command).is_some_and(|name| {
+        matches!(
+            name.metadata().dom_epoch_policy,
+            DomEpochPolicy::InvalidateSnapshotWithoutBump
+        )
+    })
+}
+
+/// Commands with argument-dependent epoch behavior. These do not increment or
+/// read epoch for every invocation, but specific args may bump or invalidate.
+fn command_has_args_dependent_epoch_policy(command: &str) -> bool {
+    CommandName::parse(command).is_some_and(|name| {
+        matches!(
+            name.metadata().dom_epoch_policy,
+            DomEpochPolicy::ArgsDependent
+        )
+    })
 }
 
 /// Commands classified as pure query: no epoch interaction.
 /// Internal commands are always query-only.
 fn command_is_epoch_neutral(command: &str) -> bool {
-    !command_increments_epoch(command) && !command_reads_epoch(command)
+    !command_increments_epoch(command)
+        && !command_reads_epoch(command)
+        && !command_has_args_dependent_epoch_policy(command)
 }
 
 /// **Regression guard**: every known CommandName wire string must be
 /// explicitly classified into exactly one epoch category:
 ///   (A) increments epoch  ← `command_increments_epoch`
 ///   (B) reads epoch       ← "scroll" | "fill" | "_trigger_fill"
-///   (C) epoch-neutral     ← all others
+///   (C) args-dependent    ← "find" | "extract" | "dialog"
+///   (D) epoch-neutral     ← all others
 ///
-/// The three categories are mutually exclusive by construction.
-/// Adding a new command to CommandName without updating policy.rs
-/// will cause (C) to silently apply — this test documents what the
-/// developer *intended* for every command, making that silent drift
-/// visible in PR review.
+/// The categories are mutually exclusive by construction. Adding a new
+/// command to CommandName without selecting a manifest policy will make this
+/// test document and verify the default explicitly.
 #[test]
 fn epoch_classification_is_exhaustive_over_all_known_commands() {
     let epoch_incrementing = [
@@ -49,6 +66,8 @@ fn epoch_classification_is_exhaustive_over_all_known_commands() {
 
     let epoch_reading = ["scroll", "fill", "_trigger_fill"];
 
+    let epoch_args_dependent = ["find", "extract", "dialog"];
+
     let epoch_neutral = [
         "_handshake",
         "_upgrade_check",
@@ -62,11 +81,9 @@ fn epoch_classification_is_exhaustive_over_all_known_commands() {
         "state",
         "pipe",
         "_trigger_pipe",
-        "extract",
         "observe",
         "orchestration",
         "inspect",
-        "find",
         "screenshot",
         "doctor",
         "runtime",
@@ -78,7 +95,6 @@ fn epoch_classification_is_exhaustive_over_all_known_commands() {
         "storage",
         "handoff",
         "takeover",
-        "dialog",
         "intercept",
         "interference",
         "close",
@@ -112,6 +128,17 @@ fn epoch_classification_is_exhaustive_over_all_known_commands() {
         );
     }
 
+    for cmd in epoch_args_dependent {
+        assert!(
+            command_has_args_dependent_epoch_policy(cmd),
+            "Expected '{cmd}' to use args-dependent epoch policy"
+        );
+        assert!(
+            !command_increments_epoch(cmd) && !command_reads_epoch(cmd),
+            "'{cmd}' has args-dependent epoch policy and must not be unconditional"
+        );
+    }
+
     for cmd in epoch_neutral {
         assert!(
             command_is_epoch_neutral(cmd),
@@ -122,70 +149,14 @@ fn epoch_classification_is_exhaustive_over_all_known_commands() {
     let all_known: Vec<&str> = [
         epoch_incrementing.as_slice(),
         &epoch_reading,
+        &epoch_args_dependent,
         &epoch_neutral,
     ]
     .concat()
     .into_iter()
     .collect();
 
-    let known_commands = [
-        CommandName::Handshake,
-        CommandName::UpgradeCheck,
-        CommandName::BlockerDiagnose,
-        CommandName::InteractabilityProbe,
-        CommandName::FillValidate,
-        CommandName::OrchestrationProbe,
-        CommandName::OrchestrationTabFrames,
-        CommandName::OrchestrationTargetDispatch,
-        CommandName::OrchestrationWorkflowSourceVars,
-        CommandName::TriggerFill,
-        CommandName::TriggerPipe,
-        CommandName::Open,
-        CommandName::State,
-        CommandName::Observe,
-        CommandName::Orchestration,
-        CommandName::Inspect,
-        CommandName::Find,
-        CommandName::Click,
-        CommandName::Exec,
-        CommandName::Scroll,
-        CommandName::Back,
-        CommandName::Forward,
-        CommandName::Reload,
-        CommandName::Screenshot,
-        CommandName::Doctor,
-        CommandName::Runtime,
-        CommandName::Frames,
-        CommandName::Frame,
-        CommandName::History,
-        CommandName::Downloads,
-        CommandName::Download,
-        CommandName::Storage,
-        CommandName::Handoff,
-        CommandName::Takeover,
-        CommandName::Dialog,
-        CommandName::Intercept,
-        CommandName::Interference,
-        CommandName::Close,
-        CommandName::Secret,
-        CommandName::Keys,
-        CommandName::Type,
-        CommandName::Wait,
-        CommandName::Tabs,
-        CommandName::Trigger,
-        CommandName::Switch,
-        CommandName::CloseTab,
-        CommandName::Get,
-        CommandName::Hover,
-        CommandName::Cookies,
-        CommandName::Upload,
-        CommandName::Select,
-        CommandName::Fill,
-        CommandName::Extract,
-        CommandName::Pipe,
-    ];
-
-    for name in known_commands {
+    for name in CommandName::ALL {
         let wire = name.as_str();
         assert!(
             all_known.contains(&wire),
@@ -195,9 +166,14 @@ fn epoch_classification_is_exhaustive_over_all_known_commands() {
 
         let in_incrementing = command_increments_epoch(wire);
         let in_reading = command_reads_epoch(wire);
+        let in_args_dependent = command_has_args_dependent_epoch_policy(wire);
         assert!(
-            !(in_incrementing && in_reading),
-            "'{wire}' is in both epoch_incrementing and epoch_reading — mutually exclusive invariant violated"
+            [in_incrementing, in_reading, in_args_dependent]
+                .into_iter()
+                .filter(|matched| *matched)
+                .count()
+                <= 1,
+            "'{wire}' appears in multiple non-neutral epoch categories — mutually exclusive invariant violated"
         );
     }
 }

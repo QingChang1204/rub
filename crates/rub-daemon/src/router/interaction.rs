@@ -18,6 +18,7 @@ use super::projection::{
 use super::request_args::{locator_json, parse_json_args};
 use super::*;
 use crate::router::timeout_projection::record_mutating_possible_commit_timeout_projection;
+use rub_core::recovery_contract::interaction_possible_commit_contract as build_interaction_possible_commit_contract;
 
 pub(super) async fn cmd_click(
     router: &DaemonRouter,
@@ -141,12 +142,7 @@ fn interaction_possible_commit_recovery_contract(
         serde_json::Value::Bool(true),
     );
 
-    serde_json::json!({
-        "kind": "interaction_possible_commit",
-        "command": command,
-        "same_command_retry_requires_same_command_id": true,
-        "request": request,
-    })
+    build_interaction_possible_commit_contract(command, serde_json::Value::Object(request))
 }
 
 fn redacted_interaction_locator(args: &serde_json::Value) -> Option<serde_json::Value> {

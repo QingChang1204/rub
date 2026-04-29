@@ -2,7 +2,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::task_local;
 
+use rub_core::command::{TimeoutRecoverySurface, command_metadata};
 use rub_core::model::OrchestrationStepResultInfo;
+use rub_core::recovery_contract::{
+    command_possible_commit_contract, orchestration_partial_commit_steps_contract,
+    partial_commit_steps_contract, registry_commit_contract,
+};
 
 task_local! {
     static ACTIVE_TIMEOUT_PROJECTION: Option<Arc<ExecutionTimeoutProjectionRecorder>>;
@@ -188,12 +193,7 @@ fn workflow_partial_commit_timeout_projection(
             "committed_step_count": committed_steps.len(),
             "rollback_attempted": false,
             "rollback_failed": false,
-            "recovery_contract": {
-                "kind": "partial_commit",
-                "committed_steps_authoritative": true,
-                "rollback_available": false,
-                "resume_from_failed_step_supported": false,
-            },
+            "recovery_contract": partial_commit_steps_contract(),
         },
         "steps": committed_steps,
     })
@@ -271,13 +271,7 @@ fn orchestration_partial_commit_timeout_projection(
             "committed_steps": committed_steps.len(),
             "total_steps": total_steps,
             "steps": committed_steps,
-            "recovery_contract": {
-                "kind": "partial_commit",
-                "committed_steps_authoritative": true,
-                "rollback_available": false,
-                "resume_from_failed_step_supported": false,
-                "possibly_committed_step": possible_commit_recovery,
-            },
+            "recovery_contract": orchestration_partial_commit_steps_contract(possible_commit_recovery),
         },
     })
 }
@@ -294,12 +288,7 @@ pub(crate) fn post_wait_partial_commit_timeout_projection(
             "command": command,
             "dom_epoch": dom_epoch,
             "committed_projection_authoritative": true,
-            "recovery_contract": {
-                "kind": "partial_commit",
-                "committed_steps_authoritative": true,
-                "rollback_available": false,
-                "resume_from_failed_step_supported": false,
-            },
+            "recovery_contract": partial_commit_steps_contract(),
         },
         "committed_response_projection": committed_projection,
     })
@@ -361,12 +350,7 @@ pub(crate) fn record_registry_control_commit_timeout_projection(
             "operation": operation,
             "commit_authority": "session_state_registry",
             "projection_authoritative": true,
-            "recovery_contract": {
-                "kind": "registry_commit",
-                "committed_projection_authoritative": true,
-                "rollback_available": false,
-                "resume_supported": false,
-            },
+            "recovery_contract": registry_commit_contract(),
         },
         "committed": serde_json::Value::Object(committed),
     }));
@@ -381,47 +365,14 @@ pub(crate) fn record_effectful_command_possible_commit_timeout_projection(
     }
     record_mutating_possible_commit_timeout_projection(
         command,
-        serde_json::json!({
-            "kind": "command_possible_commit",
-            "command": command,
-            "command_id": command_id,
-            "effect_commit_state": "possible_commit",
-            "projection_authoritative": false,
-            "retry_requires_same_command_id": command_id.is_some(),
-            "fresh_command_retry_safe": false,
-            "fallback_authority": "command_specific_replay_or_recovery_contract",
-        }),
+        command_possible_commit_contract(command, command_id),
     );
 }
 
 fn command_has_effectful_timeout_surface(command: &str) -> bool {
     matches!(
-        command,
-        "open"
-            | "back"
-            | "forward"
-            | "reload"
-            | "scroll"
-            | "switch"
-            | "close-tab"
-            | "click"
-            | "exec"
-            | "keys"
-            | "type"
-            | "hover"
-            | "upload"
-            | "select"
-            | "fill"
-            | "pipe"
-            | "dialog"
-            | "cookies"
-            | "intercept"
-            | "storage"
-            | "orchestration"
-            | "trigger"
-            | "_trigger_fill"
-            | "_trigger_pipe"
-            | "_orchestration_target_dispatch"
+        command_metadata(command).timeout_recovery_surface,
+        TimeoutRecoverySurface::PossibleCommit
     )
 }
 
@@ -455,8 +406,8 @@ pub(crate) fn merge_timeout_projection_context(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutionTimeoutProjectionRecorder, merge_timeout_projection_context,
-        post_wait_partial_commit_timeout_projection,
+        ExecutionTimeoutProjectionRecorder, command_has_effectful_timeout_surface,
+        merge_timeout_projection_context, post_wait_partial_commit_timeout_projection,
         record_effectful_command_possible_commit_timeout_projection,
         record_mutating_possible_commit_timeout_projection,
         record_orchestration_partial_commit_timeout_projection,
@@ -466,8 +417,56 @@ mod tests {
         record_workflow_partial_commit_timeout_projection,
         record_workflow_pending_step_timeout_projection, scope_timeout_projection,
     };
+    use rub_core::command::CommandName;
     use rub_core::model::{OrchestrationStepResultInfo, OrchestrationStepStatus};
     use std::sync::Arc;
+
+    #[test]
+    fn effectful_timeout_surface_matches_command_manifest_contract() {
+        let effectful = [
+            "open",
+            "back",
+            "forward",
+            "reload",
+            "scroll",
+            "switch",
+            "close-tab",
+            "click",
+            "exec",
+            "keys",
+            "type",
+            "hover",
+            "upload",
+            "select",
+            "fill",
+            "pipe",
+            "dialog",
+            "cookies",
+            "intercept",
+            "storage",
+            "orchestration",
+            "trigger",
+            "_trigger_fill",
+            "_trigger_pipe",
+            "_orchestration_target_dispatch",
+        ];
+
+        for command in effectful {
+            assert!(
+                command_has_effectful_timeout_surface(command),
+                "{command} should expose possible-commit timeout recovery"
+            );
+        }
+
+        for command in CommandName::ALL {
+            let wire = command.as_str();
+            assert_eq!(
+                command_has_effectful_timeout_surface(wire),
+                effectful.contains(&wire),
+                "{wire} timeout surface drifted from command manifest policy"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn workflow_partial_commit_projection_is_recorded_for_timeout_surface() {

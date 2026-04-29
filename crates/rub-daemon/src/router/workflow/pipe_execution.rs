@@ -20,6 +20,7 @@ use crate::workflow_policy::{
     workflow_allowed_step_descriptions, workflow_request_allowed,
 };
 use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
+use rub_core::recovery_contract::partial_commit_steps_contract;
 
 pub(super) async fn cmd_pipe_with_policy(
     router: &DaemonRouter,
@@ -295,12 +296,7 @@ fn pipe_step_error(
             "rollback_attempted": false,
             "rollback_failed": false,
             "source_error": workflow_error_projection(&source),
-            "recovery_contract": {
-                "kind": "partial_commit",
-                "committed_steps_authoritative": true,
-                "rollback_available": false,
-                "resume_from_failed_step_supported": false,
-            },
+            "recovery_contract": partial_commit_steps_contract(),
         },
         "steps": steps,
     });

@@ -1,9 +1,52 @@
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CommandEffectClass {
+    #[default]
+    Unknown,
+    ReadOnly,
+    BrowserMutation,
+    RuntimeMutation,
+    WorkflowMutation,
+    RegistryMutation,
+    InternalProbe,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DomEpochPolicy {
+    #[default]
+    None,
+    Bump,
+    InvalidateSnapshotWithoutBump,
+    ArgsDependent,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TimeoutRecoverySurface {
+    #[default]
+    None,
+    PossibleCommit,
+    PartialCommit,
+    RegistryCommit,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReplaySafety {
+    SafeWithFreshCommandId,
+    RequiresSameCommandId,
+    UnsafeFreshRetry,
+    #[default]
+    NotReplayable,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CommandMetadata {
     pub internal: bool,
     pub supports_post_wait: bool,
     pub in_process_only: bool,
     pub transport_protocol_compat_exempt: bool,
+    pub effect_class: CommandEffectClass,
+    pub dom_epoch_policy: DomEpochPolicy,
+    pub timeout_recovery_surface: TimeoutRecoverySurface,
+    pub replay_safety: ReplaySafety,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -65,6 +108,63 @@ pub enum CommandName {
 }
 
 impl CommandName {
+    pub const ALL: [Self; 54] = [
+        Self::Handshake,
+        Self::UpgradeCheck,
+        Self::BlockerDiagnose,
+        Self::InteractabilityProbe,
+        Self::FillValidate,
+        Self::OrchestrationProbe,
+        Self::OrchestrationTabFrames,
+        Self::OrchestrationTargetDispatch,
+        Self::OrchestrationWorkflowSourceVars,
+        Self::TriggerFill,
+        Self::TriggerPipe,
+        Self::Open,
+        Self::State,
+        Self::Observe,
+        Self::Orchestration,
+        Self::Inspect,
+        Self::Find,
+        Self::Click,
+        Self::Exec,
+        Self::Scroll,
+        Self::Back,
+        Self::Forward,
+        Self::Reload,
+        Self::Screenshot,
+        Self::Doctor,
+        Self::Runtime,
+        Self::Frames,
+        Self::Frame,
+        Self::History,
+        Self::Downloads,
+        Self::Download,
+        Self::Storage,
+        Self::Handoff,
+        Self::Takeover,
+        Self::Dialog,
+        Self::Intercept,
+        Self::Interference,
+        Self::Close,
+        Self::Secret,
+        Self::Keys,
+        Self::Type,
+        Self::Wait,
+        Self::Tabs,
+        Self::Trigger,
+        Self::Switch,
+        Self::CloseTab,
+        Self::Get,
+        Self::Hover,
+        Self::Cookies,
+        Self::Upload,
+        Self::Select,
+        Self::Fill,
+        Self::Extract,
+        Self::Pipe,
+    ];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Handshake => "_handshake",
@@ -131,23 +231,54 @@ impl CommandName {
                 supports_post_wait: false,
                 in_process_only: false,
                 transport_protocol_compat_exempt: true,
+                effect_class: CommandEffectClass::InternalProbe,
+                dom_epoch_policy: DomEpochPolicy::None,
+                timeout_recovery_surface: TimeoutRecoverySurface::None,
+                replay_safety: ReplaySafety::SafeWithFreshCommandId,
             },
             Self::InteractabilityProbe
             | Self::FillValidate
             | Self::OrchestrationProbe
             | Self::OrchestrationTabFrames
-            | Self::OrchestrationTargetDispatch
             | Self::OrchestrationWorkflowSourceVars => CommandMetadata {
                 internal: true,
                 supports_post_wait: false,
                 in_process_only: false,
                 transport_protocol_compat_exempt: false,
+                effect_class: CommandEffectClass::InternalProbe,
+                dom_epoch_policy: DomEpochPolicy::None,
+                timeout_recovery_surface: TimeoutRecoverySurface::None,
+                replay_safety: ReplaySafety::SafeWithFreshCommandId,
             },
-            Self::TriggerFill | Self::TriggerPipe => CommandMetadata {
+            Self::OrchestrationTargetDispatch => CommandMetadata {
+                internal: true,
+                supports_post_wait: false,
+                in_process_only: false,
+                transport_protocol_compat_exempt: false,
+                effect_class: CommandEffectClass::WorkflowMutation,
+                dom_epoch_policy: DomEpochPolicy::None,
+                timeout_recovery_surface: TimeoutRecoverySurface::PossibleCommit,
+                replay_safety: ReplaySafety::RequiresSameCommandId,
+            },
+            Self::TriggerFill => CommandMetadata {
                 internal: true,
                 supports_post_wait: true,
                 in_process_only: true,
                 transport_protocol_compat_exempt: false,
+                effect_class: CommandEffectClass::WorkflowMutation,
+                dom_epoch_policy: DomEpochPolicy::InvalidateSnapshotWithoutBump,
+                timeout_recovery_surface: TimeoutRecoverySurface::PossibleCommit,
+                replay_safety: ReplaySafety::RequiresSameCommandId,
+            },
+            Self::TriggerPipe => CommandMetadata {
+                internal: true,
+                supports_post_wait: true,
+                in_process_only: true,
+                transport_protocol_compat_exempt: false,
+                effect_class: CommandEffectClass::WorkflowMutation,
+                dom_epoch_policy: DomEpochPolicy::None,
+                timeout_recovery_surface: TimeoutRecoverySurface::PossibleCommit,
+                replay_safety: ReplaySafety::RequiresSameCommandId,
             },
             Self::Open
             | Self::Exec
@@ -160,19 +291,149 @@ impl CommandName {
             | Self::Type
             | Self::Hover
             | Self::Upload
-            | Self::Select
-            | Self::Fill
-            | Self::Pipe => CommandMetadata {
+            | Self::Select => CommandMetadata {
                 internal: false,
                 supports_post_wait: true,
                 in_process_only: false,
                 transport_protocol_compat_exempt: false,
+                effect_class: CommandEffectClass::BrowserMutation,
+                dom_epoch_policy: DomEpochPolicy::Bump,
+                timeout_recovery_surface: TimeoutRecoverySurface::PossibleCommit,
+                replay_safety: ReplaySafety::RequiresSameCommandId,
             },
-            _ => CommandMetadata {
+            Self::Fill => CommandMetadata {
+                internal: false,
+                supports_post_wait: true,
+                in_process_only: false,
+                transport_protocol_compat_exempt: false,
+                effect_class: CommandEffectClass::WorkflowMutation,
+                dom_epoch_policy: DomEpochPolicy::InvalidateSnapshotWithoutBump,
+                timeout_recovery_surface: TimeoutRecoverySurface::PossibleCommit,
+                replay_safety: ReplaySafety::RequiresSameCommandId,
+            },
+            Self::Pipe => CommandMetadata {
+                internal: false,
+                supports_post_wait: true,
+                in_process_only: false,
+                transport_protocol_compat_exempt: false,
+                effect_class: CommandEffectClass::WorkflowMutation,
+                dom_epoch_policy: DomEpochPolicy::None,
+                timeout_recovery_surface: TimeoutRecoverySurface::PossibleCommit,
+                replay_safety: ReplaySafety::RequiresSameCommandId,
+            },
+            Self::Scroll => CommandMetadata {
                 internal: false,
                 supports_post_wait: false,
                 in_process_only: false,
                 transport_protocol_compat_exempt: false,
+                effect_class: CommandEffectClass::BrowserMutation,
+                dom_epoch_policy: DomEpochPolicy::InvalidateSnapshotWithoutBump,
+                timeout_recovery_surface: TimeoutRecoverySurface::PossibleCommit,
+                replay_safety: ReplaySafety::RequiresSameCommandId,
+            },
+            Self::CloseTab => CommandMetadata {
+                internal: false,
+                supports_post_wait: false,
+                in_process_only: false,
+                transport_protocol_compat_exempt: false,
+                effect_class: CommandEffectClass::BrowserMutation,
+                dom_epoch_policy: DomEpochPolicy::Bump,
+                timeout_recovery_surface: TimeoutRecoverySurface::PossibleCommit,
+                replay_safety: ReplaySafety::RequiresSameCommandId,
+            },
+            Self::Find | Self::Extract => CommandMetadata {
+                internal: false,
+                supports_post_wait: false,
+                in_process_only: false,
+                transport_protocol_compat_exempt: false,
+                effect_class: CommandEffectClass::ReadOnly,
+                dom_epoch_policy: DomEpochPolicy::ArgsDependent,
+                timeout_recovery_surface: TimeoutRecoverySurface::None,
+                replay_safety: ReplaySafety::SafeWithFreshCommandId,
+            },
+            Self::Dialog => CommandMetadata {
+                internal: false,
+                supports_post_wait: false,
+                in_process_only: false,
+                transport_protocol_compat_exempt: false,
+                effect_class: CommandEffectClass::RuntimeMutation,
+                dom_epoch_policy: DomEpochPolicy::ArgsDependent,
+                timeout_recovery_surface: TimeoutRecoverySurface::PossibleCommit,
+                replay_safety: ReplaySafety::RequiresSameCommandId,
+            },
+            Self::Cookies | Self::Intercept | Self::Storage => CommandMetadata {
+                internal: false,
+                supports_post_wait: false,
+                in_process_only: false,
+                transport_protocol_compat_exempt: false,
+                effect_class: CommandEffectClass::RuntimeMutation,
+                dom_epoch_policy: DomEpochPolicy::None,
+                timeout_recovery_surface: TimeoutRecoverySurface::PossibleCommit,
+                replay_safety: ReplaySafety::RequiresSameCommandId,
+            },
+            Self::Orchestration => CommandMetadata {
+                internal: false,
+                supports_post_wait: false,
+                in_process_only: false,
+                transport_protocol_compat_exempt: false,
+                effect_class: CommandEffectClass::WorkflowMutation,
+                dom_epoch_policy: DomEpochPolicy::None,
+                timeout_recovery_surface: TimeoutRecoverySurface::PossibleCommit,
+                replay_safety: ReplaySafety::RequiresSameCommandId,
+            },
+            Self::Trigger => CommandMetadata {
+                internal: false,
+                supports_post_wait: false,
+                in_process_only: false,
+                transport_protocol_compat_exempt: false,
+                effect_class: CommandEffectClass::RegistryMutation,
+                dom_epoch_policy: DomEpochPolicy::None,
+                timeout_recovery_surface: TimeoutRecoverySurface::PossibleCommit,
+                replay_safety: ReplaySafety::RequiresSameCommandId,
+            },
+            Self::Download | Self::Handoff | Self::Takeover | Self::Interference | Self::Close => {
+                CommandMetadata {
+                    internal: false,
+                    supports_post_wait: false,
+                    in_process_only: false,
+                    transport_protocol_compat_exempt: false,
+                    effect_class: CommandEffectClass::RuntimeMutation,
+                    dom_epoch_policy: DomEpochPolicy::None,
+                    timeout_recovery_surface: TimeoutRecoverySurface::None,
+                    replay_safety: ReplaySafety::NotReplayable,
+                }
+            }
+            Self::Secret => CommandMetadata {
+                internal: false,
+                supports_post_wait: false,
+                in_process_only: false,
+                transport_protocol_compat_exempt: false,
+                effect_class: CommandEffectClass::RuntimeMutation,
+                dom_epoch_policy: DomEpochPolicy::None,
+                timeout_recovery_surface: TimeoutRecoverySurface::None,
+                replay_safety: ReplaySafety::NotReplayable,
+            },
+            Self::State
+            | Self::Observe
+            | Self::Inspect
+            | Self::Screenshot
+            | Self::Doctor
+            | Self::Runtime
+            | Self::Frames
+            | Self::Frame
+            | Self::History
+            | Self::Downloads
+            | Self::Wait
+            | Self::Tabs
+            | Self::Get => CommandMetadata {
+                internal: false,
+                supports_post_wait: false,
+                in_process_only: false,
+                transport_protocol_compat_exempt: false,
+                effect_class: CommandEffectClass::ReadOnly,
+                dom_epoch_policy: DomEpochPolicy::None,
+                timeout_recovery_surface: TimeoutRecoverySurface::None,
+                replay_safety: ReplaySafety::SafeWithFreshCommandId,
             },
         }
     }
@@ -264,7 +525,8 @@ pub fn allows_missing_request_command_id(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandName, allows_missing_request_command_id, allows_transport_protocol_compat_exemption,
+        CommandEffectClass, CommandName, DomEpochPolicy, ReplaySafety, TimeoutRecoverySurface,
+        allows_missing_request_command_id, allows_transport_protocol_compat_exemption,
         command_metadata, is_transport_exposed_internal_command,
     };
 
@@ -273,63 +535,7 @@ mod tests {
     /// both as_str() and parse() — this test enforces that invariant.
     #[test]
     fn all_command_names_round_trip_through_parse_and_as_str() {
-        let all_commands = [
-            CommandName::Handshake,
-            CommandName::UpgradeCheck,
-            CommandName::BlockerDiagnose,
-            CommandName::InteractabilityProbe,
-            CommandName::OrchestrationProbe,
-            CommandName::OrchestrationTabFrames,
-            CommandName::OrchestrationTargetDispatch,
-            CommandName::OrchestrationWorkflowSourceVars,
-            CommandName::TriggerFill,
-            CommandName::TriggerPipe,
-            CommandName::Open,
-            CommandName::State,
-            CommandName::Observe,
-            CommandName::Orchestration,
-            CommandName::Inspect,
-            CommandName::Find,
-            CommandName::Click,
-            CommandName::Exec,
-            CommandName::Scroll,
-            CommandName::Back,
-            CommandName::Forward,
-            CommandName::Reload,
-            CommandName::Screenshot,
-            CommandName::Doctor,
-            CommandName::Runtime,
-            CommandName::Frames,
-            CommandName::Frame,
-            CommandName::History,
-            CommandName::Downloads,
-            CommandName::Download,
-            CommandName::Storage,
-            CommandName::Handoff,
-            CommandName::Takeover,
-            CommandName::Dialog,
-            CommandName::Intercept,
-            CommandName::Interference,
-            CommandName::Close,
-            CommandName::Secret,
-            CommandName::Keys,
-            CommandName::Type,
-            CommandName::Wait,
-            CommandName::Tabs,
-            CommandName::Trigger,
-            CommandName::Switch,
-            CommandName::CloseTab,
-            CommandName::Get,
-            CommandName::Hover,
-            CommandName::Cookies,
-            CommandName::Upload,
-            CommandName::Select,
-            CommandName::Fill,
-            CommandName::Extract,
-            CommandName::Pipe,
-        ];
-
-        for command in all_commands {
+        for command in CommandName::ALL {
             assert_eq!(
                 CommandName::parse(command.as_str()),
                 Some(command),
@@ -346,6 +552,92 @@ mod tests {
         assert_eq!(CommandName::parse("Open"), None); // case-sensitive
         assert_eq!(CommandName::parse("CLICK"), None);
         assert_eq!(CommandName::parse("_unknown_internal"), None);
+    }
+
+    #[test]
+    fn unknown_command_metadata_fails_closed() {
+        let unknown = command_metadata("unknown");
+        assert!(!unknown.internal);
+        assert!(!unknown.supports_post_wait);
+        assert!(!unknown.in_process_only);
+        assert!(!unknown.transport_protocol_compat_exempt);
+        assert_eq!(unknown.effect_class, CommandEffectClass::Unknown);
+        assert_eq!(unknown.dom_epoch_policy, DomEpochPolicy::None);
+        assert_eq!(
+            unknown.timeout_recovery_surface,
+            TimeoutRecoverySurface::None
+        );
+        assert_eq!(unknown.replay_safety, ReplaySafety::NotReplayable);
+    }
+
+    #[test]
+    fn command_metadata_sources_semantic_policy_fields() {
+        let open = CommandName::Open.metadata();
+        assert_eq!(open.effect_class, CommandEffectClass::BrowserMutation);
+        assert_eq!(open.dom_epoch_policy, DomEpochPolicy::Bump);
+        assert_eq!(
+            open.timeout_recovery_surface,
+            TimeoutRecoverySurface::PossibleCommit
+        );
+        assert_eq!(open.replay_safety, ReplaySafety::RequiresSameCommandId);
+
+        let scroll = CommandName::Scroll.metadata();
+        assert_eq!(scroll.effect_class, CommandEffectClass::BrowserMutation);
+        assert_eq!(
+            scroll.dom_epoch_policy,
+            DomEpochPolicy::InvalidateSnapshotWithoutBump
+        );
+        assert_eq!(
+            scroll.timeout_recovery_surface,
+            TimeoutRecoverySurface::PossibleCommit
+        );
+        assert_eq!(scroll.replay_safety, ReplaySafety::RequiresSameCommandId);
+
+        let find = CommandName::Find.metadata();
+        assert_eq!(find.effect_class, CommandEffectClass::ReadOnly);
+        assert_eq!(find.dom_epoch_policy, DomEpochPolicy::ArgsDependent);
+        assert_eq!(find.timeout_recovery_surface, TimeoutRecoverySurface::None);
+        assert_eq!(find.replay_safety, ReplaySafety::SafeWithFreshCommandId);
+
+        let dialog = CommandName::Dialog.metadata();
+        assert_eq!(dialog.effect_class, CommandEffectClass::RuntimeMutation);
+        assert_eq!(dialog.dom_epoch_policy, DomEpochPolicy::ArgsDependent);
+        assert_eq!(
+            dialog.timeout_recovery_surface,
+            TimeoutRecoverySurface::PossibleCommit
+        );
+        assert_eq!(dialog.replay_safety, ReplaySafety::RequiresSameCommandId);
+
+        let target_dispatch = CommandName::OrchestrationTargetDispatch.metadata();
+        assert!(target_dispatch.internal);
+        assert_eq!(
+            target_dispatch.effect_class,
+            CommandEffectClass::WorkflowMutation
+        );
+        assert_eq!(
+            target_dispatch.timeout_recovery_surface,
+            TimeoutRecoverySurface::PossibleCommit
+        );
+
+        let state = CommandName::State.metadata();
+        assert_eq!(state.effect_class, CommandEffectClass::ReadOnly);
+        assert_eq!(state.dom_epoch_policy, DomEpochPolicy::None);
+        assert_eq!(state.timeout_recovery_surface, TimeoutRecoverySurface::None);
+        assert_eq!(state.replay_safety, ReplaySafety::SafeWithFreshCommandId);
+    }
+
+    #[test]
+    fn possible_commit_timeout_commands_require_command_identity_for_replay() {
+        for command in CommandName::ALL {
+            let metadata = command.metadata();
+            if metadata.timeout_recovery_surface == TimeoutRecoverySurface::PossibleCommit {
+                assert_eq!(
+                    metadata.replay_safety,
+                    ReplaySafety::RequiresSameCommandId,
+                    "{command:?} exposes possible-commit timeout recovery without same-command-id replay policy"
+                );
+            }
+        }
     }
 
     #[test]
@@ -499,63 +791,7 @@ mod tests {
 
     #[test]
     fn missing_request_command_id_allowlist_matches_transport_protocol_compat_metadata() {
-        let all_commands = [
-            CommandName::Handshake,
-            CommandName::UpgradeCheck,
-            CommandName::BlockerDiagnose,
-            CommandName::InteractabilityProbe,
-            CommandName::OrchestrationProbe,
-            CommandName::OrchestrationTabFrames,
-            CommandName::OrchestrationTargetDispatch,
-            CommandName::OrchestrationWorkflowSourceVars,
-            CommandName::TriggerFill,
-            CommandName::TriggerPipe,
-            CommandName::Open,
-            CommandName::State,
-            CommandName::Observe,
-            CommandName::Orchestration,
-            CommandName::Inspect,
-            CommandName::Find,
-            CommandName::Click,
-            CommandName::Exec,
-            CommandName::Scroll,
-            CommandName::Back,
-            CommandName::Forward,
-            CommandName::Reload,
-            CommandName::Screenshot,
-            CommandName::Doctor,
-            CommandName::Runtime,
-            CommandName::Frames,
-            CommandName::Frame,
-            CommandName::History,
-            CommandName::Downloads,
-            CommandName::Download,
-            CommandName::Storage,
-            CommandName::Handoff,
-            CommandName::Takeover,
-            CommandName::Dialog,
-            CommandName::Intercept,
-            CommandName::Interference,
-            CommandName::Close,
-            CommandName::Secret,
-            CommandName::Keys,
-            CommandName::Type,
-            CommandName::Wait,
-            CommandName::Tabs,
-            CommandName::Trigger,
-            CommandName::Switch,
-            CommandName::CloseTab,
-            CommandName::Get,
-            CommandName::Hover,
-            CommandName::Cookies,
-            CommandName::Upload,
-            CommandName::Select,
-            CommandName::Fill,
-            CommandName::Extract,
-            CommandName::Pipe,
-        ];
-
-        for command in all_commands {
+        for command in CommandName::ALL {
             let metadata = command.metadata();
             let should_allow_missing_command_id = metadata.internal
                 && !metadata.in_process_only

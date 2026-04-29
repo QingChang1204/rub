@@ -3,6 +3,7 @@ use rub_core::model::{
     OrchestrationSessionInfo, OrchestrationStepResultInfo, OrchestrationStepStatus,
     TriggerActionKind, TriggerActionSpec,
 };
+use rub_core::recovery_contract::target_replay_or_spent_tombstone_contract_with_fresh_retry_field;
 use rub_ipc::protocol::IpcRequest;
 
 use crate::router::automation_fence::ensure_committed_automation_result;
@@ -163,13 +164,11 @@ fn orchestration_target_dispatch_outer_deadline_error(request: &IpcRequest) -> E
         "command_id": request.command_id.as_deref(),
         "target_daemon_session_id": request.daemon_session_id.as_deref(),
         "effect_commit_state": "possible_commit",
-        "possible_commit_recovery_contract": {
-            "kind": "target_replay_or_spent_tombstone",
-            "target_command_id": request.command_id.as_deref(),
-            "target_daemon_session_id": request.daemon_session_id.as_deref(),
-            "retry_requires_same_command_id": request.command_id.is_some(),
-            "fresh_command_retry_safe": false,
-        },
+        "possible_commit_recovery_contract": target_replay_or_spent_tombstone_contract_with_fresh_retry_field(
+            request.command_id.as_deref(),
+            request.daemon_session_id.as_deref(),
+            true,
+        ),
     }))
 }
 
