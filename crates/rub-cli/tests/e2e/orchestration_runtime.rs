@@ -1751,6 +1751,19 @@ fn t437aa_ab_orchestration_assets_and_embedded_watch_grouped_scenario() {
     );
     assert_eq!(removed["success"], true, "{removed}");
 
+    let source_quieted = parse_json(
+        &rub_cmd(home)
+            .args([
+                "--session",
+                "source",
+                "exec",
+                "document.getElementById('status').textContent = 'Manual gate'",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(source_quieted["success"], true, "{source_quieted}");
+
     let readded = parse_json(
         &rub_cmd(home)
             .args([

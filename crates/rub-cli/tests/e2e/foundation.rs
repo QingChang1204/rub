@@ -637,9 +637,19 @@ fn t075_081d_interaction_grouped_scenario() {
     assert_eq!(opened["success"], true, "{opened}");
     let state = run_state(session.home());
     let snap = snapshot_id(&state);
+    let index = find_element_index(&state, |element| {
+        element["attributes"]["name"].as_str() == Some("custname")
+    });
     let out = session
         .cmd()
-        .args(["type", "--index", "0", "Test User", "--snapshot", &snap])
+        .args([
+            "type",
+            "--index",
+            &index.to_string(),
+            "Test User",
+            "--snapshot",
+            &snap,
+        ])
         .output()
         .unwrap();
     let json = parse_json(&out);

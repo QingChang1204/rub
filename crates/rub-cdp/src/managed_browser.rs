@@ -213,9 +213,7 @@ async fn enforce_managed_browser_process_fence(
                         let final_snapshot = process_snapshot()?;
                         let final_residual = managed_profile_residue_pids(&final_snapshot, profile);
                         if final_residual.is_empty() {
-                            if profile.ephemeral {
-                                let _ = std::fs::remove_dir_all(&profile.path);
-                            }
+                            remove_ephemeral_profile_dir(profile).await?;
                             return Ok(());
                         }
                     }
@@ -234,9 +232,7 @@ async fn enforce_managed_browser_process_fence(
                         }),
                     ));
                 }
-                if profile.ephemeral {
-                    let _ = std::fs::remove_dir_all(&profile.path);
-                }
+                remove_ephemeral_profile_dir(profile).await?;
                 return Ok(());
             };
             terminate_process_tree(&tree).await;
@@ -295,11 +291,34 @@ async fn enforce_managed_browser_process_fence(
         ));
     }
 
-    if profile.ephemeral {
-        let _ = std::fs::remove_dir_all(&profile.path);
-    }
+    remove_ephemeral_profile_dir(profile).await?;
 
     Ok(())
+}
+
+async fn remove_ephemeral_profile_dir(profile: &ManagedProfileDir) -> Result<(), RubError> {
+    if !profile.ephemeral {
+        return Ok(());
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+
+    loop {
+        match std::fs::remove_dir_all(&profile.path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(managed_profile_ownership_error(
+                        profile,
+                        "remove ephemeral managed profile after shutdown fencing",
+                        error,
+                    ));
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
 }
 
 pub fn is_profile_in_use(profile_dir: &Path) -> Result<bool, RubError> {
