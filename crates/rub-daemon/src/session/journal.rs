@@ -265,6 +265,26 @@ impl SessionState {
         self.post_commit_journal_failures.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn post_commit_journal_projection(&self) -> serde_json::Value {
+        let failure_count = self.post_commit_journal_failure_count();
+        serde_json::json!({
+            "surface": "post_commit_journal",
+            "authority": "session.post_commit_journal",
+            "status": if failure_count == 0 { "active" } else { "degraded" },
+            "failure_count": failure_count,
+            "recovery_contract": {
+                "kind": "post_commit_journal_recovery",
+                "daemon_commit_truth_preserved": true,
+                "journal_append_authoritative": failure_count == 0,
+                "operator_action": if failure_count == 0 {
+                    "none"
+                } else {
+                    "inspect daemon logs and runtime post_commit_journal surface before relying on local recovery journal completeness"
+                },
+            },
+        })
+    }
+
     pub(crate) fn pending_post_commit_followup_count(&self) -> u32 {
         self.post_commit_followup_count.load(Ordering::SeqCst)
     }

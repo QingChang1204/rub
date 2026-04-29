@@ -7,10 +7,7 @@ fn wait_for_distinct_tab_pair_by_title(
 ) -> (String, String) {
     for _ in 0..60 {
         let tabs = parse_json(&rub_cmd(home).arg("tabs").output().unwrap());
-        if tabs["success"] != true {
-            std::thread::sleep(Duration::from_millis(100));
-            continue;
-        }
+        assert_poll_success("tabs", &tabs);
         if let Some(items) = tabs["data"]["result"]["items"].as_array() {
             let target_index = items
                 .iter()

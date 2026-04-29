@@ -24,17 +24,31 @@ pub(crate) async fn cmd_screenshot(
     let full_page = parsed.full;
     let highlight = parsed.highlight;
 
+    let mut highlight_snapshot = None;
     let highlight_info = if highlight {
         let snapshot = router.browser.snapshot(Some(0)).await?;
         let count = router.browser.highlight_elements(&snapshot).await?;
+        highlight_snapshot = Some(snapshot);
         Some(count)
     } else {
         None
     };
 
-    let screenshot_result = router.browser.screenshot(full_page).await;
-    let highlight_cleanup_result = if highlight_info.is_some() {
-        Some(router.browser.cleanup_highlights().await)
+    let screenshot_result = if let Some(snapshot) = highlight_snapshot.as_ref() {
+        router
+            .browser
+            .screenshot_for_snapshot(snapshot, full_page)
+            .await
+    } else {
+        router.browser.screenshot(full_page).await
+    };
+    let highlight_cleanup_result = if let Some(snapshot) = highlight_snapshot.as_ref() {
+        Some(
+            router
+                .browser
+                .cleanup_highlights_for_snapshot(snapshot)
+                .await,
+        )
     } else {
         None
     };

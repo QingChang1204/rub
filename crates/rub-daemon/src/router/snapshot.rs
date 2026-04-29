@@ -144,7 +144,7 @@ pub(super) async fn build_stable_snapshot(
         selected_frame_id
     };
 
-    let mut pending_scope = state.take_pending_external_dom_change_scope();
+    let mut publication_guard = PendingSnapshotPublicationGuard::new(state);
 
     for attempt in 0..SNAPSHOT_SETTLE_RETRIES {
         let mut snapshot = if listeners {
@@ -165,7 +165,6 @@ pub(super) async fn build_stable_snapshot(
         };
 
         if !sleep_full_settle_window(Some(deadline), SNAPSHOT_SETTLE_DELAY_MS).await {
-            state.merge_pending_external_dom_change_scope(pending_scope);
             return Err(RubError::domain_with_context(
                 ErrorCode::StaleSnapshot,
                 "Snapshot could not stabilize before the authoritative deadline expired",
@@ -183,15 +182,15 @@ pub(super) async fn build_stable_snapshot(
         if observed_scope.is_empty() {
             commit_snapshot_publication_epoch_for_pending_scope(
                 state,
-                &pending_scope,
+                publication_guard.pending_scope(),
                 &mut snapshot,
             );
+            publication_guard.commit();
             return Ok(snapshot);
         }
-        pending_scope.merge(observed_scope);
+        publication_guard.merge(observed_scope);
 
         if attempt + 1 == SNAPSHOT_SETTLE_RETRIES {
-            state.merge_pending_external_dom_change_scope(pending_scope);
             return Err(RubError::domain_with_context(
                 ErrorCode::StaleSnapshot,
                 "Snapshot could not stabilize before publish fence",
@@ -216,6 +215,45 @@ pub(super) async fn build_stable_snapshot(
     ))
 }
 
+struct PendingSnapshotPublicationGuard<'a> {
+    state: &'a Arc<SessionState>,
+    pending_scope: Option<crate::session::PendingExternalDomChangeState>,
+}
+
+impl<'a> PendingSnapshotPublicationGuard<'a> {
+    fn new(state: &'a Arc<SessionState>) -> Self {
+        Self {
+            state,
+            pending_scope: Some(state.take_pending_external_dom_change_scope()),
+        }
+    }
+
+    fn pending_scope(&self) -> &crate::session::PendingExternalDomChangeState {
+        self.pending_scope
+            .as_ref()
+            .expect("pending snapshot publication scope should exist until commit")
+    }
+
+    fn merge(&mut self, observed_scope: crate::session::PendingExternalDomChangeState) {
+        if let Some(pending_scope) = self.pending_scope.as_mut() {
+            pending_scope.merge(observed_scope);
+        }
+    }
+
+    fn commit(&mut self) {
+        self.pending_scope = None;
+    }
+}
+
+impl Drop for PendingSnapshotPublicationGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(pending_scope) = self.pending_scope.take() {
+            self.state
+                .merge_pending_external_dom_change_scope(pending_scope);
+        }
+    }
+}
+
 fn commit_snapshot_publication_epoch_for_pending_scope(
     state: &Arc<SessionState>,
     pending_scope: &crate::session::PendingExternalDomChangeState,
@@ -233,7 +271,7 @@ fn commit_snapshot_publication_epoch_for_pending_scope(
 #[cfg(test)]
 mod tests {
     use super::{
-        DeferredSnapshotPublication, ExternalDomFenceOutcome,
+        DeferredSnapshotPublication, ExternalDomFenceOutcome, PendingSnapshotPublicationGuard,
         commit_snapshot_publication_epoch_for_pending_scope, settle_external_dom_fence,
         sleep_full_settle_window,
     };
@@ -462,6 +500,61 @@ mod tests {
         assert!(
             state.pending_external_dom_change_affects_target(Some("target-1")),
             "failed snapshot publication must keep the pending fallback authority until a later publish fence commits a new epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_snapshot_publication_guard_remerges_scope_on_error_drop() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-router-snapshot-publication-guard-error"),
+            None,
+        ));
+        state
+            .in_flight_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        state.observe_external_dom_change(Some("target-1"));
+
+        {
+            let _guard = PendingSnapshotPublicationGuard::new(&state);
+            assert!(
+                !state.has_pending_external_dom_change(),
+                "guard owns pending authority until snapshot publish either commits or fails"
+            );
+        }
+
+        assert_eq!(state.current_epoch(), 0);
+        assert!(
+            state.pending_external_dom_change_affects_target(Some("target-1")),
+            "early snapshot failure must restore the target-scoped fallback authority"
+        );
+        assert!(
+            !state.pending_external_dom_change_affects_target(Some("target-2")),
+            "fallback authority must preserve target scope when it is restored"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_snapshot_publication_guard_consumes_scope_only_on_commit() {
+        let state = Arc::new(SessionState::new(
+            "default",
+            PathBuf::from("/tmp/rub-router-snapshot-publication-guard-commit"),
+            None,
+        ));
+        state
+            .in_flight_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        state.observe_external_dom_change(Some("target-1"));
+
+        {
+            let mut guard = PendingSnapshotPublicationGuard::new(&state);
+            guard.commit();
+        }
+
+        assert_eq!(state.current_epoch(), 0);
+        assert!(
+            !state.has_pending_external_dom_change(),
+            "committed snapshot publication consumes the pending fallback authority"
         );
     }
 

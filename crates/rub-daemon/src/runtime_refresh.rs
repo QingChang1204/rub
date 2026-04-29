@@ -15,6 +15,39 @@ mod interference;
 mod orchestration;
 mod surfaces;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RefreshOutcomeStatus {
+    Refreshed,
+    Degraded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RefreshOutcome {
+    pub(crate) surface: &'static str,
+    pub(crate) status: RefreshOutcomeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) degraded_reason: Option<String>,
+}
+
+impl RefreshOutcome {
+    pub(crate) fn refreshed(surface: &'static str) -> Self {
+        Self {
+            surface,
+            status: RefreshOutcomeStatus::Refreshed,
+            degraded_reason: None,
+        }
+    }
+
+    pub(crate) fn degraded(surface: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            surface,
+            status: RefreshOutcomeStatus::Degraded,
+            degraded_reason: Some(reason.into()),
+        }
+    }
+}
+
 #[cfg(test)]
 use interference::apply_policy_driven_handoff;
 pub(crate) use interference::{

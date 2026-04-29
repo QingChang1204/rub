@@ -162,7 +162,21 @@ jobs:
           set -o pipefail
           MODULES="${{ matrix.modules }}"
           OVERALL_EXIT=0
-          FAILED_TESTS=""
+          NON_RETRYABLE_FAILURE=0
+          RETRYABLE_MODULES=""
+
+          classify_e2e_failure() {
+            local log="$1"
+            if grep -q " FAILED$" "$log"; then
+              echo "semantic_or_assertion"
+              return
+            fi
+            if grep -Eiq "RUB_E2E_FAILURE_KIND=retryable_chrome_setup|Chrome.*not found|Chromium.*not found|DevToolsActivePort.*(missing|timed out)|failed to launch.*Chrome|failed to launch.*Chromium" "$log"; then
+              echo "retryable_chrome_setup"
+              return
+            fi
+            echo "unclassified_fail_closed"
+          }
 
           echo "🧪 Running E2E shard: ${{ matrix.shard }}"
           echo "   Modules: $MODULES"
@@ -172,23 +186,30 @@ jobs:
           for module in $MODULES; do
             echo "━━━ Running module: $module ━━━"
             if ! cargo test --workspace -- --ignored "${module}::" 2>&1 | tee "/tmp/e2e_${module}.log"; then
-              # Collect failed test names for retry
-              NEWLY_FAILED=$(grep " FAILED$" "/tmp/e2e_${module}.log" | sed 's/^test //' | sed 's/ \.\.\..*$//' | tr '\n' ' ')
-              FAILED_TESTS="$FAILED_TESTS $NEWLY_FAILED"
+              FAILURE_KIND="$(classify_e2e_failure "/tmp/e2e_${module}.log")"
+              echo "::error title=E2E module failed::module=${module} kind=${FAILURE_KIND}"
+              if [ "$FAILURE_KIND" = "retryable_chrome_setup" ]; then
+                RETRYABLE_MODULES="$RETRYABLE_MODULES $module"
+              else
+                NON_RETRYABLE_FAILURE=1
+              fi
               OVERALL_EXIT=1
             fi
             echo ""
           done
 
-          # Retry any failed tests once (handles transient Chrome launch failures)
-          if [ $OVERALL_EXIT -ne 0 ] && [ -n "$(echo "$FAILED_TESTS" | tr -d ' ')" ]; then
+          # Retry only pre-test browser environment setup failures. Assertion,
+          # projection, idempotency, and product semantic failures fail closed.
+          if [ $NON_RETRYABLE_FAILURE -ne 0 ]; then
+            exit 1
+          elif [ $OVERALL_EXIT -ne 0 ] && [ -n "$(echo "$RETRYABLE_MODULES" | tr -d ' ')" ]; then
             echo ""
-            echo "⚠️  Retrying failed tests..."
-            echo "   Tests: $FAILED_TESTS"
+            echo "⚠️  Retrying retryable E2E setup failures..."
+            echo "   Modules: $RETRYABLE_MODULES"
             echo ""
             RETRY_EXIT=0
-            for test_name in $FAILED_TESTS; do
-              if ! cargo test --workspace -- --ignored "$test_name" 2>&1; then
+            for module in $RETRYABLE_MODULES; do
+              if ! cargo test --workspace -- --ignored "${module}::" 2>&1; then
                 RETRY_EXIT=1
               fi
             done

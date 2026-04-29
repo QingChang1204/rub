@@ -101,12 +101,13 @@ fn sample_rule() -> OrchestrationRuleInfo {
 }
 
 #[test]
-fn orchestration_step_command_id_changes_across_execution_attempts_even_with_same_identity_key() {
+fn orchestration_step_command_id_is_stable_across_execution_attempts_with_same_identity_key() {
     let rule = sample_rule();
     let first = orchestration_step_command_id(&rule, Some("evidence-key"), "exec-a", 1);
     let second = orchestration_step_command_id(&rule, Some("evidence-key"), "exec-b", 1);
 
-    assert_ne!(first, second);
+    assert_eq!(first, second);
+    assert_eq!(first, "orchestration:idem-demo:evidence-key:1");
 }
 
 #[test]
@@ -128,14 +129,14 @@ fn orchestration_step_command_id_falls_back_to_execution_attempt_without_identit
 }
 
 #[test]
-fn orchestration_request_meta_names_evidence_key_as_execution_scoped() {
+fn orchestration_request_meta_names_evidence_key_as_stable_identity() {
     let rule = sample_rule();
     let meta = orchestration_request_meta(&rule, Some("evidence-key"), "exec-a", 1, "action");
 
     assert_eq!(
         meta.get("command_identity_kind")
             .and_then(|value| value.as_str()),
-        Some("execution_scoped_evidence_key")
+        Some("evidence_key")
     );
     assert_eq!(
         meta.get("command_identity_key")

@@ -6,24 +6,26 @@ use rub_core::port::BrowserPort;
 
 use crate::session::SessionState;
 
+use super::RefreshOutcome;
+
 pub(crate) async fn refresh_live_runtime_state(
     browser: &Arc<dyn BrowserPort>,
     state: &Arc<SessionState>,
-) {
+) -> RefreshOutcome {
     let sequence = state.allocate_runtime_state_sequence();
     match browser.probe_runtime_state().await {
         Ok(runtime_state) => {
             state
                 .publish_runtime_state_snapshot(sequence, runtime_state)
                 .await;
+            RefreshOutcome::refreshed("runtime_state")
         }
         Err(error) => {
+            let reason = runtime_state_probe_degraded_reason(&error);
             state
-                .mark_runtime_state_probe_degraded(
-                    sequence,
-                    runtime_state_probe_degraded_reason(&error),
-                )
+                .mark_runtime_state_probe_degraded(sequence, &reason)
                 .await;
+            RefreshOutcome::degraded("runtime_state", reason)
         }
     }
 }
@@ -31,18 +33,16 @@ pub(crate) async fn refresh_live_runtime_state(
 pub(crate) async fn refresh_live_dialog_runtime(
     browser: &Arc<dyn BrowserPort>,
     state: &Arc<SessionState>,
-) {
+) -> RefreshOutcome {
     match browser.dialog_runtime().await {
         Ok(runtime) => {
             state.set_dialog_projection(0, runtime).await;
+            RefreshOutcome::refreshed("dialog_runtime")
         }
         Err(error) => {
-            state
-                .mark_dialog_runtime_degraded(
-                    0,
-                    stable_surface_probe_degraded_reason(&error, "dialog_probe_failed"),
-                )
-                .await;
+            let reason = stable_surface_probe_degraded_reason(&error, "dialog_probe_failed");
+            state.mark_dialog_runtime_degraded(0, reason.clone()).await;
+            RefreshOutcome::degraded("dialog_runtime", reason)
         }
     }
 }
@@ -50,18 +50,16 @@ pub(crate) async fn refresh_live_dialog_runtime(
 pub(crate) async fn refresh_live_frame_runtime(
     browser: &Arc<dyn BrowserPort>,
     state: &Arc<SessionState>,
-) {
+) -> RefreshOutcome {
     match browser.list_frames().await {
         Ok(frames) => {
             state.apply_frame_inventory(&frames).await;
+            RefreshOutcome::refreshed("frame_runtime")
         }
         Err(error) => {
-            state
-                .mark_frame_runtime_degraded(stable_surface_probe_degraded_reason(
-                    &error,
-                    "frame_probe_failed",
-                ))
-                .await;
+            let reason = stable_surface_probe_degraded_reason(&error, "frame_probe_failed");
+            state.mark_frame_runtime_degraded(reason.clone()).await;
+            RefreshOutcome::degraded("frame_runtime", reason)
         }
     }
 }
@@ -69,32 +67,34 @@ pub(crate) async fn refresh_live_frame_runtime(
 pub(crate) async fn refresh_takeover_runtime(
     browser: &Arc<dyn BrowserPort>,
     state: &Arc<SessionState>,
-) {
+) -> RefreshOutcome {
     let launch_policy = browser.launch_policy();
     state.refresh_takeover_runtime(&launch_policy).await;
+    RefreshOutcome::refreshed("takeover_runtime")
 }
 
 pub(crate) async fn refresh_live_storage_runtime(
     browser: &Arc<dyn BrowserPort>,
     state: &Arc<SessionState>,
-) {
+) -> RefreshOutcome {
     let selected_frame_id = state.selected_frame_id().await;
     let effective_frame_id = match selected_frame_id.as_deref() {
         Some(frame_id) => match browser.list_frames().await {
             Ok(frames) => match resolve_storage_runtime_frame_id(frame_id, &frames) {
                 Ok(frame_id) => Some(frame_id),
                 Err(error) => {
-                    state
-                        .mark_storage_runtime_degraded(storage_runtime_degraded_reason(&error))
-                        .await;
-                    return;
+                    let reason = storage_runtime_degraded_reason(&error);
+                    state.mark_storage_runtime_degraded(reason.clone()).await;
+                    return RefreshOutcome::degraded("storage_runtime", reason);
                 }
             },
             Err(error) => {
                 let degraded_reason =
                     storage_runtime_frame_inventory_degraded_reason(frame_id, &error);
-                state.mark_storage_runtime_degraded(degraded_reason).await;
-                return;
+                state
+                    .mark_storage_runtime_degraded(degraded_reason.clone())
+                    .await;
+                return RefreshOutcome::degraded("storage_runtime", degraded_reason);
             }
         },
         None => None,
@@ -105,11 +105,12 @@ pub(crate) async fn refresh_live_storage_runtime(
     {
         Ok(snapshot) => {
             state.set_storage_snapshot(snapshot).await;
+            RefreshOutcome::refreshed("storage_runtime")
         }
         Err(error) => {
-            state
-                .mark_storage_runtime_degraded(storage_runtime_degraded_reason(&error))
-                .await;
+            let reason = storage_runtime_degraded_reason(&error);
+            state.mark_storage_runtime_degraded(reason.clone()).await;
+            RefreshOutcome::degraded("storage_runtime", reason)
         }
     }
 }

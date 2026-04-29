@@ -12,11 +12,13 @@ pub(crate) async fn cmd_doctor(
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     let browser_healthy = router.browser.health_check().await.is_ok();
-    refresh_live_runtime_state(&router.browser, state).await;
-    refresh_live_dialog_runtime(&router.browser, state).await;
-    refresh_live_frame_runtime(&router.browser, state).await;
-    refresh_live_storage_runtime(&router.browser, state).await;
-    refresh_takeover_runtime(&router.browser, state).await;
+    let refresh_outcomes = vec![
+        refresh_live_runtime_state(&router.browser, state).await,
+        refresh_live_dialog_runtime(&router.browser, state).await,
+        refresh_live_frame_runtime(&router.browser, state).await,
+        refresh_live_storage_runtime(&router.browser, state).await,
+        refresh_takeover_runtime(&router.browser, state).await,
+    ];
     refresh_orchestration_runtime(state).await;
     let _ = refresh_live_trigger_runtime(&router.browser, state).await;
     let _ = refresh_live_interference_state(
@@ -68,6 +70,8 @@ pub(crate) async fn cmd_doctor(
         "detection_risks": detection_risks,
         "automation_scheduler": automation_scheduler,
         "browser_event_ingress": browser_event_ingress,
+        "post_commit_journal": state.post_commit_journal_projection(),
+        "refresh_outcomes": refresh_outcomes,
     });
     annotate_doctor_operator_path_states(&mut result);
 

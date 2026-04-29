@@ -147,6 +147,16 @@ pub trait BrowserPort: Send + Sync {
     /// `full_page`: if true, capture the entire scrollable area.
     async fn screenshot(&self, full_page: bool) -> Result<Vec<u8>, RubError>;
 
+    /// Capture a screenshot against the tab authority that produced `snapshot`.
+    async fn screenshot_for_snapshot(
+        &self,
+        snapshot: &Snapshot,
+        full_page: bool,
+    ) -> Result<Vec<u8>, RubError> {
+        let _ = snapshot;
+        self.screenshot(full_page).await
+    }
+
     /// CDP health check: `Browser.getVersion()`.
     async fn health_check(&self) -> Result<(), RubError>;
 
@@ -542,6 +552,12 @@ pub trait BrowserPort: Send + Sync {
 
     /// Remove all injected highlight overlays.
     async fn cleanup_highlights(&self) -> Result<(), RubError>;
+
+    /// Remove injected highlight overlays from the tab authority that produced `snapshot`.
+    async fn cleanup_highlights_for_snapshot(&self, snapshot: &Snapshot) -> Result<(), RubError> {
+        let _ = snapshot;
+        self.cleanup_highlights().await
+    }
 
     /// Capture a DOM snapshot and promote nodes with JavaScript listeners into
     /// the interactive projection. When `include_a11y` is true, accessibility

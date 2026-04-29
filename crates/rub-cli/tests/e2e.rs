@@ -69,6 +69,13 @@ fn assert_cli_exit_matches_command_result(output: &std::process::Output, parsed:
     );
 }
 
+fn assert_poll_success(surface: &str, parsed: &Value) {
+    assert_eq!(
+        parsed["success"], true,
+        "{surface} polling command returned a non-success CommandResult; fail closed instead of waiting through semantic/projection failure: {parsed}"
+    );
+}
+
 fn doctor_result(json: &serde_json::Value) -> &serde_json::Value {
     &json["data"]["result"]
 }
@@ -118,11 +125,11 @@ fn wait_for_no_live_sessions_with_timeout(home: &str, timeout: Duration) -> serd
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
+        assert_poll_success("sessions", &sessions);
         let observed = observe_home_cleanup(home);
-        if sessions["success"] == true
-            && sessions["data"]["result"]["items"]
-                .as_array()
-                .is_some_and(|items| items.is_empty())
+        if sessions["data"]["result"]["items"]
+            .as_array()
+            .is_some_and(|items| items.is_empty())
             && observed.daemon_root_pids.is_empty()
         {
             return sessions;
@@ -279,7 +286,8 @@ fn wait_for_pending_dialog(home: &str) -> serde_json::Value {
     for _ in 0..40 {
         let out = rub_cmd(home).arg("dialog").output().unwrap();
         let json = parse_json(&out);
-        if json["success"] == true && !json["data"]["runtime"]["pending_dialog"].is_null() {
+        assert_poll_success("dialog", &json);
+        if !json["data"]["runtime"]["pending_dialog"].is_null() {
             return json;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -290,12 +298,12 @@ fn wait_for_pending_dialog(home: &str) -> serde_json::Value {
 fn wait_for_tabs_count(home: &str, count: u64) -> serde_json::Value {
     for _ in 0..50 {
         let out = parse_json(&rub_cmd(home).arg("tabs").output().unwrap());
-        if out["success"] == true
-            && out["data"]["result"]["items"]
-                .as_array()
-                .map(|items| items.len() as u64)
-                .unwrap_or(0)
-                >= count
+        assert_poll_success("tabs", &out);
+        if out["data"]["result"]["items"]
+            .as_array()
+            .map(|items| items.len() as u64)
+            .unwrap_or(0)
+            >= count
         {
             return out;
         }
@@ -307,14 +315,14 @@ fn wait_for_tabs_count(home: &str, count: u64) -> serde_json::Value {
 fn wait_for_trigger_status(home: &str, id: u64, expected: &str) -> serde_json::Value {
     for _ in 0..80 {
         let out = parse_json(&rub_cmd(home).args(["trigger", "list"]).output().unwrap());
-        if out["success"] == true
-            && let Some(trigger) = out["data"]["result"]["items"]
-                .as_array()
-                .and_then(|triggers| {
-                    triggers
-                        .iter()
-                        .find(|trigger| trigger["id"].as_u64() == Some(id))
-                })
+        assert_poll_success("trigger list", &out);
+        if let Some(trigger) = out["data"]["result"]["items"]
+            .as_array()
+            .and_then(|triggers| {
+                triggers
+                    .iter()
+                    .find(|trigger| trigger["id"].as_u64() == Some(id))
+            })
             && trigger["status"].as_str() == Some(expected)
         {
             return out;
@@ -327,14 +335,14 @@ fn wait_for_trigger_status(home: &str, id: u64, expected: &str) -> serde_json::V
 fn wait_for_trigger_last_action_status(home: &str, id: u64, expected: &str) -> serde_json::Value {
     for _ in 0..80 {
         let out = parse_json(&rub_cmd(home).args(["trigger", "list"]).output().unwrap());
-        if out["success"] == true
-            && let Some(trigger) = out["data"]["result"]["items"]
-                .as_array()
-                .and_then(|triggers| {
-                    triggers
-                        .iter()
-                        .find(|trigger| trigger["id"].as_u64() == Some(id))
-                })
+        assert_poll_success("trigger list", &out);
+        if let Some(trigger) = out["data"]["result"]["items"]
+            .as_array()
+            .and_then(|triggers| {
+                triggers
+                    .iter()
+                    .find(|trigger| trigger["id"].as_u64() == Some(id))
+            })
             && trigger["last_action_result"]["status"].as_str() == Some(expected)
         {
             return out;
@@ -348,15 +356,15 @@ fn wait_for_trigger_unavailable_reason(home: &str, id: u64, expected: &str) -> s
     let mut last = serde_json::Value::Null;
     for _ in 0..80 {
         let out = parse_json(&rub_cmd(home).args(["trigger", "list"]).output().unwrap());
+        assert_poll_success("trigger list", &out);
         last = out.clone();
-        if out["success"] == true
-            && let Some(trigger) = out["data"]["result"]["items"]
-                .as_array()
-                .and_then(|triggers| {
-                    triggers
-                        .iter()
-                        .find(|trigger| trigger["id"].as_u64() == Some(id))
-                })
+        if let Some(trigger) = out["data"]["result"]["items"]
+            .as_array()
+            .and_then(|triggers| {
+                triggers
+                    .iter()
+                    .find(|trigger| trigger["id"].as_u64() == Some(id))
+            })
             && trigger_unavailable_reason_matches(trigger["unavailable_reason"].as_str(), expected)
         {
             return out;
@@ -383,6 +391,7 @@ fn assert_trigger_status_remains(
     let deadline = std::time::Instant::now() + duration;
     loop {
         let out = parse_json(&rub_cmd(home).args(["trigger", "list"]).output().unwrap());
+        assert_poll_success("trigger list", &out);
         let trigger = out["data"]["result"]["items"]
             .as_array()
             .and_then(|triggers| {
@@ -410,6 +419,7 @@ fn assert_trigger_remains_unavailable_without_action(
     let deadline = std::time::Instant::now() + duration;
     loop {
         let out = parse_json(&rub_cmd(home).args(["trigger", "list"]).output().unwrap());
+        assert_poll_success("trigger list", &out);
         let trigger = out["data"]["result"]["items"]
             .as_array()
             .and_then(|triggers| triggers.iter().find(|trigger| trigger["id"].as_u64() == Some(id)))
@@ -441,8 +451,8 @@ fn wait_for_runtime_frame_degraded_reason(
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let out = parse_json(&rub_cmd(home).args(["runtime", "frame"]).output().unwrap());
-        if out["success"] == true
-            && out["data"]["runtime"]["status"].as_str() == Some(expected_status)
+        assert_poll_success("runtime frame", &out);
+        if out["data"]["runtime"]["status"].as_str() == Some(expected_status)
             && out["data"]["runtime"]["degraded_reason"].as_str() == Some(expected_reason)
         {
             return out;
@@ -481,11 +491,11 @@ fn wait_for_orchestration_status(
                 .output()
                 .unwrap(),
         );
+        assert_poll_success("orchestration list", &out);
         last = out.clone();
-        if out["success"] == true
-            && let Some(rule) = out["data"]["result"]["items"]
-                .as_array()
-                .and_then(|rules| rules.iter().find(|rule| rule["id"].as_u64() == Some(id)))
+        if let Some(rule) = out["data"]["result"]["items"]
+            .as_array()
+            .and_then(|rules| rules.iter().find(|rule| rule["id"].as_u64() == Some(id)))
             && rule["status"].as_str() == Some(expected)
         {
             return out;
@@ -511,10 +521,10 @@ fn wait_for_orchestration_rule_result(
                 .output()
                 .unwrap(),
         );
-        if out["success"] == true
-            && let Some(rule) = out["data"]["result"]["items"]
-                .as_array()
-                .and_then(|rules| rules.iter().find(|rule| rule["id"].as_u64() == Some(id)))
+        assert_poll_success("orchestration list", &out);
+        if let Some(rule) = out["data"]["result"]["items"]
+            .as_array()
+            .and_then(|rules| rules.iter().find(|rule| rule["id"].as_u64() == Some(id)))
             && rule["status"].as_str() == Some(expected_status)
             && rule["last_result"]["status"].as_str() == Some(expected_result_status)
         {
@@ -542,11 +552,11 @@ fn wait_for_orchestration_condition_evidence_summary(
                 .output()
                 .unwrap(),
         );
+        assert_poll_success("orchestration list", &out);
         last = out.clone();
-        if out["success"] == true
-            && let Some(rule) = out["data"]["result"]["items"]
-                .as_array()
-                .and_then(|rules| rules.iter().find(|rule| rule["id"].as_u64() == Some(id)))
+        if let Some(rule) = out["data"]["result"]["items"]
+            .as_array()
+            .and_then(|rules| rules.iter().find(|rule| rule["id"].as_u64() == Some(id)))
             && rule["status"].as_str() == Some(expected_status)
         {
             let actual_summary = rule["last_condition_evidence"]["summary"].as_str();
@@ -578,11 +588,11 @@ fn wait_for_orchestration_cooldown_to_expire(
                 .output()
                 .unwrap(),
         );
+        assert_poll_success("orchestration list", &out);
         last = out.clone();
-        if out["success"] == true
-            && let Some(rule) = out["data"]["result"]["items"]
-                .as_array()
-                .and_then(|rules| rules.iter().find(|rule| rule["id"].as_u64() == Some(id)))
+        if let Some(rule) = out["data"]["result"]["items"]
+            .as_array()
+            .and_then(|rules| rules.iter().find(|rule| rule["id"].as_u64() == Some(id)))
         {
             let cooldown_expired = rule["execution_policy"]["cooldown_until_ms"]
                 .as_u64()
@@ -618,11 +628,11 @@ fn wait_for_orchestration_cooldown_to_renew(
                 .output()
                 .unwrap(),
         );
+        assert_poll_success("orchestration list", &out);
         last = out.clone();
-        if out["success"] == true
-            && let Some(rule) = out["data"]["result"]["items"]
-                .as_array()
-                .and_then(|rules| rules.iter().find(|rule| rule["id"].as_u64() == Some(id)))
+        if let Some(rule) = out["data"]["result"]["items"]
+            .as_array()
+            .and_then(|rules| rules.iter().find(|rule| rule["id"].as_u64() == Some(id)))
             && rule["last_result"]["status"].as_str() == Some("fired")
             && rule["execution_policy"]["cooldown_until_ms"]
                 .as_u64()
@@ -1347,6 +1357,49 @@ fn mounted_e2e_modules() -> std::collections::BTreeSet<String> {
         .collect()
 }
 
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("rub-cli crate should live under workspace/crates")
+        .parent()
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn read_workspace_file(path: &str) -> String {
+    let path = workspace_root().join(path);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+}
+
+fn ci_e2e_shard_modules(ci_workflow: &str) -> std::collections::BTreeSet<String> {
+    let modules = ci_workflow
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("modules:"))
+        .flat_map(|raw| {
+            raw.trim()
+                .trim_matches('"')
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !modules.is_empty(),
+        "CI workflow should declare E2E modules"
+    );
+    let unique = modules
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        unique.len(),
+        modules.len(),
+        "CI E2E shard modules must not be duplicated"
+    );
+    unique
+}
+
 #[test]
 fn browser_backed_unique_home_usage_matches_exception_whitelist() {
     let expected = expected_function_set(&[
@@ -1540,6 +1593,73 @@ fn browser_backed_e2e_source_files_match_mounted_modules() {
     assert_eq!(
         scanned, mounted,
         "tests/e2e/*.rs source files must exactly match the mounted #[path] module list so new browser-backed suites cannot drift out of compilation"
+    );
+}
+
+#[test]
+fn e2e_guardrail_browser_backed_e2e_ci_shards_match_mounted_modules() {
+    let ci_modules = ci_e2e_shard_modules(&read_workspace_file(".github/workflows/ci.yml"));
+    let mounted = mounted_e2e_modules();
+    assert_eq!(
+        ci_modules, mounted,
+        "CI E2E shard modules must match the mounted #[path] module list so ignored browser suites cannot drift out of CI"
+    );
+}
+
+#[test]
+fn e2e_guardrail_ci_retry_classifier_fails_closed_for_semantic_failures() {
+    let ci = read_workspace_file(".github/workflows/ci.yml");
+    assert!(ci.contains("classify_e2e_failure"), "{ci}");
+    assert!(ci.contains("semantic_or_assertion"), "{ci}");
+    assert!(ci.contains("retryable_chrome_setup"), "{ci}");
+    assert!(ci.contains("NON_RETRYABLE_FAILURE=1"), "{ci}");
+    assert!(
+        !ci.contains("FAILED_TESTS=") && !ci.contains("Retrying failed tests"),
+        "CI must not retry failed test names because assertion/projection/idempotency failures must fail closed"
+    );
+}
+
+#[test]
+fn e2e_guardrail_release_runs_frozen_baseline_suite_before_dist() {
+    let release = read_workspace_file(".github/workflows/release.yml");
+    assert!(release.contains("frozen-baseline-guardrails"), "{release}");
+    assert!(
+        release.contains("cargo test -p rub-cli --bin rub doc_contract"),
+        "{release}"
+    );
+    assert!(
+        release.contains("cargo test -p rub-cli --test e2e e2e_guardrail"),
+        "{release}"
+    );
+    assert!(
+        release.contains("cargo test -p rub-test-harness root_fixture"),
+        "{release}"
+    );
+    assert!(
+        release.contains("plan:\n    needs:\n      - frozen-baseline-guardrails"),
+        "release dist plan must be fenced behind frozen-baseline guardrails"
+    );
+}
+
+#[test]
+fn e2e_guardrail_polling_helpers_fail_closed_on_non_success_results() {
+    let e2e_source = read_workspace_file("crates/rub-cli/tests/e2e.rs");
+    let trigger_runtime = read_workspace_file("crates/rub-cli/tests/e2e/trigger_runtime.rs");
+    assert!(
+        e2e_source.contains("fn assert_poll_success"),
+        "{e2e_source}"
+    );
+    assert!(
+        trigger_runtime.contains("assert_poll_success(\"tabs\", &tabs)"),
+        "{trigger_runtime}"
+    );
+    assert!(
+        !trigger_runtime.contains("tabs[\"success\"] != true"),
+        "trigger_runtime tab polling must not sleep through non-success CommandResult"
+    );
+    assert!(
+        !e2e_source.contains("out[\"success\"] == true\n            && let Some(rule)"),
+        "orchestration polling helpers must not hide non-success CommandResult while waiting for final success"
     );
 }
 

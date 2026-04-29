@@ -436,7 +436,7 @@ mod tests {
                 "_orchestration": {
                     "frame_id": "frame-target",
                     "execution_id": "exec-a",
-                    "command_identity_kind": "execution_scoped_evidence_key",
+                    "command_identity_kind": "evidence_key",
                     "command_identity_key": "source_tab_text_present:Ready::Ready",
                     "command_id": "orchestration:idem:source_tab_text_present:Ready::Ready:0",
                     "correlation_key": "corr-a",
@@ -456,7 +456,7 @@ mod tests {
                 "_orchestration": {
                     "frame_id": "frame-target",
                     "execution_id": "exec-b",
-                    "command_identity_kind": "execution_scoped_evidence_key",
+                    "command_identity_kind": "evidence_key",
                     "command_identity_key": "source_tab_text_present:Ready::Ready",
                     "command_id": "orchestration:idem:source_tab_text_present:Ready::Ready:0",
                     "correlation_key": "corr-b",

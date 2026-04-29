@@ -204,7 +204,14 @@ pub(super) fn execute_named_command_with_fence<'a>(
 > {
     Box::pin(async move {
         validate_wait_after_args_if_requested(command, args)?;
-        let outcome = dispatch_named_command(router, command, args, deadline, state).await?;
+        let outcome = match dispatch_named_command(router, command, args, deadline, state).await {
+            Ok(outcome) => outcome,
+            Err(error) if same_epoch_viewport_error_requires_cache_fence(command, args, &error) => {
+                apply_same_epoch_snapshot_cache_fence(command, args, state).await;
+                return Err(same_epoch_viewport_side_effect_error(error, command));
+            }
+            Err(error) => return Err(error),
+        };
         let (data, pending_external_dom_commit) = outcome.into_parts();
         let response_epoch = response_dom_epoch(command, args, state, pending_external_dom_commit);
         let committed_projection = if let Some(epoch) = response_epoch {
@@ -255,6 +262,61 @@ pub(super) async fn apply_same_epoch_snapshot_cache_fence(
     if super::super::policy::command_invalidates_cached_snapshots_without_epoch_bump(command, args)
     {
         state.clear_all_snapshots().await;
+    }
+}
+
+fn same_epoch_viewport_error_requires_cache_fence(
+    command: &str,
+    args: &serde_json::Value,
+    error: &RubError,
+) -> bool {
+    super::super::policy::command_invalidates_cached_snapshots_without_epoch_bump(command, args)
+        && !matches!(error, RubError::Domain(envelope) if envelope.code == ErrorCode::InvalidInput)
+}
+
+fn same_epoch_viewport_side_effect_error(error: RubError, command: &str) -> RubError {
+    match error {
+        RubError::Domain(mut envelope) => {
+            envelope.context =
+                merge_same_epoch_viewport_side_effect_context(envelope.context.take(), command);
+            RubError::Domain(envelope)
+        }
+        other => {
+            let mut envelope = other.into_envelope();
+            envelope.context =
+                merge_same_epoch_viewport_side_effect_context(envelope.context.take(), command);
+            RubError::Domain(envelope)
+        }
+    }
+}
+
+fn merge_same_epoch_viewport_side_effect_context(
+    existing: Option<serde_json::Value>,
+    command: &str,
+) -> Option<serde_json::Value> {
+    let side_effect = serde_json::json!({
+        "command": command,
+        "effect_commit_state": "possible_commit",
+        "cache_fence": "snapshot_cache_cleared",
+        "fallback_authority": "live_viewport_state",
+        "recovery_contract": {
+            "kind": "viewport_side_effect_possible_commit",
+            "fresh_snapshot_required": true,
+            "fresh_command_retry_safe": false,
+        },
+    });
+    match existing {
+        Some(serde_json::Value::Object(mut object)) => {
+            object.insert("same_epoch_viewport_side_effect".to_string(), side_effect);
+            Some(serde_json::Value::Object(object))
+        }
+        Some(other) => Some(serde_json::json!({
+            "previous_context": other,
+            "same_epoch_viewport_side_effect": side_effect,
+        })),
+        None => Some(serde_json::json!({
+            "same_epoch_viewport_side_effect": side_effect,
+        })),
     }
 }
 
@@ -331,6 +393,7 @@ mod tests {
     use super::{
         apply_post_dispatch_same_epoch_fence_before_post_wait,
         apply_same_epoch_snapshot_cache_fence, post_wait_after_commit_error,
+        same_epoch_viewport_error_requires_cache_fence, same_epoch_viewport_side_effect_error,
     };
     use crate::session::SessionState;
     use rub_core::error::{ErrorCode, RubError};
@@ -513,6 +576,59 @@ mod tests {
         assert!(
             state.get_snapshot(&cached.snapshot_id).await.is_some(),
             "read-only commands must not clear cached snapshots when post-wait fails"
+        );
+    }
+
+    #[test]
+    fn same_epoch_viewport_error_fence_excludes_invalid_input() {
+        assert!(!same_epoch_viewport_error_requires_cache_fence(
+            "scroll",
+            &serde_json::json!({}),
+            &RubError::domain(ErrorCode::InvalidInput, "bad scroll args"),
+        ));
+        assert!(same_epoch_viewport_error_requires_cache_fence(
+            "scroll",
+            &serde_json::json!({}),
+            &RubError::domain(ErrorCode::WaitTimeout, "scroll timed out"),
+        ));
+        assert!(same_epoch_viewport_error_requires_cache_fence(
+            "extract",
+            &serde_json::json!({"scan": {"limit": 2}}),
+            &RubError::domain(ErrorCode::ElementNotFound, "scan exhausted"),
+        ));
+        assert!(same_epoch_viewport_error_requires_cache_fence(
+            "find",
+            &serde_json::json!({"topmost": true}),
+            &RubError::Internal("hit-test failed".to_string()),
+        ));
+    }
+
+    #[test]
+    fn same_epoch_viewport_error_projects_possible_commit_contract() {
+        let envelope = same_epoch_viewport_side_effect_error(
+            RubError::domain_with_context(
+                ErrorCode::WaitTimeout,
+                "scroll timed out",
+                serde_json::json!({"source": "browser"}),
+            ),
+            "scroll",
+        )
+        .into_envelope();
+
+        assert_eq!(envelope.code, ErrorCode::WaitTimeout);
+        let context = envelope.context.expect("context");
+        assert_eq!(context["source"], "browser");
+        assert_eq!(
+            context["same_epoch_viewport_side_effect"]["cache_fence"],
+            "snapshot_cache_cleared"
+        );
+        assert_eq!(
+            context["same_epoch_viewport_side_effect"]["recovery_contract"]["kind"],
+            "viewport_side_effect_possible_commit"
+        );
+        assert_eq!(
+            context["same_epoch_viewport_side_effect"]["recovery_contract"]["fresh_command_retry_safe"],
+            false
         );
     }
 

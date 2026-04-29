@@ -61,6 +61,17 @@ fn record_temp_daemon_unreleased(
     }
 }
 
+fn record_temp_daemon_authority_lost(
+    result: &mut CleanupResult,
+    daemon: &TempDaemonProcess,
+    key: &str,
+) {
+    result
+        .skipped_best_effort_phases
+        .push(format!("temp_daemon_sigkill_authority_lost:{key}"));
+    record_temp_daemon_unreleased(result, daemon, key);
+}
+
 fn record_temp_daemon_released(
     result: &mut CleanupResult,
     daemon: &TempDaemonProcess,
@@ -182,6 +193,10 @@ pub(super) async fn sweep_temp_daemons(
                                         active_temp_homes.insert(daemon.rub_home.clone());
                                         record_temp_daemon_unreleased(result, &daemon, &key);
                                     }
+                                    TempDaemonReleaseOutcome::AuthorityLost => {
+                                        active_temp_homes.insert(daemon.rub_home.clone());
+                                        record_temp_daemon_authority_lost(result, &daemon, &key);
+                                    }
                                 }
                                 continue;
                             }
@@ -232,6 +247,10 @@ pub(super) async fn sweep_temp_daemons(
                             active_temp_homes.insert(daemon.rub_home.clone());
                             record_temp_daemon_unreleased(result, &daemon, &key);
                         }
+                        TempDaemonReleaseOutcome::AuthorityLost => {
+                            active_temp_homes.insert(daemon.rub_home.clone());
+                            record_temp_daemon_authority_lost(result, &daemon, &key);
+                        }
                     }
                     continue;
                 } else {
@@ -268,6 +287,10 @@ pub(super) async fn sweep_temp_daemons(
             TempDaemonReleaseOutcome::StillLive => {
                 active_temp_homes.insert(daemon.rub_home.clone());
                 record_temp_daemon_unreleased(result, &daemon, &key);
+            }
+            TempDaemonReleaseOutcome::AuthorityLost => {
+                active_temp_homes.insert(daemon.rub_home.clone());
+                record_temp_daemon_authority_lost(result, &daemon, &key);
             }
         }
     }
@@ -504,7 +527,8 @@ fn strip_private_prefix(path: &Path) -> Option<PathBuf> {
 mod tests {
     use super::{
         TempDaemonProcess, TempHomeDeleteDecision, classify_stale_temp_home_sweep_decision,
-        compatibility_degraded_owned_for_temp_daemon_in_snapshot, record_temp_daemon_released,
+        compatibility_degraded_owned_for_temp_daemon_in_snapshot,
+        record_temp_daemon_authority_lost, record_temp_daemon_released,
         record_temp_daemon_unreleased, sweep_stale_temp_homes,
     };
     use crate::cleanup_ctl::CleanupResult;
@@ -577,6 +601,31 @@ mod tests {
 
         assert_eq!(result.skipped_busy_temp_daemons, vec!["default@temp-home"]);
         assert!(result.compatibility_degraded_owned_sessions.is_empty());
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn temp_daemon_authority_lost_is_projected_as_degraded_cleanup() {
+        let home = temp_home("rub-cleanup-temp-daemon-authority-lost");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let daemon = TempDaemonProcess {
+            pid: 42,
+            session_name: "default".to_string(),
+            session_id: "sess-default".to_string(),
+            rub_home: home.clone(),
+            user_data_dir: None,
+        };
+        let mut result = CleanupResult::default();
+
+        record_temp_daemon_authority_lost(&mut result, &daemon, "default@temp-home");
+
+        assert_eq!(result.skipped_busy_temp_daemons, vec!["default@temp-home"]);
+        assert_eq!(
+            result.skipped_best_effort_phases,
+            vec!["temp_daemon_sigkill_authority_lost:default@temp-home"]
+        );
 
         let _ = std::fs::remove_dir_all(home);
     }

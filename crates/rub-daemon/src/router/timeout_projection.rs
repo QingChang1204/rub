@@ -339,6 +339,92 @@ pub(crate) fn record_mutating_possible_commit_timeout_projection(
     }));
 }
 
+pub(crate) fn record_registry_control_commit_timeout_projection(
+    subject_kind: &'static str,
+    operation: &'static str,
+    entity_key: &'static str,
+    committed_entity: serde_json::Value,
+) {
+    let Some(recorder) = current_timeout_projection_recorder() else {
+        return;
+    };
+    let mut committed = serde_json::Map::new();
+    committed.insert(entity_key.to_string(), committed_entity);
+    recorder.record_aggregate(serde_json::json!({
+        "subject": {
+            "kind": subject_kind,
+            "source": "registry_control",
+        },
+        "transaction": {
+            "status": "committed",
+            "failure_class": "outer_timeout_after_registry_commit",
+            "operation": operation,
+            "commit_authority": "session_state_registry",
+            "projection_authoritative": true,
+            "recovery_contract": {
+                "kind": "registry_commit",
+                "committed_projection_authoritative": true,
+                "rollback_available": false,
+                "resume_supported": false,
+            },
+        },
+        "committed": serde_json::Value::Object(committed),
+    }));
+}
+
+pub(crate) fn record_effectful_command_possible_commit_timeout_projection(
+    command: &str,
+    command_id: Option<&str>,
+) {
+    if !command_has_effectful_timeout_surface(command) {
+        return;
+    }
+    record_mutating_possible_commit_timeout_projection(
+        command,
+        serde_json::json!({
+            "kind": "command_possible_commit",
+            "command": command,
+            "command_id": command_id,
+            "effect_commit_state": "possible_commit",
+            "projection_authoritative": false,
+            "retry_requires_same_command_id": command_id.is_some(),
+            "fresh_command_retry_safe": false,
+            "fallback_authority": "command_specific_replay_or_recovery_contract",
+        }),
+    );
+}
+
+fn command_has_effectful_timeout_surface(command: &str) -> bool {
+    matches!(
+        command,
+        "open"
+            | "back"
+            | "forward"
+            | "reload"
+            | "scroll"
+            | "switch"
+            | "close-tab"
+            | "click"
+            | "exec"
+            | "keys"
+            | "type"
+            | "hover"
+            | "upload"
+            | "select"
+            | "fill"
+            | "pipe"
+            | "dialog"
+            | "cookies"
+            | "intercept"
+            | "storage"
+            | "orchestration"
+            | "trigger"
+            | "_trigger_fill"
+            | "_trigger_pipe"
+            | "_orchestration_target_dispatch"
+    )
+}
+
 pub(crate) fn merge_timeout_projection_context(
     base: Option<serde_json::Value>,
     extra: Option<serde_json::Value>,
@@ -371,10 +457,12 @@ mod tests {
     use super::{
         ExecutionTimeoutProjectionRecorder, merge_timeout_projection_context,
         post_wait_partial_commit_timeout_projection,
+        record_effectful_command_possible_commit_timeout_projection,
         record_mutating_possible_commit_timeout_projection,
         record_orchestration_partial_commit_timeout_projection,
         record_orchestration_pending_step_timeout_projection,
         record_post_wait_partial_commit_timeout_projection,
+        record_registry_control_commit_timeout_projection,
         record_workflow_partial_commit_timeout_projection,
         record_workflow_pending_step_timeout_projection, scope_timeout_projection,
     };
@@ -573,6 +661,72 @@ mod tests {
             projection["partial_commit"]["recovery_contract"]["kind"],
             "interaction_possible_commit"
         );
+    }
+
+    #[tokio::test]
+    async fn registry_control_commit_projection_records_committed_authority() {
+        let recorder = Arc::new(ExecutionTimeoutProjectionRecorder::default());
+        scope_timeout_projection(recorder.clone(), async {
+            record_registry_control_commit_timeout_projection(
+                "trigger",
+                "remove",
+                "removed",
+                serde_json::json!({
+                    "id": 7,
+                    "status": "armed",
+                }),
+            );
+        })
+        .await;
+
+        let projection = recorder.snapshot().expect("projection should be recorded");
+        assert_eq!(projection["subject"]["kind"], "trigger");
+        assert_eq!(projection["transaction"]["status"], "committed");
+        assert_eq!(
+            projection["transaction"]["failure_class"],
+            "outer_timeout_after_registry_commit"
+        );
+        assert_eq!(
+            projection["transaction"]["recovery_contract"]["kind"],
+            "registry_commit"
+        );
+        assert_eq!(projection["committed"]["removed"]["id"], 7);
+    }
+
+    #[tokio::test]
+    async fn effectful_command_possible_commit_projection_records_safe_retry_policy() {
+        let recorder = Arc::new(ExecutionTimeoutProjectionRecorder::default());
+        scope_timeout_projection(recorder.clone(), async {
+            record_effectful_command_possible_commit_timeout_projection("scroll", Some("cmd-1"));
+        })
+        .await;
+
+        let projection = recorder.snapshot().expect("projection should be recorded");
+        assert_eq!(projection["reason"], "mutating_command_possible_commit");
+        assert_eq!(projection["partial_commit"]["command"], "scroll");
+        assert_eq!(
+            projection["partial_commit"]["recovery_contract"]["kind"],
+            "command_possible_commit"
+        );
+        assert_eq!(
+            projection["partial_commit"]["recovery_contract"]["fresh_command_retry_safe"],
+            false
+        );
+        assert_eq!(
+            projection["partial_commit"]["recovery_contract"]["command_id"],
+            "cmd-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_command_possible_commit_projection_is_not_recorded() {
+        let recorder = Arc::new(ExecutionTimeoutProjectionRecorder::default());
+        scope_timeout_projection(recorder.clone(), async {
+            record_effectful_command_possible_commit_timeout_projection("state", Some("cmd-1"));
+        })
+        .await;
+
+        assert!(recorder.snapshot().is_none());
     }
 
     #[tokio::test]

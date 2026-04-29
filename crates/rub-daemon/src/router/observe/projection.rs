@@ -39,11 +39,15 @@ pub(super) fn build_element_map(
 
 pub(super) async fn capture_screenshot_payload(
     router: &DaemonRouter,
+    snapshot: &rub_core::model::Snapshot,
     full: bool,
     path: Option<&str>,
     deadline: TransactionDeadline,
 ) -> Result<serde_json::Value, RubError> {
-    let png_bytes = router.browser.screenshot(full).await?;
+    let png_bytes = router
+        .browser
+        .screenshot_for_snapshot(snapshot, full)
+        .await?;
     if let Some(path) = path {
         return write_screenshot_artifact(
             path,

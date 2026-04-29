@@ -532,8 +532,8 @@ pub(crate) fn orchestration_step_command_id(
 ) -> String {
     if let Some(identity_key) = command_identity_key {
         format!(
-            "orchestration:{}:{}:{}:{}",
-            rule.idempotency_key, identity_key, execution_id, step_index
+            "orchestration:{}:{}:{}",
+            rule.idempotency_key, identity_key, step_index
         )
     } else {
         format!(
@@ -556,7 +556,7 @@ pub(crate) fn orchestration_request_meta(
         "id": rule.id,
         "execution_id": execution_id,
         "command_identity_kind": if command_identity_key.is_some() {
-            "execution_scoped_evidence_key"
+            "evidence_key"
         } else {
             "execution_attempt"
         },

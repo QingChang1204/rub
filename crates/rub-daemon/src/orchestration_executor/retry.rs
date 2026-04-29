@@ -44,11 +44,31 @@ pub(super) fn orchestration_retry_policy(rule: &OrchestrationRuleInfo) -> Orches
 pub(super) async fn run_with_orchestration_retry<T, F, Fut>(
     policy: OrchestrationRetryPolicy,
     outer_deadline: Option<TransactionDeadline>,
+    operation: F,
+) -> Result<(T, u32), OrchestrationRetryFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ErrorEnvelope>>,
+{
+    run_with_orchestration_retry_with_timeout_error(
+        policy,
+        outer_deadline,
+        orchestration_retry_timeout_budget_exhausted_error,
+        operation,
+    )
+    .await
+}
+
+pub(super) async fn run_with_orchestration_retry_with_timeout_error<T, F, Fut, G>(
+    policy: OrchestrationRetryPolicy,
+    outer_deadline: Option<TransactionDeadline>,
+    timeout_error: G,
     mut operation: F,
 ) -> Result<(T, u32), OrchestrationRetryFailure>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, ErrorEnvelope>>,
+    G: Fn() -> ErrorEnvelope,
 {
     let mut attempts = 0;
     let mut last_retry_reason = None;
@@ -57,7 +77,7 @@ where
         attempts += 1;
         let result = run_orchestration_future_with_outer_deadline(
             outer_deadline,
-            orchestration_retry_timeout_budget_exhausted_error,
+            || timeout_error(),
             operation(),
         )
         .await;

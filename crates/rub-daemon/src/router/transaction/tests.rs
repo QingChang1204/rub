@@ -555,6 +555,9 @@ fn queue_timeout_response_clamps_reported_queue_ms_to_transaction_budget() {
 
     assert_eq!(context["transaction_timeout_ms"], serde_json::json!(100));
     assert_eq!(context["queue_ms"], serde_json::json!(100));
+    assert_eq!(response.timing.queue_ms, 100);
+    assert_eq!(response.timing.exec_ms, 0);
+    assert_eq!(response.timing.total_ms, 100);
     assert_eq!(
         envelope.message,
         "Command timed out waiting in queue after 100ms"

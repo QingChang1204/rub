@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
+use rub_core::model::Timing;
 use rub_ipc::codec::{MAX_FRAME_BYTES, encoded_frame_len};
 use rub_ipc::protocol::{IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse};
 
@@ -202,6 +203,11 @@ pub(crate) fn queue_timeout_response(
             None,
         )),
     )
+    .with_timing(Timing {
+        queue_ms,
+        exec_ms: 0,
+        total_ms: queue_ms,
+    })
 }
 
 pub(crate) fn execution_timeout_error(

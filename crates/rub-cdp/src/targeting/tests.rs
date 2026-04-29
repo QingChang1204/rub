@@ -1,10 +1,10 @@
 use super::{
-    TOP_LEVEL_BOUNDING_BOX_FUNCTION, TOP_LEVEL_HIT_TEST_HELPERS, bounding_box_center_distance,
-    bounding_box_match_score, bounding_box_shape_matches, candidate_points,
-    filter_snapshot_elements_by_hit_test, finalize_hit_test_ranking, parse_backend_node_id,
-    parse_element_ref_frame_id, snapshot_candidate_match_rank, tag_matches,
-    top_level_geometry_authority_error, top_level_geometry_error_reason,
-    unverified_read_target_error, unverified_write_target_error,
+    LiveWriteTargetFingerprint, TOP_LEVEL_BOUNDING_BOX_FUNCTION, TOP_LEVEL_HIT_TEST_HELPERS,
+    bounding_box_center_distance, bounding_box_match_score, bounding_box_shape_matches,
+    candidate_points, filter_snapshot_elements_by_hit_test, finalize_hit_test_ranking,
+    live_write_target_fingerprint_mismatch, parse_backend_node_id, parse_element_ref_frame_id,
+    snapshot_candidate_match_rank, tag_matches, top_level_geometry_authority_error,
+    top_level_geometry_error_reason, unverified_read_target_error, unverified_write_target_error,
 };
 use crate::browser::{BrowserLaunchOptions, BrowserManager};
 use rub_core::error::ErrorCode;
@@ -201,6 +201,48 @@ fn snapshot_candidate_match_rank_rejects_mismatched_attributes() {
 }
 
 #[test]
+fn live_write_target_fingerprint_rejects_semantic_drift() {
+    let expected = Element {
+        index: 0,
+        tag: ElementTag::Button,
+        text: "Save".to_string(),
+        attributes: HashMap::from([("aria-label".to_string(), "Save changes".to_string())]),
+        element_ref: Some("frame-1:10".to_string()),
+        target_id: Some("target-1".to_string()),
+        bounding_box: Some(BoundingBox {
+            x: 10.0,
+            y: 10.0,
+            width: 80.0,
+            height: 30.0,
+        }),
+        ax_info: None,
+        listeners: Some(vec!["click".to_string()]),
+        depth: None,
+    };
+    let text_drift = LiveWriteTargetFingerprint {
+        tag: ElementTag::Button,
+        text: "Delete".to_string(),
+        attributes: expected.attributes.clone(),
+        bounding_box: expected.bounding_box,
+        listeners: expected.listeners.clone(),
+    };
+    let listener_drift = LiveWriteTargetFingerprint {
+        text: expected.text.clone(),
+        listeners: Some(vec!["mouseover".to_string()]),
+        ..text_drift.clone()
+    };
+
+    assert_eq!(
+        live_write_target_fingerprint_mismatch(&expected, &text_drift),
+        Some("text")
+    );
+    assert_eq!(
+        live_write_target_fingerprint_mismatch(&expected, &listener_drift),
+        Some("listeners")
+    );
+}
+
+#[test]
 fn unverified_write_target_error_is_reported_as_stale_snapshot() {
     let error = unverified_write_target_error(
         &Element {
@@ -309,6 +351,49 @@ async fn snapshot_bound_read_fails_closed_after_dom_replacement() {
             .as_ref()
             .and_then(|ctx| ctx["reason"].as_str()),
         Some("unverified_read_target")
+    );
+
+    manager.close().await.expect("browser should close cleanly");
+}
+
+#[tokio::test]
+async fn snapshot_bound_write_fails_closed_when_backend_node_semantics_drift() {
+    let manager = BrowserManager::new(options());
+    manager
+        .ensure_browser()
+        .await
+        .expect("managed browser should launch");
+    let page = manager.page().await.expect("page authority");
+    page.goto("data:text/html,<button id='save'>Save</button>")
+        .await
+        .expect("test page should load");
+
+    let snapshot = crate::dom::build_snapshot(&page, 0, Some(10))
+        .await
+        .expect("snapshot should build");
+    let button = snapshot
+        .elements
+        .iter()
+        .find(|element| element.text == "Save")
+        .cloned()
+        .expect("snapshot should capture save button");
+
+    page.evaluate("document.getElementById('save').textContent = 'Delete'")
+        .await
+        .expect("same backend node should drift semantically");
+
+    let error = crate::targeting::resolve_element(&page, &button)
+        .await
+        .expect_err("snapshot-bound write target must fail when backend node semantics drift");
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::StaleSnapshot);
+    let context = envelope.context.expect("context");
+    assert_eq!(context["reason"], "unverified_write_target");
+    assert!(
+        context["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("live semantic fingerprint diverged: text")),
+        "{context}"
     );
 
     manager.close().await.expect("browser should close cleanly");

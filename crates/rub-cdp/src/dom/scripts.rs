@@ -195,6 +195,18 @@ pub(crate) fn live_element_projection_fingerprint_function() -> &'static str {
             return attrs;
         }
 
+        function getListeners(el) {
+            if (typeof getEventListeners !== 'function') return null;
+            try {
+                const listeners = getEventListeners(el);
+                return Object.keys(listeners)
+                    .filter((name) => Array.isArray(listeners[name]) && listeners[name].length > 0)
+                    .sort();
+            } catch (_) {
+                return null;
+            }
+        }
+
         function getRect(el) {
             const r = el.getBoundingClientRect();
             let x = r.x;
@@ -230,6 +242,7 @@ pub(crate) fn live_element_projection_fingerprint_function() -> &'static str {
             tag: getTag(this),
             text: getText(this),
             attributes: getAttrs(this),
+            listeners: getListeners(this),
             bounding_box: getRect(this),
             depth: getDepth(this),
         });

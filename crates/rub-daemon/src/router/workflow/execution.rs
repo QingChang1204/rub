@@ -6,7 +6,9 @@ use super::command_build::{
 };
 use super::fill_atomic::execute_atomic_fill;
 use super::pipe_execution::cmd_pipe_with_policy;
-use super::projection::workflow_step_projection;
+use super::projection::{
+    workflow_error_projection, workflow_failed_step_projection, workflow_step_projection,
+};
 use super::spec::parse_fill_steps;
 use super::*;
 use crate::router::addressing::resolve_element;
@@ -20,7 +22,7 @@ use crate::router::timeout_projection::{
     record_workflow_partial_commit_timeout_projection,
     record_workflow_pending_step_timeout_projection,
 };
-use rub_core::error::RubError;
+use rub_core::error::{ErrorEnvelope, RubError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OrchestrationMetadataInheritancePolicy {
@@ -119,7 +121,16 @@ async fn cmd_fill_with_policy(
             );
             match build_fill_step_command(router, state, deadline, step, &locator_args).await {
                 Ok(result) => result,
-                Err(error) => return Err(redact_rub_error(error, &metadata)),
+                Err(error) => {
+                    return Err(fill_step_error(
+                        redact_rub_error(error, &metadata),
+                        step_index,
+                        "fill",
+                        Some("resolve"),
+                        &results,
+                        "step_build_failed",
+                    ));
+                }
             }
         };
         inherit_orchestration_metadata(
@@ -136,11 +147,29 @@ async fn cmd_fill_with_policy(
                 .await
             {
                 Ok(data) => data,
-                Err(error) => return Err(redact_rub_error(error, &metadata)),
+                Err(error) => {
+                    return Err(fill_step_error(
+                        redact_rub_error(error, &metadata),
+                        step_index,
+                        command,
+                        None,
+                        &results,
+                        "step_execution_failed",
+                    ));
+                }
             };
         if let Err(error) = ensure_committed_automation_result(command, Some(&data)) {
-            return Err(redact_rub_error(RubError::Domain(error), &metadata));
+            return Err(fill_step_error(
+                redact_rub_error(RubError::Domain(error), &metadata),
+                step_index,
+                command,
+                None,
+                &results,
+                "step_commit_fence_failed",
+            ));
         }
+        let mut data = data;
+        redact_json_value(&mut data, &metadata);
         results.push(workflow_step_projection(
             step_index, command, None, None, data,
         ));
@@ -163,11 +192,29 @@ async fn cmd_fill_with_policy(
                 .await
             {
                 Ok(data) => data,
-                Err(error) => return Err(redact_rub_error(error, &metadata)),
+                Err(error) => {
+                    return Err(fill_step_error(
+                        redact_rub_error(error, &metadata),
+                        results.len(),
+                        "click",
+                        Some("submit"),
+                        &results,
+                        "submit_execution_failed",
+                    ));
+                }
             };
         if let Err(error) = ensure_committed_automation_result("click", Some(&data)) {
-            return Err(redact_rub_error(RubError::Domain(error), &metadata));
+            return Err(fill_step_error(
+                redact_rub_error(RubError::Domain(error), &metadata),
+                results.len(),
+                "click",
+                Some("submit"),
+                &results,
+                "submit_commit_fence_failed",
+            ));
         }
+        let mut data = data;
+        redact_json_value(&mut data, &metadata);
         results.push(workflow_step_projection(
             results.len(),
             "click",
@@ -191,6 +238,116 @@ async fn cmd_fill_with_policy(
     attach_secret_resolution_projection(&mut data, &metadata);
     redact_json_value(&mut data, &metadata);
     Ok(data)
+}
+
+fn fill_step_error(
+    error: RubError,
+    step_index: usize,
+    step_command: &str,
+    step_role: Option<&str>,
+    completed: &[serde_json::Value],
+    failure_class: &'static str,
+) -> RubError {
+    let source = error.into_envelope();
+    let mut steps = completed.to_vec();
+    steps.push(workflow_failed_step_projection(
+        step_index,
+        step_command,
+        None,
+        step_role,
+        &source,
+    ));
+
+    let context = serde_json::json!({
+        "subject": {
+            "kind": "fill",
+            "source": "live_execution",
+        },
+        "transaction": {
+            "atomic": false,
+            "status": "failed",
+            "failure_class": failure_class,
+            "failed_step_index": step_index,
+            "committed_step_count": completed.len(),
+            "rollback_attempted": false,
+            "rollback_failed": false,
+            "source_error": workflow_error_projection(&source),
+            "recovery_contract": {
+                "kind": "partial_commit",
+                "committed_steps_authoritative": true,
+                "rollback_available": false,
+                "resume_from_failed_step_supported": false,
+            },
+        },
+        "steps": steps,
+    });
+
+    RubError::Domain(
+        ErrorEnvelope::new(
+            source.code,
+            format!(
+                "fill step {} ('{}') failed: {}",
+                step_index, step_command, source.message
+            ),
+        )
+        .with_suggestion(source.suggestion)
+        .with_context(context),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rub_core::error::ErrorCode;
+    use serde_json::json;
+
+    #[test]
+    fn fill_step_error_projects_partial_commit_recovery_contract() {
+        let completed = vec![workflow_step_projection(
+            0,
+            "type",
+            None,
+            None,
+            json!({"result": "committed"}),
+        )];
+        let envelope = fill_step_error(
+            RubError::domain_with_context(
+                ErrorCode::ElementNotFound,
+                "submit disappeared",
+                json!({"selector": "#submit"}),
+            ),
+            1,
+            "click",
+            Some("submit"),
+            &completed,
+            "submit_execution_failed",
+        )
+        .into_envelope();
+
+        assert_eq!(envelope.code, ErrorCode::ElementNotFound);
+        let context = envelope.context.expect("fill failure context");
+        assert_eq!(context["subject"]["kind"], "fill");
+        assert_eq!(context["transaction"]["atomic"], false);
+        assert_eq!(context["transaction"]["status"], "failed");
+        assert_eq!(
+            context["transaction"]["failure_class"],
+            "submit_execution_failed"
+        );
+        assert_eq!(context["transaction"]["committed_step_count"], 1);
+        assert_eq!(
+            context["transaction"]["recovery_contract"]["kind"],
+            "partial_commit"
+        );
+        assert_eq!(
+            context["transaction"]["source_error"]["context"]["selector"],
+            "#submit"
+        );
+        assert_eq!(context["steps"][0]["status"], "committed");
+        assert_eq!(context["steps"][1]["status"], "failed");
+        assert_eq!(context["steps"][1]["action"]["command"], "click");
+        assert_eq!(context["steps"][1]["action"]["role"], "submit");
+        assert_eq!(context["steps"][1]["error"]["code"], "ELEMENT_NOT_FOUND");
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -17,7 +17,7 @@ use super::action_request::{
 use super::protocol::align_orchestration_timeout_authority;
 use super::retry::{
     OrchestrationRetryFailure, OrchestrationRetryPolicy, orchestration_retry_policy,
-    run_with_orchestration_retry,
+    run_with_orchestration_retry, run_with_orchestration_retry_with_timeout_error,
 };
 use super::target::dispatch_action_to_target_session;
 use super::*;
@@ -136,11 +136,41 @@ where
     F: FnMut(IpcRequest) -> Fut,
     Fut: std::future::Future<Output = Result<T, ErrorEnvelope>>,
 {
-    run_with_orchestration_retry(policy, outer_deadline, || {
-        let request = request.clone();
-        operation(request)
-    })
+    let timeout_request = request.clone();
+    run_with_orchestration_retry_with_timeout_error(
+        policy,
+        outer_deadline,
+        || orchestration_target_dispatch_outer_deadline_error(&timeout_request),
+        || {
+            let request = request.clone();
+            operation(request)
+        },
+    )
     .await
+}
+
+fn orchestration_target_dispatch_outer_deadline_error(request: &IpcRequest) -> ErrorEnvelope {
+    ErrorEnvelope::new(
+        ErrorCode::IpcTimeout,
+        format!(
+            "Orchestration target dispatch for '{}' exhausted the caller-owned timeout budget after possible target commit",
+            request.command
+        ),
+    )
+    .with_context(serde_json::json!({
+        "reason": "orchestration_target_dispatch_outer_deadline_exhausted",
+        "command": request.command.as_str(),
+        "command_id": request.command_id.as_deref(),
+        "target_daemon_session_id": request.daemon_session_id.as_deref(),
+        "effect_commit_state": "possible_commit",
+        "possible_commit_recovery_contract": {
+            "kind": "target_replay_or_spent_tombstone",
+            "target_command_id": request.command_id.as_deref(),
+            "target_daemon_session_id": request.daemon_session_id.as_deref(),
+            "retry_requires_same_command_id": request.command_id.is_some(),
+            "fresh_command_retry_safe": false,
+        },
+    }))
 }
 
 fn dispatch_retry_policy_after_materialization(
@@ -305,6 +335,7 @@ pub(super) fn action_requires_source_materialization(action: &TriggerActionSpec)
 mod tests {
     use super::{
         OrchestrationRetryPolicy, dispatch_retry_policy_after_materialization,
+        orchestration_target_dispatch_outer_deadline_error,
         reserve_source_materialization_authority, run_with_frozen_orchestration_request_retry,
         total_orchestration_attempts, trim_action_request_timeout_after_pre_dispatch,
     };
@@ -493,6 +524,37 @@ mod tests {
         assert_eq!(total_orchestration_attempts(2, 1), 2);
         assert_eq!(total_orchestration_attempts(1, 3), 3);
         assert_eq!(total_orchestration_attempts(2, 2), 3);
+    }
+
+    #[test]
+    fn target_dispatch_outer_deadline_error_preserves_possible_commit_contract() {
+        let request = IpcRequest::new("click", serde_json::json!({}), 1_000)
+            .with_command_id("orchestration:idem:evidence:0")
+            .expect("static command id should validate")
+            .with_daemon_session_id("target-daemon")
+            .expect("daemon session id should validate");
+
+        let envelope = orchestration_target_dispatch_outer_deadline_error(&request);
+
+        assert_eq!(envelope.code, ErrorCode::IpcTimeout);
+        let context = envelope.context.expect("timeout context");
+        assert_eq!(
+            context["reason"],
+            "orchestration_target_dispatch_outer_deadline_exhausted"
+        );
+        assert_eq!(context["effect_commit_state"], "possible_commit");
+        assert_eq!(
+            context["possible_commit_recovery_contract"]["kind"],
+            "target_replay_or_spent_tombstone"
+        );
+        assert_eq!(
+            context["possible_commit_recovery_contract"]["target_command_id"],
+            "orchestration:idem:evidence:0"
+        );
+        assert_eq!(
+            context["possible_commit_recovery_contract"]["fresh_command_retry_safe"],
+            false
+        );
     }
 
     #[tokio::test]

@@ -51,8 +51,12 @@ pub(super) async fn cmd_observe(
         apply_projection_limit(&mut snapshot, limit);
     }
     let highlighted_count = router.browser.highlight_elements(&snapshot).await?;
-    let screenshot_result = capture_screenshot_payload(router, full, path, deadline).await;
-    let cleanup_result = router.browser.cleanup_highlights().await;
+    let screenshot_result =
+        capture_screenshot_payload(router, &snapshot, full, path, deadline).await;
+    let cleanup_result = router
+        .browser
+        .cleanup_highlights_for_snapshot(&snapshot)
+        .await;
 
     let screenshot = match (screenshot_result, cleanup_result) {
         (Ok(screenshot), Ok(())) => screenshot,

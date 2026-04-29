@@ -8,7 +8,7 @@ use crate::session::SessionState;
 
 use super::args::{CloseTabArgs, SwitchArgs};
 use super::projection::{attach_result, attach_subject, tab_entity, tab_subject};
-use super::settle::settle_navigation_projection;
+use super::settle::{active_tab_projection_from_tabs, settle_navigation_projection};
 
 pub(crate) async fn cmd_tabs(router: &DaemonRouter) -> Result<serde_json::Value, RubError> {
     let tabs = router.browser.list_tabs().await?;
@@ -65,18 +65,49 @@ pub(crate) async fn cmd_close_tab(
     let tabs = router.browser.close_tab(index).await?;
     let pending_external_dom_commit =
         settle_navigation_projection(router, state, "close-tab", deadline).await;
-    let active_tab = tabs.iter().find(|tab| tab.active).ok_or_else(|| {
-        RubError::Internal("close-tab completed without an active tab".to_string())
-    })?;
+    let result = close_tab_result_projection(&tabs);
     let mut data = serde_json::json!({});
     attach_subject(&mut data, tab_subject(closed_index));
-    attach_result(
-        &mut data,
-        serde_json::json!({
-            "remaining_tabs": tabs.len(),
-            "active_tab": tab_entity(active_tab),
-        }),
-    );
+    attach_result(&mut data, result);
     Ok(CommandDispatchOutcome::new(data)
         .with_pending_external_dom_commit(pending_external_dom_commit))
+}
+
+fn close_tab_result_projection(tabs: &[rub_core::model::TabInfo]) -> serde_json::Value {
+    let active_tab = active_tab_projection_from_tabs(tabs);
+    serde_json::json!({
+        "remaining_tabs": tabs.len(),
+        "active_tab": active_tab.tab,
+        "active_tab_degraded_reason": active_tab.degraded_reason,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::close_tab_result_projection;
+    use rub_core::model::TabInfo;
+
+    fn tab(index: u32, active: bool) -> TabInfo {
+        TabInfo {
+            index,
+            target_id: format!("tab-{index}"),
+            url: format!("https://example.com/{index}"),
+            title: format!("Tab {index}"),
+            active,
+            active_authority: None,
+            degraded_reason: None,
+        }
+    }
+
+    #[test]
+    fn close_tab_result_projects_degraded_active_tab_without_erasing_commit() {
+        let projection = close_tab_result_projection(&[tab(0, false)]);
+
+        assert_eq!(projection["remaining_tabs"], 1);
+        assert!(projection["active_tab"].is_null());
+        assert_eq!(
+            projection["active_tab_degraded_reason"],
+            "active_tab_unavailable"
+        );
+    }
 }

@@ -7,6 +7,7 @@ use chromiumoxide::layout::Point;
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::BoundingBox;
 use rub_core::model::{Element, ElementTag};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(crate) const TOP_LEVEL_BOUNDING_BOX_FUNCTION: &str = r#"function() {
@@ -123,6 +124,15 @@ enum CandidateMatchRank {
     Scored(f64),
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct LiveWriteTargetFingerprint {
+    tag: ElementTag,
+    text: String,
+    attributes: HashMap<String, String>,
+    bounding_box: Option<BoundingBox>,
+    listeners: Option<Vec<String>>,
+}
+
 pub(crate) async fn resolve_element(
     page: &Arc<Page>,
     element: &Element,
@@ -143,6 +153,7 @@ pub(crate) async fn resolve_element(
                 "snapshot element backend node id no longer resolves in the live DOM",
             )
         })?;
+    verify_live_write_target_fingerprint(page, element, &remote_object_id).await?;
 
     Ok(ResolvedElement {
         remote_object_id,
@@ -193,6 +204,88 @@ pub(crate) fn snapshot_element_replay_matches_authority(
     }
 
     snapshot_candidate_match_rank(expected, candidate).is_some()
+}
+
+async fn verify_live_write_target_fingerprint(
+    page: &Arc<Page>,
+    element: &Element,
+    remote_object_id: &RemoteObjectId,
+) -> Result<(), RubError> {
+    let fingerprint_json = crate::js::call_function_returning_string(
+        page,
+        remote_object_id,
+        crate::dom::live_element_projection_fingerprint_function(),
+    )
+    .await
+    .map_err(|error| {
+        unverified_write_target_error(
+            element,
+            &format!("live semantic fingerprint probe failed: {error}"),
+        )
+    })?;
+    let live =
+        serde_json::from_str::<LiveWriteTargetFingerprint>(&fingerprint_json).map_err(|error| {
+            unverified_write_target_error(
+                element,
+                &format!("live semantic fingerprint parse failed: {error}"),
+            )
+        })?;
+
+    if let Some(reason) = live_write_target_fingerprint_mismatch(element, &live) {
+        return Err(unverified_write_target_error(
+            element,
+            &format!("live semantic fingerprint diverged: {reason}"),
+        ));
+    }
+    Ok(())
+}
+
+fn live_write_target_fingerprint_mismatch(
+    expected: &Element,
+    live: &LiveWriteTargetFingerprint,
+) -> Option<&'static str> {
+    if expected
+        .listeners
+        .as_ref()
+        .is_some_and(|listeners| !listeners.is_empty())
+        && live.listeners.as_ref() != expected.listeners.as_ref()
+    {
+        return Some("listeners");
+    }
+    if !snapshot_tag_matches(expected.tag, live.tag) {
+        return Some("tag");
+    }
+    for key in [
+        "href",
+        "placeholder",
+        "aria-label",
+        "type",
+        "name",
+        "value",
+        "role",
+        "title",
+        "alt",
+    ] {
+        if let Some(expected_value) = expected.attributes.get(key)
+            && live.attributes.get(key) != Some(expected_value)
+        {
+            return Some("attributes");
+        }
+    }
+    if !expected.text.trim().is_empty()
+        && normalize_text(&live.text) != normalize_text(&expected.text)
+    {
+        return Some("text");
+    }
+    if let Some(expected_box) = expected.bounding_box
+        && live
+            .bounding_box
+            .and_then(|candidate_box| bounding_box_match_score(expected_box, candidate_box))
+            .is_none()
+    {
+        return Some("bounding_box");
+    }
+    None
 }
 
 fn unverified_write_target_error(element: &Element, reason: &str) -> RubError {

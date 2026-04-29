@@ -97,7 +97,7 @@ pub(super) async fn active_tab_projection(router: &DaemonRouter) -> ActiveTabPro
     }
 }
 
-fn active_tab_projection_from_tabs(tabs: &[TabInfo]) -> ActiveTabProjection {
+pub(super) fn active_tab_projection_from_tabs(tabs: &[TabInfo]) -> ActiveTabProjection {
     match tabs.iter().find(|tab| tab.active) {
         Some(active_tab) if !active_tab.page_identity_authoritative() => {
             degraded_active_tab_projection("active_tab_probe_failed")

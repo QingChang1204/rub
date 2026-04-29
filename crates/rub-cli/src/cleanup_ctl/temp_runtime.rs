@@ -26,6 +26,7 @@ pub(super) struct TempDaemonProcess {
 pub(super) enum TempDaemonReleaseOutcome {
     Released,
     StillLive,
+    AuthorityLost,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -116,7 +117,9 @@ pub(super) async fn terminate_revalidated_temp_daemon(
     let Ok(current_snapshot) = process_snapshot() else {
         return Ok(TempDaemonReleaseOutcome::StillLive);
     };
-    let survivors = revalidated_temp_daemon_sigkill_tree(&current_snapshot, daemon);
+    let Some(survivors) = revalidated_temp_daemon_sigkill_tree(&current_snapshot, daemon) else {
+        return Ok(TempDaemonReleaseOutcome::AuthorityLost);
+    };
     if survivors.is_empty() {
         return Ok(TempDaemonReleaseOutcome::Released);
     }
@@ -124,9 +127,11 @@ pub(super) async fn terminate_revalidated_temp_daemon(
     let Ok(final_snapshot) = process_snapshot() else {
         return Ok(TempDaemonReleaseOutcome::StillLive);
     };
-    Ok(classify_temp_daemon_release(
-        &revalidated_temp_daemon_sigkill_tree(&final_snapshot, daemon),
-    ))
+    let Some(final_survivors) = revalidated_temp_daemon_sigkill_tree(&final_snapshot, daemon)
+    else {
+        return Ok(TempDaemonReleaseOutcome::AuthorityLost);
+    };
+    Ok(classify_temp_daemon_release(&final_survivors))
 }
 
 pub(super) fn orphan_temp_browser_pids_for_roots(
@@ -264,8 +269,8 @@ fn signal_processes(processes: &HashSet<u32>, signal: i32) {
 pub(super) fn revalidated_temp_daemon_sigkill_tree(
     snapshot: &[ProcessInfo],
     daemon: &TempDaemonProcess,
-) -> HashSet<u32> {
-    revalidated_temp_daemon_tree(snapshot, daemon).unwrap_or_default()
+) -> Option<HashSet<u32>> {
+    revalidated_temp_daemon_tree(snapshot, daemon)
 }
 
 pub(super) fn is_rub_daemon_command(command: &str) -> bool {
@@ -342,10 +347,13 @@ pub(super) fn temp_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OrphanBrowserCleanupOutcome, TempDaemonReleaseOutcome, classify_temp_daemon_release,
+        OrphanBrowserCleanupOutcome, TempDaemonProcess, TempDaemonReleaseOutcome,
+        classify_temp_daemon_release, revalidated_temp_daemon_sigkill_tree,
         summarize_orphan_browser_cleanup,
     };
+    use rub_core::process::ProcessInfo;
     use std::collections::HashSet;
+    use std::path::PathBuf;
 
     #[test]
     fn temp_daemon_release_is_honest_when_authority_is_already_gone() {
@@ -361,6 +369,24 @@ mod tests {
             classify_temp_daemon_release(&HashSet::from([42_u32])),
             TempDaemonReleaseOutcome::StillLive
         );
+    }
+
+    #[test]
+    fn temp_daemon_sigkill_revalidation_reports_lost_authority() {
+        let daemon = TempDaemonProcess {
+            pid: 42,
+            session_name: "default".to_string(),
+            session_id: "sess-1".to_string(),
+            rub_home: PathBuf::from("/tmp/rub-home"),
+            user_data_dir: None,
+        };
+        let snapshot = vec![ProcessInfo {
+            pid: 42,
+            ppid: 1,
+            command: "/usr/bin/python helper.py --rub-home /tmp/rub-home".to_string(),
+        }];
+
+        assert!(revalidated_temp_daemon_sigkill_tree(&snapshot, &daemon).is_none());
     }
 
     #[test]

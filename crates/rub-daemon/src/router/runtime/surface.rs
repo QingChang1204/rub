@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use crate::runtime_refresh::{
-    InterferenceRefreshIntent, refresh_live_dialog_runtime, refresh_live_frame_runtime,
-    refresh_live_interference_state, refresh_live_runtime_and_interference,
-    refresh_live_runtime_state, refresh_live_storage_runtime, refresh_live_trigger_runtime,
-    refresh_orchestration_runtime, refresh_takeover_runtime,
+    InterferenceRefreshIntent, RefreshOutcome, refresh_live_dialog_runtime,
+    refresh_live_frame_runtime, refresh_live_interference_state,
+    refresh_live_runtime_and_interference, refresh_live_runtime_state,
+    refresh_live_storage_runtime, refresh_live_trigger_runtime, refresh_orchestration_runtime,
+    refresh_takeover_runtime,
 };
 use crate::session::SessionState;
 use rub_core::error::{ErrorCode, RubError};
@@ -106,14 +107,20 @@ impl RuntimeSurface {
         }
     }
 
-    pub(super) async fn refresh(self, router: &DaemonRouter, state: &Arc<SessionState>) {
+    pub(super) async fn refresh(
+        self,
+        router: &DaemonRouter,
+        state: &Arc<SessionState>,
+    ) -> Vec<RefreshOutcome> {
         match self {
             Self::Summary => {
-                refresh_live_runtime_state(&router.browser, state).await;
-                refresh_live_dialog_runtime(&router.browser, state).await;
-                refresh_live_frame_runtime(&router.browser, state).await;
-                refresh_live_storage_runtime(&router.browser, state).await;
-                refresh_takeover_runtime(&router.browser, state).await;
+                let outcomes = vec![
+                    refresh_live_runtime_state(&router.browser, state).await,
+                    refresh_live_dialog_runtime(&router.browser, state).await,
+                    refresh_live_frame_runtime(&router.browser, state).await,
+                    refresh_live_storage_runtime(&router.browser, state).await,
+                    refresh_takeover_runtime(&router.browser, state).await,
+                ];
                 refresh_orchestration_runtime(state).await;
                 let _ = refresh_live_trigger_runtime(&router.browser, state).await;
                 let _ = refresh_live_interference_state(
@@ -122,15 +129,16 @@ impl RuntimeSurface {
                     InterferenceRefreshIntent::ReadOnly,
                 )
                 .await;
+                outcomes
             }
             Self::Integration | Self::StateInspector | Self::Readiness => {
-                refresh_live_runtime_state(&router.browser, state).await;
+                vec![refresh_live_runtime_state(&router.browser, state).await]
             }
             Self::Dialog => {
-                refresh_live_dialog_runtime(&router.browser, state).await;
+                vec![refresh_live_dialog_runtime(&router.browser, state).await]
             }
             Self::Frame => {
-                refresh_live_frame_runtime(&router.browser, state).await;
+                vec![refresh_live_frame_runtime(&router.browser, state).await]
             }
             Self::Interference => {
                 let _ = refresh_live_runtime_and_interference(
@@ -139,23 +147,28 @@ impl RuntimeSurface {
                     InterferenceRefreshIntent::ReadOnly,
                 )
                 .await;
+                Vec::new()
             }
             Self::Storage => {
-                refresh_live_storage_runtime(&router.browser, state).await;
+                vec![refresh_live_storage_runtime(&router.browser, state).await]
             }
             Self::Takeover => {
-                refresh_takeover_runtime(&router.browser, state).await;
+                vec![refresh_takeover_runtime(&router.browser, state).await]
             }
             Self::Orchestration => {
                 refresh_orchestration_runtime(state).await;
+                Vec::new()
             }
             Self::Trigger => {
                 let _ = refresh_live_trigger_runtime(&router.browser, state).await;
+                Vec::new()
             }
-            Self::Observatory | Self::Downloads | Self::Handoff => {}
+            Self::Observatory | Self::Downloads | Self::Handoff => Vec::new(),
             Self::BindingCaptureCandidate => {
-                refresh_live_runtime_state(&router.browser, state).await;
-                refresh_takeover_runtime(&router.browser, state).await;
+                vec![
+                    refresh_live_runtime_state(&router.browser, state).await,
+                    refresh_takeover_runtime(&router.browser, state).await,
+                ]
             }
         }
     }
@@ -234,6 +247,7 @@ pub(super) async fn runtime_summary(state: &Arc<SessionState>) -> serde_json::Va
         "state_inspector": runtime_state.state_inspector,
         "readiness_state": runtime_state.readiness_state,
         "human_verification_handoff": state.human_verification_handoff().await,
+        "post_commit_journal": state.post_commit_journal_projection(),
     })
 }
 
@@ -244,10 +258,19 @@ pub(super) async fn cmd_runtime(
 ) -> Result<serde_json::Value, RubError> {
     super::super::request_args::reject_unknown_fields(args, &["sub"], "runtime")?;
     let surface = RuntimeSurface::parse(args)?;
-    surface.refresh(router, state).await;
-    Ok(runtime_surface_payload(
+    let refresh_outcomes = surface.refresh(router, state).await;
+    let mut payload = runtime_surface_payload(
         surface.subject(),
         runtime_projection_state(surface.name(), surface.projection_authority()),
         surface.projection(state).await?,
-    ))
+    );
+    if let Some(object) = payload.as_object_mut()
+        && !refresh_outcomes.is_empty()
+    {
+        object.insert(
+            "refresh_outcomes".to_string(),
+            serde_json::to_value(refresh_outcomes).map_err(RubError::from)?,
+        );
+    }
+    Ok(payload)
 }

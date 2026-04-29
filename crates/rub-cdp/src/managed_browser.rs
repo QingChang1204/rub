@@ -241,9 +241,18 @@ async fn enforce_managed_browser_process_fence(
             };
             terminate_process_tree(&tree).await;
             let current_snapshot = process_snapshot()?;
-            let authoritative_survivors =
-                authoritative_sigkill_tree(&current_snapshot, root_pid, profile);
-            signal_processes(&authoritative_survivors, libc::SIGKILL);
+            match authoritative_sigkill_tree(&current_snapshot, root_pid, profile) {
+                Some(authoritative_survivors) => {
+                    signal_processes(&authoritative_survivors, libc::SIGKILL);
+                }
+                None if current_snapshot
+                    .iter()
+                    .any(|process| process.pid == root_pid) =>
+                {
+                    return Err(sigkill_authority_lost_error(profile, root_pid));
+                }
+                None => {}
+            }
             wait_for_process_exit(root_pid, Duration::from_secs(2)).await;
             if is_process_alive(root_pid) {
                 wait_for_process_exit(root_pid, Duration::from_millis(500)).await;
@@ -378,8 +387,26 @@ fn authoritative_sigkill_tree(
     snapshot: &[ProcessInfo],
     root_pid: u32,
     profile: &ManagedProfileDir,
-) -> HashSet<u32> {
-    authoritative_process_tree(snapshot, root_pid, profile).unwrap_or_default()
+) -> Option<HashSet<u32>> {
+    authoritative_process_tree(snapshot, root_pid, profile)
+}
+
+fn sigkill_authority_lost_error(profile: &ManagedProfileDir, root_pid: u32) -> RubError {
+    RubError::domain_with_context(
+        ErrorCode::ProfileInUse,
+        format!(
+            "Managed browser root process {root_pid} lost authority before SIGKILL revalidation for profile {}",
+            profile.path.display()
+        ),
+        serde_json::json!({
+            "reason": "managed_browser_sigkill_authority_lost",
+            "user_data_dir": profile.path.display().to_string(),
+            "profile_directory": profile.profile_directory.clone(),
+            "root_pid": root_pid,
+            "cleanup_authority": "managed_browser_process_tree_revalidation",
+            "unsafe_to_kill": true,
+        }),
+    )
 }
 
 fn managed_profile_residue_pids(
@@ -514,7 +541,9 @@ mod tests {
         find_root_pid_in_snapshot, managed_profile_residue_pids,
         prepare_managed_profile_ownership_prelaunch, profile_residue_is_chromium_only,
         resolve_managed_profile_dir, rollback_managed_profile_ownership_prelaunch,
+        sigkill_authority_lost_error,
     };
+    use rub_core::error::ErrorCode;
     use rub_core::managed_profile::{
         has_temp_owned_managed_profile_marker, sync_temp_owned_managed_profile_marker,
     };
@@ -761,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_sigkill_tree_drops_reused_root_pid() {
+    fn authoritative_sigkill_tree_reports_reused_root_pid_as_lost_authority() {
         let reused = vec![ProcessInfo {
             pid: 300,
             ppid: 1,
@@ -777,7 +806,29 @@ mod tests {
                     ephemeral: false,
                 },
             )
-            .is_empty()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn sigkill_authority_lost_error_projects_unsafe_to_kill_contract() {
+        let error = sigkill_authority_lost_error(
+            &ManagedProfileDir {
+                path: PathBuf::from("/tmp/rub-chrome-300"),
+                profile_directory: None,
+                ephemeral: false,
+            },
+            300,
+        )
+        .into_envelope();
+
+        assert_eq!(error.code, ErrorCode::ProfileInUse);
+        let context = error.context.expect("context");
+        assert_eq!(context["reason"], "managed_browser_sigkill_authority_lost");
+        assert_eq!(context["unsafe_to_kill"], true);
+        assert_eq!(
+            context["cleanup_authority"],
+            "managed_browser_process_tree_revalidation"
         );
     }
 

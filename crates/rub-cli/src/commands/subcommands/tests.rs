@@ -3,7 +3,9 @@ use super::{
     render_nested_subcommand_long_help,
 };
 use crate::commands::Cli;
+use crate::timeout_budget::build_request;
 use clap::{CommandFactory, Parser};
+use std::path::PathBuf;
 
 fn render_root_long_help() -> String {
     let mut command = Cli::command();
@@ -25,6 +27,53 @@ fn render_subcommand_long_help(name: &str) -> String {
         .write_long_help(&mut buffer)
         .expect("help should render");
     String::from_utf8(buffer).expect("help should be valid utf-8")
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("rub-cli crate should live under workspace/crates")
+        .parent()
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn read_workspace_file(path: &str) -> String {
+    let path = workspace_root().join(path);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+}
+
+fn extract_pipe_payload(source: &str, marker: &str) -> String {
+    let start = source
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing pipe marker {marker:?}"));
+    let after_marker = &source[start + marker.len()..];
+    let end = after_marker
+        .find("]'")
+        .unwrap_or_else(|| panic!("missing closing pipe payload for marker {marker:?}"));
+    format!("{}]", &after_marker[..end])
+}
+
+fn extract_structured_spec_pipe_payload(source: &str) -> String {
+    for (start, _) in source.match_indices("rub pipe '") {
+        let payload = extract_pipe_payload(&source[start..], "rub pipe '");
+        if payload.contains(r#""spec":{"#) {
+            return payload;
+        }
+    }
+    panic!("missing structured spec pipe payload");
+}
+
+fn parse_and_build_doc_command(args: Vec<&str>) -> rub_ipc::protocol::IpcRequest {
+    let cli = Cli::try_parse_from(args.clone())
+        .unwrap_or_else(|error| panic!("documented command should parse: {args:?}: {error}"));
+    let effective = cli
+        .effective()
+        .unwrap_or_else(|error| panic!("documented command should materialize: {args:?}: {error}"));
+    build_request(&effective).unwrap_or_else(|error| {
+        panic!("documented command should build request: {args:?}: {error}")
+    })
 }
 
 #[test]
@@ -237,6 +286,68 @@ fn find_explain_conflicts_with_limit_in_cli_surface() {
     let rendered = error.to_string();
     assert!(rendered.contains("--limit"), "{rendered}");
     assert!(rendered.contains("--explain"), "{rendered}");
+}
+
+#[test]
+fn doc_contract_pipeline_manual_examples_parse_and_use_structured_specs() {
+    let manual = read_workspace_file("docs/rub-manual/03-pipeline-and-wait-orchestration.md");
+    assert!(
+        !manual.contains("--contains"),
+        "manual wait examples must use real wait flags"
+    );
+    assert!(
+        manual.contains("steps[2].result"),
+        "manual pipe result index must match the documented open/wait/extract step order"
+    );
+
+    let pipe_payload = extract_pipe_payload(&manual, "rub pipe '");
+    let steps: serde_json::Value =
+        serde_json::from_str(&pipe_payload).expect("manual pipe payload should be valid JSON");
+    assert!(steps[2]["args"]["spec"].is_object(), "{steps}");
+    parse_and_build_doc_command(vec![
+        "rub",
+        "pipe",
+        &pipe_payload,
+        "--rub-home",
+        "/tmp/rub-doc-contract",
+    ]);
+
+    parse_and_build_doc_command(vec!["rub", "wait", "--selector", "pre"]);
+    parse_and_build_doc_command(vec!["rub", "wait", "--text", "Order Success"]);
+}
+
+#[test]
+fn doc_contract_readme_and_skill_pipe_examples_use_structured_specs() {
+    for path in ["README.md", "SKILL.md"] {
+        let source = read_workspace_file(path);
+        assert!(
+            !source.contains(r#""args":{"spec":"{\""#),
+            "{path} must not regress to JSON-in-JSON pipe specs"
+        );
+        let pipe_payload = extract_structured_spec_pipe_payload(&source);
+        let steps: serde_json::Value =
+            serde_json::from_str(&pipe_payload).expect("pipe payload should be valid JSON");
+        let spec_is_structured = steps
+            .as_array()
+            .is_some_and(|steps| steps.iter().any(|step| step["args"]["spec"].is_object()));
+        assert!(
+            spec_is_structured,
+            "{path} pipe spec should be structured: {steps}"
+        );
+        parse_and_build_doc_command(vec!["rub", "pipe", &pipe_payload]);
+    }
+}
+
+#[test]
+fn doc_contract_manual_retry_doctrine_uses_recovery_contract() {
+    let manual = read_workspace_file("docs/rub-manual/04-real-world-business-cases.md");
+    assert!(manual.contains("recovery_contract"), "{manual}");
+    assert!(manual.contains("command_id"), "{manual}");
+    assert!(manual.contains("重新获取页面 authority"), "{manual}");
+    assert!(
+        !manual.contains("立刻补发下一条干预 CLI"),
+        "manual must not encourage fresh-command retry after ambiguous failures"
+    );
 }
 
 #[test]

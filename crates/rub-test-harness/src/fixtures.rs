@@ -99,3 +99,38 @@ pub fn dynamic_spa_page() -> &'static str {
 </body>
 </html>"##
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{dialog_trigger_page, dynamic_spa_page, form_page, long_page};
+    use std::path::PathBuf;
+
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("rub-test-harness crate should live under workspace/crates")
+            .parent()
+            .expect("workspace root")
+            .to_path_buf()
+    }
+
+    fn assert_root_fixture_matches_owner(path: &str, owner: fn() -> &'static str) {
+        let path = workspace_root().join(path);
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        assert_eq!(
+            contents.trim_end_matches('\n'),
+            owner(),
+            "{} must stay byte-equivalent to its harness-owned fixture generator",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn root_fixture_files_match_harness_owned_generators() {
+        assert_root_fixture_matches_owner("fixtures/dialog_trigger.html", dialog_trigger_page);
+        assert_root_fixture_matches_owner("fixtures/dynamic_spa.html", dynamic_spa_page);
+        assert_root_fixture_matches_owner("fixtures/form.html", form_page);
+        assert_root_fixture_matches_owner("fixtures/long_page.html", long_page);
+    }
+}

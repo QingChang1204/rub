@@ -228,6 +228,15 @@ impl BrowserPort for ChromiumAdapter {
         crate::page::screenshot(&page, full_page).await
     }
 
+    async fn screenshot_for_snapshot(
+        &self,
+        snapshot: &Snapshot,
+        full_page: bool,
+    ) -> Result<Vec<u8>, RubError> {
+        let page = page_for_snapshot_authority(self, snapshot).await?;
+        crate::page::screenshot(&page, full_page).await
+    }
+
     async fn health_check(&self) -> Result<(), RubError> {
         self.manager.health_check().await
     }
@@ -918,6 +927,11 @@ impl BrowserPort for ChromiumAdapter {
 
     async fn cleanup_highlights(&self) -> Result<(), RubError> {
         let page = self.manager.page().await?;
+        crate::page::cleanup_highlights(&page).await
+    }
+
+    async fn cleanup_highlights_for_snapshot(&self, snapshot: &Snapshot) -> Result<(), RubError> {
+        let page = page_for_snapshot_authority(self, snapshot).await?;
         crate::page::cleanup_highlights(&page).await
     }
 

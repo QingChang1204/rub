@@ -440,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn revalidated_temp_daemon_sigkill_tree_drops_reused_pid() {
+    fn revalidated_temp_daemon_sigkill_tree_reports_lost_authority_for_reused_pid() {
         let daemon = TempDaemonProcess {
             pid: 42,
             session_name: "default".to_string(),
@@ -455,7 +455,7 @@ mod tests {
                 "rub __daemon --session default --session-id sess-new --rub-home /tmp/rub-home"
                     .to_string(),
         };
-        assert!(revalidated_temp_daemon_sigkill_tree(&[reused], &daemon).is_empty());
+        assert!(revalidated_temp_daemon_sigkill_tree(&[reused], &daemon).is_none());
     }
 
     #[test]

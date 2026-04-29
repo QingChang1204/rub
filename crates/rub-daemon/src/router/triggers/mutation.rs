@@ -3,6 +3,7 @@ use std::sync::Arc;
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{TriggerConditionKind, TriggerInfo, TriggerRegistrationSpec, TriggerStatus};
 
+use crate::router::timeout_projection::record_registry_control_commit_timeout_projection;
 use crate::runtime_refresh::refresh_live_trigger_runtime;
 use crate::session::SessionState;
 
@@ -97,6 +98,12 @@ pub(super) async fn cmd_trigger_add(
             )
             .await
     };
+    record_registry_control_commit_timeout_projection(
+        "trigger",
+        "add",
+        "trigger",
+        serde_json::json!(trigger),
+    );
     state.reconcile_trigger_runtime(&tabs).await;
     let runtime = state.trigger_runtime().await;
     let trigger = runtime
@@ -161,6 +168,12 @@ pub(super) async fn cmd_trigger_remove(
             format!("Trigger id {id} is not present in the current registry"),
         )
     })?;
+    record_registry_control_commit_timeout_projection(
+        "trigger",
+        "remove",
+        "removed",
+        serde_json::json!(removed),
+    );
     let _ = refresh_live_trigger_runtime(&router.browser, state).await;
     let runtime = state.trigger_runtime().await;
     Ok(trigger_payload(

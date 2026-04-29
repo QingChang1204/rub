@@ -16,6 +16,7 @@
 name: Release
 permissions:
   "contents": "write"
+  "actions": "read"
 
 # This task will run whenever you push a git tag that looks like a version
 # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
@@ -45,8 +46,26 @@ on:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
+  frozen-baseline-guardrails:
+    runs-on: "ubuntu-22.04"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+      - name: Run frozen-baseline guardrails
+        run: |
+          cargo test -p rub-cli --bin rub doc_contract
+          cargo test -p rub-cli --test e2e e2e_guardrail
+          cargo test -p rub-test-harness root_fixture
+
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
+    needs:
+      - frozen-baseline-guardrails
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}

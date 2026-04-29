@@ -215,6 +215,67 @@ async fn doctor_marks_runtime_summary_as_operator_projection() {
         payload["runtime_projection_state"]["truth_level"],
         "operator_projection"
     );
+    assert!(payload["result"]["refresh_outcomes"].is_array());
+    assert!(
+        payload["result"]["refresh_outcomes"]
+            .as_array()
+            .is_some_and(|outcomes| outcomes
+                .iter()
+                .any(|outcome| outcome["surface"] == "runtime_state"))
+    );
+}
+
+#[tokio::test]
+async fn runtime_and_doctor_surface_post_commit_journal_degradation() {
+    let router = test_router();
+    let state = Arc::new(SessionState::new(
+        "default",
+        PathBuf::from("/tmp/rub-test-journal-surface"),
+        None,
+    ));
+    state.force_post_commit_journal_failure_once();
+    let request = rub_ipc::protocol::IpcRequest::new("state", serde_json::json!({}), 1_000);
+    let response = rub_ipc::protocol::IpcResponse::success(
+        "req-journal-surface",
+        serde_json::json!({"ok": true}),
+    );
+
+    state
+        .record_post_commit_journal(
+            &request,
+            &response,
+            crate::workflow_capture::WorkflowCaptureDeliveryState::Delivered,
+        )
+        .await
+        .expect_err("forced post-commit journal append should fail");
+
+    let runtime = cmd_runtime(&router, &state, &serde_json::json!({ "sub": "summary" }))
+        .await
+        .expect("runtime summary should succeed");
+    assert_eq!(
+        runtime["runtime"]["post_commit_journal"]["status"],
+        "degraded"
+    );
+    assert_eq!(
+        runtime["runtime"]["post_commit_journal"]["failure_count"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        runtime["runtime"]["post_commit_journal"]["recovery_contract"]["kind"],
+        "post_commit_journal_recovery"
+    );
+
+    let doctor = cmd_doctor(&router, &state)
+        .await
+        .expect("doctor should succeed");
+    assert_eq!(
+        doctor["result"]["post_commit_journal"]["status"],
+        "degraded"
+    );
+    assert_eq!(
+        doctor["result"]["post_commit_journal"]["failure_count"],
+        serde_json::json!(1)
+    );
 }
 
 #[tokio::test]

@@ -20,7 +20,10 @@ use crate::scheduler_policy::{
 
 use super::dispatch::execute_named_command_with_fence;
 use super::runtime;
-use super::timeout_projection::{ExecutionTimeoutProjectionRecorder, scope_timeout_projection};
+use super::timeout_projection::{
+    ExecutionTimeoutProjectionRecorder,
+    record_effectful_command_possible_commit_timeout_projection, scope_timeout_projection,
+};
 #[cfg(test)]
 use super::transaction::prepare_replay_fence;
 use super::transaction::{
@@ -397,10 +400,13 @@ impl DaemonRouter {
         let timeout_projection = Arc::new(ExecutionTimeoutProjectionRecorder::default());
         let result = match tokio::time::timeout(
             exec_timeout,
-            scope_timeout_projection(
-                timeout_projection.clone(),
-                self.execute_command(request, deadline, state),
-            ),
+            scope_timeout_projection(timeout_projection.clone(), async {
+                record_effectful_command_possible_commit_timeout_projection(
+                    &request.command,
+                    request.command_id.as_deref(),
+                );
+                self.execute_command(request, deadline, state).await
+            }),
         )
         .await
         {

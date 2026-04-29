@@ -578,6 +578,7 @@ fn atomic_fill_failure_from_source(
                 "rollback_attempted": true,
                 "rollback_failed": rollback.is_err(),
                 "source_error": project_atomic_error(&envelope),
+                "recovery_contract": atomic_fill_recovery_contract(rollback.is_err()),
             }),
         ),
         (
@@ -589,6 +590,19 @@ fn atomic_fill_failure_from_source(
         context.insert("rollback_errors".to_string(), serde_json::json!(errors));
     }
     RubError::domain_with_context(envelope.code, message, serde_json::Value::Object(context))
+}
+
+fn atomic_fill_recovery_contract(rollback_failed: bool) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "atomic_fill_rollback",
+        "rollback_authority": "fill_atomic",
+        "rollback_result_authoritative": true,
+        "rollback_committed": !rollback_failed,
+        "rollback_failed": rollback_failed,
+        "steps_authoritative": true,
+        "retry_same_command_safe": false,
+        "resume_from_failed_step_supported": false,
+    })
 }
 
 fn atomic_plan_requires_a11y(steps: &[FillStepSpec], submit: &SubmitLocatorArgs) -> bool {
@@ -670,5 +684,42 @@ mod tests {
             vec![2, 1, 0],
             "possible-commit current step remains a rollback target"
         );
+    }
+
+    #[test]
+    fn atomic_fill_failure_projects_rollback_recovery_contract() {
+        let plan = AtomicFillPlan {
+            snapshot_id: "snap-1".to_string(),
+            snapshot_requested: true,
+            steps: Vec::new(),
+        };
+        let envelope = atomic_fill_failure_from_source(
+            RubError::domain(ErrorCode::WaitTimeout, "forward command timed out"),
+            &plan,
+            &[],
+            Err(vec!["step 0 rollback timed out".to_string()]),
+            "fill --atomic failed during live execution and rolled the transaction back",
+        )
+        .into_envelope();
+
+        let context = envelope.context.expect("atomic failure context");
+        assert_eq!(context["transaction"]["status"], "rollback_failed");
+        assert_eq!(
+            context["transaction"]["recovery_contract"]["kind"],
+            "atomic_fill_rollback"
+        );
+        assert_eq!(
+            context["transaction"]["recovery_contract"]["rollback_authority"],
+            "fill_atomic"
+        );
+        assert_eq!(
+            context["transaction"]["recovery_contract"]["rollback_failed"],
+            true
+        );
+        assert_eq!(
+            context["transaction"]["recovery_contract"]["retry_same_command_safe"],
+            false
+        );
+        assert_eq!(context["rollback_errors"][0], "step 0 rollback timed out");
     }
 }

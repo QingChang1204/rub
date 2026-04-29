@@ -8,6 +8,7 @@ use rub_core::model::{
 use rub_ipc::protocol::IpcRequest;
 
 use crate::router::RouterFenceDisposition;
+use crate::router::timeout_projection::record_registry_control_commit_timeout_projection;
 use crate::runtime_refresh::refresh_orchestration_runtime;
 use crate::scheduler_policy::AUTOMATION_QUEUE_SHUTDOWN_POLL_INTERVAL;
 use crate::session::SessionState;
@@ -125,6 +126,12 @@ pub(super) async fn cmd_orchestration_add(
                 }),
             )
         })?;
+    record_registry_control_commit_timeout_projection(
+        "orchestration",
+        "add",
+        "rule",
+        serde_json::json!(rule),
+    );
     let runtime = state.orchestration_runtime().await;
     let rule = runtime
         .rules
@@ -216,6 +223,12 @@ async fn cmd_orchestration_remove_with_router_fence_disposition(
             format!("Orchestration rule id {id} is not present in the current registry"),
         )
     })?;
+    record_registry_control_commit_timeout_projection(
+        "orchestration",
+        "remove",
+        "removed",
+        serde_json::json!(removed),
+    );
     let runtime = state.orchestration_runtime().await;
     Ok(orchestration_payload(
         orchestration_rule_subject(id),
