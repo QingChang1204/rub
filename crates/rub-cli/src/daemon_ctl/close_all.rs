@@ -142,6 +142,11 @@ pub(crate) async fn close_all_sessions_until(
                             {
                                 graceful_close = true;
                             }
+                            Ok(response)
+                                if close_all_response_is_shutdown_in_progress(&response) =>
+                            {
+                                graceful_close = true;
+                            }
                             Ok(response) => {
                                 attach_error = Some(close_all_daemon_error_response_error(
                                     &target.session_name,
@@ -328,6 +333,19 @@ fn close_all_daemon_error_response_error(
     )
 }
 
+fn close_all_response_is_shutdown_in_progress(response: &rub_ipc::protocol::IpcResponse) -> bool {
+    response.status == rub_ipc::protocol::ResponseStatus::Error
+        && response.error.as_ref().is_some_and(|error| {
+            error.code == ErrorCode::SessionBusy
+                && error.context.as_ref().is_some_and(|context| {
+                    matches!(
+                        context.get("reason").and_then(|reason| reason.as_str()),
+                        Some("session_shutting_down" | "session_shutting_down_after_queue_wait")
+                    )
+                })
+        })
+}
+
 pub(crate) fn should_escalate_close_all_to_kill_fallback(
     shutdown: ShutdownFenceStatus,
     still_running: bool,
@@ -407,7 +425,9 @@ pub(crate) fn record_close_all_budget_exhausted(
 
 #[cfg(test)]
 mod tests {
-    use super::close_all_daemon_error_response_error;
+    use super::{
+        close_all_daemon_error_response_error, close_all_response_is_shutdown_in_progress,
+    };
     use rub_core::error::{ErrorCode, ErrorEnvelope};
     use rub_ipc::protocol::IpcResponse;
 
@@ -440,5 +460,29 @@ mod tests {
                 .and_then(|ctx| ctx.get("daemon_truth")),
             Some(&serde_json::json!(true))
         );
+    }
+
+    #[test]
+    fn close_all_treats_shutdown_busy_as_committed_shutdown_fence() {
+        for reason in [
+            "session_shutting_down",
+            "session_shutting_down_after_queue_wait",
+        ] {
+            let response = IpcResponse::error(
+                "req-close",
+                ErrorEnvelope::new(ErrorCode::SessionBusy, "session is shutting down")
+                    .with_context(serde_json::json!({ "reason": reason })),
+            );
+
+            assert!(close_all_response_is_shutdown_in_progress(&response));
+        }
+
+        let response = IpcResponse::error(
+            "req-close",
+            ErrorEnvelope::new(ErrorCode::SessionBusy, "session is busy")
+                .with_context(serde_json::json!({ "reason": "queue_busy" })),
+        );
+
+        assert!(!close_all_response_is_shutdown_in_progress(&response));
     }
 }

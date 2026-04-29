@@ -69,7 +69,7 @@ async fn open_second_tab(manager: &BrowserManager, opener: &Arc<chromiumoxide::P
     }
 }
 
-async fn child_frame_id(page: &Arc<chromiumoxide::Page>) -> String {
+async fn child_frame_id(page: &Arc<Page>) -> String {
     let main = page
         .mainframe()
         .await
@@ -98,16 +98,17 @@ async fn child_frame_id(page: &Arc<chromiumoxide::Page>) -> String {
     }
 }
 
-async fn wait_for_frame_context_resolved(page: &Arc<Page>, frame_id: &str) {
+async fn resolved_child_frame_id(page: &Arc<Page>) -> String {
     let deadline = Instant::now() + TEST_BROWSER_SETTLE_TIMEOUT;
     loop {
-        match crate::frame_runtime::resolve_frame_context(page, Some(frame_id)).await {
-            Ok(_) => return,
+        let frame_id = child_frame_id(page).await;
+        match crate::frame_runtime::resolve_frame_context(page, Some(frame_id.as_str())).await {
+            Ok(_) => return frame_id,
             Err(error) => {
                 let last_error = error.to_string();
                 assert!(
                     Instant::now() < deadline,
-                    "child frame context should resolve before timeout; last_error={last_error}"
+                    "child frame context should resolve before timeout; frame_id={frame_id}; last_error={last_error}"
                 );
             }
         }
@@ -349,7 +350,7 @@ async fn child_frame_snapshot_replay_preserves_snapshot_tab_authority_after_tab_
         .await
         .expect("first page should load");
 
-    let frame_id = child_frame_id(&first_page).await;
+    let frame_id = resolved_child_frame_id(&first_page).await;
     let snapshot = adapter
         .snapshot_for_frame(Some(frame_id.as_str()), Some(10))
         .await
@@ -407,8 +408,7 @@ async fn send_keys_in_frame_confirmation_ignores_unrelated_top_page_mutation() {
     .await;
     seed_child_frame_document(&page, r#"<input id="child" value="">"#).await;
 
-    let frame_id = child_frame_id(&page).await;
-    wait_for_frame_context_resolved(&page, &frame_id).await;
+    let frame_id = resolved_child_frame_id(&page).await;
     focus_child_input(&page, "child").await;
     arm_top_mutation(&page).await;
 
@@ -456,8 +456,7 @@ async fn type_text_in_frame_fails_closed_when_focus_is_stolen_before_dispatch() 
     .await;
     seed_child_frame_document(&page, r#"<input id="child" value="">"#).await;
 
-    let frame_id = child_frame_id(&page).await;
-    wait_for_frame_context_resolved(&page, &frame_id).await;
+    let frame_id = resolved_child_frame_id(&page).await;
     focus_child_input(&page, "child").await;
     arm_top_focus_theft(&page).await;
 

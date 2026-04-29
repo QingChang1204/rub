@@ -3058,6 +3058,8 @@ fn t350_rub_session_env() {
         .collect::<Vec<_>>();
     assert!(names.contains(&"alt"));
     assert!(names.contains(&"explicit"));
+
+    teardown_and_cleanup(home);
 }
 
 /// T360: connection mode flags are mutually exclusive.
