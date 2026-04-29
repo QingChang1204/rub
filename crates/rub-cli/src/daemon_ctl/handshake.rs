@@ -110,11 +110,24 @@ pub(crate) async fn fetch_handshake_info_with_timeout(
 
 fn handshake_send_error(error: IpcClientError) -> RubError {
     match error {
-        IpcClientError::Protocol(envelope) => RubError::domain_with_context(
-            envelope.code,
-            format!("Failed to fetch handshake info: {}", envelope.message),
-            envelope.context.unwrap_or_else(|| serde_json::json!({})),
-        ),
+        IpcClientError::Protocol(envelope) => {
+            let transport_reason = super::ipc::replay_recoverable_protocol_reason(&envelope);
+            let mut context = envelope
+                .context
+                .and_then(|context| context.as_object().cloned())
+                .unwrap_or_default();
+            if let Some(transport_reason) = transport_reason {
+                context.insert(
+                    "transport_reason".to_string(),
+                    serde_json::json!(transport_reason),
+                );
+            }
+            RubError::domain_with_context(
+                envelope.code,
+                format!("Failed to fetch handshake info: {}", envelope.message),
+                serde_json::Value::Object(context),
+            )
+        }
         IpcClientError::Transport(io_error) => {
             let mut context = serde_json::Map::from_iter([(
                 "reason".to_string(),
@@ -173,6 +186,31 @@ mod tests {
 
         let attempt = handshake_attempt_error(error);
         assert_eq!(attempt.transient_reason.as_deref(), Some("unexpected_eof"));
+        assert_eq!(
+            attempt.final_failure_class,
+            ConnectionFailureClass::TransportTransient
+        );
+    }
+
+    #[test]
+    fn handshake_attempt_error_treats_possible_commit_write_transport_as_transient() {
+        let error = handshake_send_error(IpcClientError::Protocol(
+            rub_core::error::ErrorEnvelope::new(
+                rub_core::error::ErrorCode::IpcProtocolError,
+                "request write transport failed after possible commit",
+            )
+            .with_context(serde_json::json!({
+                "reason": "ipc_request_write_transport_failure_after_possible_commit",
+                "request_commit_state": "possible",
+                "transport_error_kind": "BrokenPipe",
+            })),
+        ));
+
+        let attempt = handshake_attempt_error(error);
+        assert_eq!(
+            attempt.transient_reason.as_deref(),
+            Some("request_write_transport_failure_after_possible_commit")
+        );
         assert_eq!(
             attempt.final_failure_class,
             ConnectionFailureClass::TransportTransient

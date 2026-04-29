@@ -85,10 +85,11 @@ pub(crate) use self::handshake::{
     HandshakePayload, fetch_handshake_info, fetch_handshake_info_until,
     fetch_handshake_info_with_timeout,
 };
-use self::ipc::{
-    ipc_budget_exhausted_error, ipc_transport_error, replay_recoverable_transport_reason,
-};
+use self::ipc::{ipc_budget_exhausted_error, ipc_transport_error};
 pub(crate) use self::ipc::{ipc_timeout_error, project_request_onto_deadline};
+pub(crate) use self::ipc::{
+    replay_recoverable_protocol_reason, replay_recoverable_transport_reason,
+};
 #[cfg(test)]
 pub(crate) use self::process_identity::command_matches_daemon_identity;
 pub(crate) use self::process_lifecycle::{

@@ -4,7 +4,7 @@ use crate::protocol::{IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse, ResponseSta
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::time::Duration;
 
 fn oversized_request() -> IpcRequest {
@@ -148,6 +148,13 @@ async fn client_rejects_mismatched_response_command_id() {
         .await
         .expect_err("mismatched command_id response should fail");
     assert!(error.to_string().contains("command_id mismatch"));
+    assert_eq!(
+        error
+            .protocol_envelope()
+            .and_then(|envelope| envelope.context.as_ref())
+            .and_then(|ctx| ctx.get("request_committed")),
+        Some(&serde_json::json!(true))
+    );
 
     server.await.expect("server join");
     let _ = std::fs::remove_file(&socket_path);
@@ -224,6 +231,13 @@ async fn client_rejects_missing_response_command_id_for_non_compat_request() {
             .and_then(|ctx| ctx.get("reason"))
             .and_then(|value| value.as_str()),
         Some("ipc_response_missing_command_id")
+    );
+    assert_eq!(
+        error
+            .protocol_envelope()
+            .and_then(|envelope| envelope.context.as_ref())
+            .and_then(|ctx| ctx.get("request_committed")),
+        Some(&serde_json::json!(true))
     );
 
     server.await.expect("server join");
@@ -688,6 +702,13 @@ async fn client_surfaces_structured_response_contract_errors() {
             .and_then(|value| value.as_str()),
         Some("invalid_ipc_response_contract")
     );
+    assert_eq!(
+        error
+            .protocol_envelope()
+            .and_then(|envelope| envelope.context.as_ref())
+            .and_then(|ctx| ctx.get("request_committed")),
+        Some(&serde_json::json!(true))
+    );
 
     server.await.expect("server join");
     let _ = std::fs::remove_file(&socket_path);
@@ -773,6 +794,47 @@ async fn client_classifies_oversized_response_frame_without_string_matching() {
             .and_then(|value| value.as_str()),
         Some("oversized_ndjson_frame")
     );
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("request_committed")),
+        Some(&serde_json::json!(true))
+    );
+}
+
+#[tokio::test]
+async fn client_marks_write_transport_failure_as_possible_commit() {
+    let (client_stream, server_stream) = UnixStream::pair().expect("create unix stream pair");
+    drop(server_stream);
+    let mut client = IpcClient {
+        stream: Some(client_stream),
+        deferred_socket_path: None,
+        bound_daemon_session_id: None,
+        used: false,
+    };
+    let request = IpcRequest::new("doctor", serde_json::json!({}), 1_000)
+        .with_command_id("cmd-write-fail")
+        .expect("static command_id must be valid");
+
+    let error = client
+        .send(&request)
+        .await
+        .expect_err("closed peer should fail during request write");
+    let envelope = error
+        .protocol_envelope()
+        .expect("write transport failure after possible commit must be protocol-scoped");
+    assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
+    let context = envelope.context.as_ref().expect("context");
+    assert_eq!(
+        context["reason"],
+        serde_json::json!("ipc_request_write_transport_failure_after_possible_commit")
+    );
+    assert_eq!(
+        context["request_commit_state"],
+        serde_json::json!("possible")
+    );
+    assert_eq!(context["command_id"], serde_json::json!("cmd-write-fail"));
 }
 
 #[tokio::test]

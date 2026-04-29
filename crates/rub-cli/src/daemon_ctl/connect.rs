@@ -565,14 +565,27 @@ fn upgrade_check_not_idle_error(error: &RubError) -> bool {
 
 fn upgrade_probe_send_error(session_name: &str, error: IpcClientError) -> RubError {
     match error {
-        IpcClientError::Protocol(envelope) => RubError::domain_with_context(
-            envelope.code,
-            format!(
-                "Failed to fetch upgrade status for session '{session_name}': {}",
-                envelope.message
-            ),
-            envelope.context.unwrap_or_else(|| serde_json::json!({})),
-        ),
+        IpcClientError::Protocol(envelope) => {
+            let transport_reason = super::ipc::replay_recoverable_protocol_reason(&envelope);
+            let mut context = envelope
+                .context
+                .and_then(|context| context.as_object().cloned())
+                .unwrap_or_default();
+            if let Some(transport_reason) = transport_reason {
+                context.insert(
+                    "transport_reason".to_string(),
+                    serde_json::json!(transport_reason),
+                );
+            }
+            RubError::domain_with_context(
+                envelope.code,
+                format!(
+                    "Failed to fetch upgrade status for session '{session_name}': {}",
+                    envelope.message
+                ),
+                serde_json::Value::Object(context),
+            )
+        }
         IpcClientError::Transport(io_error) => {
             let mut context = serde_json::Map::from_iter([(
                 "reason".to_string(),

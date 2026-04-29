@@ -22,13 +22,16 @@ pub(crate) fn replay_recoverable_transport_reason(
         .or_else(|| classify_transport_message(&error.to_string()))
 }
 
-fn replay_recoverable_protocol_reason(envelope: &ErrorEnvelope) -> Option<&'static str> {
+pub(crate) fn replay_recoverable_protocol_reason(envelope: &ErrorEnvelope) -> Option<&'static str> {
     match envelope
         .context
         .as_ref()
         .and_then(|context| context.get("reason"))
         .and_then(|value| value.as_str())
     {
+        Some("ipc_request_write_transport_failure_after_possible_commit") => {
+            Some("request_write_transport_failure_after_possible_commit")
+        }
         Some("ipc_request_write_timeout_after_possible_commit") => {
             Some("request_write_timeout_after_possible_commit")
         }
@@ -243,6 +246,24 @@ mod tests {
         assert_eq!(
             replay_recoverable_transport_reason(&error),
             Some("request_write_timeout_after_possible_commit")
+        );
+    }
+
+    #[test]
+    fn replay_recovery_recognizes_possible_commit_write_transport_protocol_failures() {
+        let error = IpcClientError::Protocol(
+            rub_core::error::ErrorEnvelope::new(
+                rub_core::error::ErrorCode::IpcProtocolError,
+                "request write transport failed after possible commit",
+            )
+            .with_context(serde_json::json!({
+                "reason": "ipc_request_write_transport_failure_after_possible_commit",
+                "transport_error_kind": "BrokenPipe",
+            })),
+        );
+        assert_eq!(
+            replay_recoverable_transport_reason(&error),
+            Some("request_write_transport_failure_after_possible_commit")
         );
     }
 }

@@ -183,13 +183,26 @@ fn cleanup_upgrade_probe_response_error(
 
 fn cleanup_upgrade_probe_send_error(socket_path: &Path, error: IpcClientError) -> RubError {
     match error {
-        IpcClientError::Protocol(envelope) => cleanup_upgrade_status_error(
-            envelope.code,
-            format!("Failed to fetch upgrade status: {}", envelope.message),
-            socket_path,
-            envelope.context,
-            "cleanup_upgrade_check_protocol_failed",
-        ),
+        IpcClientError::Protocol(envelope) => {
+            let transport_reason = crate::daemon_ctl::replay_recoverable_protocol_reason(&envelope);
+            let mut context = envelope
+                .context
+                .and_then(|context| context.as_object().cloned())
+                .unwrap_or_default();
+            if let Some(transport_reason) = transport_reason {
+                context.insert(
+                    "transport_reason".to_string(),
+                    serde_json::json!(transport_reason),
+                );
+            }
+            cleanup_upgrade_status_error(
+                envelope.code,
+                format!("Failed to fetch upgrade status: {}", envelope.message),
+                socket_path,
+                Some(serde_json::Value::Object(context)),
+                "cleanup_upgrade_check_protocol_failed",
+            )
+        }
         IpcClientError::Transport(io_error) => {
             let mut context = serde_json::Map::new();
             if let Some(transport_reason) =

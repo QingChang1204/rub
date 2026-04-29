@@ -18,9 +18,12 @@ pub(crate) use validation::{validate_trigger_action, validate_trigger_condition}
 pub(super) async fn cmd_trigger(
     router: &DaemonRouter,
     args: &serde_json::Value,
+    deadline: crate::router::TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
-    TriggerCommand::parse(args)?.execute(router, state).await
+    TriggerCommand::parse(args)?
+        .execute(router, deadline, state)
+        .await
 }
 
 #[cfg(test)]

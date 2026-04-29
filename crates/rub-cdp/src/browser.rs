@@ -43,7 +43,8 @@ use crate::{
         new_listener_generation_channel,
     },
     managed_browser::{
-        ManagedProfileDir, projected_managed_profile_path_for_scope, resolve_managed_profile_dir,
+        EPHEMERAL_PROFILE_REMOVE_AFTER_SHUTDOWN_OPERATION, ManagedProfileDir,
+        projected_managed_profile_path_for_scope, resolve_managed_profile_dir,
         shutdown_managed_browser,
     },
     network_rules::NetworkRuleRuntime,

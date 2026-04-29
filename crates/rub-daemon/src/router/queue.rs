@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use rub_core::command::{DomEpochPolicy, command_metadata};
 use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
 use rub_core::model::Timing;
 use rub_ipc::protocol::{IpcRequest, IpcResponse};
@@ -411,13 +412,16 @@ impl DaemonRouter {
         .await
         {
             Ok(r) => r,
-            Err(_) => Err(execution_timeout_error(
-                request,
-                queue_ms,
-                exec_budget_ms,
-                deadline.timeout_ms,
-                timeout_projection.snapshot(),
-            )),
+            Err(_) => {
+                apply_execution_timeout_authority_fence(request, state).await;
+                Err(execution_timeout_error(
+                    request,
+                    queue_ms,
+                    exec_budget_ms,
+                    deadline.timeout_ms,
+                    timeout_projection.snapshot(),
+                ))
+            }
         };
         let exec_ms = exec_start.elapsed().as_millis() as u64;
         let timing = Timing {
@@ -590,6 +594,32 @@ fn automation_shutdown_rejection(state: &Arc<SessionState>, command: &str) -> Er
         "command": command,
         "reason": "session_shutting_down_after_queue_wait",
     }))
+}
+
+async fn apply_execution_timeout_authority_fence(request: &IpcRequest, state: &Arc<SessionState>) {
+    if command_may_have_dom_commit_after_timeout(request) {
+        state.mark_pending_external_dom_change();
+        state.clear_all_snapshots().await;
+    } else if super::policy::command_invalidates_cached_snapshots_without_epoch_bump(
+        &request.command,
+        &request.args,
+    ) {
+        state.clear_all_snapshots().await;
+    }
+}
+
+fn command_may_have_dom_commit_after_timeout(request: &IpcRequest) -> bool {
+    let policy = command_metadata(&request.command).dom_epoch_policy;
+    matches!(policy, DomEpochPolicy::Bump)
+        || (matches!(policy, DomEpochPolicy::ArgsDependent) && dialog_action_commits_epoch(request))
+}
+
+fn dialog_action_commits_epoch(request: &IpcRequest) -> bool {
+    request.command == "dialog"
+        && matches!(
+            request.args.get("sub").and_then(|value| value.as_str()),
+            Some("accept" | "dismiss")
+        )
 }
 
 fn automation_queue_timeout_rejection(

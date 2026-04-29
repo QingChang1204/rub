@@ -26,6 +26,9 @@ pub(crate) struct ManagedProfileDir {
     pub ephemeral: bool,
 }
 
+pub(crate) const EPHEMERAL_PROFILE_REMOVE_AFTER_SHUTDOWN_OPERATION: &str =
+    "remove ephemeral managed profile after shutdown fencing";
+
 pub(crate) fn projected_managed_profile_path_for_scope(scope: &str) -> PathBuf {
     shared_projected_managed_profile_path_for_scope(scope)
 }
@@ -311,7 +314,7 @@ async fn remove_ephemeral_profile_dir(profile: &ManagedProfileDir) -> Result<(),
                 if tokio::time::Instant::now() >= deadline {
                     return Err(managed_profile_ownership_error(
                         profile,
-                        "remove ephemeral managed profile after shutdown fencing",
+                        EPHEMERAL_PROFILE_REMOVE_AFTER_SHUTDOWN_OPERATION,
                         error,
                     ));
                 }

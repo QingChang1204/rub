@@ -91,6 +91,38 @@ impl IpcClientError {
         )
     }
 
+    fn possible_request_write_transport_failure(
+        request: &IpcRequest,
+        timeout_budget: Duration,
+        error: std::io::Error,
+    ) -> Self {
+        let mut context = serde_json::json!({
+            "phase": "ipc_request_write",
+            "reason": "ipc_request_write_transport_failure_after_possible_commit",
+            "command": request.command,
+            "timeout_ms": timeout_budget.as_millis() as u64,
+            "request_commit_state": "possible",
+            "command_id_present": request.command_id.is_some(),
+            "transport_error_kind": format!("{:?}", error.kind()),
+        });
+        if let Some(context_object) = context.as_object_mut()
+            && let Some(command_id) = request.command_id.as_ref()
+        {
+            context_object.insert("command_id".to_string(), serde_json::json!(command_id));
+        }
+        Self::Protocol(
+            ErrorEnvelope::new(
+                ErrorCode::IpcProtocolError,
+                format!(
+                    "IPC request '{}' failed during local write after the request frame may already have been committed: {error}",
+                    request.command
+                ),
+            )
+            .with_context(context)
+            .with_suggestion(Self::replay_sensitive_timeout_suggestion(request)),
+        )
+    }
+
     fn committed_request_timeout(request: &IpcRequest, timeout_budget: Duration) -> Self {
         let mut context = serde_json::json!({
             "phase": "ipc_response_read",
@@ -116,6 +148,39 @@ impl IpcClientError {
             .with_context(context)
             .with_suggestion(Self::replay_sensitive_timeout_suggestion(request)),
         )
+    }
+
+    fn committed_request_protocol_failure(
+        request: &IpcRequest,
+        timeout_budget: Duration,
+        mut envelope: ErrorEnvelope,
+    ) -> Self {
+        let mut context = envelope
+            .context
+            .take()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        context
+            .entry("phase")
+            .or_insert_with(|| serde_json::json!("ipc_response_read"));
+        context.entry("reason").or_insert_with(|| {
+            serde_json::json!("ipc_response_protocol_failure_after_request_commit")
+        });
+        context.insert("command".to_string(), serde_json::json!(request.command));
+        context.insert(
+            "timeout_ms".to_string(),
+            serde_json::json!(timeout_budget.as_millis() as u64),
+        );
+        context.insert("request_committed".to_string(), serde_json::json!(true));
+        context.insert(
+            "command_id_present".to_string(),
+            serde_json::json!(request.command_id.is_some()),
+        );
+        if let Some(command_id) = request.command_id.as_ref() {
+            context.insert("command_id".to_string(), serde_json::json!(command_id));
+        }
+        envelope.context = Some(serde_json::Value::Object(context));
+        Self::Protocol(envelope)
     }
 
     fn committed_response_transport_failure(
@@ -164,7 +229,11 @@ impl IpcClientError {
         error: Box<dyn Error + Send + Sync>,
     ) -> Self {
         match error.downcast::<IpcProtocolDecodeError>() {
-            Ok(protocol_error) => Self::Protocol(protocol_error.into_envelope()),
+            Ok(protocol_error) => Self::committed_request_protocol_failure(
+                request,
+                timeout_budget,
+                protocol_error.into_envelope(),
+            ),
             Err(error) => match error.downcast::<std::io::Error>() {
                 Ok(io_error) => match io_error.kind() {
                     // Response framing is not committed until a full NDJSON line arrives.
@@ -187,7 +256,9 @@ impl IpcClientError {
                     std::io::ErrorKind::InvalidData
                         if is_oversized_frame_io_error(io_error.as_ref()) =>
                     {
-                        Self::Protocol(
+                        Self::committed_request_protocol_failure(
+                            request,
+                            timeout_budget,
                             ErrorEnvelope::new(
                                 ErrorCode::IpcProtocolError,
                                 format!("Invalid IPC response frame: {io_error}"),
@@ -198,7 +269,9 @@ impl IpcClientError {
                             })),
                         )
                     }
-                    std::io::ErrorKind::InvalidData => Self::Protocol(
+                    std::io::ErrorKind::InvalidData => Self::committed_request_protocol_failure(
+                        request,
+                        timeout_budget,
                         ErrorEnvelope::new(
                             ErrorCode::IpcProtocolError,
                             format!("Invalid IPC response frame: {io_error}"),
@@ -211,7 +284,9 @@ impl IpcClientError {
                     _ => Self::Transport(*io_error),
                 },
                 Err(error) => match error.downcast::<serde_json::Error>() {
-                    Ok(json_error) => Self::Protocol(
+                    Ok(json_error) => Self::committed_request_protocol_failure(
+                        request,
+                        timeout_budget,
                         ErrorEnvelope::new(
                             ErrorCode::IpcProtocolError,
                             format!("Invalid JSON response body: {json_error}"),
@@ -221,7 +296,9 @@ impl IpcClientError {
                             "reason": "invalid_json_response",
                         })),
                     ),
-                    Err(error) => Self::Protocol(
+                    Err(error) => Self::committed_request_protocol_failure(
+                        request,
+                        timeout_budget,
                         ErrorEnvelope::new(
                             ErrorCode::IpcProtocolError,
                             format!("Failed to decode IPC response: {error}"),
@@ -405,15 +482,31 @@ impl IpcClient {
             )
         })?;
 
-        timeout(timeout_budget, async {
+        let write_result = timeout(timeout_budget, async {
             writer
                 .write_all(&encoded_request)
                 .await
                 .map_err(IpcClientError::transport)?;
             writer.flush().await.map_err(IpcClientError::transport)
         })
-        .await
-        .map_err(|_| IpcClientError::possible_request_write_timeout(&request, timeout_budget))??;
+        .await;
+        match write_result {
+            Ok(Ok(())) => {}
+            Ok(Err(IpcClientError::Transport(error))) => {
+                return Err(IpcClientError::possible_request_write_transport_failure(
+                    &request,
+                    timeout_budget,
+                    error,
+                ));
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(IpcClientError::possible_request_write_timeout(
+                    &request,
+                    timeout_budget,
+                ));
+            }
+        }
 
         let remaining_budget = deadline
             .checked_duration_since(Instant::now())
@@ -452,8 +545,14 @@ impl IpcClient {
                 }
             };
 
-        let response = IpcResponse::from_value_transport(response_value, &request)
-            .map_err(IpcClientError::protocol)?;
+        let response =
+            IpcResponse::from_value_transport(response_value, &request).map_err(|envelope| {
+                IpcClientError::committed_request_protocol_failure(
+                    &request,
+                    timeout_budget,
+                    envelope,
+                )
+            })?;
 
         Ok(response)
     }

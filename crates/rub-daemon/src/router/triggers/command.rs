@@ -45,18 +45,19 @@ impl TriggerCommand {
     pub(super) async fn execute(
         self,
         router: &DaemonRouter,
+        deadline: crate::router::TransactionDeadline,
         state: &Arc<SessionState>,
     ) -> Result<serde_json::Value, RubError> {
         match self {
             Self::Add(args) => cmd_trigger_add(router, args, state).await,
             Self::List => cmd_trigger_list(router, state).await,
             Self::Trace(args) => cmd_trigger_trace(router, args, state).await,
-            Self::Remove(args) => cmd_trigger_remove(router, args.id, state).await,
+            Self::Remove(args) => cmd_trigger_remove(router, args.id, deadline, state).await,
             Self::Pause(args) => {
-                update_trigger_status(router, args.id, state, TriggerStatus::Paused).await
+                update_trigger_status(router, args.id, deadline, state, TriggerStatus::Paused).await
             }
             Self::Resume(args) => {
-                update_trigger_status(router, args.id, state, TriggerStatus::Armed).await
+                update_trigger_status(router, args.id, deadline, state, TriggerStatus::Armed).await
             }
         }
     }

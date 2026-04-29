@@ -156,7 +156,7 @@ pub(super) async fn dispatch_named_command(
         Some(CommandName::Tabs) => navigation::cmd_tabs(router)
             .await
             .map(CommandDispatchOutcome::new),
-        Some(CommandName::Trigger) => triggers::cmd_trigger(router, args, state)
+        Some(CommandName::Trigger) => triggers::cmd_trigger(router, args, deadline, state)
             .await
             .map(CommandDispatchOutcome::new),
         Some(CommandName::Switch) => navigation::cmd_switch(router, args, deadline, state).await,

@@ -34,6 +34,95 @@ fn temp_home(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("rub-queue-{label}-{}", Uuid::now_v7()))
 }
 
+fn test_snapshot(snapshot_id: &str) -> rub_core::model::Snapshot {
+    rub_core::model::Snapshot {
+        snapshot_id: snapshot_id.to_string(),
+        dom_epoch: 1,
+        frame_context: rub_core::model::FrameContextInfo {
+            frame_id: "main".to_string(),
+            name: Some("main".to_string()),
+            parent_frame_id: None,
+            target_id: Some("target-1".to_string()),
+            url: Some("https://example.com".to_string()),
+            depth: 0,
+            same_origin_accessible: Some(true),
+        },
+        frame_lineage: vec!["main".to_string()],
+        url: "https://example.com".to_string(),
+        title: "Example".to_string(),
+        elements: Vec::new(),
+        total_count: 0,
+        truncated: false,
+        scroll: rub_core::model::ScrollPosition {
+            x: 0.0,
+            y: 0.0,
+            at_bottom: false,
+        },
+        timestamp: "2026-03-29T00:00:00Z".to_string(),
+        projection: rub_core::model::SnapshotProjection {
+            verified: true,
+            js_traversal_count: 0,
+            backend_traversal_count: 0,
+            resolved_ref_count: 0,
+            warning: None,
+        },
+        viewport_filtered: None,
+        viewport_count: None,
+    }
+}
+
+#[tokio::test]
+async fn execution_timeout_fence_marks_possible_dom_commit_and_drops_snapshots() {
+    let state = Arc::new(SessionState::new(
+        "default",
+        temp_home("timeout-dom-commit-fence"),
+        None,
+    ));
+    let cached = state.cache_snapshot(test_snapshot("snap-open")).await;
+    let request = IpcRequest::new(
+        "open",
+        serde_json::json!({ "url": "https://example.com" }),
+        1_000,
+    );
+
+    apply_execution_timeout_authority_fence(&request, &state).await;
+
+    assert!(state.has_pending_external_dom_change());
+    assert!(state.get_snapshot(&cached.snapshot_id).await.is_none());
+}
+
+#[tokio::test]
+async fn execution_timeout_fence_clears_same_epoch_snapshot_mutations() {
+    let state = Arc::new(SessionState::new(
+        "default",
+        temp_home("timeout-same-epoch-fence"),
+        None,
+    ));
+    let cached = state.cache_snapshot(test_snapshot("snap-scroll")).await;
+    let request = IpcRequest::new("scroll", serde_json::json!({ "amount": 600 }), 1_000);
+
+    apply_execution_timeout_authority_fence(&request, &state).await;
+
+    assert!(!state.has_pending_external_dom_change());
+    assert!(state.get_snapshot(&cached.snapshot_id).await.is_none());
+}
+
+#[tokio::test]
+async fn execution_timeout_fence_keeps_read_only_snapshot_authority() {
+    let state = Arc::new(SessionState::new(
+        "default",
+        temp_home("timeout-read-only-fence"),
+        None,
+    ));
+    let cached = state.cache_snapshot(test_snapshot("snap-state")).await;
+    let request = IpcRequest::new("state", serde_json::json!({}), 1_000);
+
+    apply_execution_timeout_authority_fence(&request, &state).await;
+
+    assert!(!state.has_pending_external_dom_change());
+    assert!(state.get_snapshot(&cached.snapshot_id).await.is_some());
+}
+
 #[tokio::test]
 async fn expired_execution_budget_releases_replay_without_committed_truth() {
     let router = test_router();

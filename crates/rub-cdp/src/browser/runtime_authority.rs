@@ -5,6 +5,8 @@ use crate::tab_projection::{CommittedTabProjection, LocalActiveTargetAuthority};
 use rub_core::model::DialogRuntimeStatus;
 
 const BROWSER_AUTHORITY_REBUILD_FAILED_REASON: &str = "browser_authority_rebuild_failed";
+const PREVIOUS_AUTHORITY_CLEANUP_FAILED_AFTER_RELEASE_REASON: &str =
+    "previous_authority_cleanup_failed_after_release";
 
 #[derive(Clone)]
 pub(super) struct BrowserAuthoritySnapshot {
@@ -146,6 +148,11 @@ impl BrowserAuthorityInstallTransaction {
                 .release_browser_authority_snapshot(previous_authority.clone())
                 .await
         {
+            if previous_authority_release_error_is_post_shutdown_cleanup(&release_error) {
+                return Err(previous_authority_cleanup_failed_after_release_error(
+                    release_error,
+                ));
+            }
             return Err(self
                 .rollback_after_failed_previous_release(manager, previous_authority, release_error)
                 .await);
@@ -209,6 +216,57 @@ impl BrowserAuthorityInstallTransaction {
                 }),
             ),
         }
+    }
+}
+
+fn previous_authority_release_error_is_post_shutdown_cleanup(error: &RubError) -> bool {
+    matches!(
+        error,
+        RubError::Domain(envelope)
+            if envelope
+                .context
+                .as_ref()
+                .and_then(|context| context.get("operation"))
+                .and_then(|value| value.as_str())
+                == Some(EPHEMERAL_PROFILE_REMOVE_AFTER_SHUTDOWN_OPERATION)
+    )
+}
+
+fn previous_authority_cleanup_failed_after_release_error(release_error: RubError) -> RubError {
+    let release_error_context = match &release_error {
+        RubError::Domain(envelope) => envelope.context.clone(),
+        _ => None,
+    };
+    RubError::domain_with_context(
+        ErrorCode::BrowserLaunchFailed,
+        format!(
+            "Replacement browser authority committed, but previous authority cleanup failed after release: {release_error}"
+        ),
+        serde_json::json!({
+            "reason": PREVIOUS_AUTHORITY_CLEANUP_FAILED_AFTER_RELEASE_REASON,
+            "new_authority_committed": true,
+            "new_authority_usable": true,
+            "previous_authority_released": true,
+            "previous_authority_restored": false,
+            "cleanup_degraded": true,
+            "release_error": release_error.to_string(),
+            "release_error_context": release_error_context,
+        }),
+    )
+}
+
+fn release_previous_result_should_replay_runtime_projection(result: &Result<(), RubError>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(RubError::Domain(envelope)) => {
+            envelope
+                .context
+                .as_ref()
+                .and_then(|context| context.get("reason"))
+                .and_then(|value| value.as_str())
+                == Some(PREVIOUS_AUTHORITY_CLEANUP_FAILED_AFTER_RELEASE_REASON)
+        }
+        Err(_) => false,
     }
 }
 
@@ -1107,7 +1165,7 @@ impl BrowserManager {
         }
         let result = transaction.release_previous_after_commit(self).await;
         self.set_authority_commit_in_progress(false);
-        if result.is_ok() {
+        if release_previous_result_should_replay_runtime_projection(&result) {
             self.replay_runtime_state_projection_to_callbacks().await;
             self.replay_dialog_runtime_projection_to_callbacks().await;
             self.replay_download_runtime_projection_to_callbacks().await;
@@ -1183,5 +1241,65 @@ fn append_runtime_degraded_reason(existing: Option<String>, reason: &str) -> Opt
             Some(existing)
         }
         Some(existing) => Some(format!("{existing},{reason}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_shutdown_cleanup_failure_keeps_replacement_authority_committed() {
+        let release_error = RubError::domain_with_context(
+            ErrorCode::BrowserLaunchFailed,
+            "cleanup failed after previous authority release",
+            serde_json::json!({
+                "operation": EPHEMERAL_PROFILE_REMOVE_AFTER_SHUTDOWN_OPERATION,
+                "user_data_dir": "/tmp/rub-profile",
+            }),
+        );
+
+        assert!(previous_authority_release_error_is_post_shutdown_cleanup(
+            &release_error
+        ));
+        let error = previous_authority_cleanup_failed_after_release_error(release_error);
+        let replay_result = Err(error);
+        assert!(release_previous_result_should_replay_runtime_projection(
+            &replay_result
+        ));
+        let envelope = match replay_result {
+            Ok(()) => panic!("expected cleanup-degraded error"),
+            Err(error) => error.into_envelope(),
+        };
+        let context = envelope.context.expect("cleanup-degraded context");
+        assert_eq!(
+            context["reason"],
+            serde_json::json!("previous_authority_cleanup_failed_after_release")
+        );
+        assert_eq!(context["new_authority_committed"], serde_json::json!(true));
+        assert_eq!(context["new_authority_usable"], serde_json::json!(true));
+        assert_eq!(
+            context["previous_authority_released"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            context["previous_authority_restored"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn pre_release_failure_still_requires_rollback_path() {
+        let release_error = RubError::domain(
+            ErrorCode::BrowserLaunchFailed,
+            "previous authority did not release",
+        );
+
+        assert!(!previous_authority_release_error_is_post_shutdown_cleanup(
+            &release_error
+        ));
+        assert!(!release_previous_result_should_replay_runtime_projection(
+            &Err(release_error)
+        ));
     }
 }
