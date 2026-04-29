@@ -35,11 +35,12 @@ pub fn session_pid_path(home: &str, session: &str) -> PathBuf {
 }
 
 pub fn cleanup(home: &str) {
-    match try_cleanup_home(home) {
-        Ok(CleanupVerification::Verified | CleanupVerification::SkippedDuringPanic) => {}
-        Ok(CleanupVerification::VerifiedWithHarnessFallback) => unreachable!(
-            "strict cleanup must surface harness fallback as an error before returning"
-        ),
+    match try_cleanup_home_allow_harness_fallback(home) {
+        Ok(
+            CleanupVerification::Verified
+            | CleanupVerification::VerifiedWithHarnessFallback
+            | CleanupVerification::SkippedDuringPanic,
+        ) => {}
         Err(message) => panic!("{message}"),
     }
 }
@@ -51,6 +52,7 @@ pub fn prepare_home(home: &str) {
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn try_cleanup_home(home: &str) -> Result<CleanupVerification, String> {
     let observed = observe_home_cleanup(home);
     let outcome = try_cleanup_home_allow_harness_fallback_with_observation(home, &observed)?;

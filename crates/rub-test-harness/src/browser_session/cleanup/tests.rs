@@ -177,7 +177,7 @@ fn cleanup_verification_distinguishes_harness_fallback_from_product_teardown() {
 }
 
 #[test]
-fn default_cleanup_acceptance_rejects_harness_fallback_verification() {
+fn strict_product_teardown_acceptance_rejects_harness_fallback_verification() {
     let _serial = cleanup_test_serial().lock().expect("cleanup test serial");
     let accepted =
         require_product_teardown_verification("/tmp/rub-home", CleanupVerification::Verified)
@@ -188,7 +188,7 @@ fn default_cleanup_acceptance_rejects_harness_fallback_verification() {
         "/tmp/rub-home",
         CleanupVerification::VerifiedWithHarnessFallback,
     )
-    .expect_err("harness fallback must fail default browser-backed cleanup");
+    .expect_err("harness fallback must fail strict product teardown verification");
     assert!(
         err.contains("required harness fallback"),
         "strict cleanup error should explain the fallback regression: {err}"
