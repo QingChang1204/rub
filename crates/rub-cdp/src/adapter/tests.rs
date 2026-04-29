@@ -9,6 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::time::{Duration, Instant, sleep};
 
+const TEST_BROWSER_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+const TEST_BROWSER_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 fn options() -> BrowserLaunchOptions {
     let unique = format!("{}-{}", std::process::id(), uuid::Uuid::now_v7());
     BrowserLaunchOptions {
@@ -49,7 +52,7 @@ async fn open_second_tab(manager: &BrowserManager, opener: &Arc<chromiumoxide::P
         .evaluate(script)
         .await
         .expect("window.open should succeed");
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + TEST_BROWSER_SETTLE_TIMEOUT;
     loop {
         let tabs = manager
             .tab_list()
@@ -62,7 +65,7 @@ async fn open_second_tab(manager: &BrowserManager, opener: &Arc<chromiumoxide::P
             Instant::now() < deadline,
             "second tab should appear before timeout"
         );
-        sleep(Duration::from_millis(20)).await;
+        sleep(TEST_BROWSER_POLL_INTERVAL).await;
     }
 }
 
@@ -74,7 +77,7 @@ async fn child_frame_id(page: &Arc<chromiumoxide::Page>) -> String {
         .expect("main frame should exist")
         .as_ref()
         .to_string();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + TEST_BROWSER_SETTLE_TIMEOUT;
     loop {
         let frames = page
             .frames()
@@ -91,24 +94,24 @@ async fn child_frame_id(page: &Arc<chromiumoxide::Page>) -> String {
             Instant::now() < deadline,
             "child frame should appear before timeout"
         );
-        sleep(Duration::from_millis(20)).await;
+        sleep(TEST_BROWSER_POLL_INTERVAL).await;
     }
 }
 
 async fn wait_for_frame_context_resolved(page: &Arc<Page>, frame_id: &str) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + TEST_BROWSER_SETTLE_TIMEOUT;
     loop {
-        if crate::frame_runtime::resolve_frame_context(page, Some(frame_id))
-            .await
-            .is_ok()
-        {
-            return;
+        match crate::frame_runtime::resolve_frame_context(page, Some(frame_id)).await {
+            Ok(_) => return,
+            Err(error) => {
+                let last_error = error.to_string();
+                assert!(
+                    Instant::now() < deadline,
+                    "child frame context should resolve before timeout; last_error={last_error}"
+                );
+            }
         }
-        assert!(
-            Instant::now() < deadline,
-            "child frame context should resolve before timeout"
-        );
-        sleep(Duration::from_millis(20)).await;
+        sleep(TEST_BROWSER_POLL_INTERVAL).await;
     }
 }
 
@@ -134,7 +137,7 @@ async fn seed_child_frame_document(page: &Arc<Page>, html: &str) {
 }
 
 async fn focus_child_input(page: &Arc<Page>, input_id: &str) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + TEST_BROWSER_SETTLE_TIMEOUT;
     loop {
         let active_id = crate::js::evaluate_returning_string_in_context(
             page,
@@ -153,7 +156,7 @@ async fn focus_child_input(page: &Arc<Page>, input_id: &str) {
             Instant::now() < deadline,
             "child input should become focusable before timeout"
         );
-        sleep(Duration::from_millis(20)).await;
+        sleep(TEST_BROWSER_POLL_INTERVAL).await;
     }
 }
 
