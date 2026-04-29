@@ -2683,7 +2683,7 @@ fn t414k_extract_collection_row_failures_publish_row_scoped_hints() {
     );
 }
 
-/// T430: click-triggered downloads should surface canonical download effects on the interaction.
+/// T430: click-triggered downloads should be observable through the download runtime fence.
 #[test]
 #[ignore]
 #[serial]
@@ -2712,16 +2712,17 @@ fn t430_433_download_runtime_grouped_scenario() {
         clicked["data"]["interaction"]["interaction_confirmed"], true,
         "{clicked}"
     );
-    let downloads = &clicked["data"]["interaction"]["downloads"];
-    assert!(
-        downloads["events"]
-            .as_array()
-            .is_some_and(|events| !events.is_empty()),
-        "{clicked}"
+    let waited = parse_json(
+        &session
+            .cmd()
+            .args(["download", "wait", "--state", "completed"])
+            .output()
+            .unwrap(),
     );
+    assert_eq!(waited["success"], true, "{waited}");
     assert_eq!(
-        downloads["last_download"]["suggested_filename"], "report.csv",
-        "{clicked}"
+        waited["data"]["result"]["download"]["suggested_filename"], "report.csv",
+        "{waited}"
     );
 
     let reopened = parse_json(
