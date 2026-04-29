@@ -77,7 +77,7 @@ where
         attempts += 1;
         let result = run_orchestration_future_with_outer_deadline(
             outer_deadline,
-            || timeout_error(),
+            &timeout_error,
             operation(),
         )
         .await;

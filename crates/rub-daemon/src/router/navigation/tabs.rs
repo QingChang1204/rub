@@ -110,4 +110,22 @@ mod tests {
             "active_tab_unavailable"
         );
     }
+
+    #[test]
+    fn close_tab_result_preserves_active_tab_when_only_title_degraded() {
+        let mut active = tab(0, true);
+        active.url = "about:blank".to_string();
+        active.title = String::new();
+        active.degraded_reason = Some("tab_title_probe_failed".to_string());
+
+        let projection = close_tab_result_projection(&[active]);
+
+        assert_eq!(projection["remaining_tabs"], 1);
+        assert_eq!(projection["active_tab"]["url"], "about:blank");
+        assert_eq!(
+            projection["active_tab"]["degraded_reason"],
+            "tab_title_probe_failed"
+        );
+        assert!(projection["active_tab_degraded_reason"].is_null());
+    }
 }

@@ -262,6 +262,13 @@ fn orchestration_condition_requires_revalidation_after_queue(rule: &Orchestratio
     !matches!(rule.condition.kind, TriggerConditionKind::NetworkRequest)
 }
 
+fn orchestration_worker_command_identity_key(
+    requires_revalidation_after_queue: bool,
+    evidence_key: &str,
+) -> Option<&str> {
+    (!requires_revalidation_after_queue).then_some(evidence_key)
+}
+
 fn orchestration_rule_semantics_fingerprint(rule: &OrchestrationRuleInfo) -> String {
     serde_json::json!({
         "source": {
@@ -420,6 +427,8 @@ async fn handle_orchestration_reservation_completion(
         return;
     };
 
+    let requires_revalidation_after_queue =
+        pending.condition_policy.requires_revalidation_after_queue;
     let reserved = match completion.result {
         Ok(transaction) => match complete_orchestration_reservation(
             router,
@@ -485,7 +494,10 @@ async fn handle_orchestration_reservation_completion(
         state,
         &reserved.runtime,
         &reserved.rule,
-        Some(reserved.evidence_key.as_str()),
+        orchestration_worker_command_identity_key(
+            requires_revalidation_after_queue,
+            reserved.evidence_key.as_str(),
+        ),
         None,
         RouterFenceDisposition::ReuseCurrentTransaction,
     )

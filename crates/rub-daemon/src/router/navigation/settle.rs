@@ -76,7 +76,7 @@ async fn active_tab_and_frame_runtime_converged(
 ) -> bool {
     let Some(active_tab) = tabs.and_then(|tabs| {
         tabs.iter()
-            .find(|tab| tab.active && tab.page_identity_authoritative())
+            .find(|tab| tab.active && tab.page_url_authoritative())
     }) else {
         return false;
     };
@@ -99,7 +99,7 @@ pub(super) async fn active_tab_projection(router: &DaemonRouter) -> ActiveTabPro
 
 pub(super) fn active_tab_projection_from_tabs(tabs: &[TabInfo]) -> ActiveTabProjection {
     match tabs.iter().find(|tab| tab.active) {
-        Some(active_tab) if !active_tab.page_identity_authoritative() => {
+        Some(active_tab) if !active_tab.page_url_authoritative() => {
             degraded_active_tab_projection("active_tab_probe_failed")
         }
         Some(active_tab) => ActiveTabProjection {
@@ -154,6 +154,32 @@ mod tests {
         let projection = active_tab_projection_from_tabs(&[tab(0, "tab-a", false)]);
         assert!(projection.tab.is_none());
         assert_eq!(projection.degraded_reason, Some("active_tab_unavailable"));
+    }
+
+    #[test]
+    fn active_tab_projection_preserves_active_tab_when_only_title_degraded() {
+        let mut active = tab(0, "tab-a", true);
+        active.title = String::new();
+        active.degraded_reason = Some("tab_title_probe_failed".to_string());
+
+        let projection = active_tab_projection_from_tabs(&[active]);
+        assert!(projection.degraded_reason.is_none());
+        let tab = projection
+            .tab
+            .expect("URL-authoritative tab should project");
+        assert_eq!(tab["url"], "https://example.com/0");
+        assert_eq!(tab["degraded_reason"], "tab_title_probe_failed");
+    }
+
+    #[test]
+    fn active_tab_projection_degrades_when_url_probe_failed() {
+        let mut active = tab(0, "tab-a", true);
+        active.url = String::new();
+        active.degraded_reason = Some("tab_url_probe_failed".to_string());
+
+        let projection = active_tab_projection_from_tabs(&[active]);
+        assert!(projection.tab.is_none());
+        assert_eq!(projection.degraded_reason, Some("active_tab_probe_failed"));
     }
 
     #[test]

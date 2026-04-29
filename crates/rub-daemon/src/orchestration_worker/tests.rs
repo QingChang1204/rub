@@ -9,8 +9,8 @@ use super::{
     ReservedOrchestrationExecution, TriggeredOrchestrationCondition,
     commit_orchestration_execution, complete_orchestration_reservation,
     drain_orchestration_reservation_completions, orchestration_rule_semantics_fingerprint,
-    process_orchestration_rule, reconcile_pending_orchestration_reservations,
-    run_orchestration_cycle,
+    orchestration_worker_command_identity_key, process_orchestration_rule,
+    reconcile_pending_orchestration_reservations, run_orchestration_cycle,
 };
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 use rub_core::model::{
@@ -120,6 +120,22 @@ fn orchestration_evidence_key_prefers_fingerprint_when_present() {
     assert_eq!(
         orchestration_evidence_key(&evidence),
         "source_tab_text_present:Ready::doc-1"
+    );
+}
+
+#[test]
+fn worker_command_identity_uses_execution_attempt_for_revalidated_conditions() {
+    assert_eq!(
+        orchestration_worker_command_identity_key(true, "source_tab_text_present:Ready::Ready"),
+        None
+    );
+}
+
+#[test]
+fn worker_command_identity_uses_evidence_key_for_preserved_network_conditions() {
+    assert_eq!(
+        orchestration_worker_command_identity_key(false, "network_request:/api/save::42"),
+        Some("network_request:/api/save::42")
     );
 }
 

@@ -256,6 +256,14 @@ impl TabInfo {
     pub fn page_identity_authoritative(&self) -> bool {
         self.degraded_reason.is_none()
     }
+
+    pub fn page_url_authoritative(&self) -> bool {
+        !self.url.is_empty()
+            && !matches!(
+                self.degraded_reason.as_deref(),
+                Some("tab_url_probe_failed" | "tab_url_and_title_probe_failed")
+            )
+    }
 }
 
 /// Keyboard modifier keys.
