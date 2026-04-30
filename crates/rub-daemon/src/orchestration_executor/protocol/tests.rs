@@ -386,6 +386,43 @@ fn remote_dispatch_replay_classifies_post_commit_response_transport_protocol_fai
     );
 }
 
+#[test]
+fn remote_dispatch_replay_classifies_possible_commit_write_timeout_protocol_failures() {
+    let error = IpcClientError::Protocol(
+        ErrorEnvelope::new(
+            ErrorCode::IpcTimeout,
+            "request write timed out after possible commit",
+        )
+        .with_context(serde_json::json!({
+            "reason": "ipc_request_write_timeout_after_possible_commit",
+            "request_commit_state": "possible",
+        })),
+    );
+    assert_eq!(
+        super::orchestration_recoverable_transport_reason(&error),
+        Some("request_write_timeout_after_possible_commit")
+    );
+}
+
+#[test]
+fn remote_dispatch_replay_classifies_possible_commit_write_transport_protocol_failures() {
+    let error = IpcClientError::Protocol(
+        ErrorEnvelope::new(
+            ErrorCode::IpcProtocolError,
+            "request write transport failed after possible commit",
+        )
+        .with_context(serde_json::json!({
+            "reason": "ipc_request_write_transport_failure_after_possible_commit",
+            "request_commit_state": "possible",
+            "transport_error_kind": "BrokenPipe",
+        })),
+    );
+    assert_eq!(
+        super::orchestration_recoverable_transport_reason(&error),
+        Some("request_write_transport_failure_after_possible_commit")
+    );
+}
+
 #[tokio::test]
 async fn remote_dispatch_fails_closed_after_partial_response_for_compat_request_without_command_id()
 {

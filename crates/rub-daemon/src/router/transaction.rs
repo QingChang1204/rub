@@ -26,11 +26,23 @@ pub(crate) use self::response::{
     replay_spent_response_evicted_response, replay_timeout_response,
 };
 
-#[derive(Debug, Clone)]
 pub(super) struct ReplayFenceOwner {
     pub(super) command_id: String,
     fingerprint: String,
     finalize: ReplayFinalizeMode,
+    state: Arc<SessionState>,
+    finalized: bool,
+}
+
+impl std::fmt::Debug for ReplayFenceOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplayFenceOwner")
+            .field("command_id", &self.command_id)
+            .field("fingerprint", &self.fingerprint)
+            .field("finalize", &self.finalize)
+            .field("finalized", &self.finalized)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -40,16 +52,35 @@ enum ReplayFinalizeMode {
 }
 
 impl ReplayFenceOwner {
-    pub(super) fn new(command_id: String, fingerprint: String) -> Self {
+    pub(super) fn new(command_id: String, fingerprint: String, state: Arc<SessionState>) -> Self {
         Self {
             command_id,
             fingerprint,
             finalize: ReplayFinalizeMode::ReleaseOnly,
+            state,
+            finalized: false,
         }
     }
 
     pub(super) fn mark_execution_started(&mut self) {
         self.finalize = ReplayFinalizeMode::CacheCommittedResponse;
+    }
+
+    pub(super) fn mark_finalized(&mut self) {
+        self.finalized = true;
+    }
+}
+
+impl Drop for ReplayFenceOwner {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        if self.finalize == ReplayFinalizeMode::CacheCommittedResponse {
+            self.state
+                .mark_replay_command_spent(&self.command_id, &self.fingerprint);
+        }
+        self.state.release_replay_command(&self.command_id);
     }
 }
 
@@ -172,11 +203,11 @@ impl PendingResponseCommit {
     async fn finalize_committed_truth(
         request: &IpcRequest,
         response: &IpcResponse,
-        replay_owner: Option<&ReplayFenceOwner>,
+        replay_owner: Option<&mut ReplayFenceOwner>,
         post_commit_projection: Option<(WorkflowCaptureDeliveryState, PostCommitProjectionFence)>,
         state: &Arc<SessionState>,
     ) {
-        finalize_replay_fence(replay_owner, response, state).await;
+        finalize_replay_fence(replay_owner, response).await;
         if let Some((delivery_state, projection_fence)) = post_commit_projection {
             finalize_post_commit_followups(
                 request,
@@ -253,13 +284,13 @@ impl PendingResponseCommit {
             internal_command,
             execution_started,
             daemon_request_committed: _,
-            replay_owner,
+            mut replay_owner,
             request_transaction: _request_transaction,
         } = self;
         Self::finalize_committed_truth(
             &request,
             &response,
-            replay_owner.as_ref(),
+            replay_owner.as_mut(),
             (execution_started && !internal_command).then_some((
                 WorkflowCaptureDeliveryState::Delivered,
                 PostCommitProjectionFence::Synchronous,
@@ -277,7 +308,7 @@ impl PendingResponseCommit {
             internal_command,
             execution_started,
             daemon_request_committed: _,
-            replay_owner,
+            mut replay_owner,
             request_transaction,
         } = self;
         drop(request_transaction);
@@ -295,7 +326,7 @@ impl PendingResponseCommit {
             Self::finalize_committed_truth(
                 &request,
                 &response,
-                replay_owner.as_ref(),
+                replay_owner.as_mut(),
                 (execution_started && !internal_command).then_some((
                     WorkflowCaptureDeliveryState::Delivered,
                     PostCommitProjectionFence::Detached,
@@ -317,7 +348,7 @@ impl PendingResponseCommit {
             internal_command,
             execution_started,
             daemon_request_committed: _,
-            replay_owner,
+            mut replay_owner,
             request_transaction,
         } = self;
         let response = response
@@ -328,7 +359,7 @@ impl PendingResponseCommit {
             Self::finalize_committed_truth(
                 &request,
                 &response,
-                replay_owner.as_ref(),
+                replay_owner.as_mut(),
                 (execution_started && !internal_command).then_some((
                     WorkflowCaptureDeliveryState::DeliveryFailedAfterCommit,
                     PostCommitProjectionFence::Synchronous,
@@ -364,6 +395,7 @@ pub(super) async fn prepare_replay_fence(
                 return Ok(Some(ReplayFenceOwner::new(
                     command_id.clone(),
                     fingerprint.clone(),
+                    state.clone(),
                 )));
             }
             ReplayCommandClaim::Conflict => {

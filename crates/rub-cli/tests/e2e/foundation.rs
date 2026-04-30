@@ -46,8 +46,8 @@ fn t039_daemon_auto_start_lifecycle() {
     let mut closeable = false;
     for _ in 0..60 {
         let sessions = parse_json(&rub_cmd(home).arg("sessions").output().unwrap());
-        if sessions["success"] == true
-            && sessions["data"]["result"]["items"]
+        assert_poll_success("sessions", &sessions);
+        if sessions["data"]["result"]["items"]
                 .as_array()
                 .is_some_and(|items| {
                     items

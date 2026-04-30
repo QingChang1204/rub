@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use rub_core::command::{DomEpochPolicy, command_metadata};
+use rub_core::command::{
+    CommandEffectClass, DomEpochPolicy, TimeoutRecoverySurface, command_metadata,
+};
 use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
 use rub_core::model::Timing;
 use rub_ipc::protocol::{IpcRequest, IpcResponse};
@@ -609,9 +611,13 @@ async fn apply_execution_timeout_authority_fence(request: &IpcRequest, state: &A
 }
 
 fn command_may_have_dom_commit_after_timeout(request: &IpcRequest) -> bool {
-    let policy = command_metadata(&request.command).dom_epoch_policy;
-    matches!(policy, DomEpochPolicy::Bump)
-        || (matches!(policy, DomEpochPolicy::ArgsDependent) && dialog_action_commits_epoch(request))
+    let metadata = command_metadata(&request.command);
+    matches!(metadata.dom_epoch_policy, DomEpochPolicy::Bump)
+        || (matches!(metadata.dom_epoch_policy, DomEpochPolicy::ArgsDependent)
+            && dialog_action_commits_epoch(request))
+        || (metadata.effect_class == CommandEffectClass::WorkflowMutation
+            && metadata.timeout_recovery_surface == TimeoutRecoverySurface::PossibleCommit
+            && metadata.dom_epoch_policy == DomEpochPolicy::None)
 }
 
 fn dialog_action_commits_epoch(request: &IpcRequest) -> bool {

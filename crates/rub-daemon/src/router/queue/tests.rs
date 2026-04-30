@@ -92,6 +92,35 @@ async fn execution_timeout_fence_marks_possible_dom_commit_and_drops_snapshots()
 }
 
 #[tokio::test]
+async fn execution_timeout_fence_marks_aggregate_workflow_possible_dom_commit() {
+    for command in [
+        "pipe",
+        "_trigger_pipe",
+        "orchestration",
+        "_orchestration_target_dispatch",
+    ] {
+        let state = Arc::new(SessionState::new(
+            "default",
+            temp_home(&format!("timeout-aggregate-{command}")),
+            None,
+        ));
+        let cached = state.cache_snapshot(test_snapshot(command)).await;
+        let request = IpcRequest::new(command, serde_json::json!({}), 1_000);
+
+        apply_execution_timeout_authority_fence(&request, &state).await;
+
+        assert!(
+            state.has_pending_external_dom_change(),
+            "{command} possible-commit timeout must mark pending DOM drift"
+        );
+        assert!(
+            state.get_snapshot(&cached.snapshot_id).await.is_none(),
+            "{command} possible-commit timeout must clear stale snapshot authority"
+        );
+    }
+}
+
+#[tokio::test]
 async fn execution_timeout_fence_clears_same_epoch_snapshot_mutations() {
     let state = Arc::new(SessionState::new(
         "default",

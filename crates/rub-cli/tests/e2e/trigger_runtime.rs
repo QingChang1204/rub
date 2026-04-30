@@ -1419,8 +1419,8 @@ fn t437g_h_trigger_workflow_grouped_scenario() {
     let mut fired = serde_json::Value::Null;
     for _ in 0..120 {
         let out = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
-        if out["success"] == true
-            && let Some(trigger) = out["data"]["result"]["items"].as_array().and_then(|items| {
+        assert_poll_success("trigger list", &out);
+        if let Some(trigger) = out["data"]["result"]["items"].as_array().and_then(|items| {
                 items
                     .iter()
                     .find(|item| item["id"].as_u64() == Some(trigger_id))
@@ -1537,8 +1537,8 @@ fn t437g_h_trigger_workflow_grouped_scenario() {
     let mut fired = serde_json::Value::Null;
     for _ in 0..120 {
         let out = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
-        if out["success"] == true
-            && let Some(trigger) = out["data"]["result"]["items"].as_array().and_then(|items| {
+        assert_poll_success("trigger list", &out);
+        if let Some(trigger) = out["data"]["result"]["items"].as_array().and_then(|items| {
                 items
                     .iter()
                     .find(|item| item["id"].as_u64() == Some(trigger_id))
@@ -1903,8 +1903,8 @@ fn t437i_l_trigger_source_vars_storage_blocked_and_removed_grouped_scenario() {
     let mut fired = serde_json::Value::Null;
     for _ in 0..120 {
         let out = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
-        if out["success"] == true
-            && let Some(trigger) = out["data"]["result"]["items"].as_array().and_then(|items| {
+        assert_poll_success("trigger list", &out);
+        if let Some(trigger) = out["data"]["result"]["items"].as_array().and_then(|items| {
                 items
                     .iter()
                     .find(|item| item["id"].as_u64() == Some(trigger_id))
@@ -2030,8 +2030,8 @@ fn t437i_l_trigger_source_vars_storage_blocked_and_removed_grouped_scenario() {
     let mut fired = serde_json::Value::Null;
     for _ in 0..120 {
         let out = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
-        if out["success"] == true
-            && let Some(trigger) = out["data"]["result"]["items"].as_array().and_then(|items| {
+        assert_poll_success("trigger list", &out);
+        if let Some(trigger) = out["data"]["result"]["items"].as_array().and_then(|items| {
                 items
                     .iter()
                     .find(|item| item["id"].as_u64() == Some(trigger_id))
@@ -2155,8 +2155,8 @@ fn t437i_l_trigger_source_vars_storage_blocked_and_removed_grouped_scenario() {
     let mut blocked = serde_json::Value::Null;
     for _ in 0..120 {
         let out = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
-        if out["success"] == true
-            && let Some(trigger) = out["data"]["result"]["items"].as_array().and_then(|items| {
+        assert_poll_success("trigger list", &out);
+        if let Some(trigger) = out["data"]["result"]["items"].as_array().and_then(|items| {
                 items
                     .iter()
                     .find(|item| item["id"].as_u64() == Some(trigger_id))

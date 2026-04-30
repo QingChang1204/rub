@@ -263,10 +263,10 @@ fn orchestration_condition_requires_revalidation_after_queue(rule: &Orchestratio
 }
 
 fn orchestration_worker_command_identity_key(
-    requires_revalidation_after_queue: bool,
+    _requires_revalidation_after_queue: bool,
     evidence_key: &str,
 ) -> Option<&str> {
-    (!requires_revalidation_after_queue).then_some(evidence_key)
+    Some(evidence_key)
 }
 
 fn orchestration_rule_semantics_fingerprint(rule: &OrchestrationRuleInfo) -> String {

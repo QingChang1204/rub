@@ -751,8 +751,8 @@ fn wait_for_text_in_session(
                 .output()
                 .unwrap(),
         );
-        if out["success"] == true
-            && let Some(text) = out["data"]["result"]["value"].as_str()
+        assert_poll_success("inspect text", &out);
+        if let Some(text) = out["data"]["result"]["value"].as_str()
             && text == expected
         {
             return text.to_string();
@@ -1628,8 +1628,8 @@ fn e2e_guardrail_release_runs_frozen_baseline_suite_before_dist() {
     let release = read_workspace_file(".github/workflows/release.yml");
     assert!(release.contains("frozen-baseline-guardrails"), "{release}");
     assert!(
-        release.contains("cargo test -p rub-cli --bin rub doc_contract"),
-        "{release}"
+        !release.contains("doc_contract"),
+        "release guardrails must not claim a docs contract fence; some docs are local-only and not part of the release contract: {release}"
     );
     assert!(
         release.contains("cargo test -p rub-cli --test e2e e2e_guardrail"),
@@ -1656,6 +1656,14 @@ fn e2e_guardrail_polling_helpers_fail_closed_on_non_success_results() {
     assert!(
         trigger_runtime.contains("assert_poll_success(\"tabs\", &tabs)"),
         "{trigger_runtime}"
+    );
+    assert!(
+        !e2e_source.contains("out[\"success\"] == true"),
+        "shared E2E polling helpers must fail closed on non-success CommandResult instead of waiting through it"
+    );
+    assert!(
+        !trigger_runtime.contains("out[\"success\"] == true"),
+        "trigger polling must fail closed on non-success CommandResult instead of waiting through it"
     );
     assert!(
         !trigger_runtime.contains("tabs[\"success\"] != true"),

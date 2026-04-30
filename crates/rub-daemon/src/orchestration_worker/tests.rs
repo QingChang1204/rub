@@ -124,10 +124,10 @@ fn orchestration_evidence_key_prefers_fingerprint_when_present() {
 }
 
 #[test]
-fn worker_command_identity_uses_execution_attempt_for_revalidated_conditions() {
+fn worker_command_identity_uses_revalidated_evidence_key_for_revalidated_conditions() {
     assert_eq!(
         orchestration_worker_command_identity_key(true, "source_tab_text_present:Ready::Ready"),
-        None
+        Some("source_tab_text_present:Ready::Ready")
     );
 }
 

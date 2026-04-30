@@ -2633,8 +2633,8 @@ fn t310a_external_attach_accepts_multi_tab_browser_with_unique_active_tab_author
                 .output()
                 .unwrap(),
         );
-        if out["success"] == true
-            && out["data"]["result"]["snapshot"]["title"] == "External Two"
+        assert_poll_success("state", &out);
+        if out["data"]["result"]["snapshot"]["title"] == "External Two"
         {
             break out;
         }

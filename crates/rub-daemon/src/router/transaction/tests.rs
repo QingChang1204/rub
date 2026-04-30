@@ -212,6 +212,92 @@ async fn delivery_failure_after_execution_caches_committed_response_truth_across
 }
 
 #[tokio::test]
+async fn dropping_unstarted_replay_owner_releases_in_flight_claim() {
+    let home = unique_home("drop-unstarted-replay-owner");
+    std::fs::create_dir_all(&home).expect("create rub_home");
+    let state = Arc::new(SessionState::new("default", home.clone(), None));
+    let request = IpcRequest::new(
+        "open",
+        serde_json::json!({ "url": "https://example.com" }),
+        1_000,
+    )
+    .with_command_id("cmd-drop-unstarted")
+    .expect("static command_id must be valid");
+    let owner = prepare_replay_fence(
+        &request,
+        &state,
+        "req-1",
+        TransactionDeadline::new(request.timeout_ms),
+    )
+    .await
+    .expect("first request should claim replay owner")
+    .expect("replay owner should be present");
+
+    drop(owner);
+
+    let replacement = prepare_replay_fence(
+        &request,
+        &state,
+        "req-2",
+        TransactionDeadline::new(request.timeout_ms),
+    )
+    .await
+    .expect("dropped unstarted owner should release in-flight claim")
+    .expect("same command_id should be claimable again before execution starts");
+    drop(replacement);
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[tokio::test]
+async fn dropping_started_replay_owner_marks_spent_without_cached_response() {
+    let home = unique_home("drop-started-replay-owner");
+    std::fs::create_dir_all(&home).expect("create rub_home");
+    let state = Arc::new(SessionState::new("default", home.clone(), None));
+    let request = IpcRequest::new(
+        "open",
+        serde_json::json!({ "url": "https://example.com" }),
+        1_000,
+    )
+    .with_command_id("cmd-drop-started")
+    .expect("static command_id must be valid");
+    let mut owner = prepare_replay_fence(
+        &request,
+        &state,
+        "req-1",
+        TransactionDeadline::new(request.timeout_ms),
+    )
+    .await
+    .expect("first request should claim replay owner")
+    .expect("replay owner should be present");
+    owner.mark_execution_started();
+
+    drop(owner);
+
+    let replay = prepare_replay_fence(
+        &request,
+        &state,
+        "req-2",
+        TransactionDeadline::new(request.timeout_ms),
+    )
+    .await
+    .expect_err("dropped started owner must fail closed as already spent");
+    assert_eq!(replay.command_id.as_deref(), Some("cmd-drop-started"));
+    assert_eq!(replay.status, rub_ipc::protocol::ResponseStatus::Error);
+    assert_eq!(
+        replay
+            .error
+            .as_ref()
+            .and_then(|error| error.context.as_ref())
+            .and_then(|context| context.get("reason"))
+            .and_then(|reason| reason.as_str()),
+        Some("replay_command_id_already_spent_original_response_evicted")
+    );
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[tokio::test]
 async fn transport_frame_overflow_does_not_replace_committed_response_truth() {
     let home = unique_home("transport-overflow-truth");
     std::fs::create_dir_all(&home).expect("create rub_home");

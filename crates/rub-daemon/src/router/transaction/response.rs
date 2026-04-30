@@ -56,24 +56,24 @@ pub(crate) async fn finalize_post_commit_followups(
 }
 
 pub(crate) async fn finalize_replay_fence(
-    replay_owner: Option<&ReplayFenceOwner>,
+    replay_owner: Option<&mut ReplayFenceOwner>,
     response: &IpcResponse,
-    state: &Arc<SessionState>,
 ) {
     let Some(owner) = replay_owner else {
         return;
     };
-    if owner.finalize == ReplayFinalizeMode::CacheCommittedResponse {
-        state.mark_replay_command_spent(&owner.command_id, &owner.fingerprint);
+    let command_id = owner.command_id.clone();
+    let fingerprint = owner.fingerprint.clone();
+    let finalize = owner.finalize;
+    let state = owner.state.clone();
+    if finalize == ReplayFinalizeMode::CacheCommittedResponse {
+        state.mark_replay_command_spent(&command_id, &fingerprint);
         state
-            .cache_response(
-                owner.command_id.clone(),
-                owner.fingerprint.clone(),
-                response.clone(),
-            )
+            .cache_response(command_id.clone(), fingerprint, response.clone())
             .await;
     }
-    state.release_replay_command(&owner.command_id);
+    state.release_replay_command(&command_id);
+    owner.mark_finalized();
 }
 
 pub(crate) fn enforce_response_frame_limit(

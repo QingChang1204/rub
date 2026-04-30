@@ -560,6 +560,12 @@ fn orchestration_recoverable_protocol_reason(
         .and_then(|context| context.get("reason"))
         .and_then(|value| value.as_str())
     {
+        Some("ipc_request_write_transport_failure_after_possible_commit") => {
+            Some("request_write_transport_failure_after_possible_commit")
+        }
+        Some("ipc_request_write_timeout_after_possible_commit") => {
+            Some("request_write_timeout_after_possible_commit")
+        }
         Some("ipc_response_timeout_after_request_commit") => {
             Some("response_timeout_after_request_commit")
         }

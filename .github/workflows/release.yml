@@ -58,7 +58,6 @@ jobs:
           toolchain: "1.94.1"
       - name: Run frozen-baseline guardrails
         run: |
-          cargo test -p rub-cli --bin rub doc_contract
           cargo test -p rub-cli --test e2e e2e_guardrail
           cargo test -p rub-test-harness root_fixture
 
