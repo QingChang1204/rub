@@ -532,8 +532,8 @@ pub(crate) fn orchestration_step_command_id(
 ) -> String {
     if let Some(identity_key) = command_identity_key {
         format!(
-            "orchestration:{}:{}:{}",
-            rule.idempotency_key, identity_key, step_index
+            "orchestration:{}:g{}:{}:{}",
+            rule.idempotency_key, rule.lifecycle_generation, identity_key, step_index
         )
     } else {
         format!(
@@ -561,6 +561,7 @@ pub(crate) fn orchestration_request_meta(
             "execution_attempt"
         },
         "command_identity_key": command_identity_key,
+        "lifecycle_generation": rule.lifecycle_generation,
         "phase": phase,
         "step_index": step_index,
         "command_id": command_id,

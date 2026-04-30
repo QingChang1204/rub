@@ -296,13 +296,13 @@ impl DownloadSaveBatch {
 #[cfg(test)]
 mod tests {
     use super::paths::{
+        TrackedTempPathGuard, bulk_output_dir_state, cleanup_tracked_temp_path,
+        reserve_reconciled_output_path, saved_asset_output_path_state, set_tracked_temp_path,
+    };
+    use super::paths::{
         build_base_filename, content_type_extension, is_meaningful_filename_stem,
         normalize_known_extension, reconcile_output_path, reconcile_output_path_with_bytes,
         sanitize_filename, sniff_content_extension, split_known_extension, with_numeric_suffix,
-    };
-    use super::paths::{
-        bulk_output_dir_state, cleanup_tracked_temp_path, reserve_reconciled_output_path,
-        saved_asset_output_path_state, set_tracked_temp_path,
     };
     use super::request::{
         asset_request_authority, lookup_json_path, parse_save_request, parse_text_asset_sources,
@@ -583,6 +583,27 @@ mod tests {
         set_tracked_temp_path(&slot, Some(temp_path.clone()));
         cleanup_tracked_temp_path(&slot).await;
         assert!(!temp_path.exists());
+        assert!(slot.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn tracked_temp_guard_removes_temp_path_when_save_future_is_dropped() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "rub-asset-save-drop-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let temp_path = temp_root.join("alpha.webp.part-drop");
+        std::fs::write(&temp_path, "partial").unwrap();
+        let slot = Arc::new(Mutex::new(Some(temp_path.clone())));
+
+        drop(TrackedTempPathGuard::new(slot.clone()));
+
+        assert!(
+            !temp_path.exists(),
+            "download save must remove temp authority when cancellation drops the save future"
+        );
         assert!(slot.lock().unwrap().is_none());
         let _ = std::fs::remove_dir_all(&temp_root);
     }

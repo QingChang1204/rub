@@ -67,13 +67,45 @@ impl SessionState {
 
     /// Replace the canonical session-scoped network rule list.
     pub async fn replace_network_rules(&self, rules: Vec<NetworkRule>) {
+        self.replace_network_rules_with_status(
+            rules,
+            IntegrationRuntimeStatus::Active,
+            IntegrationRuntimeStatus::Inactive,
+        )
+        .await;
+    }
+
+    /// Publish a conservative rule projection while the browser mirror is not
+    /// confirmed to match the target rule list.
+    pub async fn replace_network_rules_degraded(&self, rules: Vec<NetworkRule>) {
+        let rules = rules
+            .into_iter()
+            .map(|mut rule| {
+                rule.status = NetworkRuleStatus::Degraded;
+                rule
+            })
+            .collect();
+        self.replace_network_rules_with_status(
+            rules,
+            IntegrationRuntimeStatus::Degraded,
+            IntegrationRuntimeStatus::Inactive,
+        )
+        .await;
+    }
+
+    async fn replace_network_rules_with_status(
+        &self,
+        rules: Vec<NetworkRule>,
+        non_empty_status: IntegrationRuntimeStatus,
+        empty_status: IntegrationRuntimeStatus,
+    ) {
         let mut integration = self.integration_runtime.write().await;
         integration.request_rules = rules;
         integration.sync_request_rule_count();
         integration.status = if integration.request_rules.is_empty() {
-            IntegrationRuntimeStatus::Inactive
+            empty_status
         } else {
-            IntegrationRuntimeStatus::Active
+            non_empty_status
         };
     }
 }

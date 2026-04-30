@@ -12,8 +12,9 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use super::paths::{
-    cleanup_tracked_temp_path, reserve_reconciled_output_path, saved_asset_output_path_state,
-    set_tracked_output_path, set_tracked_temp_path, temporary_path, tracked_output_path,
+    TrackedTempPathGuard, cleanup_tracked_temp_path, reserve_reconciled_output_path,
+    saved_asset_output_path_state, set_tracked_output_path, set_tracked_temp_path, temporary_path,
+    tracked_output_path,
 };
 use super::request::{AssetSource, PreparedAssetSource};
 
@@ -41,6 +42,7 @@ pub(super) async fn save_one(
         output_path: planned_output_path.clone(),
     };
     let temp_path_slot = Arc::new(Mutex::new(None::<PathBuf>));
+    let _temp_path_guard = TrackedTempPathGuard::new(temp_path_slot.clone());
     let output_path_slot = Arc::new(Mutex::new(None::<PathBuf>));
     let Some(timeout) = context.deadline.checked_duration_since(Instant::now()) else {
         return timeout_entry(
@@ -216,22 +218,14 @@ async fn finalize_prepared_asset_commit(
             "asset_commit_deadline_exceeded_before_commit",
         );
     }
-    match tokio::task::spawn_blocking({
-        let tmp_path = tmp_path.clone();
-        let output_path = output_path.clone();
-        let tmp_file = tmp_file;
-        let deadline = context.deadline;
-        move || {
-            if context.overwrite {
-                commit_temporary_file_until(&tmp_file, &tmp_path, &output_path, deadline)
-            } else {
-                commit_temporary_file_no_clobber_until(&tmp_file, &tmp_path, &output_path, deadline)
-            }
-        }
-    })
-    .await
-    {
-        Ok(Ok(commit_outcome)) => {
+    let commit_result = if context.overwrite {
+        commit_temporary_file_until(&tmp_file, &tmp_path, &output_path, context.deadline)
+    } else {
+        commit_temporary_file_no_clobber_until(&tmp_file, &tmp_path, &output_path, context.deadline)
+    };
+
+    match commit_result {
+        Ok(commit_outcome) => {
             set_tracked_temp_path(temp_path_slot, None);
             SavedAssetEntry {
                 index: source.index,
@@ -249,7 +243,7 @@ async fn finalize_prepared_asset_commit(
                 error: None,
             }
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             if error.kind() == std::io::ErrorKind::TimedOut {
                 let _ = fs::remove_file(&tmp_path).await;
                 set_tracked_temp_path(temp_path_slot, None);
@@ -292,24 +286,6 @@ async fn finalize_prepared_asset_commit(
                 bytes_written: None,
                 durability_confirmed: None,
                 error: Some(error.to_string()),
-            }
-        }
-        Err(join_error) => {
-            let _ = fs::remove_file(&tmp_path).await;
-            set_tracked_temp_path(temp_path_slot, None);
-            SavedAssetEntry {
-                index: source.index,
-                url: source.url.clone(),
-                status: SavedAssetStatus::Failed,
-                output_path: output_path.display().to_string(),
-                output_path_state: Some(saved_asset_output_path_state(
-                    SavedAssetStatus::Failed,
-                    None,
-                )),
-                source_name: source.source_name.clone(),
-                bytes_written: None,
-                durability_confirmed: None,
-                error: Some(join_error.to_string()),
             }
         }
     }
@@ -412,5 +388,23 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepared_asset_commit_has_no_cancellable_spawn_blocking_gap() {
+        let source = include_str!("execute.rs");
+        let start = source
+            .find("async fn finalize_prepared_asset_commit")
+            .expect("commit implementation should exist");
+        let tail = &source[start..];
+        let end = tail
+            .find("pub(super) fn timeout_entry")
+            .unwrap_or(tail.len());
+        let commit = &tail[..end];
+
+        assert!(
+            !commit.contains("spawn_blocking"),
+            "download save commit must run as a single non-awaiting fence once commit starts"
+        );
     }
 }

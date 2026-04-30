@@ -31,6 +31,24 @@ fn snapshot_target_authority_error(snapshot: &Snapshot, detail: &str) -> RubErro
     )
 }
 
+fn snapshot_frame_document_fence_error(
+    snapshot: &Snapshot,
+    current_frame: Option<&rub_core::model::FrameContextInfo>,
+    detail: &str,
+) -> RubError {
+    RubError::domain_with_context(
+        rub_core::error::ErrorCode::StaleSnapshot,
+        "Snapshot-bound operations require the original frame document authority",
+        serde_json::json!({
+            "reason": "snapshot_frame_document_fence_mismatch",
+            "detail": detail,
+            "snapshot_id": snapshot.snapshot_id,
+            "snapshot_frame": &snapshot.frame_context,
+            "current_frame": current_frame,
+        }),
+    )
+}
+
 fn element_target_authority_error(element: &Element, detail: &str) -> RubError {
     RubError::domain_with_context(
         rub_core::error::ErrorCode::StaleSnapshot,
@@ -55,7 +73,7 @@ async fn page_for_snapshot_authority(
             "snapshot does not carry tab target authority",
         ));
     };
-    adapter
+    let page = adapter
         .manager
         .page_for_target_id(target_id)
         .await
@@ -64,7 +82,50 @@ async fn page_for_snapshot_authority(
                 snapshot,
                 "snapshot target id no longer resolves to a live tab",
             )
-        })
+        })?;
+    ensure_snapshot_frame_document_authority(&page, snapshot).await?;
+    Ok(page)
+}
+
+async fn ensure_snapshot_frame_document_authority(
+    page: &std::sync::Arc<chromiumoxide::Page>,
+    snapshot: &Snapshot,
+) -> Result<(), RubError> {
+    let current_frame =
+        crate::frame_runtime::resolve_frame_context(page, Some(&snapshot.frame_context.frame_id))
+            .await
+            .map_err(|error| {
+                snapshot_frame_document_fence_error(
+                    snapshot,
+                    None,
+                    &format!("snapshot frame no longer resolves: {error}"),
+                )
+            })?
+            .frame;
+    if let Some(detail) = snapshot_frame_document_mismatch(snapshot, &current_frame) {
+        return Err(snapshot_frame_document_fence_error(
+            snapshot,
+            Some(&current_frame),
+            detail,
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn snapshot_frame_document_mismatch(
+    snapshot: &Snapshot,
+    current_frame: &rub_core::model::FrameContextInfo,
+) -> Option<&'static str> {
+    if current_frame.frame_id != snapshot.frame_context.frame_id {
+        return Some("frame_id_changed");
+    }
+    if current_frame.target_id != snapshot.frame_context.target_id {
+        return Some("target_id_changed");
+    }
+    if snapshot.frame_context.url.is_some() && current_frame.url != snapshot.frame_context.url {
+        return Some("document_url_changed");
+    }
+    None
 }
 
 async fn page_for_element_authority(

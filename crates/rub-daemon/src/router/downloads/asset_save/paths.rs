@@ -305,6 +305,31 @@ pub(super) fn set_tracked_temp_path(slot: &Arc<Mutex<Option<PathBuf>>>, value: O
     }
 }
 
+pub(super) struct TrackedTempPathGuard {
+    slot: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl TrackedTempPathGuard {
+    pub(super) fn new(slot: Arc<Mutex<Option<PathBuf>>>) -> Self {
+        Self { slot }
+    }
+}
+
+impl Drop for TrackedTempPathGuard {
+    fn drop(&mut self) {
+        let path = {
+            let mut guard = self
+                .slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.take()
+        };
+        if let Some(path) = path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 pub(super) async fn cleanup_tracked_temp_path(slot: &Arc<Mutex<Option<PathBuf>>>) {
     let path = {
         let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());

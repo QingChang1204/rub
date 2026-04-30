@@ -1,15 +1,155 @@
 use std::path::Path;
+use std::path::PathBuf;
 
 use rub_core::error::{ErrorCode, RubError};
+use rub_daemon::rub_paths::RubPaths;
+use serde_json::json;
 
 use super::process_identity::process_matches_registry_entry_for_termination;
 use super::{DaemonCtlPathContext, daemon_ctl_path_error};
 
 pub(crate) fn cleanup_stale(rub_home: &Path, entry: &rub_daemon::session::RegistryEntry) {
+    let _ = cleanup_stale_checked(rub_home, entry);
+}
+
+pub(crate) fn cleanup_stale_checked(
+    rub_home: &Path,
+    entry: &rub_daemon::session::RegistryEntry,
+) -> Result<(), RubError> {
     if rub_daemon::session::hard_cut_release_pending_blocks_entry(rub_home, entry) {
-        return;
+        return Ok(());
     }
     rub_daemon::session::cleanup_projections(rub_home, entry);
+    let residues = stale_projection_residues(rub_home, entry);
+    if residues.is_empty() {
+        return Ok(());
+    }
+    Err(RubError::domain_with_context(
+        ErrorCode::IoError,
+        format!(
+            "Failed to confirm stale projection cleanup for session '{}' ({})",
+            entry.session_name, entry.session_id
+        ),
+        json!({
+            "reason": "stale_projection_cleanup_fence_unconfirmed",
+            "session_name": entry.session_name,
+            "session_id": entry.session_id,
+            "rub_home": rub_home.display().to_string(),
+            "residual_projections": residues,
+        }),
+    ))
+}
+
+fn stale_projection_residues(
+    rub_home: &Path,
+    entry: &rub_daemon::session::RegistryEntry,
+) -> Vec<serde_json::Value> {
+    let paths = RubPaths::new(rub_home);
+    let runtime = paths.session_runtime(&entry.session_name, &entry.session_id);
+    let projection = paths.session(&entry.session_name);
+    let runtime_socket_path = runtime.socket_path();
+    let entry_socket_path = PathBuf::from(&entry.socket_path);
+    let mut residues = Vec::new();
+
+    if runtime.session_dir().exists() {
+        residues.push(stale_projection_residue(
+            "session_runtime_dir",
+            &runtime.session_dir(),
+            "session_runtime_directory_still_present",
+        ));
+    }
+
+    if runtime_socket_path.exists() {
+        residues.push(stale_projection_residue(
+            "runtime_socket",
+            &runtime_socket_path,
+            "runtime_socket_still_present",
+        ));
+    }
+
+    if entry_socket_path == runtime_socket_path && entry_socket_path.exists() {
+        residues.push(stale_projection_residue(
+            "registry_socket",
+            &entry_socket_path,
+            "registry_socket_still_present",
+        ));
+    }
+
+    for actual_socket in [&runtime_socket_path, &entry_socket_path] {
+        if projection_socket_points_to(&projection.canonical_socket_path(), actual_socket) {
+            residues.push(stale_projection_residue(
+                "canonical_socket",
+                &projection.canonical_socket_path(),
+                "canonical_socket_still_points_to_stale_entry",
+            ));
+        }
+    }
+
+    if projection_pid_matches(&projection.canonical_pid_path(), entry.pid) {
+        residues.push(stale_projection_residue(
+            "canonical_pid",
+            &projection.canonical_pid_path(),
+            "canonical_pid_still_points_to_stale_entry",
+        ));
+    }
+
+    if file_contains_session_id(
+        &projection.hard_cut_release_pending_path(),
+        &entry.session_id,
+    ) {
+        residues.push(stale_projection_residue(
+            "hard_cut_release_pending",
+            &projection.hard_cut_release_pending_path(),
+            "hard_cut_release_pending_still_points_to_stale_entry",
+        ));
+    }
+
+    if file_contains_session_id(&projection.startup_committed_path(), &entry.session_id) {
+        residues.push(stale_projection_residue(
+            "startup_committed",
+            &projection.startup_committed_path(),
+            "startup_committed_still_points_to_stale_entry",
+        ));
+    }
+
+    residues
+}
+
+fn stale_projection_residue(kind: &str, path: &Path, reason: &str) -> serde_json::Value {
+    json!({
+        "kind": kind,
+        "path": path.display().to_string(),
+        "reason": reason,
+    })
+}
+
+fn projection_socket_points_to(path: &Path, actual_socket: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        metadata.file_type().is_symlink()
+            && std::fs::read_link(path).ok().as_deref() == Some(actual_socket)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        let _ = actual_socket;
+        false
+    }
+}
+
+fn projection_pid_matches(path: &Path, pid: u32) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .is_some_and(|contents| contents.trim() == pid.to_string())
+}
+
+fn file_contains_session_id(path: &Path, session_id: &str) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .is_some_and(|contents| contents.contains(session_id))
 }
 
 pub(crate) fn registry_entry_by_name(

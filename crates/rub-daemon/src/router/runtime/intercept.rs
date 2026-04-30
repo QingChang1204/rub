@@ -157,13 +157,61 @@ async fn commit_intercept_registry_change(
     result: serde_json::Value,
     rules: Vec<NetworkRule>,
 ) -> Result<serde_json::Value, RubError> {
-    router.browser.sync_network_rules(&rules).await?;
+    let previous_rules = state.network_rules().await;
+    let pending_rules = pending_intercept_projection_rules(&previous_rules, &rules);
+    state.replace_network_rules_degraded(pending_rules).await;
+    if let Err(error) = router.browser.sync_network_rules(&rules).await {
+        return Err(intercept_browser_sync_failure_error(
+            error,
+            state.integration_runtime().await,
+        ));
+    }
     state.replace_network_rules(rules).await;
     Ok(intercept_payload(
         subject,
         result,
         serde_json::json!(state.integration_runtime().await),
     ))
+}
+
+pub(super) fn pending_intercept_projection_rules(
+    previous_rules: &[NetworkRule],
+    target_rules: &[NetworkRule],
+) -> Vec<NetworkRule> {
+    let source = if target_rules.len() < previous_rules.len() {
+        previous_rules
+    } else {
+        target_rules
+    };
+    source
+        .iter()
+        .cloned()
+        .map(|mut rule| {
+            rule.status = NetworkRuleStatus::Degraded;
+            rule
+        })
+        .collect()
+}
+
+fn intercept_browser_sync_failure_error(
+    error: RubError,
+    runtime: rub_core::model::IntegrationRuntimeInfo,
+) -> RubError {
+    let upstream = error.into_envelope();
+    RubError::Domain(
+        rub_core::error::ErrorEnvelope::new(
+            upstream.code,
+            format!(
+                "Intercept rule change was not confirmed by the browser runtime: {}",
+                upstream.message
+            ),
+        )
+        .with_context(serde_json::json!({
+            "reason": "intercept_browser_sync_failed_after_session_projection_degraded",
+            "browser_sync_error": upstream,
+            "runtime": runtime,
+        })),
+    )
 }
 
 pub(super) fn validate_rewrite_pattern(pattern: &str) -> Result<(), RubError> {

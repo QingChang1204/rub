@@ -3,7 +3,10 @@ use crate::browser::{BrowserLaunchOptions, BrowserManager};
 use crate::humanize::{HumanizeConfig, HumanizeSpeed};
 use chromiumoxide::Page;
 use rub_core::error::ErrorCode;
-use rub_core::model::{InteractionConfirmationStatus, KeyCombo};
+use rub_core::model::{
+    FrameContextInfo, InteractionConfirmationStatus, KeyCombo, ScrollPosition, Snapshot,
+    SnapshotProjection,
+};
 use rub_core::port::BrowserPort;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -41,6 +44,56 @@ fn test_adapter_with_humanize(
     humanize: HumanizeConfig,
 ) -> ChromiumAdapter {
     ChromiumAdapter::new(manager, Arc::new(AtomicU64::new(0)), humanize)
+}
+
+fn test_snapshot_for_frame(frame: FrameContextInfo) -> Snapshot {
+    Snapshot {
+        snapshot_id: "snap-frame".to_string(),
+        dom_epoch: 1,
+        frame_context: frame,
+        frame_lineage: vec!["frame-1".to_string()],
+        url: "https://example.test/a".to_string(),
+        title: "Example".to_string(),
+        elements: Vec::new(),
+        total_count: 0,
+        truncated: false,
+        scroll: ScrollPosition {
+            x: 0.0,
+            y: 0.0,
+            at_bottom: false,
+        },
+        timestamp: "2026-04-30T00:00:00Z".to_string(),
+        projection: SnapshotProjection {
+            verified: true,
+            js_traversal_count: 0,
+            backend_traversal_count: 0,
+            resolved_ref_count: 0,
+            warning: None,
+        },
+        viewport_filtered: None,
+        viewport_count: None,
+    }
+}
+
+#[test]
+fn snapshot_frame_document_mismatch_rejects_same_frame_after_document_url_drift() {
+    let frame = FrameContextInfo {
+        frame_id: "frame-1".to_string(),
+        name: None,
+        parent_frame_id: None,
+        target_id: Some("target-1".to_string()),
+        url: Some("https://example.test/a".to_string()),
+        depth: 0,
+        same_origin_accessible: Some(true),
+    };
+    let snapshot = test_snapshot_for_frame(frame.clone());
+    let mut drifted = frame;
+    drifted.url = Some("https://example.test/b".to_string());
+
+    assert_eq!(
+        super::browser_port::snapshot_frame_document_mismatch(&snapshot, &drifted),
+        Some("document_url_changed")
+    );
 }
 
 async fn open_second_tab(manager: &BrowserManager, opener: &Arc<chromiumoxide::Page>, url: &str) {

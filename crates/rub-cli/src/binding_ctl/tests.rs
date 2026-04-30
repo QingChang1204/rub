@@ -295,39 +295,45 @@ fn project_live_status_returns_typed_live_match_resolution() {
 #[test]
 fn project_live_status_does_not_reuse_degraded_registry_authority() {
     let home = temp_home();
-    let mut binding = sample_binding("old-admin", &home);
-    binding.session_reference = Some(BindingSessionReference {
-        kind: BindingSessionReferenceKind::LiveSessionHint,
-        session_id: "sess-1".to_string(),
-        session_name: "default".to_string(),
-    });
-    binding.attachment_identity = Some("profile:Work".to_string());
-    let snapshot = RegistryAuthoritySnapshot {
-        sessions: vec![RegistrySessionSnapshot {
+    for liveness in [
+        RegistryEntryLiveness::BusyOrUnknown,
+        RegistryEntryLiveness::ProbeContractFailure,
+        RegistryEntryLiveness::ProtocolIncompatible,
+    ] {
+        let mut binding = sample_binding("old-admin", &home);
+        binding.session_reference = Some(BindingSessionReference {
+            kind: BindingSessionReferenceKind::LiveSessionHint,
+            session_id: "sess-1".to_string(),
             session_name: "default".to_string(),
-            entries: vec![RegistryEntrySnapshot {
-                entry: RegistryEntry {
-                    session_id: "sess-1".to_string(),
-                    session_name: "default".to_string(),
-                    pid: 4242,
-                    socket_path: "/tmp/rub.sock".to_string(),
-                    created_at: "2026-04-14T00:00:00Z".to_string(),
-                    ipc_protocol_version: "1".to_string(),
-                    user_data_dir: Some("/Users/test/Chrome".to_string()),
-                    attachment_identity: Some("profile:Work".to_string()),
-                    connection_target: None,
-                },
-                liveness: RegistryEntryLiveness::ProtocolIncompatible,
-                pid_live: true,
+        });
+        binding.attachment_identity = Some("profile:Work".to_string());
+        let snapshot = RegistryAuthoritySnapshot {
+            sessions: vec![RegistrySessionSnapshot {
+                session_name: "default".to_string(),
+                entries: vec![RegistryEntrySnapshot {
+                    entry: RegistryEntry {
+                        session_id: "sess-1".to_string(),
+                        session_name: "default".to_string(),
+                        pid: 4242,
+                        socket_path: "/tmp/rub.sock".to_string(),
+                        created_at: "2026-04-14T00:00:00Z".to_string(),
+                        ipc_protocol_version: "1".to_string(),
+                        user_data_dir: Some("/Users/test/Chrome".to_string()),
+                        attachment_identity: Some("profile:Work".to_string()),
+                        connection_target: None,
+                    },
+                    liveness,
+                    pid_live: true,
+                }],
             }],
-        }],
-    };
+        };
 
-    let (live_status, resolution) = project_live_status(&binding, Some(&snapshot));
+        let (live_status, resolution) = project_live_status(&binding, Some(&snapshot));
 
-    assert_eq!(live_status.status, BindingStatus::VerificationRequired);
-    assert!(!live_status.live_session_present);
-    assert_eq!(resolution, BindingResolution::NoLiveMatch);
+        assert_eq!(live_status.status, BindingStatus::VerificationRequired);
+        assert!(!live_status.live_session_present);
+        assert_eq!(resolution, BindingResolution::NoLiveMatch);
+    }
 }
 
 #[test]

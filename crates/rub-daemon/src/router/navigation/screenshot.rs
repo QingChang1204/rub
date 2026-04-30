@@ -27,7 +27,18 @@ pub(crate) async fn cmd_screenshot(
     let mut highlight_snapshot = None;
     let highlight_info = if highlight {
         let snapshot = router.browser.snapshot(Some(0)).await?;
-        let count = router.browser.highlight_elements(&snapshot).await?;
+        let count = match router.browser.highlight_elements(&snapshot).await {
+            Ok(count) => count,
+            Err(error) => {
+                let cleanup_error = router
+                    .browser
+                    .cleanup_highlights_for_snapshot(&snapshot)
+                    .await
+                    .err();
+                state.mark_pending_external_dom_change();
+                return Err(highlight_injection_failed_error(error, cleanup_error));
+            }
+        };
         highlight_snapshot = Some(snapshot);
         Some(count)
     } else {
@@ -165,6 +176,25 @@ fn highlight_cleanup_committed_error(
     )
 }
 
+fn highlight_injection_failed_error(
+    injection_error: RubError,
+    cleanup_error: Option<RubError>,
+) -> RubError {
+    let mut context = serde_json::json!({
+        "reason": "highlight_injection_failed_after_possible_dom_mutation",
+        "highlight_error": injection_error.to_string(),
+        "fallback_authority": "pending_external_dom_change",
+    });
+    if let Some(cleanup_error) = cleanup_error {
+        context["highlight_cleanup_error"] = serde_json::json!(cleanup_error.to_string());
+    }
+    RubError::domain_with_context(
+        ErrorCode::InternalError,
+        format!("Highlight injection failed before screenshot capture: {injection_error}"),
+        context,
+    )
+}
+
 pub(crate) fn inline_screenshot_payload_exceeds_limit(png_bytes_len: usize) -> bool {
     let encoded_len = png_bytes_len.saturating_add(2) / 3 * 4;
     encoded_len.saturating_add(INLINE_SCREENSHOT_RESPONSE_OVERHEAD_BYTES) > MAX_FRAME_BYTES
@@ -183,4 +213,37 @@ fn ensure_inline_screenshot_fits_protocol(png_bytes_len: usize) -> Result<(), Ru
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::highlight_injection_failed_error;
+    use rub_core::error::{ErrorCode, RubError};
+
+    #[test]
+    fn highlight_injection_failure_error_marks_pending_dom_fallback() {
+        let error = highlight_injection_failed_error(
+            RubError::domain(ErrorCode::BrowserCrashed, "injection failed"),
+            None,
+        )
+        .into_envelope();
+
+        assert_eq!(error.code, ErrorCode::InternalError);
+        assert_eq!(
+            error
+                .context
+                .as_ref()
+                .and_then(|context| context.get("reason")),
+            Some(&serde_json::json!(
+                "highlight_injection_failed_after_possible_dom_mutation"
+            ))
+        );
+        assert_eq!(
+            error
+                .context
+                .as_ref()
+                .and_then(|context| context.get("fallback_authority")),
+            Some(&serde_json::json!("pending_external_dom_change"))
+        );
+    }
 }

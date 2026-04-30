@@ -2,12 +2,15 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::task_local;
 
-use rub_core::command::{TimeoutRecoverySurface, command_metadata};
+#[cfg(test)]
+use rub_core::command::command_metadata;
+use rub_core::command::{TimeoutRecoverySurface, command_metadata_for_args};
 use rub_core::model::OrchestrationStepResultInfo;
 use rub_core::recovery_contract::{
     command_possible_commit_contract, orchestration_partial_commit_steps_contract,
     partial_commit_steps_contract, registry_commit_contract,
 };
+use rub_ipc::protocol::IpcRequest;
 
 task_local! {
     static ACTIVE_TIMEOUT_PROJECTION: Option<Arc<ExecutionTimeoutProjectionRecorder>>;
@@ -18,6 +21,7 @@ pub(crate) struct ExecutionTimeoutProjectionRecorder {
     aggregate: StdMutex<Option<serde_json::Value>>,
     nested_aggregate: StdMutex<Option<serde_json::Value>>,
     in_flight_step: StdMutex<Option<serde_json::Value>>,
+    active_child: StdMutex<Option<Arc<ExecutionTimeoutProjectionRecorder>>>,
 }
 
 impl ExecutionTimeoutProjectionRecorder {
@@ -33,6 +37,12 @@ impl ExecutionTimeoutProjectionRecorder {
             .lock()
             .ok()
             .and_then(|guard| guard.clone());
+        let active_child = self
+            .active_child
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().and_then(|child| child.snapshot()));
+        let nested_aggregate = merge_nested_owner_projection(nested_aggregate, active_child);
 
         match (aggregate, nested_aggregate, in_flight_step) {
             (
@@ -97,6 +107,57 @@ impl ExecutionTimeoutProjectionRecorder {
             *guard = Some(projection);
         }
     }
+
+    fn install_active_child(
+        self: &Arc<Self>,
+        child: Arc<ExecutionTimeoutProjectionRecorder>,
+    ) -> ActiveChildRecorderGuard {
+        if let Ok(mut guard) = self.active_child.lock() {
+            *guard = Some(child.clone());
+        }
+        ActiveChildRecorderGuard {
+            parent: Arc::clone(self),
+            child,
+        }
+    }
+}
+
+struct ActiveChildRecorderGuard {
+    parent: Arc<ExecutionTimeoutProjectionRecorder>,
+    child: Arc<ExecutionTimeoutProjectionRecorder>,
+}
+
+impl Drop for ActiveChildRecorderGuard {
+    fn drop(&mut self) {
+        let Ok(mut guard) = self.parent.active_child.lock() else {
+            return;
+        };
+        if guard
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, &self.child))
+        {
+            *guard = None;
+        }
+    }
+}
+
+fn merge_nested_owner_projection(
+    nested_aggregate: Option<serde_json::Value>,
+    active_child: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (nested_aggregate, active_child) {
+        (Some(serde_json::Value::Object(mut nested)), Some(active_child)) => {
+            nested.insert("nested_owner_projection".to_string(), active_child);
+            Some(serde_json::Value::Object(nested))
+        }
+        (Some(other), Some(active_child)) => Some(serde_json::json!({
+            "previous_context": other,
+            "nested_owner_projection": active_child,
+        })),
+        (Some(nested), None) => Some(nested),
+        (None, Some(active_child)) => Some(active_child),
+        (None, None) => None,
+    }
 }
 
 fn merge_nested_timeout_projection(
@@ -132,8 +193,14 @@ pub(crate) async fn scope_timeout_projection<F, T>(
 where
     F: std::future::Future<Output = T>,
 {
+    let active_child_guard = current_timeout_projection_recorder()
+        .filter(|parent| !Arc::ptr_eq(parent, &recorder))
+        .map(|parent| parent.install_active_child(recorder.clone()));
     ACTIVE_TIMEOUT_PROJECTION
-        .scope(Some(recorder), future)
+        .scope(Some(recorder), async move {
+            let _active_child_guard = active_child_guard;
+            future.await
+        })
         .await
 }
 
@@ -356,22 +423,27 @@ pub(crate) fn record_registry_control_commit_timeout_projection(
     }));
 }
 
-pub(crate) fn record_effectful_command_possible_commit_timeout_projection(
-    command: &str,
-    command_id: Option<&str>,
-) {
-    if !command_has_effectful_timeout_surface(command) {
+pub(crate) fn record_effectful_command_possible_commit_timeout_projection(request: &IpcRequest) {
+    if !request_has_effectful_timeout_surface(request) {
         return;
     }
     record_mutating_possible_commit_timeout_projection(
-        command,
-        command_possible_commit_contract(command, command_id),
+        request.command.as_str(),
+        command_possible_commit_contract(&request.command, request.command_id.as_deref()),
     );
 }
 
+#[cfg(test)]
 fn command_has_effectful_timeout_surface(command: &str) -> bool {
     matches!(
         command_metadata(command).timeout_recovery_surface,
+        TimeoutRecoverySurface::PossibleCommit
+    )
+}
+
+fn request_has_effectful_timeout_surface(request: &IpcRequest) -> bool {
+    matches!(
+        command_metadata_for_args(&request.command, &request.args).timeout_recovery_surface,
         TimeoutRecoverySurface::PossibleCommit
     )
 }
@@ -419,6 +491,7 @@ mod tests {
     };
     use rub_core::command::CommandName;
     use rub_core::model::{OrchestrationStepResultInfo, OrchestrationStepStatus};
+    use rub_ipc::protocol::IpcRequest;
     use std::sync::Arc;
 
     #[test]
@@ -695,8 +768,11 @@ mod tests {
     #[tokio::test]
     async fn effectful_command_possible_commit_projection_records_safe_retry_policy() {
         let recorder = Arc::new(ExecutionTimeoutProjectionRecorder::default());
+        let request = IpcRequest::new("scroll", serde_json::json!({ "amount": 600 }), 1_000)
+            .with_command_id("cmd-1")
+            .expect("static command_id must be valid");
         scope_timeout_projection(recorder.clone(), async {
-            record_effectful_command_possible_commit_timeout_projection("scroll", Some("cmd-1"));
+            record_effectful_command_possible_commit_timeout_projection(&request);
         })
         .await;
 
@@ -720,12 +796,78 @@ mod tests {
     #[tokio::test]
     async fn read_only_command_possible_commit_projection_is_not_recorded() {
         let recorder = Arc::new(ExecutionTimeoutProjectionRecorder::default());
+        let request = IpcRequest::new("state", serde_json::json!({}), 1_000)
+            .with_command_id("cmd-1")
+            .expect("static command_id must be valid");
         scope_timeout_projection(recorder.clone(), async {
-            record_effectful_command_possible_commit_timeout_projection("state", Some("cmd-1"));
+            record_effectful_command_possible_commit_timeout_projection(&request);
         })
         .await;
 
         assert!(recorder.snapshot().is_none());
+    }
+
+    #[tokio::test]
+    async fn request_aware_runtime_subcommand_timeout_surface_records_only_mutations() {
+        let mutating = [
+            IpcRequest::new("download", serde_json::json!({ "sub": "cancel" }), 1_000),
+            IpcRequest::new("download", serde_json::json!({ "sub": "save" }), 1_000),
+            IpcRequest::new("handoff", serde_json::json!({ "sub": "start" }), 1_000),
+            IpcRequest::new("handoff", serde_json::json!({ "sub": "complete" }), 1_000),
+            IpcRequest::new("takeover", serde_json::json!({ "sub": "start" }), 1_000),
+            IpcRequest::new("takeover", serde_json::json!({ "sub": "elevate" }), 1_000),
+            IpcRequest::new("takeover", serde_json::json!({ "sub": "resume" }), 1_000),
+            IpcRequest::new("interference", serde_json::json!({ "sub": "mode" }), 1_000),
+            IpcRequest::new(
+                "interference",
+                serde_json::json!({ "sub": "recover" }),
+                1_000,
+            ),
+            IpcRequest::new("close", serde_json::json!({}), 1_000),
+        ];
+
+        for request in mutating {
+            let recorder = Arc::new(ExecutionTimeoutProjectionRecorder::default());
+            scope_timeout_projection(recorder.clone(), async {
+                record_effectful_command_possible_commit_timeout_projection(&request);
+            })
+            .await;
+            let projection = recorder.snapshot().unwrap_or_else(|| {
+                panic!(
+                    "{} {:?} should record possible commit",
+                    request.command, request.args
+                )
+            });
+            assert_eq!(
+                projection["reason"], "mutating_command_possible_commit",
+                "{} {:?}",
+                request.command, request.args
+            );
+        }
+
+        let read_only = [
+            IpcRequest::new("download", serde_json::json!({ "sub": "wait" }), 1_000),
+            IpcRequest::new("handoff", serde_json::json!({ "sub": "status" }), 1_000),
+            IpcRequest::new("takeover", serde_json::json!({ "sub": "status" }), 1_000),
+            IpcRequest::new(
+                "interference",
+                serde_json::json!({ "sub": "status" }),
+                1_000,
+            ),
+        ];
+        for request in read_only {
+            let recorder = Arc::new(ExecutionTimeoutProjectionRecorder::default());
+            scope_timeout_projection(recorder.clone(), async {
+                record_effectful_command_possible_commit_timeout_projection(&request);
+            })
+            .await;
+            assert!(
+                recorder.snapshot().is_none(),
+                "{} {:?} should not record a mutating timeout projection",
+                request.command,
+                request.args
+            );
+        }
     }
 
     #[tokio::test]
@@ -768,6 +910,60 @@ mod tests {
         assert_eq!(
             projection["nested_owner_projection"]["in_flight_step_projection"]["partial_commit"]["kind"],
             "post_wait_after_commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_snapshot_preserves_active_child_recorder_even_for_same_subject_kind() {
+        let parent = Arc::new(ExecutionTimeoutProjectionRecorder::default());
+        let child = Arc::new(ExecutionTimeoutProjectionRecorder::default());
+
+        let projection = scope_timeout_projection(parent.clone(), async {
+            record_workflow_pending_step_timeout_projection("pipe", false, &[], 0);
+            scope_timeout_projection(child.clone(), async {
+                record_workflow_pending_step_timeout_projection("pipe", false, &[], 1);
+                parent
+                    .snapshot()
+                    .expect("parent snapshot should include active child")
+            })
+            .await
+        })
+        .await;
+
+        assert_eq!(projection["subject"]["kind"], "pipe");
+        assert_eq!(projection["transaction"]["failed_step_index"], 0);
+        assert_eq!(
+            projection["nested_owner_projection"]["subject"]["kind"],
+            "pipe"
+        );
+        assert_eq!(
+            projection["nested_owner_projection"]["transaction"]["failed_step_index"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_child_recorder_does_not_remain_as_stale_nested_owner() {
+        let parent = Arc::new(ExecutionTimeoutProjectionRecorder::default());
+        let child = Arc::new(ExecutionTimeoutProjectionRecorder::default());
+
+        let projection = scope_timeout_projection(parent.clone(), async {
+            record_workflow_pending_step_timeout_projection("pipe", false, &[], 0);
+            scope_timeout_projection(child.clone(), async {
+                record_workflow_pending_step_timeout_projection("pipe", false, &[], 1);
+            })
+            .await;
+            parent
+                .snapshot()
+                .expect("parent snapshot should remain available")
+        })
+        .await;
+
+        assert_eq!(projection["subject"]["kind"], "pipe");
+        assert_eq!(projection["transaction"]["failed_step_index"], 0);
+        assert!(
+            projection.get("nested_owner_projection").is_none(),
+            "finished child recorder must not leak into later parent timeout projections"
         );
     }
 }

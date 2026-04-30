@@ -203,6 +203,47 @@ async fn expired_execution_budget_releases_replay_without_committed_truth() {
     assert_eq!(replay_owner.command_id, "cmd-expired-exec-budget");
 }
 
+#[test]
+fn replay_fence_execution_started_is_marked_before_cancellable_dispatch_await() {
+    let source = include_str!("../queue.rs");
+    for function_name in [
+        "execute_prepared_request",
+        "execute_prepared_request_for_external",
+    ] {
+        let function = source
+            .split(&format!("async fn {function_name}"))
+            .nth(1)
+            .and_then(|tail| tail.split("async fn ").next())
+            .expect("queue execution helper should exist");
+        let execute_call = function
+            .find(".execute_request_once(")
+            .expect("helper should call execute_request_once");
+        let post_await_mark = function[execute_call..].find("mark_execution_started()");
+        assert!(
+            post_await_mark.is_none(),
+            "{function_name} must not wait for execute_request_once to return before marking replay execution started"
+        );
+    }
+    let helper = source
+        .split("async fn execute_request_once")
+        .nth(1)
+        .and_then(|tail| tail.split("async fn ").next())
+        .expect("execute_request_once helper should exist");
+    let deadline_check = helper
+        .find("deadline.remaining_duration()")
+        .expect("helper should check execution budget");
+    let mark = helper
+        .find("prepared.mark_execution_started();")
+        .expect("helper should mark replay execution before dispatch await");
+    let dispatch = helper
+        .find("self.execute_command(request, deadline, state).await")
+        .expect("helper should execute command inside cancellable timeout");
+    assert!(
+        deadline_check < mark && mark < dispatch,
+        "replay owner must become spent-capable after execution budget exists but before cancellable command dispatch"
+    );
+}
+
 #[tokio::test]
 async fn automation_transactions_share_fifo_authority_with_default_budget() {
     let router = test_router();

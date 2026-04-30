@@ -50,7 +50,22 @@ pub(super) async fn cmd_observe(
     if observation_scope.is_some() || observation_projection.depth_limit.is_some() {
         apply_projection_limit(&mut snapshot, limit);
     }
-    let highlighted_count = router.browser.highlight_elements(&snapshot).await?;
+    let highlighted_count = match router.browser.highlight_elements(&snapshot).await {
+        Ok(count) => count,
+        Err(error) => {
+            let cleanup_error = router
+                .browser
+                .cleanup_highlights_for_snapshot(&snapshot)
+                .await
+                .err();
+            state.mark_pending_external_dom_change();
+            return Err(RubError::domain_with_context(
+                ErrorCode::InternalError,
+                format!("Observe highlight injection failed before screenshot capture: {error}"),
+                highlight_injection_failure_context(error.to_string(), cleanup_error),
+            ));
+        }
+    };
     let screenshot_result =
         capture_screenshot_payload(router, &snapshot, full, path, deadline).await;
     let cleanup_result = router
@@ -237,6 +252,21 @@ fn highlight_cleanup_failure_context(
     context
 }
 
+fn highlight_injection_failure_context(
+    highlight_error: String,
+    cleanup_error: Option<RubError>,
+) -> serde_json::Value {
+    let mut context = serde_json::json!({
+        "reason": "highlight_injection_failed_after_possible_dom_mutation",
+        "highlight_error": highlight_error,
+        "fallback_authority": "pending_external_dom_change",
+    });
+    if let Some(cleanup_error) = cleanup_error {
+        context["highlight_cleanup_error"] = serde_json::json!(cleanup_error.to_string());
+    }
+    context
+}
+
 fn copy_semantic_raw_field(
     args: &serde_json::Value,
     key: &str,
@@ -250,7 +280,7 @@ fn copy_semantic_raw_field(
 #[cfg(test)]
 mod tests {
     use super::args::{ObserveArgs, parse_observe_limit};
-    use super::highlight_cleanup_failure_context;
+    use super::{highlight_cleanup_failure_context, highlight_injection_failure_context};
     use crate::router::request_args::parse_json_args;
     use rub_core::error::ErrorCode;
 
@@ -312,5 +342,17 @@ mod tests {
         assert_eq!(context["fallback_authority"], "pending_external_dom_change");
         assert_eq!(context["highlighted_count"], 3);
         assert_eq!(context["committed_screenshot"], committed_screenshot);
+    }
+
+    #[test]
+    fn highlight_injection_failure_context_marks_pending_dom_fallback() {
+        let context = highlight_injection_failure_context("injection boom".to_string(), None);
+
+        assert_eq!(
+            context["reason"],
+            "highlight_injection_failed_after_possible_dom_mutation"
+        );
+        assert_eq!(context["highlight_error"], "injection boom");
+        assert_eq!(context["fallback_authority"], "pending_external_dom_change");
     }
 }

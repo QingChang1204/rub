@@ -107,7 +107,19 @@ fn orchestration_step_command_id_is_stable_across_execution_attempts_with_same_i
     let second = orchestration_step_command_id(&rule, Some("evidence-key"), "exec-b", 1);
 
     assert_eq!(first, second);
-    assert_eq!(first, "orchestration:idem-demo:evidence-key:1");
+    assert_eq!(first, "orchestration:idem-demo:g1:evidence-key:1");
+}
+
+#[test]
+fn orchestration_step_command_id_changes_when_lifecycle_generation_changes() {
+    let first_rule = sample_rule();
+    let mut second_rule = sample_rule();
+    second_rule.lifecycle_generation = first_rule.lifecycle_generation + 1;
+
+    let first = orchestration_step_command_id(&first_rule, Some("evidence-key"), "exec-a", 1);
+    let second = orchestration_step_command_id(&second_rule, Some("evidence-key"), "exec-b", 1);
+
+    assert_ne!(first, second);
 }
 
 #[test]
@@ -142,6 +154,11 @@ fn orchestration_request_meta_names_evidence_key_as_stable_identity() {
         meta.get("command_identity_key")
             .and_then(|value| value.as_str()),
         Some("evidence-key")
+    );
+    assert_eq!(
+        meta.get("lifecycle_generation")
+            .and_then(|value| value.as_u64()),
+        Some(1)
     );
 }
 

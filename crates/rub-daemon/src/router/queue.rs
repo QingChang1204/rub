@@ -5,7 +5,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use rub_core::command::{
-    CommandEffectClass, DomEpochPolicy, TimeoutRecoverySurface, command_metadata,
+    CommandEffectClass, DomEpochPolicy, TimeoutRecoverySurface, command_metadata_for_args,
 };
 use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
 use rub_core::model::Timing;
@@ -388,26 +388,25 @@ impl DaemonRouter {
         &self,
         request: &IpcRequest,
         state: &Arc<SessionState>,
-        request_id: &str,
         queue_ms: u64,
         deadline: TransactionDeadline,
+        prepared: &mut PreparedCommandDispatch,
     ) -> (IpcResponse, bool) {
         let exec_start = Instant::now();
         let exec_budget_ms = deadline.remaining_ms();
+        let request_id = prepared.request_id().to_string();
         let Some(exec_timeout) = deadline.remaining_duration() else {
             return (
-                execution_timeout_response(request, request_id, queue_ms, 0, deadline.timeout_ms),
+                execution_timeout_response(request, &request_id, queue_ms, 0, deadline.timeout_ms),
                 false,
             );
         };
+        prepared.mark_execution_started();
         let timeout_projection = Arc::new(ExecutionTimeoutProjectionRecorder::default());
         let result = match tokio::time::timeout(
             exec_timeout,
             scope_timeout_projection(timeout_projection.clone(), async {
-                record_effectful_command_possible_commit_timeout_projection(
-                    &request.command,
-                    request.command_id.as_deref(),
-                );
+                record_effectful_command_possible_commit_timeout_projection(request);
                 self.execute_command(request, deadline, state).await
             }),
         )
@@ -443,8 +442,8 @@ impl DaemonRouter {
         );
 
         let response = match result {
-            Ok(data) => IpcResponse::success(request_id, data).with_timing(timing),
-            Err(err) => IpcResponse::error(request_id, err.into_envelope()).with_timing(timing),
+            Ok(data) => IpcResponse::success(&request_id, data).with_timing(timing),
+            Err(err) => IpcResponse::error(&request_id, err.into_envelope()).with_timing(timing),
         };
         (response, true)
     }
@@ -456,18 +455,9 @@ impl DaemonRouter {
         mut prepared: PreparedCommandDispatch,
     ) -> IpcResponse {
         let queue_ms = prepared.queue_ms();
-        let (response, execution_entered) = self
-            .execute_request_once(
-                request,
-                state,
-                prepared.request_id(),
-                queue_ms,
-                prepared.deadline(),
-            )
+        let (response, _execution_entered) = self
+            .execute_request_once(request, state, queue_ms, prepared.deadline(), &mut prepared)
             .await;
-        if execution_entered {
-            prepared.mark_execution_started();
-        }
         prepared
             .prepare_response_commit(request, response)
             .commit_locally(state)
@@ -481,18 +471,9 @@ impl DaemonRouter {
         mut prepared: PreparedCommandDispatch,
     ) -> PendingResponseCommit {
         let queue_ms = prepared.queue_ms();
-        let (response, execution_entered) = self
-            .execute_request_once(
-                request,
-                state,
-                prepared.request_id(),
-                queue_ms,
-                prepared.deadline(),
-            )
+        let (response, _execution_entered) = self
+            .execute_request_once(request, state, queue_ms, prepared.deadline(), &mut prepared)
             .await;
-        if execution_entered {
-            prepared.mark_execution_started();
-        }
         prepared.prepare_response_commit(request, response)
     }
 
@@ -611,7 +592,7 @@ async fn apply_execution_timeout_authority_fence(request: &IpcRequest, state: &A
 }
 
 fn command_may_have_dom_commit_after_timeout(request: &IpcRequest) -> bool {
-    let metadata = command_metadata(&request.command);
+    let metadata = command_metadata_for_args(&request.command, &request.args);
     matches!(metadata.dom_epoch_policy, DomEpochPolicy::Bump)
         || (matches!(metadata.dom_epoch_policy, DomEpochPolicy::ArgsDependent)
             && dialog_action_commits_epoch(request))

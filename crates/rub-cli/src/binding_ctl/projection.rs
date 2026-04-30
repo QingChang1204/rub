@@ -307,14 +307,7 @@ fn find_live_matches(
     let entries = snapshot
         .active_entry_snapshots()
         .into_iter()
-        .filter(|entry| {
-            matches!(
-                entry.liveness,
-                RegistryEntryLiveness::Live
-                    | RegistryEntryLiveness::BusyOrUnknown
-                    | RegistryEntryLiveness::ProbeContractFailure
-            )
-        })
+        .filter(|entry| matches!(entry.liveness, RegistryEntryLiveness::Live))
         .map(|entry| entry.entry)
         .collect::<Vec<_>>();
     let attachment_identity_authority = binding.attachment_identity.as_ref().or(binding

@@ -13,11 +13,13 @@ use rub_core::model::{
 };
 use rub_daemon::rub_paths::RubPaths;
 use rub_daemon::session::{RegistryData, RegistryEntry, write_registry};
-use std::io::Read as _;
+use rub_ipc::codec::NdJsonCodec;
+use rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID;
+use rub_ipc::protocol::{IpcRequest, IpcResponse};
+use std::io::{BufReader, Write as _};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
 use uuid::Uuid;
 
 fn temp_home() -> PathBuf {
@@ -133,6 +135,43 @@ fn write_profile_binding(home: &Path, persistence_policy: BindingPersistencePoli
     .unwrap();
 }
 
+fn spawn_live_registry_handshake_server(
+    listener: UnixListener,
+    daemon_session_id: &'static str,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut reader = BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone accepted stream for handshake read"),
+            );
+            let request: IpcRequest = NdJsonCodec::read_blocking(&mut reader)
+                .expect("read handshake request")
+                .expect("handshake request");
+            assert_eq!(request.command, "_handshake");
+            assert_eq!(
+                request.command_id.as_deref(),
+                Some(HANDSHAKE_PROBE_COMMAND_ID)
+            );
+            let response = IpcResponse::success(
+                request.command.clone(),
+                serde_json::json!({
+                    "daemon_session_id": daemon_session_id,
+                }),
+            )
+            .with_command_id(HANDSHAKE_PROBE_COMMAND_ID)
+            .expect("valid handshake command id")
+            .with_daemon_session_id(daemon_session_id)
+            .expect("valid daemon session id");
+            let encoded = NdJsonCodec::encode(&response).expect("encode handshake response");
+            stream
+                .write_all(&encoded)
+                .expect("write handshake response");
+        }
+    })
+}
+
 #[test]
 fn remembered_alias_live_match_reuses_live_session() {
     let home = temp_home();
@@ -153,13 +192,7 @@ fn remembered_alias_live_match_reuses_live_session() {
         std::fs::create_dir_all(parent).unwrap();
     }
     let listener = UnixListener::bind(runtime.socket_path()).unwrap();
-    let _server = thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buffer = [0_u8; 512];
-            let _ = stream.read(&mut buffer);
-            thread::sleep(Duration::from_millis(1_000));
-        }
-    });
+    let _server = spawn_live_registry_handshake_server(listener, "sess-work");
     write_registry(
         &home,
         &RegistryData {
@@ -216,13 +249,7 @@ fn remembered_alias_live_match_clears_default_user_data_dir_from_reuse_path() {
         std::fs::create_dir_all(parent).unwrap();
     }
     let listener = UnixListener::bind(runtime.socket_path()).unwrap();
-    let _server = thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buffer = [0_u8; 512];
-            let _ = stream.read(&mut buffer);
-            thread::sleep(Duration::from_millis(1_000));
-        }
-    });
+    let _server = spawn_live_registry_handshake_server(listener, "sess-work");
     write_registry(
         &home,
         &RegistryData {

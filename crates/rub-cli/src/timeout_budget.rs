@@ -34,6 +34,7 @@ use self::workflow_budget::{
     fill_workflow_budget_ms, pipe_workflow_budget_ms, validate_click_projection_inputs,
     validate_scroll_projection_inputs,
 };
+use rub_core::DEFAULT_WAIT_AFTER_TIMEOUT_MS;
 
 const ATOMIC_FILL_ROLLBACK_RESERVE_MS_PER_STEP: u64 = 1_000;
 
@@ -87,6 +88,34 @@ pub(crate) fn align_embedded_timeout_authority(request: &mut IpcRequest) {
         if object.contains_key("wait_timeout_ms") {
             object.insert("wait_timeout_ms".to_string(), serde_json::json!(timeout_ms));
         }
+    }
+    align_wait_after_timeout_authority(request);
+}
+
+fn align_wait_after_timeout_authority(request: &mut IpcRequest) {
+    let Some(object) = request.args.as_object_mut() else {
+        return;
+    };
+    let Some(wait_after) = object
+        .get_mut("wait_after")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    if wait_after.is_empty() {
+        return;
+    }
+
+    let requested_timeout_ms = wait_after
+        .get("timeout_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(DEFAULT_WAIT_AFTER_TIMEOUT_MS);
+    let effective_timeout_ms = requested_timeout_ms.min(request.timeout_ms);
+    if wait_after.contains_key("timeout_ms") || effective_timeout_ms < requested_timeout_ms {
+        wait_after.insert(
+            "timeout_ms".to_string(),
+            serde_json::json!(effective_timeout_ms),
+        );
     }
 }
 

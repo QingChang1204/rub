@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use super::{
     BatchCloseResult, BatchCloseSessionError, CompatibilityDegradedOwnedSession, DaemonConnection,
-    ShutdownFenceStatus, TransientSocketPolicy, cleanup_stale,
+    ShutdownFenceStatus, TransientSocketPolicy, cleanup_stale_checked,
     compatibility_degraded_owned_from_snapshot, detect_or_connect_hardened_until,
     registry_authority_snapshot, remaining_budget_ms, send_existing_request_with_replay_recovery,
     terminate_registry_entry_process, wait_for_shutdown_until,
@@ -79,15 +79,26 @@ pub(crate) async fn close_all_sessions_until(
             continue;
         }
         let mut session_cleaned_stale = false;
+        let mut session_cleanup_failed = false;
         for entry in &target.stale_entries {
-            cleanup_stale(rub_home, entry);
-            let _ = rub_daemon::session::deregister_session(rub_home, &entry.session_id);
-            session_cleaned_stale = true;
+            match cleanup_and_deregister_close_all_entry(rub_home, entry) {
+                Ok(()) => {
+                    session_cleaned_stale = true;
+                }
+                Err(error) => {
+                    session_cleanup_failed = true;
+                    record_close_all_session_error(
+                        &target.session_name,
+                        error,
+                        &mut session_error_details,
+                    );
+                }
+            }
         }
 
         let Some(entry) = target.authority_entry.as_ref() else {
-            if target.has_uncertain_entries {
-                failed.push(target.session_name);
+            if target.has_uncertain_entries || session_cleanup_failed {
+                push_unique_session(&mut failed, target.session_name);
             } else if session_cleaned_stale {
                 cleaned_stale.push(target.session_name);
             }
@@ -224,27 +235,45 @@ pub(crate) async fn close_all_sessions_until(
             if matches!(
                 disposition,
                 CloseAllDisposition::Closed | CloseAllDisposition::CleanedStale
-            ) {
-                cleanup_stale(rub_home, &current_entry);
-                let _ =
-                    rub_daemon::session::deregister_session(rub_home, &current_entry.session_id);
+            ) && let Err(error) =
+                cleanup_and_deregister_close_all_entry(rub_home, &current_entry)
+            {
+                record_close_all_session_error(
+                    &target.session_name,
+                    error,
+                    &mut session_error_details,
+                );
             }
-            failed.push(target.session_name);
+            push_unique_session(&mut failed, target.session_name);
             continue;
         }
 
         match disposition {
             CloseAllDisposition::Closed => {
-                cleanup_stale(rub_home, &current_entry);
-                let _ =
-                    rub_daemon::session::deregister_session(rub_home, &current_entry.session_id);
-                closed.push(target.session_name);
+                match cleanup_and_deregister_close_all_entry(rub_home, &current_entry) {
+                    Ok(()) => closed.push(target.session_name),
+                    Err(error) => {
+                        record_close_all_session_error(
+                            &target.session_name,
+                            error,
+                            &mut session_error_details,
+                        );
+                        push_unique_session(&mut failed, target.session_name);
+                    }
+                }
             }
             CloseAllDisposition::CleanedStale => {
-                cleanup_stale(rub_home, &current_entry);
-                let _ =
-                    rub_daemon::session::deregister_session(rub_home, &current_entry.session_id);
-                cleaned_stale.push(target.session_name);
+                match cleanup_and_deregister_close_all_entry(rub_home, &current_entry) {
+                    Ok(()) => cleaned_stale.push(target.session_name),
+                    Err(error) => {
+                        record_close_all_session_error(
+                            &target.session_name,
+                            error,
+                            &mut session_error_details,
+                        );
+                        push_unique_session(&mut failed, target.session_name);
+                    }
+                }
             }
             CloseAllDisposition::Failed => {
                 if let Some(compatibility_degraded_owned) = target.compatibility_degraded_owned {
@@ -281,6 +310,46 @@ fn resolve_attached_close_all_authority(
         .and_then(|session| session.authoritative_entry())
         .filter(|entry| entry.entry.session_id == daemon_session_id)
         .map(|entry| entry.entry.clone()))
+}
+
+fn cleanup_and_deregister_close_all_entry(
+    rub_home: &Path,
+    entry: &rub_daemon::session::RegistryEntry,
+) -> Result<(), RubError> {
+    cleanup_stale_checked(rub_home, entry)?;
+    rub_daemon::session::deregister_session(rub_home, &entry.session_id).map_err(|error| {
+        RubError::domain_with_context(
+            ErrorCode::IoError,
+            format!(
+                "Failed to deregister session '{}' ({}) during close --all",
+                entry.session_name, entry.session_id
+            ),
+            json!({
+                "reason": "close_all_registry_deregister_failed",
+                "session_name": entry.session_name,
+                "session_id": entry.session_id,
+                "rub_home": rub_home.display().to_string(),
+                "source_error": error.to_string(),
+            }),
+        )
+    })
+}
+
+fn record_close_all_session_error(
+    session_name: &str,
+    error: RubError,
+    session_error_details: &mut Vec<BatchCloseSessionError>,
+) {
+    session_error_details.push(BatchCloseSessionError {
+        session: session_name.to_string(),
+        error: error.into_envelope(),
+    });
+}
+
+fn push_unique_session(sessions: &mut Vec<String>, session_name: String) {
+    if !sessions.iter().any(|existing| existing == &session_name) {
+        sessions.push(session_name);
+    }
 }
 
 fn close_all_attached_authority_missing_error(

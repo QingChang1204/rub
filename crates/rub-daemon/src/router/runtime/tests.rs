@@ -1,4 +1,5 @@
 use super::cookies::CookiesPathArgs;
+use super::intercept::pending_intercept_projection_rules;
 use super::projection::{
     cookie_artifact, cookie_payload, cookie_subject, cookies_subject, runtime_subject,
     runtime_surface_payload,
@@ -20,8 +21,8 @@ use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{
     Cookie, FrameContextInfo, FrameContextStatus, HumanVerificationHandoffInfo,
     HumanVerificationHandoffStatus, IntegrationMode, IntegrationRuntimeInfo,
-    IntegrationRuntimeStatus, IntegrationSurface, NetworkRule, NetworkRuleSpec, ReadinessInfo,
-    ReadinessStatus, TakeoverRuntimeInfo, TakeoverRuntimeStatus,
+    IntegrationRuntimeStatus, IntegrationSurface, NetworkRule, NetworkRuleSpec, NetworkRuleStatus,
+    ReadinessInfo, ReadinessStatus, TakeoverRuntimeInfo, TakeoverRuntimeStatus,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -157,6 +158,126 @@ fn intercept_payload_uses_subject_result_runtime_envelope() {
     assert_eq!(payload["subject"]["kind"], "intercept_rule_registry");
     assert_eq!(payload["result"]["rules"], serde_json::json!([]));
     assert_eq!(payload["runtime"]["status"], "active");
+}
+
+#[test]
+fn intercept_pending_projection_degrades_added_target_rules_before_browser_sync() {
+    let previous = vec![NetworkRule {
+        id: 1,
+        status: NetworkRuleStatus::Active,
+        spec: NetworkRuleSpec::Block {
+            url_pattern: "https://old.example.com/*".to_string(),
+        },
+    }];
+    let target = vec![
+        previous[0].clone(),
+        NetworkRule {
+            id: 2,
+            status: NetworkRuleStatus::Active,
+            spec: NetworkRuleSpec::Allow {
+                url_pattern: "https://new.example.com/*".to_string(),
+            },
+        },
+    ];
+
+    let pending = pending_intercept_projection_rules(&previous, &target);
+
+    assert_eq!(pending.len(), 2);
+    assert!(
+        pending
+            .iter()
+            .all(|rule| matches!(rule.status, NetworkRuleStatus::Degraded))
+    );
+}
+
+#[test]
+fn intercept_pending_projection_keeps_previous_rules_when_removal_is_not_synced() {
+    let previous = vec![
+        NetworkRule {
+            id: 1,
+            status: NetworkRuleStatus::Active,
+            spec: NetworkRuleSpec::Block {
+                url_pattern: "https://old.example.com/*".to_string(),
+            },
+        },
+        NetworkRule {
+            id: 2,
+            status: NetworkRuleStatus::Active,
+            spec: NetworkRuleSpec::Allow {
+                url_pattern: "https://new.example.com/*".to_string(),
+            },
+        },
+    ];
+    let target = vec![previous[1].clone()];
+
+    let pending = pending_intercept_projection_rules(&previous, &target);
+
+    assert_eq!(
+        pending.iter().map(|rule| rule.id).collect::<Vec<_>>(),
+        vec![1, 2],
+        "while browser sync is unconfirmed, SessionState must not erase rules that may still be enforced in the browser"
+    );
+    assert!(
+        pending
+            .iter()
+            .all(|rule| matches!(rule.status, NetworkRuleStatus::Degraded))
+    );
+}
+
+#[test]
+fn takeover_resume_records_committed_resume_before_cancellable_continuity_refresh() {
+    let source = include_str!("takeover.rs");
+    let resume_start = source
+        .find("async fn execute_resume")
+        .expect("resume implementation should exist");
+    let resume_end = source[resume_start..]
+        .find("async fn reject")
+        .map(|offset| resume_start + offset)
+        .expect("reject implementation should follow resume");
+    let resume = &source[resume_start..resume_end];
+
+    let degrade = resume
+        .find("resume_continuity_unconfirmed")
+        .expect("resume should publish a degraded transition fence before commit");
+    let complete = resume
+        .find("complete_handoff")
+        .expect("resume should commit handoff completion");
+    let record = resume
+        .find("record_success")
+        .expect("resume should record committed transition outcome");
+    let refresh = resume
+        .find("refresh_takeover_runtime")
+        .expect("resume should refresh projection after commit");
+    let verify = resume
+        .find("verify_takeover_continuity")
+        .expect("resume should run continuity checks");
+
+    assert!(degrade < complete);
+    assert!(complete < record);
+    assert!(record < refresh);
+    assert!(refresh < verify);
+}
+
+#[test]
+fn takeover_elevate_marks_unconfirmed_authority_before_browser_actuation() {
+    let source = include_str!("takeover.rs");
+    let elevate_start = source
+        .find("async fn execute_elevate")
+        .expect("elevate implementation should exist");
+    let elevate_end = source[elevate_start..]
+        .find("async fn execute_resume")
+        .map(|offset| elevate_start + offset)
+        .expect("resume implementation should follow elevate");
+    let elevate = &source[elevate_start..elevate_end];
+
+    let degraded = elevate
+        .find("elevation_transition_unconfirmed")
+        .expect("elevate should publish an unconfirmed transition fence");
+    let browser_actuation = elevate
+        .find("elevate_to_visible")
+        .expect("elevate should call browser actuation");
+
+    assert!(degraded < browser_actuation);
 }
 
 #[test]

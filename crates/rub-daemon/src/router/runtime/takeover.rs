@@ -134,8 +134,8 @@ impl TakeoverAction {
                 .await);
         }
         state.activate_handoff().await;
-        refresh_takeover_runtime(&router.browser, state).await;
         self.record_success(state).await;
+        refresh_takeover_runtime(&router.browser, state).await;
         Ok(())
     }
 
@@ -162,7 +162,14 @@ impl TakeoverAction {
                 )
                 .await);
         }
-        router.browser.elevate_to_visible().await?;
+        state
+            .mark_takeover_runtime_degraded("elevation_transition_unconfirmed")
+            .await;
+        if let Err(error) = router.browser.elevate_to_visible().await {
+            self.record_rejection(state, Some("elevation_failed".to_string()))
+                .await;
+            return Err(error);
+        }
         state.set_handoff_available(true).await;
         refresh_takeover_runtime(&router.browser, state).await;
         if let Err(error) = verify_takeover_continuity(router, state).await {
@@ -201,7 +208,11 @@ impl TakeoverAction {
                 )
                 .await);
         }
+        state
+            .mark_takeover_runtime_degraded("resume_continuity_unconfirmed")
+            .await;
         state.complete_handoff().await;
+        self.record_success(state).await;
         refresh_takeover_runtime(&router.browser, state).await;
         if let Err(error) = verify_takeover_continuity(router, state).await {
             state.activate_handoff().await;
@@ -217,7 +228,6 @@ impl TakeoverAction {
                 .await;
             return Err(error);
         }
-        self.record_success(state).await;
         Ok(())
     }
 

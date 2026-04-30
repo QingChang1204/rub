@@ -49,6 +49,23 @@ pub struct CommandMetadata {
     pub replay_safety: ReplaySafety,
 }
 
+impl CommandMetadata {
+    fn read_only(mut self) -> Self {
+        self.effect_class = CommandEffectClass::ReadOnly;
+        self.dom_epoch_policy = DomEpochPolicy::None;
+        self.timeout_recovery_surface = TimeoutRecoverySurface::None;
+        self.replay_safety = ReplaySafety::SafeWithFreshCommandId;
+        self
+    }
+
+    fn possible_runtime_commit(mut self) -> Self {
+        self.effect_class = CommandEffectClass::RuntimeMutation;
+        self.timeout_recovery_surface = TimeoutRecoverySurface::PossibleCommit;
+        self.replay_safety = ReplaySafety::RequiresSameCommandId;
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandName {
     Handshake,
@@ -505,6 +522,36 @@ pub fn command_metadata(command: &str) -> CommandMetadata {
         .unwrap_or_default()
 }
 
+pub fn command_metadata_for_args(command: &str, args: &serde_json::Value) -> CommandMetadata {
+    let metadata = command_metadata(command);
+    match CommandName::parse(command) {
+        Some(CommandName::Download) => match args.get("sub").and_then(serde_json::Value::as_str) {
+            Some("wait") => metadata.read_only(),
+            Some("cancel" | "save") => metadata.possible_runtime_commit(),
+            _ => metadata,
+        },
+        Some(CommandName::Handoff) => match args.get("sub").and_then(serde_json::Value::as_str) {
+            Some("status") | None => metadata.read_only(),
+            Some("start" | "complete") => metadata.possible_runtime_commit(),
+            _ => metadata,
+        },
+        Some(CommandName::Takeover) => match args.get("sub").and_then(serde_json::Value::as_str) {
+            Some("status") | None => metadata.read_only(),
+            Some("start" | "elevate" | "resume") => metadata.possible_runtime_commit(),
+            _ => metadata,
+        },
+        Some(CommandName::Interference) => {
+            match args.get("sub").and_then(serde_json::Value::as_str) {
+                Some("status") => metadata.read_only(),
+                Some("mode" | "recover") | None => metadata.possible_runtime_commit(),
+                _ => metadata,
+            }
+        }
+        Some(CommandName::Close) => metadata.possible_runtime_commit(),
+        _ => metadata,
+    }
+}
+
 pub fn is_transport_exposed_internal_command(command: &str) -> bool {
     let metadata = command_metadata(command);
     metadata.internal && !metadata.in_process_only
@@ -527,7 +574,7 @@ mod tests {
     use super::{
         CommandEffectClass, CommandName, DomEpochPolicy, ReplaySafety, TimeoutRecoverySurface,
         allows_missing_request_command_id, allows_transport_protocol_compat_exemption,
-        command_metadata, is_transport_exposed_internal_command,
+        command_metadata, command_metadata_for_args, is_transport_exposed_internal_command,
     };
 
     /// Every CommandName variant must round-trip through parse(as_str()).
@@ -624,6 +671,49 @@ mod tests {
         assert_eq!(state.dom_epoch_policy, DomEpochPolicy::None);
         assert_eq!(state.timeout_recovery_surface, TimeoutRecoverySurface::None);
         assert_eq!(state.replay_safety, ReplaySafety::SafeWithFreshCommandId);
+    }
+
+    #[test]
+    fn command_metadata_for_args_distinguishes_runtime_read_and_mutation_subcommands() {
+        let runtime_mutations = [
+            ("download", serde_json::json!({ "sub": "cancel" })),
+            ("download", serde_json::json!({ "sub": "save" })),
+            ("handoff", serde_json::json!({ "sub": "start" })),
+            ("handoff", serde_json::json!({ "sub": "complete" })),
+            ("takeover", serde_json::json!({ "sub": "start" })),
+            ("takeover", serde_json::json!({ "sub": "elevate" })),
+            ("takeover", serde_json::json!({ "sub": "resume" })),
+            ("interference", serde_json::json!({ "sub": "mode" })),
+            ("interference", serde_json::json!({ "sub": "recover" })),
+            ("close", serde_json::json!({})),
+        ];
+        for (command, args) in runtime_mutations {
+            let metadata = command_metadata_for_args(command, &args);
+            assert_eq!(metadata.effect_class, CommandEffectClass::RuntimeMutation);
+            assert_eq!(
+                metadata.timeout_recovery_surface,
+                TimeoutRecoverySurface::PossibleCommit,
+                "{command} {args:?}"
+            );
+            assert_eq!(metadata.replay_safety, ReplaySafety::RequiresSameCommandId);
+        }
+
+        let read_only_runtime_surfaces = [
+            ("download", serde_json::json!({ "sub": "wait" })),
+            ("handoff", serde_json::json!({ "sub": "status" })),
+            ("takeover", serde_json::json!({ "sub": "status" })),
+            ("interference", serde_json::json!({ "sub": "status" })),
+        ];
+        for (command, args) in read_only_runtime_surfaces {
+            let metadata = command_metadata_for_args(command, &args);
+            assert_eq!(metadata.effect_class, CommandEffectClass::ReadOnly);
+            assert_eq!(
+                metadata.timeout_recovery_surface,
+                TimeoutRecoverySurface::None,
+                "{command} {args:?}"
+            );
+            assert_eq!(metadata.replay_safety, ReplaySafety::SafeWithFreshCommandId);
+        }
     }
 
     #[test]

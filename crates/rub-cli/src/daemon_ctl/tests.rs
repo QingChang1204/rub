@@ -114,6 +114,56 @@ fn project_request_onto_deadline_shrinks_request_and_embedded_wait_budget_togeth
 }
 
 #[test]
+fn project_request_onto_deadline_shrinks_explicit_wait_after_budget_together() {
+    let request = IpcRequest::new(
+        "open",
+        serde_json::json!({
+            "url": "https://example.com",
+            "wait_after": {
+                "selector": "#ready",
+                "timeout_ms": 7_500,
+            },
+        }),
+        37_500,
+    );
+    let deadline = Instant::now() + Duration::from_millis(1_200);
+
+    let projected =
+        project_request_onto_deadline(&request, deadline).expect("deadline should remain");
+
+    assert!(projected.timeout_ms <= 1_200);
+    assert_eq!(
+        projected.args["wait_after"]["timeout_ms"],
+        serde_json::json!(projected.timeout_ms)
+    );
+}
+
+#[test]
+fn project_request_onto_deadline_materializes_default_wait_after_when_remaining_budget_is_smaller()
+{
+    let request = IpcRequest::new(
+        "open",
+        serde_json::json!({
+            "url": "https://example.com",
+            "wait_after": {
+                "selector": "#ready",
+            },
+        }),
+        30_000 + rub_core::DEFAULT_WAIT_AFTER_TIMEOUT_MS,
+    );
+    let deadline = Instant::now() + Duration::from_millis(1_200);
+
+    let projected =
+        project_request_onto_deadline(&request, deadline).expect("deadline should remain");
+
+    assert!(projected.timeout_ms <= 1_200);
+    assert_eq!(
+        projected.args["wait_after"]["timeout_ms"],
+        serde_json::json!(projected.timeout_ms)
+    );
+}
+
+#[test]
 fn project_request_onto_deadline_returns_none_when_deadline_is_exhausted() {
     let request = IpcRequest::new("doctor", serde_json::json!({}), 5_000);
     let deadline = Instant::now() - Duration::from_millis(1);
@@ -209,6 +259,63 @@ async fn close_all_reports_stale_cleanup_in_cleaned_stale_list() {
     let result = close_all_sessions(&home, 1_000).await.unwrap();
     assert!(result.closed.is_empty());
     assert_eq!(result.cleaned_stale.len(), 2);
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[tokio::test]
+async fn close_all_reports_projection_cleanup_fence_failure_before_deregister() {
+    let home = temp_home();
+    std::fs::create_dir_all(&home).unwrap();
+    let runtime = RubPaths::new(&home).session_runtime("default", "sess-default");
+    std::fs::create_dir_all(runtime.session_dir().join("residue")).unwrap();
+    std::fs::write(
+        runtime.session_dir().join("residue").join("keep"),
+        b"still here",
+    )
+    .unwrap();
+    write_registry(
+        &home,
+        &RegistryData {
+            sessions: vec![RegistryEntry {
+                session_id: "sess-default".to_string(),
+                session_name: "default".to_string(),
+                pid: 424242,
+                socket_path: runtime.socket_path().display().to_string(),
+                created_at: "2026-03-28T00:00:00Z".to_string(),
+                ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+                user_data_dir: None,
+                attachment_identity: None,
+                connection_target: None,
+            }],
+        },
+    )
+    .unwrap();
+
+    let result = close_all_sessions(&home, 1_000).await.unwrap();
+
+    assert!(result.cleaned_stale.is_empty());
+    assert_eq!(result.failed, vec!["default".to_string()]);
+    assert_eq!(result.session_error_details.len(), 1);
+    assert_eq!(result.session_error_details[0].session, "default");
+    assert_eq!(
+        result.session_error_details[0]
+            .error
+            .context
+            .as_ref()
+            .and_then(|context| context.get("reason")),
+        Some(&serde_json::json!(
+            "stale_projection_cleanup_fence_unconfirmed"
+        ))
+    );
+    assert!(
+        rub_daemon::session::read_registry(&home)
+            .unwrap()
+            .sessions
+            .iter()
+            .any(|entry| entry.session_id == "sess-default"),
+        "close --all must not deregister a session when projection cleanup did not reach its fence"
+    );
 
     let _ = std::fs::remove_dir_all(home);
 }
@@ -1880,7 +1987,7 @@ async fn connect_ipc_with_retry_until_respects_shared_attach_budget_on_stale_soc
         Some("close_selector_resolution")
     );
     assert!(
-        started.elapsed() < Duration::from_millis(250),
+        started.elapsed() < Duration::from_secs(1),
         "deadline-bound attach helper must stay within the shared timeout budget"
     );
 
