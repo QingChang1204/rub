@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rub_core::error::{ErrorCode, RubError};
-use rub_core::model::{DownloadRuntimeStatus, DownloadState};
+use rub_core::model::{
+    DownloadEntry, DownloadEvent, DownloadRuntimeInfo, DownloadRuntimeStatus, DownloadState,
+};
 
 use crate::session::SessionState;
 
@@ -68,54 +70,62 @@ async fn cmd_download_wait(
     let mut poll_count = 0u32;
 
     let initial_runtime = state.download_runtime().await;
-    let mut target_guid = args.id.clone().or_else(|| {
-        initial_runtime
-            .last_download
-            .as_ref()
-            .map(|download| download.guid.clone())
-    });
     if matches!(initial_runtime.status, DownloadRuntimeStatus::Unsupported) {
         return Err(RubError::domain(
             ErrorCode::InvalidInput,
             "Download runtime is unsupported for this session",
         ));
     }
+    let explicit_guid = args.id.clone();
 
     loop {
-        if target_guid.is_none() {
-            target_guid = state
-                .download_events_after(cursor)
-                .await
-                .into_iter()
-                .last()
-                .map(|event| event.download.guid);
-        }
-
         let runtime = state.download_runtime().await;
-        if let Some(guid) = target_guid.as_deref()
-            && let Some(download) = state.download_entry(guid).await
-            && matches_wait_state(&download, desired_state)
-        {
-            let mut runtime_projection = serde_json::to_value(runtime).map_err(RubError::from)?;
-            annotate_download_runtime_path_states(&mut runtime_projection);
-            return Ok(download_payload(
-                download_subject(Some(guid), "wait", Some(wait_state_label(desired_state))),
-                serde_json::json!({
-                    "download": download,
-                    "matched": true,
-                }),
-                runtime_projection,
-            ));
+        if let Some(guid) = explicit_guid.as_deref() {
+            if let Some(download) = state.download_entry(guid).await
+                && matches_wait_state(&download, desired_state)
+            {
+                let mut runtime_projection =
+                    serde_json::to_value(runtime).map_err(RubError::from)?;
+                annotate_download_runtime_path_states(&mut runtime_projection);
+                return Ok(download_payload(
+                    download_subject(Some(guid), "wait", Some(wait_state_label(desired_state))),
+                    serde_json::json!({
+                        "download": download,
+                        "matched": true,
+                    }),
+                    runtime_projection,
+                ));
+            }
+        } else {
+            let events = state.download_events_after(cursor).await;
+            if let Some(download) = implicit_wait_match(&runtime, &events, desired_state) {
+                let guid = download.guid.clone();
+                let mut runtime_projection =
+                    serde_json::to_value(runtime).map_err(RubError::from)?;
+                annotate_download_runtime_path_states(&mut runtime_projection);
+                return Ok(download_payload(
+                    download_subject(
+                        Some(guid.as_str()),
+                        "wait",
+                        Some(wait_state_label(desired_state)),
+                    ),
+                    serde_json::json!({
+                        "download": download,
+                        "matched": true,
+                    }),
+                    runtime_projection,
+                ));
+            }
         }
 
         if started.elapsed() >= timeout {
             let runtime = state.download_runtime().await;
-            let current_download = match target_guid.as_deref() {
+            let current_download = match explicit_guid.as_deref() {
                 Some(guid) => state.download_entry(guid).await,
                 None => runtime.last_download.clone(),
             };
             return Err(download_wait_timeout_error(
-                target_guid.as_deref(),
+                explicit_guid.as_deref(),
                 args.state.as_deref().unwrap_or("completed"),
                 timeout,
                 started.elapsed(),
@@ -127,6 +137,33 @@ async fn cmd_download_wait(
         tokio::time::sleep(download_poll_delay(poll_count)).await;
         poll_count = poll_count.saturating_add(1);
     }
+}
+
+fn implicit_wait_match(
+    runtime: &DownloadRuntimeInfo,
+    events_after_cursor: &[DownloadEvent],
+    desired_state: args::DownloadWaitState,
+) -> Option<DownloadEntry> {
+    events_after_cursor
+        .iter()
+        .rev()
+        .find(|event| matches_wait_state(&event.download, desired_state))
+        .map(|event| event.download.clone())
+        .or_else(|| {
+            runtime
+                .last_download
+                .as_ref()
+                .filter(|download| matches_wait_state(download, desired_state))
+                .cloned()
+        })
+        .or_else(|| {
+            runtime
+                .active_downloads
+                .iter()
+                .rev()
+                .find(|download| matches_wait_state(download, desired_state))
+                .cloned()
+        })
 }
 
 async fn cmd_download_cancel(
@@ -188,16 +225,23 @@ mod tests {
     use super::args::DownloadWaitState;
     use super::projection::download_wait_timeout_error;
     use super::{
-        annotate_download_runtime_path_states, download_poll_delay, matches_wait_state,
-        parse_wait_state,
+        annotate_download_runtime_path_states, download_poll_delay, implicit_wait_match,
+        matches_wait_state, parse_wait_state,
     };
     use rub_core::error::ErrorCode;
-    use rub_core::model::{DownloadEntry, DownloadMode, DownloadRuntimeInfo, DownloadState};
+    use rub_core::model::{
+        DownloadEntry, DownloadEvent, DownloadEventKind, DownloadMode, DownloadRuntimeInfo,
+        DownloadRuntimeStatus, DownloadState,
+    };
     use std::time::Duration;
 
     fn download(state: DownloadState) -> DownloadEntry {
+        download_with_guid("guid-1", state)
+    }
+
+    fn download_with_guid(guid: &str, state: DownloadState) -> DownloadEntry {
         DownloadEntry {
-            guid: "guid-1".to_string(),
+            guid: guid.to_string(),
             state,
             url: None,
             suggested_filename: None,
@@ -209,6 +253,21 @@ mod tests {
             completed_at: None,
             frame_id: None,
             trigger_command_id: None,
+        }
+    }
+
+    fn download_event(sequence: u64, guid: &str, state: DownloadState) -> DownloadEvent {
+        let kind = match state {
+            DownloadState::Started => DownloadEventKind::Started,
+            DownloadState::InProgress => DownloadEventKind::Progress,
+            DownloadState::Completed => DownloadEventKind::Completed,
+            DownloadState::Failed => DownloadEventKind::Failed,
+            DownloadState::Canceled => DownloadEventKind::Canceled,
+        };
+        DownloadEvent {
+            sequence,
+            kind,
+            download: download_with_guid(guid, state),
         }
     }
 
@@ -236,6 +295,71 @@ mod tests {
             &download(DownloadState::InProgress),
             DownloadWaitState::Terminal
         ));
+    }
+
+    #[test]
+    fn implicit_wait_match_accepts_matching_current_last_download() {
+        let matched = implicit_wait_match(
+            &DownloadRuntimeInfo {
+                status: DownloadRuntimeStatus::Active,
+                mode: DownloadMode::Managed,
+                download_dir: Some("/tmp/downloads".to_string()),
+                active_downloads: Vec::new(),
+                completed_downloads: vec![download_with_guid("fast", DownloadState::Completed)],
+                last_download: Some(download_with_guid("fast", DownloadState::Completed)),
+                degraded_reason: None,
+            },
+            &[],
+            DownloadWaitState::Completed,
+        )
+        .expect("matching last download should satisfy implicit wait");
+
+        assert_eq!(matched.guid, "fast");
+    }
+
+    #[test]
+    fn implicit_wait_match_does_not_bind_nonmatching_terminal_last_download() {
+        let matched = implicit_wait_match(
+            &DownloadRuntimeInfo {
+                status: DownloadRuntimeStatus::Active,
+                mode: DownloadMode::Managed,
+                download_dir: Some("/tmp/downloads".to_string()),
+                active_downloads: Vec::new(),
+                completed_downloads: vec![download_with_guid("slow", DownloadState::Canceled)],
+                last_download: Some(download_with_guid("slow", DownloadState::Canceled)),
+                degraded_reason: None,
+            },
+            &[],
+            DownloadWaitState::Completed,
+        );
+
+        assert!(matched.is_none());
+    }
+
+    #[test]
+    fn implicit_wait_match_prefers_post_cursor_matching_event() {
+        let matched = implicit_wait_match(
+            &DownloadRuntimeInfo {
+                status: DownloadRuntimeStatus::Active,
+                mode: DownloadMode::Managed,
+                download_dir: Some("/tmp/downloads".to_string()),
+                active_downloads: Vec::new(),
+                completed_downloads: vec![
+                    download_with_guid("slow", DownloadState::Canceled),
+                    download_with_guid("fast", DownloadState::Completed),
+                ],
+                last_download: Some(download_with_guid("slow", DownloadState::Canceled)),
+                degraded_reason: None,
+            },
+            &[
+                download_event(10, "slow", DownloadState::Canceled),
+                download_event(11, "fast", DownloadState::Completed),
+            ],
+            DownloadWaitState::Completed,
+        )
+        .expect("post-cursor completed download should satisfy implicit wait");
+
+        assert_eq!(matched.guid, "fast");
     }
 
     #[test]
