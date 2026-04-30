@@ -15,10 +15,10 @@ name = "rub"
 path = "src/main.rs"
 
 [dependencies]
-rub-core = { version = "0.1.0", path = "../rub-core" }
-rub-ipc = { version = "0.1.0", path = "../rub-ipc" }
-rub-daemon = { version = "0.1.0", path = "../rub-daemon" }
-rub-cdp = { version = "0.1.0", path = "../rub-cdp" }
+rub-core = { version = "0.1.7", path = "../rub-core" }
+rub-ipc = { version = "0.1.7", path = "../rub-ipc" }
+rub-daemon = { version = "0.1.7", path = "../rub-daemon" }
+rub-cdp = { version = "0.1.7", path = "../rub-cdp" }
 clap.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -33,4 +33,4 @@ time.workspace = true
 
 [dev-dependencies]
 serial_test = "3.2.0"
-rub-test-harness = { path = "../rub-test-harness" }
+rub-test-harness = { version = "0.1.7", path = "../rub-test-harness" }

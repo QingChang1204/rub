@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 rust-version = "1.94.1"
 license = "MIT"
@@ -84,6 +84,9 @@ tap = "QingChang1204/homebrew-tap"
 publish-jobs = ["homebrew"]
 # Read release notes from CHANGELOG.md (populated by git-cliff before each release)
 changelog = "CHANGELOG.md"
+# release.yml contains repo-owned frozen-baseline guardrails; keep cargo-dist
+# from rejecting the hand-maintained CI wrapper as an out-of-date generated file.
+allow-dirty = ["ci"]
 
 [profile.release]
 lto = true

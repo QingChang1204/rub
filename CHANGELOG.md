@@ -1,6 +1,10 @@
 
 ## Unreleased
 
+Nothing yet.
+
+## v0.1.7 — 2026-04-30
+
 ### 🚀 Features
 
 - Add authenticated runtime bindings, remembered alias reuse via `--use`, and explicit binding inspection/management commands (#operator-workflow)
