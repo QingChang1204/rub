@@ -256,7 +256,10 @@ fn build_managed_config_with_executable(
     let mut config_builder = if options.headless {
         BrowserConfig::builder().new_headless_mode()
     } else {
-        BrowserConfig::builder().with_head()
+        BrowserConfig::builder()
+            .with_head()
+            .viewport(None)
+            .arg("--start-maximized")
     };
     if let Some(executable) = executable_override {
         config_builder = config_builder.chrome_executable(executable);
@@ -435,6 +438,8 @@ mod tests {
         let debug = format!("{config:?}");
 
         assert!(debug.contains("headless: False"), "{debug}");
+        assert!(debug.contains("viewport: None"), "{debug}");
+        assert!(debug.contains("--start-maximized"), "{debug}");
     }
 
     #[test]
