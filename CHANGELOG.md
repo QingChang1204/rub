@@ -3,6 +3,12 @@
 
 Nothing yet.
 
+## v0.1.8 — 2026-05-01
+
+### 🐛 Bug Fixes
+
+- Maximize headed managed browser startup and disable chromiumoxide's default 800x600 viewport emulation for native headed windows.
+
 ## v0.1.7 — 2026-04-30
 
 ### 🚀 Features

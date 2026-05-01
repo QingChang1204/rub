@@ -11,9 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-rub-core = { version = "0.1.7", path = "../rub-core" }
-rub-cdp = { version = "0.1.7", path = "../rub-cdp" }
-rub-ipc = { version = "0.1.7", path = "../rub-ipc" }
+rub-core = { version = "0.1.8", path = "../rub-core" }
+rub-cdp = { version = "0.1.8", path = "../rub-cdp" }
+rub-ipc = { version = "0.1.8", path = "../rub-ipc" }
 tokio.workspace = true
 tracing.workspace = true
 serde.workspace = true
@@ -29,4 +29,4 @@ reqwest.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 async-trait.workspace = true
-rub-ipc = { version = "0.1.7", path = "../rub-ipc", features = ["test-utils"] }
+rub-ipc = { version = "0.1.8", path = "../rub-ipc", features = ["test-utils"] }

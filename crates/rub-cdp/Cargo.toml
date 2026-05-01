@@ -11,7 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-rub-core = { version = "0.1.7", path = "../rub-core" }
+rub-core = { version = "0.1.8", path = "../rub-core" }
 chromiumoxide.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
