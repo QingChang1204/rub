@@ -5,7 +5,10 @@ use rub_core::error::{ErrorCode, RubError};
 use rub_daemon::rub_paths::RubPaths;
 use serde_json::json;
 
-use super::process_identity::process_matches_registry_entry_for_termination;
+use super::process_identity::{
+    process_matches_daemon_identity, process_matches_registry_entry_for_termination,
+};
+use super::process_lifecycle::force_kill_process;
 use super::{DaemonCtlPathContext, daemon_ctl_path_error};
 
 pub(crate) fn cleanup_stale(rub_home: &Path, entry: &rub_daemon::session::RegistryEntry) {
@@ -206,6 +209,46 @@ pub(crate) fn terminate_registry_entry_process(
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+pub(crate) fn force_kill_registry_entry_process(
+    rub_home: &Path,
+    entry: &rub_daemon::session::RegistryEntry,
+) -> std::io::Result<()> {
+    if !process_matches_daemon_identity(
+        rub_home,
+        &entry.session_name,
+        Some(entry.session_id.as_str()),
+        entry.pid,
+    )? || !runtime_commit_matches_registry_entry(rub_home, entry)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "Refused to force kill pid {} because it no longer matches daemon authority for session '{}' under {}",
+                entry.pid,
+                entry.session_name,
+                rub_home.display()
+            ),
+        ));
+    }
+    force_kill_process(entry.pid)
+}
+
+fn runtime_commit_matches_registry_entry(
+    rub_home: &Path,
+    entry: &rub_daemon::session::RegistryEntry,
+) -> bool {
+    let runtime = RubPaths::new(rub_home).session_runtime(&entry.session_name, &entry.session_id);
+    let pid_matches = std::fs::read_to_string(runtime.pid_path())
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        == Some(entry.pid);
+    let committed_matches = std::fs::read_to_string(runtime.startup_committed_path())
+        .ok()
+        .is_some_and(|raw| raw.trim() == entry.session_id);
+    let socket_matches = Path::new(&entry.socket_path) == runtime.socket_path();
+    pid_matches && committed_matches && socket_matches
 }
 
 pub(crate) fn registry_authority_snapshot(

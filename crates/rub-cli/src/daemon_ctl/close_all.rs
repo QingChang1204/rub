@@ -10,9 +10,14 @@ use super::{
     BatchCloseResult, BatchCloseSessionError, CompatibilityDegradedOwnedSession, DaemonConnection,
     ShutdownFenceStatus, TransientSocketPolicy, cleanup_stale_checked,
     compatibility_degraded_owned_from_snapshot, detect_or_connect_hardened_until,
-    registry_authority_snapshot, remaining_budget_ms, send_existing_request_with_replay_recovery,
-    terminate_registry_entry_process, wait_for_shutdown_until,
+    force_kill_registry_entry_process, registry_authority_snapshot, remaining_budget_ms,
+    send_existing_request_with_replay_recovery, terminate_registry_entry_process,
+    wait_for_shutdown_until,
 };
+
+const CLOSE_ALL_GRACEFUL_SHUTDOWN_MAX_MS: u64 = 10_000;
+const CLOSE_ALL_FALLBACK_RESERVE_MS: u64 = 2_000;
+const CLOSE_ALL_SIGTERM_DRAIN_MS: u64 = 2_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseAllDisposition {
@@ -191,7 +196,12 @@ pub(crate) async fn close_all_sessions_until(
                 profile_released: false,
             }
         } else {
-            wait_for_shutdown_until(rub_home, &current_entry, command_deadline).await
+            wait_for_shutdown_until(
+                rub_home,
+                &current_entry,
+                close_all_graceful_shutdown_deadline(command_deadline),
+            )
+            .await
         };
         let mut shutdown = initial_shutdown;
         let mut kill_fallback_used = false;
@@ -207,9 +217,25 @@ pub(crate) async fn close_all_sessions_until(
             && terminate_registry_entry_process(rub_home, &current_entry).is_ok()
         {
             kill_fallback_used = true;
-            shutdown = wait_for_shutdown_until(rub_home, &current_entry, command_deadline).await;
+            shutdown = wait_for_shutdown_until(
+                rub_home,
+                &current_entry,
+                close_all_sigterm_shutdown_deadline(command_deadline),
+            )
+            .await;
             still_running = rub_core::process::is_process_alive(current_entry.pid)
                 || !session_paths.existing_socket_paths().is_empty();
+            if should_escalate_close_all_to_force_kill(
+                shutdown,
+                still_running,
+                remaining_budget_ms(command_deadline),
+            ) && force_kill_registry_entry_process(rub_home, &current_entry).is_ok()
+            {
+                shutdown =
+                    wait_for_shutdown_until(rub_home, &current_entry, command_deadline).await;
+                still_running = rub_core::process::is_process_alive(current_entry.pid)
+                    || !session_paths.existing_socket_paths().is_empty();
+            }
         }
 
         if let Some(error) = attach_error.take() {
@@ -421,6 +447,37 @@ pub(crate) fn should_escalate_close_all_to_kill_fallback(
     remaining_budget_ms: u64,
 ) -> bool {
     !shutdown.fully_released() && still_running && remaining_budget_ms > 0
+}
+
+pub(crate) fn should_escalate_close_all_to_force_kill(
+    shutdown: ShutdownFenceStatus,
+    still_running: bool,
+    remaining_budget_ms: u64,
+) -> bool {
+    !shutdown.fully_released() && still_running && remaining_budget_ms > 0
+}
+
+fn close_all_graceful_shutdown_deadline(command_deadline: Instant) -> Instant {
+    let now = Instant::now();
+    let remaining = command_deadline.saturating_duration_since(now);
+    let reserve = std::time::Duration::from_millis(CLOSE_ALL_FALLBACK_RESERVE_MS);
+    if remaining <= reserve {
+        return command_deadline;
+    }
+    let graceful_budget = remaining
+        .saturating_sub(reserve)
+        .min(std::time::Duration::from_millis(
+            CLOSE_ALL_GRACEFUL_SHUTDOWN_MAX_MS,
+        ));
+    now.checked_add(graceful_budget).unwrap_or(command_deadline)
+}
+
+fn close_all_sigterm_shutdown_deadline(command_deadline: Instant) -> Instant {
+    let now = Instant::now();
+    let sigterm_budget = command_deadline
+        .saturating_duration_since(now)
+        .min(std::time::Duration::from_millis(CLOSE_ALL_SIGTERM_DRAIN_MS));
+    now.checked_add(sigterm_budget).unwrap_or(command_deadline)
 }
 
 pub(crate) fn requires_immediate_batch_shutdown_after_external_close(

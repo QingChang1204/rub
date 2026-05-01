@@ -2792,7 +2792,6 @@ fn t330_333_close_and_cleanup_grouped_scenario() {
         let json = parse_json(&out);
         assert_eq!(json["success"], true, "{json}");
     };
-
     open_default();
     open_work();
     let json = parse_json(&session.cmd().args(["close", "--all"]).output().unwrap());
@@ -2975,23 +2974,22 @@ fn t330_333_close_and_cleanup_grouped_scenario() {
     assert_eq!(teardown_failed["success"], false, "{teardown_failed}");
     assert_eq!(
         teardown_failed["error"]["code"],
-        "IPC_TIMEOUT",
+        "SESSION_BUSY",
         "{teardown_failed}"
     );
     assert_eq!(
         teardown_failed["error"]["context"]["reason"],
-        "command_deadline_exhausted",
+        "teardown_sessions_failed_to_release",
         "{teardown_failed}"
     );
     assert_eq!(
-        teardown_failed["error"]["context"]["teardown_close_all"]["result"]["session_error_details"]
-            [0]["session"],
+        teardown_failed["error"]["context"]["session_error_details"][0]["session"],
         "broken-teardown",
         "{teardown_failed}"
     );
     let teardown_recovery_contract =
-        &teardown_failed["error"]["context"]["teardown_close_all"]["result"]
-            ["session_error_details"][0]["error"]["context"]["recovery_contract"];
+        &teardown_failed["error"]["context"]["session_error_details"][0]["error"]["context"]
+            ["recovery_contract"];
     assert_session_post_commit_recovery_contract(
         teardown_recovery_contract,
         &home,

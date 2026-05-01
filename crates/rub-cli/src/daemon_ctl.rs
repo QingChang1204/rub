@@ -100,9 +100,9 @@ pub(crate) use self::projection::{
     project_batch_close_result,
 };
 pub(crate) use self::registry::{
-    cleanup_stale, cleanup_stale_checked, latest_definitely_stale_entry_by_name,
-    latest_registry_entry_by_name, registry_authority_snapshot, registry_entry_by_name,
-    terminate_registry_entry_process,
+    cleanup_stale, cleanup_stale_checked, force_kill_registry_entry_process,
+    latest_definitely_stale_entry_by_name, latest_registry_entry_by_name,
+    registry_authority_snapshot, registry_entry_by_name, terminate_registry_entry_process,
 };
 #[cfg(test)]
 pub(crate) use self::replay::replay_retry_matches_daemon_authority;
