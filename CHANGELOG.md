@@ -3,6 +3,14 @@
 
 Nothing yet.
 
+## v0.1.9 — 2026-05-02
+
+### 🐛 Bug Fixes
+
+- Disable the default WorkerContextBridge stealth patch so real worker script URLs remain authoritative for WASM and IndexedDB-backed SDK initialization.
+
+- Harden close-all shutdown fallback so stale registry cleanup can remove the proven stale authority even when newer uncertain sibling entries exist.
+
 ## v0.1.8 — 2026-05-01
 
 ### 🐛 Bug Fixes
