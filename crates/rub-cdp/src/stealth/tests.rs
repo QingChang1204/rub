@@ -2,7 +2,7 @@ use super::*;
 use crate::environment_profile::EnvironmentProfile;
 
 #[test]
-fn combined_script_contains_all_patches_when_enabled() {
+fn combined_script_contains_default_patches_when_enabled() {
     let config = StealthConfig {
         environment_profile: Some(EnvironmentProfile::for_seed(0)),
         ..StealthConfig::default()
@@ -18,7 +18,8 @@ fn combined_script_contains_all_patches_when_enabled() {
     assert!(script.contains("window.chrome"));
     assert!(script.contains("navigator.connection"));
     assert!(script.contains("WebGLRenderingContext"));
-    assert!(script.contains("installWorkerBridge"));
+    assert!(!script.contains("installWorkerBridge"));
+    assert!(!script.contains("root[globalName] = WrappedCtor"));
     assert!(script.contains("CanvasRenderingContext2D"));
     assert!(script.contains("AudioBuffer"));
     assert!(script.contains("maxTouchPoints"));
@@ -34,15 +35,15 @@ fn combined_script_none_when_disabled() {
 }
 
 #[test]
-fn applied_patch_names_returns_all_when_enabled() {
+fn applied_patch_names_returns_default_patches_when_enabled() {
     let config = StealthConfig {
         environment_profile: Some(EnvironmentProfile::for_seed(0)),
         ..StealthConfig::default()
     };
     let names = applied_patch_names(&config);
-    assert_eq!(names.len(), 12);
+    assert_eq!(names.len(), 11);
     assert!(names.contains(&"webdriver_undefined".to_string()));
-    assert!(names.contains(&"worker_context_bridge".to_string()));
+    assert!(!names.contains(&"worker_context_bridge".to_string()));
     assert!(names.contains(&"canvas_fingerprint".to_string()));
     assert!(names.contains(&"audio_fingerprint".to_string()));
 }
@@ -71,6 +72,18 @@ fn worker_bridge_patch_wraps_dedicated_and_shared_workers() {
     assert!(script.contains("installWorkerBridge('SharedWorker')"));
     assert!(script.contains("replace(/HeadlessChrome/g, 'Chrome')"));
     assert!(script.contains("importScripts"));
+}
+
+#[test]
+fn worker_bridge_patch_is_not_default_because_it_rewrites_worker_urls() {
+    let config = StealthConfig {
+        environment_profile: Some(EnvironmentProfile::for_seed(0)),
+        ..StealthConfig::default()
+    };
+    let script = combined_stealth_script(&config).unwrap();
+    assert!(!script.contains("URL.createObjectURL(blob)"));
+    assert!(!script.contains("new Blob([workerBootstrap + loader]"));
+    assert!(!applied_patch_names(&config).contains(&"worker_context_bridge".to_string()));
 }
 
 #[test]

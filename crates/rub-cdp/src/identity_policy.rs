@@ -11,13 +11,13 @@ use crate::stealth::StealthConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityCoverageMode {
-    PageFrameWorkerBridge,
+    PageFrameOnly,
 }
 
 impl IdentityCoverageMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::PageFrameWorkerBridge => "page_frame_worker_bridge",
+            Self::PageFrameOnly => "page_frame_only",
         }
     }
 }
@@ -48,7 +48,7 @@ impl IdentityPolicy {
         Self {
             stealth_enabled: options.stealth,
             headless: options.headless,
-            coverage_mode: IdentityCoverageMode::PageFrameWorkerBridge,
+            coverage_mode: IdentityCoverageMode::PageFrameOnly,
             fingerprint_profile: FingerprintProfile::for_seed(seed),
             environment_profile: environment_profile_for(options, seed),
         }
@@ -79,7 +79,7 @@ impl IdentityPolicy {
     }
 
     pub fn worker_coverage_supported(&self) -> bool {
-        self.stealth_enabled
+        false
     }
 
     pub fn user_agent_override_expected(&self) -> bool {

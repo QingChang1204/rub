@@ -787,7 +787,7 @@ async fn detect_or_connect_hardened_cleans_the_proven_stale_authority_not_newer_
 
     let mut child = Command::new("python3")
         .arg("-c")
-        .arg("import time; time.sleep(30)")
+        .arg("pass")
         .arg("__daemon")
         .arg("--session")
         .arg(session_name)
@@ -797,38 +797,15 @@ async fn detect_or_connect_hardened_cleans_the_proven_stale_authority_not_newer_
         .arg(home.display().to_string())
         .spawn()
         .expect("spawn daemon-shaped process");
-
-    std::fs::write(old_runtime.pid_path(), child.id().to_string()).unwrap();
-    std::fs::write(old_runtime.startup_committed_path(), old_session_id).unwrap();
-    std::fs::create_dir_all(old_runtime.socket_path().parent().unwrap()).unwrap();
-    let _ = std::fs::remove_file(old_runtime.socket_path());
-    let listener = bind_std_unix_listener(&old_runtime.socket_path());
     let child_pid = child.id();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept snapshot handshake");
-        let mut reader = StdBufReader::new(
-            stream
-                .try_clone()
-                .expect("clone accepted stream for blocking handshake read"),
-        );
-        let request: IpcRequest = NdJsonCodec::read_blocking(&mut reader)
-            .expect("read request")
-            .expect("request");
-        assert_eq!(request.command, "_handshake");
-        let response = IpcResponse::success(
-            request.command.clone(),
-            serde_json::json!({
-                "daemon_session_id": old_session_id,
-            }),
-        )
-        .with_command_id(HANDSHAKE_PROBE_COMMAND_ID)
-        .unwrap()
-        .with_daemon_session_id(old_session_id)
-        .unwrap();
-        let encoded = NdJsonCodec::encode(&response).unwrap();
-        stream.write_all(&encoded).expect("write response");
-        let _ = unsafe { libc::kill(child_pid as i32, libc::SIGTERM) };
-    });
+    child.wait().expect("dead daemon-shaped process exits");
+    assert!(
+        !rub_core::process::is_process_alive(child_pid),
+        "test fixture must publish a deterministic dead pid"
+    );
+
+    std::fs::write(old_runtime.pid_path(), child_pid.to_string()).unwrap();
+    std::fs::write(old_runtime.startup_committed_path(), old_session_id).unwrap();
 
     std::fs::write(new_runtime.pid_path(), std::process::id().to_string()).unwrap();
     std::fs::write(
@@ -845,7 +822,7 @@ async fn detect_or_connect_hardened_cleans_the_proven_stale_authority_not_newer_
                 RegistryEntry {
                     session_id: old_session_id.to_string(),
                     session_name: session_name.to_string(),
-                    pid: child.id(),
+                    pid: child_pid,
                     socket_path: old_runtime.socket_path().display().to_string(),
                     created_at: "2026-04-21T00:00:00Z".to_string(),
                     ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
@@ -877,9 +854,6 @@ async fn detect_or_connect_hardened_cleans_the_proven_stale_authority_not_newer_
     .await
     .expect("stale dead authority should resolve to restart");
     assert!(matches!(resolution, super::DaemonConnection::NeedStart));
-
-    server.join().unwrap();
-    let _ = child.wait();
 
     assert!(
         !old_runtime.pid_path().exists(),

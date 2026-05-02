@@ -1788,11 +1788,29 @@ fn t380_doctor_reports_default_l1_with_clean_args_patch() {
 #[serial]
 fn t384_385_default_stealth_coverage_and_worker_grouped_scenario() {
     let session = ManagedBrowserSession::new();
-    let (_rt, server) = start_test_server(vec![(
-        "/",
-        "text/html",
-        r#"<!DOCTYPE html><html><body><div>Stealth Coverage Fixture</div></body></html>"#,
-    )]);
+    let (_rt, server) = start_test_server(vec![
+        (
+            "/",
+            "text/html",
+            r#"<!DOCTYPE html><html><body><div>Stealth Coverage Fixture</div></body></html>"#,
+        ),
+        (
+            "/worker.js",
+            "text/javascript",
+            r#"
+self.onmessage = () => {
+    self.postMessage({
+        userAgent: navigator.userAgent,
+        webdriverIn: ('webdriver' in navigator),
+        webdriverType: typeof navigator.webdriver,
+        chromeRuntime: typeof (self.chrome && self.chrome.runtime),
+        locationHref: self.location.href,
+        wasmUrl: new URL('./openim.wasm', self.location.href).href
+    });
+};
+"#,
+        ),
+    ]);
 
     let out = session
         .cmd()
@@ -1807,7 +1825,7 @@ fn t384_385_default_stealth_coverage_and_worker_grouped_scenario() {
     assert_eq!(json["success"], true);
     assert_eq!(
         report["launch_policy"]["stealth_coverage"]["coverage_mode"],
-        "page_frame_worker_bridge"
+        "page_frame_only"
     );
     assert_eq!(
         report["launch_policy"]["stealth_coverage"]["user_agent_override"],
@@ -1860,11 +1878,9 @@ fn t384_385_default_stealth_coverage_and_worker_grouped_scenario() {
         ),
         "{json}"
     );
-    assert!(
-        matches!(
-            report["launch_policy"]["stealth_coverage"]["self_probe"]["worker_context"].as_str(),
-            Some("passed" | "unknown")
-        ),
+    assert_eq!(
+        report["launch_policy"]["stealth_coverage"]["self_probe"]["worker_context"],
+        "unknown",
         "{json}"
     );
     assert_eq!(
@@ -1872,53 +1888,44 @@ fn t384_385_default_stealth_coverage_and_worker_grouped_scenario() {
         json!(["service_worker"])
     );
     let probe = r#"(async () => {
-        const workerSource = `
-            self.onmessage = () => {
-                self.postMessage({
-                    userAgent: navigator.userAgent,
-                    webdriverIn: ('webdriver' in navigator),
-                    webdriverType: typeof navigator.webdriver,
-                    chromeRuntime: typeof (self.chrome && self.chrome.runtime)
-                });
+        const workerUrl = '/worker.js';
+        return await new Promise((resolve, reject) => {
+            const worker = new Worker(workerUrl);
+            const timer = setTimeout(() => {
+                worker.terminate();
+                reject(new Error('worker timeout'));
+            }, 5000);
+            worker.onmessage = (event) => {
+                clearTimeout(timer);
+                worker.terminate();
+                resolve(event.data);
             };
-        `;
-        const workerBlob = new Blob([workerSource], { type: 'text/javascript' });
-        const workerUrl = URL.createObjectURL(workerBlob);
-        try {
-            return await new Promise((resolve, reject) => {
-                const worker = new Worker(workerUrl);
-                const timer = setTimeout(() => {
-                    worker.terminate();
-                    reject(new Error('worker timeout'));
-                }, 5000);
-                worker.onmessage = (event) => {
-                    clearTimeout(timer);
-                    worker.terminate();
-                    resolve(event.data);
-                };
-                worker.onerror = (event) => {
-                    clearTimeout(timer);
-                    worker.terminate();
-                    reject(new Error(event.message || 'worker error'));
-                };
-                worker.postMessage('go');
-            });
-        } finally {
-            URL.revokeObjectURL(workerUrl);
-        }
+            worker.onerror = (event) => {
+                clearTimeout(timer);
+                worker.terminate();
+                reject(new Error(event.message || 'worker error'));
+            };
+            worker.postMessage('go');
+        });
     })()"#;
     let out = session.cmd().args(["exec", probe]).output().unwrap();
     let json = parse_json(&out);
     assert_eq!(json["success"], true);
+    assert_eq!(
+        json["data"]["result"]["locationHref"],
+        server.url_for("/worker.js")
+    );
+    assert_eq!(
+        json["data"]["result"]["wasmUrl"],
+        server.url_for("/openim.wasm")
+    );
     assert!(
-        !json["data"]["result"]["userAgent"]
+        !json["data"]["result"]["locationHref"]
             .as_str()
             .unwrap_or_default()
-            .contains("HeadlessChrome")
+            .starts_with("blob:"),
+        "{json}"
     );
-    assert_eq!(json["data"]["result"]["webdriverIn"], false);
-    assert_eq!(json["data"]["result"]["webdriverType"], "undefined");
-    assert_eq!(json["data"]["result"]["chromeRuntime"], "object");
 }
 
 #[test]

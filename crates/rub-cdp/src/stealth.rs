@@ -101,6 +101,29 @@ impl StealthPatch {
             Self::EnvironmentProfile,
         ]
     }
+
+    /// Default page-level patches in recommended application order.
+    ///
+    /// `WorkerContextBridge` is intentionally not enabled by default because it
+    /// rewrites `new Worker(url)` / `new SharedWorker(url)` into blob-backed
+    /// bootstrap workers. That changes worker URL authority and can break SDKs
+    /// that resolve WASM or IndexedDB-backed SQLite assets relative to the
+    /// worker script URL.
+    pub fn default_enabled() -> &'static [StealthPatch] {
+        &[
+            Self::WebdriverUndefined,
+            Self::ChromeRuntimeMock,
+            Self::NavigatorPlugins,
+            Self::NavigatorLanguages,
+            Self::PermissionsQuery,
+            Self::WindowChrome,
+            Self::NavigatorConnection,
+            Self::WebGLDebugInfo,
+            Self::CanvasFingerprint,
+            Self::AudioFingerprint,
+            Self::EnvironmentProfile,
+        ]
+    }
 }
 
 /// Runtime stealth configuration threaded from CLI to daemon.
@@ -128,7 +151,7 @@ pub fn combined_stealth_script(config: &StealthConfig) -> Option<String> {
         return None;
     }
 
-    let patches = StealthPatch::all();
+    let patches = StealthPatch::default_enabled();
     let mut script = String::with_capacity(8192);
     script.push_str("// rub stealth patches\n");
     script.push_str(STEALTH_SHARED_HELPERS);
@@ -146,7 +169,7 @@ pub fn applied_patch_names(config: &StealthConfig) -> Vec<String> {
         return vec![];
     }
     let mut names = Vec::new();
-    for patch in StealthPatch::all() {
+    for patch in StealthPatch::default_enabled() {
         if matches!(patch, StealthPatch::EnvironmentProfile) && config.environment_profile.is_none()
         {
             continue;

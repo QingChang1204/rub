@@ -183,8 +183,13 @@ pub(crate) fn latest_definitely_stale_entry_by_name(
 ) -> Result<Option<rub_daemon::session::RegistryEntry>, RubError> {
     Ok(registry_authority_snapshot(rub_home)?
         .session(session_name)
-        .and_then(|session| session.latest_entry())
-        .filter(|entry| entry.is_definitely_stale())
+        .and_then(|session| {
+            session
+                .entries
+                .iter()
+                .rev()
+                .find(|entry| entry.is_definitely_stale())
+        })
         .map(|entry| entry.entry.clone()))
 }
 
