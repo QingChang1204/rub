@@ -1,7 +1,8 @@
 use super::{ConnectionRequest, EffectiveCli};
+use crate::path_normalization::canonical_existing_or_normalized_absolute_path;
 use crate::timeout_budget::run_with_remaining_budget;
 use rub_core::error::RubError;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 pub(crate) fn requested_user_data_dir(
@@ -185,35 +186,9 @@ pub(crate) async fn effective_attachment_identity(
 }
 
 pub(crate) fn normalize_identity_path(path: impl AsRef<Path>) -> String {
-    let path = path.as_ref();
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    };
-    if let Ok(canonical) = absolute.canonicalize() {
-        return canonical.to_string_lossy().into_owned();
-    }
-
-    let mut normalized = if absolute.is_absolute() {
-        PathBuf::from("/")
-    } else {
-        PathBuf::new()
-    };
-    for component in absolute.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => {}
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    normalized.to_string_lossy().into_owned()
+    canonical_existing_or_normalized_absolute_path(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub(crate) fn normalize_cdp_identity(url: &str) -> String {

@@ -14,6 +14,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+fn assert_background_hook_incomplete(error: rub_core::error::RubError) {
+    let envelope = error.into_envelope();
+    assert_eq!(envelope.code, ErrorCode::BrowserCrashed);
+    assert_eq!(
+        envelope
+            .context
+            .and_then(|context| context.get("reason").cloned())
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .as_deref(),
+        Some("background_page_runtime_hooks_incomplete")
+    );
+}
+
 #[test]
 fn page_hook_install_poll_delay_uses_bounded_backoff() {
     assert_eq!(page_hook_install_poll_delay(0), Duration::from_millis(25));
@@ -201,15 +214,7 @@ async fn background_required_hook_wait_fails_closed_when_required_authority_is_m
     .await
     .expect_err("missing required background hook must fail closed");
 
-    let envelope = error.into_envelope();
-    assert_eq!(envelope.code, ErrorCode::BrowserCrashed);
-    let context = envelope
-        .context
-        .expect("background hook failure should explain why");
-    assert_eq!(
-        context.get("reason").and_then(serde_json::Value::as_str),
-        Some("background_page_runtime_hooks_incomplete")
-    );
+    assert_background_hook_incomplete(error);
 }
 
 #[tokio::test]
@@ -226,16 +231,7 @@ async fn background_required_hook_wait_fails_closed_when_observatory_authority_i
     .await
     .expect_err("missing required observatory hook must fail closed");
 
-    let envelope = error.into_envelope();
-    assert_eq!(envelope.code, ErrorCode::BrowserCrashed);
-    assert_eq!(
-        envelope
-            .context
-            .and_then(|context| context.get("reason").cloned())
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .as_deref(),
-        Some("background_page_runtime_hooks_incomplete")
-    );
+    assert_background_hook_incomplete(error);
 }
 
 #[tokio::test]
@@ -252,14 +248,5 @@ async fn background_required_hook_wait_fails_closed_when_network_rule_authority_
     .await
     .expect_err("missing required network-rule hook must fail closed");
 
-    let envelope = error.into_envelope();
-    assert_eq!(envelope.code, ErrorCode::BrowserCrashed);
-    assert_eq!(
-        envelope
-            .context
-            .and_then(|context| context.get("reason").cloned())
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .as_deref(),
-        Some("background_page_runtime_hooks_incomplete")
-    );
+    assert_background_hook_incomplete(error);
 }

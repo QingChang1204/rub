@@ -320,6 +320,23 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
+    fn teardown_result_fully_released(
+        envelope: &rub_core::error::ErrorEnvelope,
+    ) -> Option<&serde_json::Value> {
+        envelope
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.pointer("/teardown/result/fully_released"))
+    }
+
+    fn first_session_error_recovery_kind(
+        envelope: &rub_core::error::ErrorEnvelope,
+    ) -> Option<&serde_json::Value> {
+        envelope.context.as_ref().and_then(|ctx| {
+            ctx.pointer("/session_error_details/0/error/context/recovery_contract/kind")
+        })
+    }
+
     #[test]
     fn project_teardown_result_combines_close_and_cleanup_surfaces() {
         let result = TeardownResult {
@@ -398,24 +415,11 @@ mod tests {
             Some("teardown_sessions_failed_to_release")
         );
         assert_eq!(
-            envelope
-                .context
-                .as_ref()
-                .and_then(|ctx| ctx.get("teardown"))
-                .and_then(|value| value.get("result"))
-                .and_then(|value| value.get("fully_released")),
+            teardown_result_fully_released(&envelope),
             Some(&json!(false))
         );
         assert_eq!(
-            envelope
-                .context
-                .as_ref()
-                .and_then(|ctx| ctx.get("session_error_details"))
-                .and_then(|value| value.get(0))
-                .and_then(|value| value.get("error"))
-                .and_then(|value| value.get("context"))
-                .and_then(|value| value.get("recovery_contract"))
-                .and_then(|value| value.get("kind")),
+            first_session_error_recovery_kind(&envelope),
             Some(&json!("session_post_commit_journal"))
         );
     }
@@ -462,12 +466,7 @@ mod tests {
             Some("teardown_cleanup_degraded_under_shared_deadline")
         );
         assert_eq!(
-            envelope
-                .context
-                .as_ref()
-                .and_then(|ctx| ctx.get("teardown"))
-                .and_then(|value| value.get("result"))
-                .and_then(|value| value.get("fully_released")),
+            teardown_result_fully_released(&envelope),
             Some(&json!(false))
         );
     }

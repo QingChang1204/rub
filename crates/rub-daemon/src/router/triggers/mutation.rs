@@ -320,44 +320,22 @@ async fn update_trigger_status_with_router_fence_disposition(
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
-    use rub_core::locator::CanonicalLocator;
     use rub_core::model::{
-        TriggerActionKind, TriggerActionSpec, TriggerConditionKind, TriggerConditionSpec,
-        TriggerInfo, TriggerMode, TriggerStatus, TriggerTabBindingInfo,
+        TriggerActionKind, TriggerActionSpec, TriggerConditionSpec, TriggerInfo, TriggerMode,
+        TriggerStatus, TriggerTabBindingInfo,
     };
 
     use super::{
         cmd_trigger_remove_with_router_fence_disposition,
         update_trigger_status_with_router_fence_disposition,
     };
-    use crate::router::{DaemonRouter, RouterFenceDisposition, TransactionDeadline};
+    use crate::router::{RouterFenceDisposition, TransactionDeadline};
     use crate::session::SessionState;
 
-    fn test_router() -> DaemonRouter {
-        let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
-            rub_cdp::browser::BrowserLaunchOptions {
-                headless: true,
-                ignore_cert_errors: false,
-                user_data_dir: None,
-                managed_profile_ephemeral: false,
-                download_dir: None,
-                profile_directory: None,
-                hide_infobars: true,
-                stealth: true,
-            },
-        ));
-        let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
-            manager,
-            Arc::new(AtomicU64::new(0)),
-            rub_cdp::humanize::HumanizeConfig {
-                enabled: false,
-                speed: rub_cdp::humanize::HumanizeSpeed::Normal,
-            },
-        ));
-        DaemonRouter::new(adapter)
+    fn test_router() -> crate::router::DaemonRouter {
+        crate::test_support::daemon_router()
     }
 
     fn temp_home(name: &str) -> PathBuf {
@@ -372,21 +350,7 @@ mod tests {
             mode: TriggerMode::Once,
             source_tab: tab_binding(0, "SOURCE_TAB"),
             target_tab: tab_binding(1, "TARGET_TAB"),
-            condition: TriggerConditionSpec {
-                kind: TriggerConditionKind::LocatorPresent,
-                locator: Some(CanonicalLocator::Selector {
-                    css: "#ready".to_string(),
-                    selection: None,
-                }),
-                text: None,
-                url_pattern: None,
-                readiness_state: None,
-                method: None,
-                status_code: None,
-                storage_area: None,
-                key: None,
-                value: None,
-            },
+            condition: locator_present_condition(),
             action: TriggerActionSpec {
                 kind: TriggerActionKind::BrowserCommand,
                 command: Some("click".to_string()),
@@ -397,6 +361,14 @@ mod tests {
             last_action_result: None,
             unavailable_reason: None,
         }
+    }
+
+    fn locator_present_condition() -> TriggerConditionSpec {
+        serde_json::from_value(serde_json::json!({
+            "kind": "locator_present",
+            "locator": { "selector": "#ready" }
+        }))
+        .expect("locator_present condition fixture should parse")
     }
 
     fn tab_binding(index: u32, target_id: &str) -> TriggerTabBindingInfo {
@@ -431,7 +403,7 @@ mod tests {
             .expect("held transaction should acquire");
 
         let deadline = TransactionDeadline::new(1);
-        std::thread::sleep(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
         let error = cmd_trigger_remove_with_router_fence_disposition(
             &router,
             registered.id,
@@ -508,7 +480,7 @@ mod tests {
             .expect("held transaction should acquire");
 
         let deadline = TransactionDeadline::new(1);
-        std::thread::sleep(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
         let error = update_trigger_status_with_router_fence_disposition(
             &router,
             registered.id,

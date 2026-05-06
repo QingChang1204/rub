@@ -23,38 +23,19 @@ pub(crate) fn replay_recoverable_transport_reason(
 }
 
 pub(crate) fn replay_recoverable_protocol_reason(envelope: &ErrorEnvelope) -> Option<&'static str> {
-    match envelope
-        .context
-        .as_ref()
-        .and_then(|context| context.get("reason"))
-        .and_then(|value| value.as_str())
-    {
-        Some("ipc_request_write_transport_failure_after_possible_commit") => {
-            Some("request_write_transport_failure_after_possible_commit")
-        }
-        Some("ipc_request_write_timeout_after_possible_commit") => {
-            Some("request_write_timeout_after_possible_commit")
-        }
-        Some("ipc_response_timeout_after_request_commit") => {
-            Some("response_timeout_after_request_commit")
-        }
-        Some("ipc_response_transport_failure_after_request_commit") => {
-            Some("response_transport_failure_after_request_commit")
-        }
-        _ => None,
-    }
+    rub_core::recovery_contract::ipc_possible_commit_recovery_reason(envelope)
 }
 
 fn ipc_protocol_envelope_from_error<'a>(
     error: &'a (dyn std::error::Error + 'static),
-) -> Option<&'a rub_core::error::ErrorEnvelope> {
+) -> Option<&'a ErrorEnvelope> {
     error
         .downcast_ref::<IpcClientError>()
         .and_then(IpcClientError::protocol_envelope)
 }
 
 fn merge_ipc_error_context(
-    envelope: &rub_core::error::ErrorEnvelope,
+    envelope: &ErrorEnvelope,
     command_id: Option<&str>,
     extra_context: Option<serde_json::Value>,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -184,6 +165,7 @@ fn ipc_classified_error(
 #[cfg(test)]
 mod tests {
     use super::replay_recoverable_transport_reason;
+    use rub_core::error::{ErrorCode, ErrorEnvelope};
     use rub_ipc::client::IpcClientError;
 
     #[test]
@@ -201,8 +183,8 @@ mod tests {
     #[test]
     fn replay_recovery_recognizes_post_commit_timeout_protocol_failures() {
         let error = IpcClientError::Protocol(
-            rub_core::error::ErrorEnvelope::new(
-                rub_core::error::ErrorCode::IpcTimeout,
+            ErrorEnvelope::new(
+                ErrorCode::IpcTimeout,
                 "response timed out after request commit",
             )
             .with_context(serde_json::json!({
@@ -218,8 +200,8 @@ mod tests {
     #[test]
     fn replay_recovery_recognizes_post_commit_response_transport_protocol_failures() {
         let error = IpcClientError::Protocol(
-            rub_core::error::ErrorEnvelope::new(
-                rub_core::error::ErrorCode::IpcProtocolError,
+            ErrorEnvelope::new(
+                ErrorCode::IpcProtocolError,
                 "response transport failed after request commit",
             )
             .with_context(serde_json::json!({
@@ -235,8 +217,8 @@ mod tests {
     #[test]
     fn replay_recovery_recognizes_possible_commit_write_timeout_protocol_failures() {
         let error = IpcClientError::Protocol(
-            rub_core::error::ErrorEnvelope::new(
-                rub_core::error::ErrorCode::IpcTimeout,
+            ErrorEnvelope::new(
+                ErrorCode::IpcTimeout,
                 "request write timed out after possible commit",
             )
             .with_context(serde_json::json!({
@@ -252,8 +234,8 @@ mod tests {
     #[test]
     fn replay_recovery_recognizes_possible_commit_write_transport_protocol_failures() {
         let error = IpcClientError::Protocol(
-            rub_core::error::ErrorEnvelope::new(
-                rub_core::error::ErrorCode::IpcProtocolError,
+            ErrorEnvelope::new(
+                ErrorCode::IpcProtocolError,
                 "request write transport failed after possible commit",
             )
             .with_context(serde_json::json!({

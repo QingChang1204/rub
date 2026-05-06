@@ -6,6 +6,8 @@ use rub_core::error::{ErrorCode, RubError};
 use tokio::fs;
 
 use crate::router::DaemonRouter;
+pub(super) use crate::router::request_args::lookup_json_path;
+use crate::router::request_args::{canonical_json_batch_root, first_canonical_json_root};
 
 use super::paths::planned_output_path;
 use super::{DownloadSaveArgs, DownloadSaveRequest};
@@ -214,7 +216,7 @@ pub(super) fn resolve_json_asset_root<'a>(
                 }),
             )
         })?;
-        return Ok(canonical_batch_root(selected).unwrap_or(selected));
+        return Ok(canonical_json_batch_root(selected).unwrap_or(selected));
     }
 
     if matches!(
@@ -224,16 +226,12 @@ pub(super) fn resolve_json_asset_root<'a>(
         return Ok(root);
     }
 
-    if let Some(items) = canonical_batch_root(root) {
+    if let Some(items) = canonical_json_batch_root(root) {
         return Ok(items);
     }
 
-    for candidate in ["data.result", "result", "data"] {
-        if let Some(value) = lookup_json_path(root, candidate)
-            && let Some(selected) = canonical_batch_root(value).or(array_or_string_root(value))
-        {
-            return Ok(selected);
-        }
+    if let Some(selected) = first_canonical_json_root(root, &["data.result", "result", "data"]) {
+        return Ok(selected);
     }
 
     Ok(root)
@@ -326,34 +324,5 @@ pub(super) fn asset_request_authority<'a>(
     AssetRequestAuthority {
         cookie_lookup_url: asset_url,
         referer_url: cookie_url,
-    }
-}
-
-pub(super) fn lookup_json_path<'a>(
-    value: &'a serde_json::Value,
-    path: &str,
-) -> Option<&'a serde_json::Value> {
-    let mut current = value;
-    for segment in path.split('.') {
-        if segment.is_empty() {
-            return None;
-        }
-        current = current.get(segment)?;
-    }
-    Some(current)
-}
-
-fn canonical_batch_root(value: &serde_json::Value) -> Option<&serde_json::Value> {
-    let items = value.get("items")?;
-    match items {
-        serde_json::Value::Array(_) | serde_json::Value::String(_) => Some(items),
-        _ => None,
-    }
-}
-
-fn array_or_string_root(value: &serde_json::Value) -> Option<&serde_json::Value> {
-    match value {
-        serde_json::Value::Array(_) | serde_json::Value::String(_) => Some(value),
-        _ => None,
     }
 }

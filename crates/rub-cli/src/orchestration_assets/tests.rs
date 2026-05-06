@@ -3,36 +3,24 @@ use super::{
     persist_orchestration_export_asset, persist_orchestration_export_asset_until,
     remove_newly_created_asset_if_matches,
 };
-use crate::commands::{Commands, EffectiveCli, OrchestrationSubcommand, RequestedLaunchPolicy};
+use crate::commands::{Commands, OrchestrationSubcommand};
+use crate::test_support::effective_cli as cli_with;
 use rub_core::error::ErrorCode;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-fn cli_with(command: Commands, rub_home: PathBuf) -> EffectiveCli {
-    EffectiveCli {
-        session: "default".to_string(),
-        session_id: None,
-        rub_home,
-        timeout: 30_000,
-        headed: false,
-        ignore_cert_errors: false,
-        user_data_dir: None,
-        hide_infobars: true,
-        json_pretty: false,
-        verbose: false,
-        trace: false,
-        command,
-        cdp_url: None,
-        connect: false,
-        profile: None,
-        profile_resolved_path: None,
-        use_alias: None,
-        no_stealth: false,
-        humanize: false,
-        humanize_speed: "normal".to_string(),
-        requested_launch_policy: RequestedLaunchPolicy::default(),
-        effective_launch_policy: RequestedLaunchPolicy::default(),
-    }
+fn orchestration_export_response(condition: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "subject": { "kind": "orchestration_rule", "id": 7 },
+        "result": {
+            "format": "orchestration",
+            "spec": {
+                "source": { "session_id": "source" },
+                "target": { "session_id": "target" },
+                "condition": condition,
+                "actions": [{ "kind": "browser_command", "command": "reload" }]
+            }
+        }
+    })
 }
 
 #[test]
@@ -223,18 +211,10 @@ fn persist_orchestration_export_asset_rolls_back_prior_write_on_second_failure()
         },
         rub_home.clone(),
     );
-    let mut data = serde_json::json!({
-        "subject": { "kind": "orchestration_rule", "id": 7 },
-        "result": {
-            "format": "orchestration",
-            "spec": {
-                "source": { "session_id": "source" },
-                "target": { "session_id": "target" },
-                "condition": { "kind": "url_match", "url_pattern": "https://example.com" },
-                "actions": [{ "kind": "browser_command", "command": "reload" }]
-            }
-        }
-    });
+    let mut data = orchestration_export_response(serde_json::json!({
+        "kind": "url_match",
+        "url_pattern": "https://example.com"
+    }));
 
     persist_orchestration_export_asset(&cli, &mut data)
         .expect_err("second write should fail and roll back the first");
@@ -261,18 +241,10 @@ fn persist_orchestration_export_asset_until_fails_closed_after_deadline_without_
         },
         rub_home.clone(),
     );
-    let mut data = serde_json::json!({
-        "subject": { "kind": "orchestration_rule", "id": 7 },
-        "result": {
-            "format": "orchestration",
-            "spec": {
-                "source": { "session_id": "source" },
-                "target": { "session_id": "target" },
-                "condition": { "kind": "url_match", "url": "https://example.com" },
-                "actions": [{ "kind": "browser_command", "command": "reload" }]
-            }
-        }
-    });
+    let mut data = orchestration_export_response(serde_json::json!({
+        "kind": "url_match",
+        "url": "https://example.com"
+    }));
 
     let error = persist_orchestration_export_asset_until(
         &cli,

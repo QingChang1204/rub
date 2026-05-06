@@ -126,14 +126,14 @@ async fn cmd_network_wait(
         status,
         desired_state,
     ) {
-        return Ok(network_payload(
-            network_wait_subject(request_id, url_match, method, status, desired_state),
-            serde_json::json!({
-                "matched": true,
-                "elapsed_ms": started.elapsed().as_millis() as u64,
-                "request": request,
-                "outcome_summary": network_wait_outcome_summary(desired_state),
-            }),
+        return Ok(network_wait_match_payload(
+            request_id,
+            url_match,
+            method,
+            status,
+            desired_state,
+            started,
+            request,
         ));
     }
 
@@ -162,14 +162,14 @@ async fn cmd_network_wait(
             status,
             desired_state,
         ) {
-            return Ok(network_payload(
-                network_wait_subject(request_id, url_match, method, status, desired_state),
-                serde_json::json!({
-                    "matched": true,
-                    "elapsed_ms": started.elapsed().as_millis() as u64,
-                    "request": request,
-                    "outcome_summary": network_wait_outcome_summary(desired_state),
-                }),
+            return Ok(network_wait_match_payload(
+                request_id,
+                url_match,
+                method,
+                status,
+                desired_state,
+                started,
+                request,
             ));
         }
 
@@ -182,6 +182,26 @@ async fn cmd_network_wait(
             return Err(network_wait_timeout_error(error_context));
         }
     }
+}
+
+fn network_wait_match_payload(
+    request_id: Option<&str>,
+    url_match: Option<&str>,
+    method: Option<&str>,
+    status: Option<u16>,
+    desired_state: NetworkRequestWaitState,
+    started: Instant,
+    request: rub_core::model::NetworkRequestRecord,
+) -> serde_json::Value {
+    network_payload(
+        network_wait_subject(request_id, url_match, method, status, desired_state),
+        serde_json::json!({
+            "matched": true,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "request": request,
+            "outcome_summary": network_wait_outcome_summary(desired_state),
+        }),
+    )
 }
 
 fn find_matching_network_wait_record(
@@ -297,13 +317,53 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    #[tokio::test]
-    async fn network_wait_fails_closed_when_observatory_degrades_while_waiting() {
-        let state = Arc::new(crate::session::SessionState::new(
+    fn test_state() -> Arc<crate::session::SessionState> {
+        Arc::new(crate::session::SessionState::new(
             "default",
             PathBuf::from("/tmp/rub-test"),
             None,
-        ));
+        ))
+    }
+
+    fn terminal_request_record() -> NetworkRequestRecord {
+        NetworkRequestRecord {
+            request_id: "req-existing".to_string(),
+            sequence: 1,
+            lifecycle: NetworkRequestLifecycle::Completed,
+            url: "https://example.com/api/delayed?order=7".to_string(),
+            method: "POST".to_string(),
+            tab_target_id: Some("tab-1".to_string()),
+            status: Some(200),
+            request_headers: BTreeMap::new(),
+            response_headers: BTreeMap::new(),
+            request_body: None,
+            response_body: None,
+            original_url: None,
+            rewritten_url: None,
+            applied_rule_effects: Vec::new(),
+            error_text: None,
+            frame_id: Some("frame-1".to_string()),
+            resource_type: Some("Fetch".to_string()),
+            mime_type: Some("application/json".to_string()),
+        }
+    }
+
+    fn terminal_wait_args(id: Option<&str>) -> NetworkTimelineArgs {
+        NetworkTimelineArgs {
+            wait: true,
+            id: id.map(str::to_string),
+            last: None,
+            url_match: id.is_none().then(|| "/api/delayed".to_string()),
+            method: id.is_none().then(|| "POST".to_string()),
+            status: None,
+            lifecycle: Some("terminal".to_string()),
+            timeout_ms: Some(5_000),
+        }
+    }
+
+    #[tokio::test]
+    async fn network_wait_fails_closed_when_observatory_degrades_while_waiting() {
+        let state = test_state();
         let args = NetworkTimelineArgs {
             wait: true,
             id: None,
@@ -340,49 +400,14 @@ mod tests {
 
     #[tokio::test]
     async fn network_wait_matches_existing_terminal_record_before_waiting() {
-        let state = Arc::new(crate::session::SessionState::new(
-            "default",
-            PathBuf::from("/tmp/rub-test"),
-            None,
-        ));
+        let state = test_state();
         state
-            .upsert_network_request_record(NetworkRequestRecord {
-                request_id: "req-existing".to_string(),
-                sequence: 1,
-                lifecycle: NetworkRequestLifecycle::Completed,
-                url: "https://example.com/api/delayed?order=7".to_string(),
-                method: "POST".to_string(),
-                tab_target_id: Some("tab-1".to_string()),
-                status: Some(200),
-                request_headers: BTreeMap::new(),
-                response_headers: BTreeMap::new(),
-                request_body: None,
-                response_body: None,
-                original_url: None,
-                rewritten_url: None,
-                applied_rule_effects: Vec::new(),
-                error_text: None,
-                frame_id: Some("frame-1".to_string()),
-                resource_type: Some("Fetch".to_string()),
-                mime_type: Some("application/json".to_string()),
-            })
+            .upsert_network_request_record(terminal_request_record())
             .await;
 
-        let result = cmd_network_wait(
-            NetworkTimelineArgs {
-                wait: true,
-                id: None,
-                last: None,
-                url_match: Some("/api/delayed".to_string()),
-                method: Some("POST".to_string()),
-                status: None,
-                lifecycle: Some("terminal".to_string()),
-                timeout_ms: Some(5_000),
-            },
-            &state,
-        )
-        .await
-        .expect("existing terminal request should satisfy wait immediately");
+        let result = cmd_network_wait(terminal_wait_args(None), &state)
+            .await
+            .expect("existing terminal request should satisfy wait immediately");
 
         assert_eq!(result["result"]["matched"], true);
         assert_eq!(result["result"]["request"]["request_id"], "req-existing");
@@ -396,50 +421,15 @@ mod tests {
     #[tokio::test]
     async fn network_wait_existing_terminal_record_fails_closed_when_authority_is_already_degraded()
     {
-        let state = Arc::new(crate::session::SessionState::new(
-            "default",
-            PathBuf::from("/tmp/rub-test"),
-            None,
-        ));
+        let state = test_state();
         assert_eq!(state.record_network_request_ingress_overflow(), 1);
         state
-            .upsert_network_request_record(NetworkRequestRecord {
-                request_id: "req-existing".to_string(),
-                sequence: 1,
-                lifecycle: NetworkRequestLifecycle::Completed,
-                url: "https://example.com/api/delayed?order=7".to_string(),
-                method: "POST".to_string(),
-                tab_target_id: Some("tab-1".to_string()),
-                status: Some(200),
-                request_headers: BTreeMap::new(),
-                response_headers: BTreeMap::new(),
-                request_body: None,
-                response_body: None,
-                original_url: None,
-                rewritten_url: None,
-                applied_rule_effects: Vec::new(),
-                error_text: None,
-                frame_id: Some("frame-1".to_string()),
-                resource_type: Some("Fetch".to_string()),
-                mime_type: Some("application/json".to_string()),
-            })
+            .upsert_network_request_record(terminal_request_record())
             .await;
 
-        let error = cmd_network_wait(
-            NetworkTimelineArgs {
-                wait: true,
-                id: None,
-                last: None,
-                url_match: Some("/api/delayed".to_string()),
-                method: Some("POST".to_string()),
-                status: None,
-                lifecycle: Some("terminal".to_string()),
-                timeout_ms: Some(5_000),
-            },
-            &state,
-        )
-        .await
-        .expect_err("degraded request authority must fail closed before immediate match");
+        let error = cmd_network_wait(terminal_wait_args(None), &state)
+            .await
+            .expect_err("degraded request authority must fail closed before immediate match");
 
         let envelope = error.into_envelope();
         assert_eq!(envelope.code, ErrorCode::SessionBusy);
@@ -455,50 +445,15 @@ mod tests {
 
     #[tokio::test]
     async fn network_wait_request_id_path_still_uses_authoritative_window_for_existing_record() {
-        let state = Arc::new(crate::session::SessionState::new(
-            "default",
-            PathBuf::from("/tmp/rub-test"),
-            None,
-        ));
+        let state = test_state();
         assert_eq!(state.record_network_request_ingress_overflow(), 1);
         state
-            .upsert_network_request_record(NetworkRequestRecord {
-                request_id: "req-existing".to_string(),
-                sequence: 1,
-                lifecycle: NetworkRequestLifecycle::Completed,
-                url: "https://example.com/api/delayed?order=7".to_string(),
-                method: "POST".to_string(),
-                tab_target_id: Some("tab-1".to_string()),
-                status: Some(200),
-                request_headers: BTreeMap::new(),
-                response_headers: BTreeMap::new(),
-                request_body: None,
-                response_body: None,
-                original_url: None,
-                rewritten_url: None,
-                applied_rule_effects: Vec::new(),
-                error_text: None,
-                frame_id: Some("frame-1".to_string()),
-                resource_type: Some("Fetch".to_string()),
-                mime_type: Some("application/json".to_string()),
-            })
+            .upsert_network_request_record(terminal_request_record())
             .await;
 
-        let error = cmd_network_wait(
-            NetworkTimelineArgs {
-                wait: true,
-                id: Some("req-existing".to_string()),
-                last: None,
-                url_match: None,
-                method: None,
-                status: None,
-                lifecycle: Some("terminal".to_string()),
-                timeout_ms: Some(5_000),
-            },
-            &state,
-        )
-        .await
-        .expect_err("request-id wait must not bypass degraded authoritative window");
+        let error = cmd_network_wait(terminal_wait_args(Some("req-existing")), &state)
+            .await
+            .expect_err("request-id wait must not bypass degraded authoritative window");
 
         let envelope = error.into_envelope();
         assert_eq!(envelope.code, ErrorCode::SessionBusy);

@@ -275,10 +275,10 @@ fn copy_file_data_from_synced_handle(source: &File, destination: &mut File) -> i
         destination.seek(SeekFrom::Start(0))?;
         src.seek(SeekFrom::Start(0))?;
         std::io::copy(&mut src, destination)?;
-        return Ok(());
+        Ok(())
     }
 
-    #[allow(unreachable_code)]
+    #[cfg(not(target_vendor = "apple"))]
     {
         let mut src = source.try_clone()?;
         src.seek(SeekFrom::Start(0))?;

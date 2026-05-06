@@ -1,4 +1,9 @@
 use super::*;
+use crate::tab_projection::LocalActiveTargetAuthority;
+use chromiumoxide::cdp::browser_protocol::browser::GetVersionParams;
+use rub_core::DEFAULT_WAIT_TIMEOUT_MS;
+use std::time::Duration;
+use tracing::warn;
 
 pub(super) fn resolve_close_tab_index(
     requested_index: Option<u32>,
@@ -40,9 +45,8 @@ pub(super) fn resolve_close_tab_index(
 impl BrowserManager {
     async fn commit_local_active_page_authority(&self, page: Arc<Page>) {
         let target_id = page.target_id().clone();
-        *self.local_active_target_authority.lock().await = Some(
-            crate::tab_projection::LocalActiveTargetAuthority::new(target_id.clone()),
-        );
+        *self.local_active_target_authority.lock().await =
+            Some(LocalActiveTargetAuthority::new(target_id.clone()));
         let mut projection = self.tab_projection.lock().await;
         *projection = projection.clone().with_local_active_page(page);
     }
@@ -216,7 +220,7 @@ impl BrowserManager {
         self.ensure_browser_locked().await?;
         let browser = self.browser_handle().await?;
         browser
-            .execute(chromiumoxide::cdp::browser_protocol::browser::GetVersionParams::default())
+            .execute(GetVersionParams::default())
             .await
             .map_err(|e| {
                 RubError::domain(
@@ -230,7 +234,7 @@ impl BrowserManager {
     /// Recover from a browser crash by clearing local projections and relaunching.
     pub async fn recover_browser(&self) -> Result<(), RubError> {
         let _launch_guard = self.launch_lock.lock().await;
-        tracing::warn!("Browser crash detected, auto-restarting");
+        warn!("Browser crash detected, auto-restarting");
         self.bump_listener_generation();
         self.clear_local_browser_authority().await;
         self.ensure_browser_locked().await
@@ -323,7 +327,7 @@ impl BrowserManager {
                 &page,
                 url,
                 LoadStrategy::Load,
-                std::time::Duration::from_millis(rub_core::DEFAULT_WAIT_TIMEOUT_MS),
+                Duration::from_millis(DEFAULT_WAIT_TIMEOUT_MS),
             )
             .await?;
             self.sync_tabs_projection().await?;

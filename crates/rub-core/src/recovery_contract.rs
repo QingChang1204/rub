@@ -1,5 +1,7 @@
 use serde_json::{Value, json};
 
+use crate::error::ErrorEnvelope;
+
 pub const STORAGE_RECENT_MUTATIONS_AUTHORITY: &str = "storage_runtime.recent_mutations";
 const ALREADY_EXECUTED_RESPONSE_EVICTED_DO_NOT_RERUN: &str =
     "already_executed_response_evicted_do_not_rerun";
@@ -188,6 +190,33 @@ pub fn already_executed_response_evicted_do_not_rerun_contract() -> Value {
 
 pub fn no_public_recovery_contract() -> Value {
     json!(NO_PUBLIC_RECOVERY_CONTRACT)
+}
+
+pub fn ipc_possible_commit_recovery_reason(envelope: &ErrorEnvelope) -> Option<&'static str> {
+    let reason = envelope
+        .context
+        .as_ref()
+        .and_then(|context| context.get("reason"))
+        .and_then(|value| value.as_str())?;
+    ipc_possible_commit_recovery_reason_from_context(reason)
+}
+
+pub fn ipc_possible_commit_recovery_reason_from_context(reason: &str) -> Option<&'static str> {
+    match reason {
+        "ipc_request_write_transport_failure_after_possible_commit" => {
+            Some("request_write_transport_failure_after_possible_commit")
+        }
+        "ipc_request_write_timeout_after_possible_commit" => {
+            Some("request_write_timeout_after_possible_commit")
+        }
+        "ipc_response_timeout_after_request_commit" => {
+            Some("response_timeout_after_request_commit")
+        }
+        "ipc_response_transport_failure_after_request_commit" => {
+            Some("response_transport_failure_after_request_commit")
+        }
+        _ => None,
+    }
 }
 
 pub fn target_replay_or_spent_tombstone_contract(

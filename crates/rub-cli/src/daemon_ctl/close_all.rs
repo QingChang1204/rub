@@ -139,7 +139,7 @@ pub(crate) async fn close_all_sessions_until(
                         current_entry = attached_entry;
                         let request = mutating_request(
                             "close",
-                            serde_json::json!({}),
+                            json!({}),
                             remaining_budget_ms(command_deadline).max(1),
                         );
                         match send_existing_request_with_replay_recovery(
@@ -276,30 +276,22 @@ pub(crate) async fn close_all_sessions_until(
 
         match disposition {
             CloseAllDisposition::Closed => {
-                match cleanup_and_deregister_close_all_entry(rub_home, &current_entry) {
-                    Ok(()) => closed.push(target.session_name),
-                    Err(error) => {
-                        record_close_all_session_error(
-                            &target.session_name,
-                            error,
-                            &mut session_error_details,
-                        );
-                        push_unique_session(&mut failed, target.session_name);
-                    }
-                }
+                record_close_all_cleanup_result(
+                    cleanup_and_deregister_close_all_entry(rub_home, &current_entry),
+                    &target.session_name,
+                    &mut closed,
+                    &mut failed,
+                    &mut session_error_details,
+                );
             }
             CloseAllDisposition::CleanedStale => {
-                match cleanup_and_deregister_close_all_entry(rub_home, &current_entry) {
-                    Ok(()) => cleaned_stale.push(target.session_name),
-                    Err(error) => {
-                        record_close_all_session_error(
-                            &target.session_name,
-                            error,
-                            &mut session_error_details,
-                        );
-                        push_unique_session(&mut failed, target.session_name);
-                    }
-                }
+                record_close_all_cleanup_result(
+                    cleanup_and_deregister_close_all_entry(rub_home, &current_entry),
+                    &target.session_name,
+                    &mut cleaned_stale,
+                    &mut failed,
+                    &mut session_error_details,
+                );
             }
             CloseAllDisposition::Failed => {
                 if let Some(compatibility_degraded_owned) = target.compatibility_degraded_owned {
@@ -321,6 +313,22 @@ pub(crate) async fn close_all_sessions_until(
         failed,
         session_error_details,
     })
+}
+
+fn record_close_all_cleanup_result(
+    cleanup_result: Result<(), RubError>,
+    session_name: &str,
+    success_bucket: &mut Vec<String>,
+    failed: &mut Vec<String>,
+    session_error_details: &mut Vec<BatchCloseSessionError>,
+) {
+    match cleanup_result {
+        Ok(()) => success_bucket.push(session_name.to_string()),
+        Err(error) => {
+            record_close_all_session_error(session_name, error, session_error_details);
+            push_unique_session(failed, session_name.to_string());
+        }
+    }
 }
 
 fn resolve_attached_close_all_authority(
@@ -556,13 +564,14 @@ mod tests {
     };
     use rub_core::error::{ErrorCode, ErrorEnvelope};
     use rub_ipc::protocol::IpcResponse;
+    use serde_json::json;
 
     #[test]
     fn close_all_preserves_daemon_authoritative_error_response() {
         let response = IpcResponse::error(
             "req-close",
             ErrorEnvelope::new(ErrorCode::AutomationPaused, "automation is paused").with_context(
-                serde_json::json!({
+                json!({
                     "reason": "automation_paused_for_handoff",
                     "daemon_truth": true,
                 }),
@@ -577,14 +586,14 @@ mod tests {
         assert_eq!(envelope.code, ErrorCode::AutomationPaused);
         assert_eq!(
             envelope.context.as_ref().and_then(|ctx| ctx.get("reason")),
-            Some(&serde_json::json!("automation_paused_for_handoff"))
+            Some(&json!("automation_paused_for_handoff"))
         );
         assert_eq!(
             envelope
                 .context
                 .as_ref()
                 .and_then(|ctx| ctx.get("daemon_truth")),
-            Some(&serde_json::json!(true))
+            Some(&json!(true))
         );
     }
 
@@ -597,7 +606,7 @@ mod tests {
             let response = IpcResponse::error(
                 "req-close",
                 ErrorEnvelope::new(ErrorCode::SessionBusy, "session is shutting down")
-                    .with_context(serde_json::json!({ "reason": reason })),
+                    .with_context(json!({ "reason": reason })),
             );
 
             assert!(close_all_response_is_shutdown_in_progress(&response));
@@ -606,7 +615,7 @@ mod tests {
         let response = IpcResponse::error(
             "req-close",
             ErrorEnvelope::new(ErrorCode::SessionBusy, "session is busy")
-                .with_context(serde_json::json!({ "reason": "queue_busy" })),
+                .with_context(json!({ "reason": "queue_busy" })),
         );
 
         assert!(!close_all_response_is_shutdown_in_progress(&response));

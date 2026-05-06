@@ -251,7 +251,7 @@ fn build_managed_config(
 fn build_managed_config_with_executable(
     options: &BrowserLaunchOptions,
     identity_policy: &IdentityPolicy,
-    executable_override: Option<&std::path::Path>,
+    executable_override: Option<&Path>,
 ) -> Result<BrowserConfig, RubError> {
     let mut config_builder = if options.headless {
         BrowserConfig::builder().new_headless_mode()

@@ -3,27 +3,30 @@ use super::args::{
     PipeWorkflowAssetSpec,
 };
 use super::*;
-use crate::router::secret_resolution::resolve_json_value_with_secret_resolution;
+use crate::router::secret_resolution::{
+    ResolvedJsonSpec, resolve_json_value_with_secret_resolution,
+};
 use rub_core::json_spec::NormalizedJsonSpec;
+use std::path::Path;
 
 pub(super) fn parse_fill_steps(
     raw: &NormalizedJsonSpec,
-    rub_home: &std::path::Path,
-) -> Result<super::super::secret_resolution::ResolvedJsonSpec<Vec<FillStepSpec>>, RubError> {
+    rub_home: &Path,
+) -> Result<ResolvedJsonSpec<Vec<FillStepSpec>>, RubError> {
     resolve_json_value_with_secret_resolution(raw.as_value().clone(), "fill", rub_home)
 }
 
 pub(super) fn parse_pipe_spec(
     raw: &NormalizedJsonSpec,
-    rub_home: &std::path::Path,
-) -> Result<super::super::secret_resolution::ResolvedJsonSpec<ParsedPipeWorkflowSpec>, RubError> {
+    rub_home: &Path,
+) -> Result<ResolvedJsonSpec<ParsedPipeWorkflowSpec>, RubError> {
     let parsed = if raw.as_value().is_array() {
         let parsed = resolve_json_value_with_secret_resolution::<Vec<PipeStepSpec>>(
             raw.as_value().clone(),
             "pipe",
             rub_home,
         )?;
-        super::super::secret_resolution::ResolvedJsonSpec {
+        ResolvedJsonSpec {
             value: ParsedPipeWorkflowSpec {
                 steps: parsed.value,
                 orchestrations: Vec::new(),
@@ -36,7 +39,7 @@ pub(super) fn parse_pipe_spec(
             "pipe",
             rub_home,
         )?;
-        super::super::secret_resolution::ResolvedJsonSpec {
+        ResolvedJsonSpec {
             value: ParsedPipeWorkflowSpec {
                 steps: parsed.value.steps,
                 orchestrations: parsed.value.orchestrations,

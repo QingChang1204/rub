@@ -20,7 +20,8 @@ mod tests {
         list_workflows, persist_history_export_asset, persist_history_export_asset_until,
         resolve_named_workflow_path,
     };
-    use crate::commands::{Commands, EffectiveCli, RequestedLaunchPolicy};
+    use crate::commands::{Commands, EffectiveCli};
+    use crate::test_support::effective_cli as cli_with;
     use rub_core::error::ErrorCode;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -39,31 +40,20 @@ mod tests {
         })
     }
 
-    fn cli_with(command: Commands, rub_home: PathBuf) -> EffectiveCli {
-        EffectiveCli {
-            session: "default".to_string(),
-            session_id: None,
-            rub_home,
-            timeout: 30_000,
-            headed: false,
-            ignore_cert_errors: false,
-            user_data_dir: None,
-            hide_infobars: true,
-            json_pretty: false,
-            verbose: false,
-            trace: false,
-            command,
-            cdp_url: None,
-            connect: false,
-            profile: None,
-            profile_resolved_path: None,
-            use_alias: None,
-            no_stealth: false,
-            humanize: false,
-            humanize_speed: "normal".to_string(),
-            requested_launch_policy: RequestedLaunchPolicy::default(),
-            effective_launch_policy: RequestedLaunchPolicy::default(),
-        }
+    fn history_pipe_output_cli(home: &Path, output_path: &Path) -> EffectiveCli {
+        cli_with(
+            Commands::History {
+                last: 10,
+                from: None,
+                to: None,
+                export_pipe: true,
+                export_script: false,
+                include_observation: false,
+                save_as: None,
+                output: Some(output_path.display().to_string()),
+            },
+            home.to_path_buf(),
+        )
     }
 
     #[test]
@@ -176,19 +166,7 @@ mod tests {
             std::env::temp_dir().join(format!("rub-workflow-projection-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let output_path = home.join("exports/history.json");
-        let cli = cli_with(
-            Commands::History {
-                last: 10,
-                from: None,
-                to: None,
-                export_pipe: true,
-                export_script: false,
-                include_observation: false,
-                save_as: None,
-                output: Some(output_path.display().to_string()),
-            },
-            home.clone(),
-        );
+        let cli = history_pipe_output_cli(&home, &output_path);
 
         let mut data = serde_json::json!({
             "subject": {
@@ -525,19 +503,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&home);
         let output_path = home.join("exports/history.json");
-        let cli = cli_with(
-            Commands::History {
-                last: 10,
-                from: None,
-                to: None,
-                export_pipe: true,
-                export_script: false,
-                include_observation: false,
-                save_as: None,
-                output: Some(output_path.display().to_string()),
-            },
-            home.clone(),
-        );
+        let cli = history_pipe_output_cli(&home, &output_path);
 
         let mut data = serde_json::json!({
             "subject": { "kind": "command_history" },

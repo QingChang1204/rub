@@ -1,19 +1,22 @@
 use super::*;
 use crate::router::request_args::parse_optional_u32_arg;
 use rub_core::error::ErrorCode;
+use rub_core::model::Snapshot;
 use rub_core::observation::{ObservationScope, ObservationSelection};
 
 #[derive(Debug, Clone)]
 pub(super) struct ScopedSnapshot {
-    pub snapshot: rub_core::model::Snapshot,
+    pub snapshot: Snapshot,
     pub scope: ObservationScope,
     pub scope_total_count: u32,
     pub scope_match_count: u32,
 }
 
+pub(super) type ObservationScopeMetadata = (ObservationScope, u32, u32);
+
 pub(super) async fn apply_observation_scope(
     router: &DaemonRouter,
-    snapshot: rub_core::model::Snapshot,
+    snapshot: Snapshot,
     scope: &ObservationScope,
 ) -> Result<ScopedSnapshot, RubError> {
     let (scoped_elements, scope_match_count) = router
@@ -33,6 +36,23 @@ pub(super) async fn apply_observation_scope(
         scope_total_count,
         scope_match_count,
     })
+}
+
+pub(super) async fn apply_optional_observation_scope(
+    router: &DaemonRouter,
+    snapshot: Snapshot,
+    observation_scope: Option<&ObservationScope>,
+) -> Result<(Snapshot, Option<ObservationScopeMetadata>), RubError> {
+    let Some(scope) = observation_scope else {
+        return Ok((snapshot, None));
+    };
+    let scoped = apply_observation_scope(router, snapshot, scope).await?;
+    let metadata = Some((
+        scoped.scope.clone(),
+        scoped.scope_total_count,
+        scoped.scope_match_count,
+    ));
+    Ok((scoped.snapshot, metadata))
 }
 
 pub(super) fn parse_observation_scope(
@@ -90,7 +110,7 @@ pub(super) fn parse_observation_scope(
     Ok(Some(scope))
 }
 
-pub(super) fn apply_projection_limit(snapshot: &mut rub_core::model::Snapshot, limit: Option<u32>) {
+pub(super) fn apply_projection_limit(snapshot: &mut Snapshot, limit: Option<u32>) {
     let Some(limit) = limit else {
         return;
     };

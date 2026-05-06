@@ -688,14 +688,13 @@ mod tests {
             ("close", serde_json::json!({})),
         ];
         for (command, args) in runtime_mutations {
-            let metadata = command_metadata_for_args(command, &args);
-            assert_eq!(metadata.effect_class, CommandEffectClass::RuntimeMutation);
-            assert_eq!(
-                metadata.timeout_recovery_surface,
+            assert_runtime_metadata(
+                command,
+                &args,
+                CommandEffectClass::RuntimeMutation,
                 TimeoutRecoverySurface::PossibleCommit,
-                "{command} {args:?}"
+                ReplaySafety::RequiresSameCommandId,
             );
-            assert_eq!(metadata.replay_safety, ReplaySafety::RequiresSameCommandId);
         }
 
         let read_only_runtime_surfaces = [
@@ -705,15 +704,30 @@ mod tests {
             ("interference", serde_json::json!({ "sub": "status" })),
         ];
         for (command, args) in read_only_runtime_surfaces {
-            let metadata = command_metadata_for_args(command, &args);
-            assert_eq!(metadata.effect_class, CommandEffectClass::ReadOnly);
-            assert_eq!(
-                metadata.timeout_recovery_surface,
+            assert_runtime_metadata(
+                command,
+                &args,
+                CommandEffectClass::ReadOnly,
                 TimeoutRecoverySurface::None,
-                "{command} {args:?}"
+                ReplaySafety::SafeWithFreshCommandId,
             );
-            assert_eq!(metadata.replay_safety, ReplaySafety::SafeWithFreshCommandId);
         }
+    }
+
+    fn assert_runtime_metadata(
+        command: &str,
+        args: &serde_json::Value,
+        effect_class: CommandEffectClass,
+        timeout_recovery_surface: TimeoutRecoverySurface,
+        replay_safety: ReplaySafety,
+    ) {
+        let metadata = command_metadata_for_args(command, args);
+        assert_eq!(metadata.effect_class, effect_class);
+        assert_eq!(
+            metadata.timeout_recovery_surface, timeout_recovery_surface,
+            "{command} {args:?}"
+        );
+        assert_eq!(metadata.replay_safety, replay_safety);
     }
 
     #[test]

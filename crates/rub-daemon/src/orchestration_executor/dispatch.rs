@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::time::Duration;
+
 use rub_core::error::ErrorEnvelope;
 use rub_core::model::{
     OrchestrationSessionInfo, OrchestrationStepResultInfo, OrchestrationStepStatus,
@@ -7,7 +10,7 @@ use rub_core::recovery_contract::target_replay_or_spent_tombstone_contract_with_
 use rub_ipc::protocol::IpcRequest;
 
 use crate::router::automation_fence::ensure_committed_automation_result;
-use crate::router::{RouterFenceDisposition, RouterTransactionGuard};
+use crate::router::{RouterFenceDisposition, RouterTransactionGuard, TransactionDeadline};
 use crate::scheduler_policy::AUTOMATION_QUEUE_SHUTDOWN_POLL_INTERVAL;
 
 use super::action_request::{
@@ -135,7 +138,7 @@ async fn run_with_frozen_orchestration_request_retry<T, F, Fut>(
 ) -> Result<(T, u32), OrchestrationRetryFailure>
 where
     F: FnMut(IpcRequest) -> Fut,
-    Fut: std::future::Future<Output = Result<T, ErrorEnvelope>>,
+    Fut: Future<Output = Result<T, ErrorEnvelope>>,
 {
     let timeout_request = request.clone();
     run_with_orchestration_retry_with_timeout_error(
@@ -201,15 +204,14 @@ async fn reserve_source_materialization_authority<'a>(
         return Ok(None);
     }
 
-    let queue_wait_budget = std::time::Duration::from_millis(
+    let queue_wait_budget = Duration::from_millis(
         orchestration_source_materialization_wait_budget_ms(action, context.rub_home)?,
     );
     let queue_wait_budget = context
         .outer_deadline
         .and_then(|deadline| {
             let remaining_ms = deadline.remaining_ms();
-            (remaining_ms > 0)
-                .then_some(queue_wait_budget.min(std::time::Duration::from_millis(remaining_ms)))
+            (remaining_ms > 0).then_some(queue_wait_budget.min(Duration::from_millis(remaining_ms)))
         })
         .unwrap_or(queue_wait_budget);
     if queue_wait_budget.is_zero() {
@@ -266,7 +268,7 @@ fn trim_action_request_timeout_after_pre_dispatch(
     request: &mut IpcRequest,
     step_started_at: tokio::time::Instant,
     step_index: u32,
-    outer_deadline: Option<crate::router::TransactionDeadline>,
+    outer_deadline: Option<TransactionDeadline>,
 ) -> Result<(), ErrorEnvelope> {
     let original_timeout_ms = request.timeout_ms;
     let elapsed_ms = step_started_at.elapsed().as_millis() as u64;
@@ -356,27 +358,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     fn test_router() -> DaemonRouter {
-        let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
-            rub_cdp::browser::BrowserLaunchOptions {
-                headless: true,
-                ignore_cert_errors: false,
-                user_data_dir: None,
-                managed_profile_ephemeral: false,
-                download_dir: None,
-                profile_directory: None,
-                hide_infobars: true,
-                stealth: true,
-            },
-        ));
-        let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
-            manager,
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            rub_cdp::humanize::HumanizeConfig {
-                enabled: false,
-                speed: rub_cdp::humanize::HumanizeSpeed::Normal,
-            },
-        ));
-        DaemonRouter::new(adapter)
+        crate::test_support::daemon_router()
     }
 
     fn sample_rule() -> OrchestrationRuleInfo {
@@ -423,7 +405,7 @@ mod tests {
 
     #[test]
     fn trim_action_request_timeout_after_pre_dispatch_projects_remaining_budget() {
-        let started_at = tokio::time::Instant::now() - std::time::Duration::from_millis(80);
+        let started_at = tokio::time::Instant::now() - Duration::from_millis(80);
         let mut request = IpcRequest::new("wait", serde_json::json!({ "timeout_ms": 500 }), 500);
 
         trim_action_request_timeout_after_pre_dispatch(&mut request, started_at, 0, None)
@@ -441,7 +423,7 @@ mod tests {
 
     #[test]
     fn trim_action_request_timeout_after_pre_dispatch_fails_when_budget_is_exhausted() {
-        let started_at = tokio::time::Instant::now() - std::time::Duration::from_millis(50);
+        let started_at = tokio::time::Instant::now() - Duration::from_millis(50);
         let mut request = IpcRequest::new("wait", serde_json::json!({ "timeout_ms": 10 }), 10);
 
         let error =

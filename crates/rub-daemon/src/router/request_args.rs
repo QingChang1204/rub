@@ -4,7 +4,9 @@ mod locator;
 #[cfg(test)]
 pub(crate) use self::json::parse_json_spec;
 pub(crate) use self::json::{
-    parse_json_args, parse_json_spec_value, reject_unknown_fields, required_string_arg,
+    canonical_json_batch_root, copy_semantic_raw_field, first_canonical_json_root,
+    lookup_json_path, parse_json_args, parse_json_spec_value, reject_unknown_fields,
+    required_string_arg,
 };
 pub(crate) use self::json::{parse_optional_u32_arg, subcommand_arg};
 pub(crate) use self::locator::parse_canonical_locator;

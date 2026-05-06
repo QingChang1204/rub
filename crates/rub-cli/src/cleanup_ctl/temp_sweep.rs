@@ -72,6 +72,52 @@ fn record_temp_daemon_authority_lost(
     record_temp_daemon_unreleased(result, daemon, key);
 }
 
+fn record_active_temp_daemon_unreleased(
+    active_temp_homes: &mut HashSet<PathBuf>,
+    result: &mut CleanupResult,
+    daemon: &TempDaemonProcess,
+    key: &str,
+) {
+    active_temp_homes.insert(daemon.rub_home.clone());
+    record_temp_daemon_unreleased(result, daemon, key);
+}
+
+fn handle_temp_daemon_release_outcome(
+    outcome: TempDaemonReleaseOutcome,
+    active_temp_homes: &mut HashSet<PathBuf>,
+    result: &mut CleanupResult,
+    daemon: &TempDaemonProcess,
+    key: String,
+) {
+    match outcome {
+        TempDaemonReleaseOutcome::Released => record_temp_daemon_released(result, daemon, key),
+        TempDaemonReleaseOutcome::StillLive => {
+            record_active_temp_daemon_unreleased(active_temp_homes, result, daemon, &key);
+        }
+        TempDaemonReleaseOutcome::AuthorityLost => {
+            active_temp_homes.insert(daemon.rub_home.clone());
+            record_temp_daemon_authority_lost(result, daemon, &key);
+        }
+    }
+}
+
+fn best_effort_temp_sweep_result<T>(
+    value: Result<T, RubError>,
+    active_temp_homes: &mut HashSet<PathBuf>,
+    result: &mut CleanupResult,
+    daemon: &TempDaemonProcess,
+    key: &str,
+) -> Result<Option<T>, RubError> {
+    match value {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if timeout_error_for_best_effort_temp_sweep(&error) => {
+            record_active_temp_daemon_unreleased(active_temp_homes, result, daemon, key);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn record_temp_daemon_released(
     result: &mut CleanupResult,
     daemon: &TempDaemonProcess,
@@ -118,8 +164,12 @@ pub(super) async fn sweep_temp_daemons(
                     ) {
                         Ok(timeout_ms) => timeout_ms,
                         Err(error) if timeout_error_for_best_effort_temp_sweep(&error) => {
-                            active_temp_homes.insert(daemon.rub_home.clone());
-                            record_temp_daemon_unreleased(result, &daemon, &key);
+                            record_active_temp_daemon_unreleased(
+                                &mut active_temp_homes,
+                                result,
+                                &daemon,
+                                &key,
+                            );
                             continue;
                         }
                         Err(error) => return Err(error),
@@ -157,13 +207,16 @@ pub(super) async fn sweep_temp_daemons(
                                         ),
                                     )
                                     .await;
-                                if let Err(error) = close_result {
-                                    if timeout_error_for_best_effort_temp_sweep(&error) {
-                                        active_temp_homes.insert(daemon.rub_home.clone());
-                                        record_temp_daemon_unreleased(result, &daemon, &key);
-                                        continue;
-                                    }
-                                    return Err(error);
+                                if best_effort_temp_sweep_result(
+                                    close_result,
+                                    &mut active_temp_homes,
+                                    result,
+                                    &daemon,
+                                    &key,
+                                )?
+                                .is_none()
+                                {
+                                    continue;
                                 }
                             }
                             None => {
@@ -174,36 +227,33 @@ pub(super) async fn sweep_temp_daemons(
                                     async { terminate_revalidated_temp_daemon(&daemon).await },
                                 )
                                 .await;
-                                let terminated = match terminated {
-                                    Ok(terminated) => terminated,
-                                    Err(error)
-                                        if timeout_error_for_best_effort_temp_sweep(&error) =>
-                                    {
-                                        active_temp_homes.insert(daemon.rub_home.clone());
-                                        record_temp_daemon_unreleased(result, &daemon, &key);
-                                        continue;
-                                    }
-                                    Err(error) => return Err(error),
+                                let Some(terminated) = best_effort_temp_sweep_result(
+                                    terminated,
+                                    &mut active_temp_homes,
+                                    result,
+                                    &daemon,
+                                    &key,
+                                )?
+                                else {
+                                    continue;
                                 };
-                                match terminated {
-                                    TempDaemonReleaseOutcome::Released => {
-                                        record_temp_daemon_released(result, &daemon, key);
-                                    }
-                                    TempDaemonReleaseOutcome::StillLive => {
-                                        active_temp_homes.insert(daemon.rub_home.clone());
-                                        record_temp_daemon_unreleased(result, &daemon, &key);
-                                    }
-                                    TempDaemonReleaseOutcome::AuthorityLost => {
-                                        active_temp_homes.insert(daemon.rub_home.clone());
-                                        record_temp_daemon_authority_lost(result, &daemon, &key);
-                                    }
-                                }
+                                handle_temp_daemon_release_outcome(
+                                    terminated,
+                                    &mut active_temp_homes,
+                                    result,
+                                    &daemon,
+                                    key,
+                                );
                                 continue;
                             }
                         },
                         Err(error) if timeout_error_for_best_effort_temp_sweep(&error) => {
-                            active_temp_homes.insert(daemon.rub_home.clone());
-                            record_temp_daemon_unreleased(result, &daemon, &key);
+                            record_active_temp_daemon_unreleased(
+                                &mut active_temp_homes,
+                                result,
+                                &daemon,
+                                &key,
+                            );
                             continue;
                         }
                         Err(error) => return Err(error),
@@ -215,13 +265,16 @@ pub(super) async fn sweep_temp_daemons(
                         "cleanup_temp_daemon_shutdown_wait",
                     )
                     .await;
-                    if let Err(error) = shutdown_wait {
-                        if timeout_error_for_best_effort_temp_sweep(&error) {
-                            active_temp_homes.insert(daemon.rub_home.clone());
-                            record_temp_daemon_unreleased(result, &daemon, &key);
-                            continue;
-                        }
-                        return Err(error);
+                    if best_effort_temp_sweep_result(
+                        shutdown_wait,
+                        &mut active_temp_homes,
+                        result,
+                        &daemon,
+                        &key,
+                    )?
+                    .is_none()
+                    {
+                        continue;
                     }
                     let terminated = crate::timeout_budget::run_with_remaining_budget(
                         deadline,
@@ -230,44 +283,41 @@ pub(super) async fn sweep_temp_daemons(
                         async { terminate_revalidated_temp_daemon(&daemon).await },
                     )
                     .await;
-                    let terminated = match terminated {
-                        Ok(terminated) => terminated,
-                        Err(error) if timeout_error_for_best_effort_temp_sweep(&error) => {
-                            active_temp_homes.insert(daemon.rub_home.clone());
-                            record_temp_daemon_unreleased(result, &daemon, &key);
-                            continue;
-                        }
-                        Err(error) => return Err(error),
+                    let Some(terminated) = best_effort_temp_sweep_result(
+                        terminated,
+                        &mut active_temp_homes,
+                        result,
+                        &daemon,
+                        &key,
+                    )?
+                    else {
+                        continue;
                     };
-                    match terminated {
-                        TempDaemonReleaseOutcome::Released => {
-                            record_temp_daemon_released(result, &daemon, key);
-                        }
-                        TempDaemonReleaseOutcome::StillLive => {
-                            active_temp_homes.insert(daemon.rub_home.clone());
-                            record_temp_daemon_unreleased(result, &daemon, &key);
-                        }
-                        TempDaemonReleaseOutcome::AuthorityLost => {
-                            active_temp_homes.insert(daemon.rub_home.clone());
-                            record_temp_daemon_authority_lost(result, &daemon, &key);
-                        }
-                    }
+                    handle_temp_daemon_release_outcome(
+                        terminated,
+                        &mut active_temp_homes,
+                        result,
+                        &daemon,
+                        key,
+                    );
                     continue;
                 } else {
-                    active_temp_homes.insert(daemon.rub_home.clone());
-                    record_temp_daemon_unreleased(result, &daemon, &key);
+                    record_active_temp_daemon_unreleased(
+                        &mut active_temp_homes,
+                        result,
+                        &daemon,
+                        &key,
+                    );
                 }
                 continue;
             }
             Ok(None) => {}
             Err(error) if timeout_error_for_best_effort_temp_sweep(&error) => {
-                active_temp_homes.insert(daemon.rub_home.clone());
-                record_temp_daemon_unreleased(result, &daemon, &key);
+                record_active_temp_daemon_unreleased(&mut active_temp_homes, result, &daemon, &key);
                 continue;
             }
             Err(_) if is_process_alive(daemon.pid) => {
-                active_temp_homes.insert(daemon.rub_home.clone());
-                record_temp_daemon_unreleased(result, &daemon, &key);
+                record_active_temp_daemon_unreleased(&mut active_temp_homes, result, &daemon, &key);
                 continue;
             }
             Err(_) => {}
@@ -280,19 +330,13 @@ pub(super) async fn sweep_temp_daemons(
             async { terminate_revalidated_temp_daemon(&daemon).await },
         )
         .await?;
-        match terminated {
-            TempDaemonReleaseOutcome::Released => {
-                record_temp_daemon_released(result, &daemon, key);
-            }
-            TempDaemonReleaseOutcome::StillLive => {
-                active_temp_homes.insert(daemon.rub_home.clone());
-                record_temp_daemon_unreleased(result, &daemon, &key);
-            }
-            TempDaemonReleaseOutcome::AuthorityLost => {
-                active_temp_homes.insert(daemon.rub_home.clone());
-                record_temp_daemon_authority_lost(result, &daemon, &key);
-            }
-        }
+        handle_temp_daemon_release_outcome(
+            terminated,
+            &mut active_temp_homes,
+            result,
+            &daemon,
+            key,
+        );
     }
 
     Ok(active_temp_homes)
@@ -310,9 +354,7 @@ fn remaining_cleanup_budget_ms(
     timeout_ms: u64,
     phase: &'static str,
 ) -> Result<u64, RubError> {
-    crate::timeout_budget::remaining_budget_duration(deadline)
-        .map(|remaining| remaining.as_millis().clamp(1, u64::MAX as u128) as u64)
-        .ok_or_else(|| crate::main_support::command_timeout_error(timeout_ms, phase))
+    crate::timeout_budget::remaining_budget_ms_or_timeout(deadline, timeout_ms, phase)
 }
 
 pub(super) async fn sweep_orphan_temp_browsers(

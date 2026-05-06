@@ -1,3 +1,5 @@
+use crate::http_fixture::{local_http_origin, normalize_url_path};
+
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -108,12 +110,12 @@ impl TestServer {
 
     /// Get the base URL for this test server.
     pub fn url(&self) -> String {
-        format!("http://{}", self.addr)
+        local_http_origin(self.addr)
     }
 
     /// Get the URL for a specific path.
     pub fn url_for(&self, path: &str) -> String {
-        format!("http://{}{}", self.addr, normalize_url_path(path))
+        format!("{}{}", self.url(), normalize_url_path(path))
     }
 
     pub async fn stop_async(mut self) {
@@ -139,16 +141,6 @@ fn parse_request_line(request: &str) -> Option<(String, String)> {
 
 fn normalize_request_target(target: &str) -> String {
     target.split('?').next().unwrap_or(target).to_string()
-}
-
-fn normalize_url_path(path: &str) -> String {
-    if path.is_empty() {
-        "/".to_string()
-    } else if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{path}")
-    }
 }
 
 fn route_matches_definition(route: &RouteDefinition, method: &str, path: &str) -> bool {

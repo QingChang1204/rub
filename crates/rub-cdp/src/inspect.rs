@@ -4,6 +4,8 @@ use rub_core::model::{BoundingBox, Element, Snapshot};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::snapshot_lookup::snapshot_uses_listener_promoted_classifier;
+
 const MATCH_INTERACTIVE_SELECTOR_JS_TEMPLATE: &str = r##"
 JSON.stringify((() => {
     const selector = __SELECTOR__;
@@ -383,15 +385,6 @@ async fn resolve_selector_matches(
     resolve_snapshot_selector_matches(snapshot, selector, error_label, payload.match_entries)
 }
 
-fn snapshot_uses_listener_promoted_classifier(snapshot: &Snapshot) -> bool {
-    snapshot.elements.iter().any(|element| {
-        element
-            .listeners
-            .as_ref()
-            .is_some_and(|listeners| !listeners.is_empty())
-    })
-}
-
 fn resolve_snapshot_selector_matches(
     snapshot: &Snapshot,
     selector: &str,
@@ -399,22 +392,13 @@ fn resolve_snapshot_selector_matches(
     match_entries: Vec<SelectorMatchEntry>,
 ) -> Result<Vec<Element>, RubError> {
     let snapshot_by_index = crate::snapshot_lookup::build_snapshot_index_lookup(snapshot);
-    let missing_indices = match_entries
-        .iter()
-        .map(|matched| matched.index)
-        .filter(|index| !snapshot_by_index.contains_key(index))
-        .collect::<Vec<_>>();
-    let mismatched_indices = match_entries
-        .iter()
-        .filter_map(|matched| {
-            let expected = snapshot_by_index.get(&matched.index)?;
-            (!crate::targeting::snapshot_element_replay_matches_authority(
-                expected,
-                &matched.element,
-            ))
-            .then_some(matched.index)
-        })
-        .collect::<Vec<_>>();
+    let (missing_indices, mismatched_indices) =
+        crate::snapshot_lookup::collect_replay_mismatch_indices(
+            &snapshot_by_index,
+            match_entries
+                .iter()
+                .map(|matched| (matched.index, &matched.element)),
+        );
 
     if !missing_indices.is_empty() || !mismatched_indices.is_empty() {
         return Err(snapshot_selector_replay_error(
@@ -493,15 +477,12 @@ fn parse_attributes_json(raw: &str) -> Result<HashMap<String, String>, RubError>
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        SelectorMatchEntry, parse_attributes_json, resolve_snapshot_selector_matches,
-        snapshot_uses_listener_promoted_classifier,
+    use super::{SelectorMatchEntry, parse_attributes_json, resolve_snapshot_selector_matches};
+    use crate::snapshot_lookup::{
+        sample_button_element, sample_frame_context, snapshot_uses_listener_promoted_classifier,
     };
     use rub_core::error::ErrorCode;
-    use rub_core::model::{
-        Element, ElementTag, FrameContextInfo, ScrollPosition, Snapshot, SnapshotProjection,
-    };
-    use std::collections::HashMap;
+    use rub_core::model::{Element, ScrollPosition, Snapshot, SnapshotProjection};
 
     #[test]
     fn parse_attributes_json_rejects_invalid_payload() {
@@ -601,15 +582,7 @@ mod tests {
         Snapshot {
             snapshot_id: "snap-selector".to_string(),
             dom_epoch: 1,
-            frame_context: FrameContextInfo {
-                frame_id: "frame-main".to_string(),
-                name: Some("main".to_string()),
-                parent_frame_id: None,
-                target_id: Some("target-1".to_string()),
-                url: Some("https://example.test".to_string()),
-                depth: 0,
-                same_origin_accessible: Some(true),
-            },
+            frame_context: sample_frame_context("frame-main", Some("main")),
             frame_lineage: vec!["frame-main".to_string()],
             url: "https://example.test".to_string(),
             title: "Example".to_string(),
@@ -635,18 +608,7 @@ mod tests {
     }
 
     fn sample_element(index: u32, text: &str) -> Element {
-        Element {
-            index,
-            tag: ElementTag::Button,
-            text: text.to_string(),
-            attributes: HashMap::new(),
-            element_ref: Some(format!("frame-main:{index}")),
-            target_id: None,
-            bounding_box: None,
-            ax_info: None,
-            listeners: None,
-            depth: Some(0),
-        }
+        sample_button_element(index, text)
     }
 
     fn sample_match_entry(index: u32, text: &str) -> SelectorMatchEntry {

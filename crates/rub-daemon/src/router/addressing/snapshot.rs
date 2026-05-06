@@ -2,26 +2,22 @@ use crate::runtime_refresh::refresh_live_frame_runtime;
 use crate::session::SessionState;
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::Snapshot;
+use serde_json::Value;
 use std::sync::Arc;
 
+use super::super::frame_scope::{ensure_request_frame_available, orchestration_frame_override};
 use super::super::snapshot::{DeferredSnapshotPublication, build_stable_snapshot};
 use super::super::{DaemonRouter, TransactionDeadline};
 
 pub(super) async fn load_snapshot(
     router: &DaemonRouter,
-    args: &serde_json::Value,
+    args: &Value,
     state: &Arc<SessionState>,
     deadline: TransactionDeadline,
     prefer_a11y: bool,
 ) -> Result<Arc<Snapshot>, RubError> {
     if let Some(snapshot_id) = args.get("snapshot_id").and_then(|value| value.as_str()) {
-        let requested_frame_id =
-            if let Some(frame_id) = super::super::frame_scope::orchestration_frame_override(args) {
-                super::super::frame_scope::ensure_request_frame_available(router, frame_id).await?;
-                Some(frame_id.to_string())
-            } else {
-                None
-            };
+        let requested_frame_id = requested_frame_id(router, args).await?;
         refresh_live_frame_runtime(&router.browser, state).await;
         return load_cached_snapshot(state, snapshot_id, requested_frame_id.as_deref()).await;
     }
@@ -34,19 +30,13 @@ pub(super) async fn load_snapshot(
 
 pub(super) async fn load_snapshot_deferred(
     router: &DaemonRouter,
-    args: &serde_json::Value,
+    args: &Value,
     state: &Arc<SessionState>,
     deadline: TransactionDeadline,
     prefer_a11y: bool,
 ) -> Result<DeferredSnapshotPublication, RubError> {
     if let Some(snapshot_id) = args.get("snapshot_id").and_then(|value| value.as_str()) {
-        let requested_frame_id =
-            if let Some(frame_id) = super::super::frame_scope::orchestration_frame_override(args) {
-                super::super::frame_scope::ensure_request_frame_available(router, frame_id).await?;
-                Some(frame_id.to_string())
-            } else {
-                None
-            };
+        let requested_frame_id = requested_frame_id(router, args).await?;
         refresh_live_frame_runtime(&router.browser, state).await;
         let snapshot =
             load_cached_snapshot(state, snapshot_id, requested_frame_id.as_deref()).await?;
@@ -56,6 +46,18 @@ pub(super) async fn load_snapshot_deferred(
     let snapshot =
         build_stable_snapshot(router, args, state, deadline, Some(0), prefer_a11y, false).await?;
     Ok(DeferredSnapshotPublication::fresh(snapshot))
+}
+
+async fn requested_frame_id(
+    router: &DaemonRouter,
+    args: &Value,
+) -> Result<Option<String>, RubError> {
+    if let Some(frame_id) = orchestration_frame_override(args) {
+        ensure_request_frame_available(router, frame_id).await?;
+        Ok(Some(frame_id.to_string()))
+    } else {
+        Ok(None)
+    }
 }
 
 async fn load_cached_snapshot(

@@ -69,12 +69,8 @@ pub(super) const CRITICAL_RUNTIME_HOOKS_MASK: u16 = PageHookFlag::SelfProbe.bit(
 pub(super) const BACKGROUND_DIALOG_HOOK_MASK: u16 = PageHookFlag::Dialogs.bit();
 pub(super) const BACKGROUND_OBSERVATORY_HOOK_MASK: u16 = PageHookFlag::Observatory.bit();
 pub(super) const BACKGROUND_NETWORK_RULES_HOOK_MASK: u16 = PageHookFlag::NetworkRules.bit();
-pub(super) const RUNTIME_CALLBACK_HOOKS_MASK: u16 = PageHookFlag::RuntimeProbe.bit()
-    | PageHookFlag::FrameListener.bit()
-    | PageHookFlag::DocumentListener.bit()
-    | PageHookFlag::Observatory.bit()
-    | PageHookFlag::Dialogs.bit()
-    | PageHookFlag::NetworkRules.bit();
+pub(super) const RUNTIME_CALLBACK_HOOKS_MASK: u16 =
+    CRITICAL_RUNTIME_HOOKS_MASK & !(PageHookFlag::SelfProbe.bit() | PageHookFlag::DomEnable.bit());
 pub(super) const ALL_PAGE_HOOKS_MASK: u16 = IDENTITY_HOOKS_MASK | CRITICAL_RUNTIME_HOOKS_MASK;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

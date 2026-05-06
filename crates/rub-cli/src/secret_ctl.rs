@@ -331,7 +331,7 @@ pub(super) fn secret_registry_error(
 ) -> RubError {
     let mut envelope = error.into_envelope();
     let mut context = match envelope.context.take() {
-        Some(serde_json::Value::Object(existing)) => existing,
+        Some(Value::Object(existing)) => existing,
         Some(other) => {
             let mut object = serde_json::Map::new();
             object.insert("previous_context".to_string(), other);
@@ -355,7 +355,7 @@ pub(super) fn secret_registry_error(
     );
     context.insert("reason".to_string(), json!(reason));
     RubError::Domain(ErrorEnvelope {
-        context: Some(serde_json::Value::Object(context)),
+        context: Some(Value::Object(context)),
         ..envelope
     })
 }

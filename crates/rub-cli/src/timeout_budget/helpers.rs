@@ -369,13 +369,15 @@ fn element_address_args_with_requirement(
         "Match selection is ambiguous: provide at most one of --first, --last, or --nth",
     )?;
 
-    let configured = index.is_some() as u8
-        + element_ref.is_some() as u8
-        + selector.is_some() as u8
-        + target_text.is_some() as u8
-        + role.is_some() as u8
-        + label.is_some() as u8
-        + testid.is_some() as u8;
+    let configured = element_target_configured_count([
+        index.is_some(),
+        element_ref.is_some(),
+        selector.is_some(),
+        target_text.is_some(),
+        role.is_some(),
+        label.is_some(),
+        testid.is_some(),
+    ]);
     if configured == 0 {
         if snapshot.is_some() {
             return Err(RubError::domain(
@@ -431,6 +433,10 @@ fn element_address_args_with_requirement(
         "last": target.last,
         "nth": target.nth,
     }))
+}
+
+fn element_target_configured_count(flags: [bool; 7]) -> u8 {
+    flags.into_iter().map(u8::from).sum()
 }
 
 pub(crate) fn observation_scope_args(
@@ -516,12 +522,5 @@ pub(crate) fn observation_projection_args(
 }
 
 pub(crate) fn resolve_cli_path(path: &str) -> PathBuf {
-    let raw = Path::new(path);
-    if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(raw)
-    }
+    crate::path_normalization::absolute_path(Path::new(path))
 }

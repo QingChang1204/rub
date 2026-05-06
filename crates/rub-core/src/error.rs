@@ -69,6 +69,46 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    pub const ALL: &'static [Self] = &[
+        Self::NavigationFailed,
+        Self::PageLoadTimeout,
+        Self::CertError,
+        Self::ElementNotFound,
+        Self::ElementNotInteractable,
+        Self::InteractionNotConfirmed,
+        Self::StaleSnapshot,
+        Self::StaleIndex,
+        Self::WaitTimeout,
+        Self::TabNotFound,
+        Self::InvalidKeyName,
+        Self::InvalidInput,
+        Self::NoMatchingOption,
+        Self::FileNotFound,
+        Self::JsEvalError,
+        Self::JsTimeout,
+        Self::DaemonStartFailed,
+        Self::DaemonNotRunning,
+        Self::SessionBusy,
+        Self::IpcTimeout,
+        Self::IpcProtocolError,
+        Self::IpcVersionMismatch,
+        Self::IoError,
+        Self::JsonError,
+        Self::InternalError,
+        Self::BrowserNotFound,
+        Self::BrowserCrashed,
+        Self::BrowserLaunchFailed,
+        Self::ProfileInUse,
+        Self::CdpConnectionFailed,
+        Self::CdpConnectionAmbiguous,
+        Self::CdpConnectionLost,
+        Self::ProfileNotFound,
+        Self::ConflictingConnectOptions,
+        Self::StealthPatchFailed,
+        Self::HumanizeTargetNotFound,
+        Self::AutomationPaused,
+    ];
+
     /// Returns the default recovery suggestion for this error code.
     pub fn suggestion(&self) -> &'static str {
         match self {
@@ -272,94 +312,16 @@ mod tests {
 
     #[test]
     fn error_code_roundtrip() {
-        let codes = [
-            ErrorCode::NavigationFailed,
-            ErrorCode::PageLoadTimeout,
-            ErrorCode::CertError,
-            ErrorCode::ElementNotFound,
-            ErrorCode::ElementNotInteractable,
-            ErrorCode::StaleSnapshot,
-            ErrorCode::StaleIndex,
-            ErrorCode::WaitTimeout,
-            ErrorCode::TabNotFound,
-            ErrorCode::InvalidKeyName,
-            ErrorCode::InvalidInput,
-            ErrorCode::NoMatchingOption,
-            ErrorCode::FileNotFound,
-            ErrorCode::JsEvalError,
-            ErrorCode::JsTimeout,
-            ErrorCode::DaemonStartFailed,
-            ErrorCode::DaemonNotRunning,
-            ErrorCode::SessionBusy,
-            ErrorCode::IpcTimeout,
-            ErrorCode::IpcProtocolError,
-            ErrorCode::IpcVersionMismatch,
-            ErrorCode::IoError,
-            ErrorCode::JsonError,
-            ErrorCode::InternalError,
-            ErrorCode::BrowserNotFound,
-            ErrorCode::BrowserCrashed,
-            ErrorCode::BrowserLaunchFailed,
-            ErrorCode::ProfileInUse,
-            ErrorCode::CdpConnectionFailed,
-            ErrorCode::CdpConnectionAmbiguous,
-            ErrorCode::CdpConnectionLost,
-            ErrorCode::ProfileNotFound,
-            ErrorCode::ConflictingConnectOptions,
-            ErrorCode::StealthPatchFailed,
-            ErrorCode::HumanizeTargetNotFound,
-            ErrorCode::AutomationPaused,
-        ];
-
-        for code in codes {
+        for code in ErrorCode::ALL {
             let json = serde_json::to_string(&code).unwrap();
             let back: ErrorCode = serde_json::from_str(&json).unwrap();
-            assert_eq!(code, back, "Roundtrip failed for {json}");
+            assert_eq!(*code, back, "Roundtrip failed for {json}");
         }
     }
 
     #[test]
     fn all_error_codes_have_suggestions() {
-        let codes = [
-            ErrorCode::NavigationFailed,
-            ErrorCode::PageLoadTimeout,
-            ErrorCode::CertError,
-            ErrorCode::ElementNotFound,
-            ErrorCode::ElementNotInteractable,
-            ErrorCode::StaleSnapshot,
-            ErrorCode::StaleIndex,
-            ErrorCode::WaitTimeout,
-            ErrorCode::TabNotFound,
-            ErrorCode::InvalidKeyName,
-            ErrorCode::InvalidInput,
-            ErrorCode::NoMatchingOption,
-            ErrorCode::FileNotFound,
-            ErrorCode::JsEvalError,
-            ErrorCode::JsTimeout,
-            ErrorCode::DaemonStartFailed,
-            ErrorCode::DaemonNotRunning,
-            ErrorCode::SessionBusy,
-            ErrorCode::IpcTimeout,
-            ErrorCode::IpcProtocolError,
-            ErrorCode::IpcVersionMismatch,
-            ErrorCode::IoError,
-            ErrorCode::JsonError,
-            ErrorCode::InternalError,
-            ErrorCode::BrowserNotFound,
-            ErrorCode::BrowserCrashed,
-            ErrorCode::BrowserLaunchFailed,
-            ErrorCode::ProfileInUse,
-            ErrorCode::CdpConnectionFailed,
-            ErrorCode::CdpConnectionAmbiguous,
-            ErrorCode::CdpConnectionLost,
-            ErrorCode::ProfileNotFound,
-            ErrorCode::ConflictingConnectOptions,
-            ErrorCode::StealthPatchFailed,
-            ErrorCode::HumanizeTargetNotFound,
-            ErrorCode::AutomationPaused,
-        ];
-
-        for code in codes {
+        for code in ErrorCode::ALL {
             assert!(
                 !code.suggestion().is_empty(),
                 "Missing suggestion for {code:?}"

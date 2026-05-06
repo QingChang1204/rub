@@ -136,20 +136,7 @@ impl DownloadRuntimeProjectionState {
         let entry = self
             .entries
             .entry(guid.clone())
-            .or_insert_with(|| DownloadEntry {
-                guid: guid.clone(),
-                state: DownloadState::Started,
-                url: None,
-                suggested_filename: None,
-                final_path: None,
-                mime_hint: None,
-                received_bytes: 0,
-                total_bytes: None,
-                started_at: rfc3339_now(),
-                completed_at: None,
-                frame_id: None,
-                trigger_command_id: None,
-            });
+            .or_insert_with(|| default_download_entry(guid.clone()));
         entry.state = DownloadState::Started;
         entry.url = Some(url);
         entry.suggested_filename = Some(suggested_filename);
@@ -178,20 +165,7 @@ impl DownloadRuntimeProjectionState {
         let entry = self
             .entries
             .entry(guid.clone())
-            .or_insert_with(|| DownloadEntry {
-                guid: guid.clone(),
-                state: DownloadState::Started,
-                url: None,
-                suggested_filename: None,
-                final_path: None,
-                mime_hint: None,
-                received_bytes: 0,
-                total_bytes: None,
-                started_at: rfc3339_now(),
-                completed_at: None,
-                frame_id: None,
-                trigger_command_id: None,
-            });
+            .or_insert_with(|| default_download_entry(guid.clone()));
         entry.state = state;
         entry.received_bytes = entry.received_bytes.max(received_bytes);
         if total_bytes.is_some() {
@@ -237,29 +211,24 @@ impl DownloadRuntimeProjectionState {
         self.active_order.retain(|existing| existing != &guid);
         self.completed_order.retain(|existing| existing != &guid);
         self.active_order.push_back(guid.clone());
-        while self.active_order.len() > ACTIVE_DOWNLOAD_LIMIT {
-            if let Some(oldest) = self.active_order.pop_front()
-                && !self
-                    .completed_order
-                    .iter()
-                    .any(|existing| existing == &oldest)
-            {
-                self.entries.remove(&oldest);
-            }
-        }
+        trim_download_order(
+            &mut self.active_order,
+            ACTIVE_DOWNLOAD_LIMIT,
+            &self.completed_order,
+            &mut self.entries,
+        );
     }
 
     fn move_to_completed(&mut self, guid: String) {
         self.active_order.retain(|existing| existing != &guid);
         self.completed_order.retain(|existing| existing != &guid);
         self.completed_order.push_back(guid.clone());
-        while self.completed_order.len() > COMPLETED_DOWNLOAD_LIMIT {
-            if let Some(oldest) = self.completed_order.pop_front()
-                && !self.active_order.iter().any(|existing| existing == &oldest)
-            {
-                self.entries.remove(&oldest);
-            }
-        }
+        trim_download_order(
+            &mut self.completed_order,
+            COMPLETED_DOWNLOAD_LIMIT,
+            &self.active_order,
+            &mut self.entries,
+        );
     }
 
     fn refresh_projection_lists(&mut self) {
@@ -273,6 +242,40 @@ impl DownloadRuntimeProjectionState {
             .iter()
             .filter_map(|guid| self.entries.get(guid).cloned())
             .collect();
+    }
+}
+
+fn default_download_entry(guid: String) -> DownloadEntry {
+    DownloadEntry {
+        guid,
+        state: DownloadState::Started,
+        url: None,
+        suggested_filename: None,
+        final_path: None,
+        mime_hint: None,
+        received_bytes: 0,
+        total_bytes: None,
+        started_at: rfc3339_now(),
+        completed_at: None,
+        frame_id: None,
+        trigger_command_id: None,
+    }
+}
+
+fn trim_download_order(
+    order: &mut VecDeque<String>,
+    limit: usize,
+    retained_elsewhere: &VecDeque<String>,
+    entries: &mut HashMap<String, DownloadEntry>,
+) {
+    while order.len() > limit {
+        if let Some(oldest) = order.pop_front()
+            && !retained_elsewhere
+                .iter()
+                .any(|existing| existing == &oldest)
+        {
+            entries.remove(&oldest);
+        }
     }
 }
 
@@ -720,7 +723,7 @@ mod tests {
             ..DownloadRuntimeInfo::default()
         };
         let callbacks = DownloadCallbacks {
-            on_started: Some(std::sync::Arc::new(|_| {})),
+            on_started: Some(Arc::new(|_| {})),
             on_progress: None,
             on_runtime: None,
         };
@@ -745,8 +748,8 @@ mod tests {
             ..DownloadRuntimeInfo::default()
         };
         let callbacks = DownloadCallbacks {
-            on_started: Some(std::sync::Arc::new(|_| {})),
-            on_progress: Some(std::sync::Arc::new(|_| {})),
+            on_started: Some(Arc::new(|_| {})),
+            on_progress: Some(Arc::new(|_| {})),
             on_runtime: None,
         };
 

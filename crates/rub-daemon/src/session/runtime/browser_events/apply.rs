@@ -2,10 +2,10 @@ use super::*;
 use crate::dialogs;
 use crate::dialogs::DialogOpenedEvent;
 use crate::session::protocol::{
-    BROWSER_EVENT_CRITICAL_SOFT_LIMIT, DOWNLOAD_PROGRESS_OVERFLOW_REASON,
+    BROWSER_EVENT_CRITICAL_SOFT_LIMIT, DOWNLOAD_PROGRESS_OVERFLOW_REASON, DownloadEventWindow,
 };
-use rub_core::model::PendingDialogInfo;
-use std::sync::atomic::Ordering;
+use rub_core::model::{DownloadEntry, PendingDialogInfo};
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::time::{Duration, Instant, sleep};
 
 pub(super) struct BrowserEventApplyOutcome {
@@ -430,7 +430,7 @@ impl SessionState {
         &self,
         cursor: u64,
         last_observed_ingress_drop_count: u64,
-    ) -> crate::session::protocol::DownloadEventWindow {
+    ) -> DownloadEventWindow {
         let runtime = self.download_runtime().await;
         let downloads = self.downloads.read().await;
         let events = downloads.events_after(cursor);
@@ -441,9 +441,9 @@ impl SessionState {
         let cursor_lost_to_timeline_eviction =
             current_timeline_drop_count > 0 && cursor < current_last_evicted_sequence;
         let degraded_reason = if ingress_overflow {
-            runtime.degraded_reason.or_else(|| {
-                Some(crate::session::protocol::DOWNLOAD_PROGRESS_OVERFLOW_REASON.to_string())
-            })
+            runtime
+                .degraded_reason
+                .or_else(|| Some(DOWNLOAD_PROGRESS_OVERFLOW_REASON.to_string()))
         } else if cursor_lost_to_timeline_eviction {
             runtime
                 .degraded_reason
@@ -451,7 +451,7 @@ impl SessionState {
         } else {
             runtime.degraded_reason
         };
-        crate::session::protocol::DownloadEventWindow {
+        DownloadEventWindow {
             events,
             authoritative: degraded_reason.is_none(),
             degraded_reason,
@@ -466,7 +466,7 @@ impl SessionState {
         observed_ingress_drop_count: u64,
         baseline_degraded_reason: Option<&str>,
         observed_degraded_reason: Option<&str>,
-    ) -> crate::session::protocol::DownloadEventWindow {
+    ) -> DownloadEventWindow {
         let downloads = self.downloads.read().await;
         let events = downloads.events_between(cursor, end_cursor);
         let current_timeline_drop_count = downloads.dropped_event_count();
@@ -480,13 +480,13 @@ impl SessionState {
         {
             Some(reason)
         } else if ingress_overflow {
-            Some(crate::session::protocol::DOWNLOAD_PROGRESS_OVERFLOW_REASON.to_string())
+            Some(DOWNLOAD_PROGRESS_OVERFLOW_REASON.to_string())
         } else if cursor_lost_to_timeline_eviction {
             Some("download_event_timeline_overflow".to_string())
         } else {
             None
         };
-        crate::session::protocol::DownloadEventWindow {
+        DownloadEventWindow {
             events,
             authoritative: degraded_reason.is_none(),
             degraded_reason,
@@ -625,17 +625,7 @@ fn age_from_uptime(current_uptime_ms: u64, event_uptime_ms: u64) -> Option<u64> 
     (event_uptime_ms != 0).then_some(current_uptime_ms.saturating_sub(event_uptime_ms))
 }
 
-fn atomic_max_u32(target: &std::sync::atomic::AtomicU32, candidate: u32) {
-    let mut current = target.load(Ordering::SeqCst);
-    while candidate > current {
-        match target.compare_exchange(current, candidate, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => return,
-            Err(observed) => current = observed,
-        }
-    }
-}
-
-fn atomic_saturating_decrement_u32(target: &std::sync::atomic::AtomicU32) -> u32 {
+fn atomic_saturating_decrement_u32(target: &AtomicU32) -> u32 {
     let mut current = target.load(Ordering::SeqCst);
     loop {
         if current == 0 {

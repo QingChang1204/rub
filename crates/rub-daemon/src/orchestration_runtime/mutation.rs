@@ -52,53 +52,19 @@ impl OrchestrationRuntimeState {
         status: OrchestrationRuleStatus,
     ) -> Option<OrchestrationRuleInfo> {
         let preserved_network_baseline = self.network_request_baselines.get(&id).copied();
-        let rule = {
-            let rule = self
-                .projection
-                .rules
-                .iter_mut()
-                .find(|rule| rule.id == id)?;
-            rule.status = status;
-            rule.lifecycle_generation = rule.lifecycle_generation.saturating_add(1);
-            rule.clone()
-        };
-        self.commit_network_request_baseline(&rule, preserved_network_baseline);
-        let kind = match status {
-            OrchestrationRuleStatus::Paused => Some(OrchestrationEventKind::Paused),
-            OrchestrationRuleStatus::Armed => Some(OrchestrationEventKind::Resumed),
-            _ => None,
-        };
-        if let Some(kind) = kind {
-            self.push_event(OrchestrationEventInfo {
-                sequence: 0,
-                kind,
-                rule_id: Some(rule.id),
-                summary: format!(
-                    "orchestration rule {} {}",
-                    rule.id,
-                    match kind {
-                        OrchestrationEventKind::Paused => "paused",
-                        OrchestrationEventKind::Resumed => "resumed",
-                        _ => "updated",
-                    }
-                ),
-                unavailable_reason: rule.unavailable_reason.clone(),
-                evidence: rule.last_condition_evidence.clone(),
-                correlation_key: Some(rule.correlation_key.clone()),
-                idempotency_key: Some(rule.idempotency_key.clone()),
-                error_code: None,
-                reason: None,
-                error_context: None,
-                committed_steps: None,
-                total_steps: None,
-            });
-        }
-        self.refresh_counts();
-        self.refresh_status();
-        Some(rule)
+        self.update_status_with_baseline(id, status, preserved_network_baseline)
     }
 
     pub(crate) fn update_status_with_network_baseline(
+        &mut self,
+        id: u32,
+        status: OrchestrationRuleStatus,
+        network_baseline: Option<NetworkRequestBaseline>,
+    ) -> Option<OrchestrationRuleInfo> {
+        self.update_status_with_baseline(id, status, network_baseline)
+    }
+
+    fn update_status_with_baseline(
         &mut self,
         id: u32,
         status: OrchestrationRuleStatus,

@@ -238,6 +238,26 @@ fn storage_remove_session_failure_partial(
     }
 }
 
+async fn snapshot_or_record_partial(
+    router: &DaemonRouter,
+    state: &Arc<SessionState>,
+    snapshot: Result<StorageSnapshot, RubError>,
+    mutation_kind: StorageMutationKind,
+    area: Option<StorageArea>,
+    key: Option<String>,
+) -> Result<StorageSnapshot, RubError> {
+    match snapshot {
+        Ok(snapshot) => Ok(snapshot),
+        Err(error) => {
+            if let Some(partial) = storage_partial_commit_from_error(&error) {
+                record_storage_partial_commit(router, state, partial, mutation_kind, area, key)
+                    .await;
+            }
+            Err(error)
+        }
+    }
+}
+
 pub(super) async fn cmd_storage_clear(
     router: &DaemonRouter,
     raw_args: &serde_json::Value,
@@ -251,23 +271,15 @@ pub(super) async fn cmd_storage_clear(
         .browser
         .clear_storage(frame_id.as_deref(), None, area)
         .await;
-    let snapshot = match snapshot {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            if let Some(partial) = storage_partial_commit_from_error(&error) {
-                record_storage_partial_commit(
-                    router,
-                    state,
-                    partial,
-                    StorageMutationKind::Clear,
-                    area,
-                    None,
-                )
-                .await;
-            }
-            return Err(error);
-        }
-    };
+    let snapshot = snapshot_or_record_partial(
+        router,
+        state,
+        snapshot,
+        StorageMutationKind::Clear,
+        area,
+        None,
+    )
+    .await?;
     record_storage_commit(
         router,
         state,
@@ -317,23 +329,15 @@ pub(super) async fn cmd_storage_import(
             &snapshot,
         )
         .await;
-    let snapshot = match snapshot {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            if let Some(partial) = storage_partial_commit_from_error(&error) {
-                record_storage_partial_commit(
-                    router,
-                    state,
-                    partial,
-                    StorageMutationKind::Import,
-                    None,
-                    None,
-                )
-                .await;
-            }
-            return Err(error);
-        }
-    };
+    let snapshot = snapshot_or_record_partial(
+        router,
+        state,
+        snapshot,
+        StorageMutationKind::Import,
+        None,
+        None,
+    )
+    .await?;
     record_storage_commit(
         router,
         state,

@@ -1,5 +1,6 @@
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 
 use rub_core::command::{
@@ -57,12 +58,12 @@ impl IpcRequest {
     }
 
     pub fn with_command_id(mut self, id: impl Into<String>) -> Result<Self, String> {
-        self.command_id = validate_optional_command_id(Some(id.into()))?;
+        set_validated_command_id(&mut self.command_id, id)?;
         Ok(self)
     }
 
     pub fn with_daemon_session_id(mut self, id: impl Into<String>) -> Result<Self, String> {
-        self.daemon_session_id = validate_optional_daemon_session_id(Some(id.into()))?;
+        set_validated_daemon_session_id(&mut self.daemon_session_id, id)?;
         Ok(self)
     }
 
@@ -280,12 +281,12 @@ impl IpcResponse {
     }
 
     pub fn with_command_id(mut self, id: impl Into<String>) -> Result<Self, String> {
-        self.command_id = validate_optional_command_id(Some(id.into()))?;
+        set_validated_command_id(&mut self.command_id, id)?;
         Ok(self)
     }
 
     pub fn with_daemon_session_id(mut self, id: impl Into<String>) -> Result<Self, String> {
-        self.daemon_session_id = validate_optional_daemon_session_id(Some(id.into()))?;
+        set_validated_daemon_session_id(&mut self.daemon_session_id, id)?;
         Ok(self)
     }
 
@@ -511,15 +512,8 @@ impl IpcResponse {
     }
 
     pub fn from_value_strict(value: serde_json::Value) -> Result<Self, ErrorEnvelope> {
-        let raw: RawIpcResponse = serde_json::from_value(value).map_err(|error| {
-            ErrorEnvelope::new(
-                rub_core::error::ErrorCode::IpcProtocolError,
-                format!("IPC response schema error: {error}"),
-            )
-            .with_context(serde_json::json!({
-                "reason": "invalid_ipc_response_schema",
-            }))
-        })?;
+        let raw = response_raw_from_value(value)?;
+        raw.reject_unknown_fields()?;
         let response = response_from_raw(raw);
         response.validate_contract()?;
         Ok(response)
@@ -530,26 +524,10 @@ impl IpcResponse {
         request: &IpcRequest,
     ) -> Result<Self, ErrorEnvelope> {
         let response = if allows_transport_protocol_compat_exemption(&request.command) {
-            let raw: RawTransportIpcResponse = serde_json::from_value(value).map_err(|error| {
-                ErrorEnvelope::new(
-                    rub_core::error::ErrorCode::IpcProtocolError,
-                    format!("IPC response schema error: {error}"),
-                )
-                .with_context(serde_json::json!({
-                    "reason": "invalid_ipc_response_schema",
-                }))
-            })?;
-            response_from_transport_raw(raw)
+            response_from_raw(response_raw_from_value(value)?)
         } else {
-            let raw: RawIpcResponse = serde_json::from_value(value).map_err(|error| {
-                ErrorEnvelope::new(
-                    rub_core::error::ErrorCode::IpcProtocolError,
-                    format!("IPC response schema error: {error}"),
-                )
-                .with_context(serde_json::json!({
-                    "reason": "invalid_ipc_response_schema",
-                }))
-            })?;
+            let raw = response_raw_from_value(value)?;
+            raw.reject_unknown_fields()?;
             response_from_raw(raw)
         };
         response.validate_transport_contract(request)?;
@@ -635,7 +613,6 @@ impl<'de> Deserialize<'de> for IpcRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawIpcResponse {
     pub ipc_protocol_version: String,
     #[serde(default, deserialize_with = "deserialize_optional_command_id")]
@@ -650,23 +627,22 @@ struct RawIpcResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorEnvelope>,
     pub timing: Timing,
+    #[serde(flatten)]
+    pub unknown_fields: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct RawTransportIpcResponse {
-    pub ipc_protocol_version: String,
-    #[serde(default, deserialize_with = "deserialize_optional_command_id")]
-    pub command_id: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_daemon_session_id")]
-    pub daemon_session_id: Option<String>,
-    #[serde(deserialize_with = "deserialize_request_id")]
-    pub request_id: String,
-    pub status: ResponseStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<ErrorEnvelope>,
-    pub timing: Timing,
+impl RawIpcResponse {
+    fn reject_unknown_fields(&self) -> Result<(), ErrorEnvelope> {
+        if self.unknown_fields.is_empty() {
+            return Ok(());
+        }
+        let mut fields = self.unknown_fields.keys().cloned().collect::<Vec<_>>();
+        fields.sort();
+        Err(response_schema_error(format!(
+            "IPC response schema error: unknown field(s): {}",
+            fields.join(", ")
+        )))
+    }
 }
 
 impl<'de> Deserialize<'de> for IpcResponse {
@@ -680,20 +656,20 @@ impl<'de> Deserialize<'de> for IpcResponse {
     }
 }
 
-fn response_from_raw(raw: RawIpcResponse) -> IpcResponse {
-    IpcResponse {
-        ipc_protocol_version: raw.ipc_protocol_version,
-        command_id: raw.command_id,
-        daemon_session_id: raw.daemon_session_id,
-        request_id: raw.request_id,
-        status: raw.status,
-        data: raw.data,
-        error: raw.error,
-        timing: raw.timing,
-    }
+fn response_schema_error(message: impl Into<String>) -> ErrorEnvelope {
+    ErrorEnvelope::new(rub_core::error::ErrorCode::IpcProtocolError, message.into()).with_context(
+        serde_json::json!({
+            "reason": "invalid_ipc_response_schema",
+        }),
+    )
 }
 
-fn response_from_transport_raw(raw: RawTransportIpcResponse) -> IpcResponse {
+fn response_raw_from_value(value: serde_json::Value) -> Result<RawIpcResponse, ErrorEnvelope> {
+    serde_json::from_value(value)
+        .map_err(|error| response_schema_error(format!("IPC response schema error: {error}")))
+}
+
+fn response_from_raw(raw: RawIpcResponse) -> IpcResponse {
     IpcResponse {
         ipc_protocol_version: raw.ipc_protocol_version,
         command_id: raw.command_id,
@@ -741,6 +717,14 @@ fn validate_optional_command_id(command_id: Option<String>) -> Result<Option<Str
     }
 }
 
+fn set_validated_command_id(
+    target: &mut Option<String>,
+    id: impl Into<String>,
+) -> Result<(), String> {
+    *target = validate_optional_command_id(Some(id.into()))?;
+    Ok(())
+}
+
 fn default_request_command_id(command: &str) -> Option<String> {
     if allows_missing_request_command_id(command) {
         None
@@ -766,6 +750,14 @@ fn validate_optional_daemon_session_id(
         }
         other => Ok(other),
     }
+}
+
+fn set_validated_daemon_session_id(
+    target: &mut Option<String>,
+    id: impl Into<String>,
+) -> Result<(), String> {
+    *target = validate_optional_daemon_session_id(Some(id.into()))?;
+    Ok(())
 }
 
 #[cfg(test)]

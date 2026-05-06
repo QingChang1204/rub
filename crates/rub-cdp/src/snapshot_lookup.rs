@@ -25,13 +25,80 @@ pub(crate) fn clone_snapshot_elements_by_index(
         .collect()
 }
 
+pub(crate) fn snapshot_uses_listener_promoted_classifier(snapshot: &Snapshot) -> bool {
+    snapshot.elements.iter().any(|element| {
+        element
+            .listeners
+            .as_ref()
+            .is_some_and(|listeners| !listeners.is_empty())
+    })
+}
+
+pub(crate) fn collect_replay_mismatch_indices<'a>(
+    snapshot_index: &SnapshotIndexLookup<'_>,
+    match_entries: impl IntoIterator<Item = (u32, &'a Element)>,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut missing_indices = Vec::new();
+    let mut mismatched_indices = Vec::new();
+    for (index, element) in match_entries {
+        match snapshot_index.get(&index) {
+            Some(expected)
+                if crate::targeting::snapshot_element_replay_matches_authority(
+                    expected, element,
+                ) => {}
+            Some(_) => mismatched_indices.push(index),
+            None => missing_indices.push(index),
+        }
+    }
+    (missing_indices, mismatched_indices)
+}
+
+#[cfg(test)]
+pub(crate) fn sample_frame_context(
+    frame_id: &str,
+    name: Option<&str>,
+) -> rub_core::model::FrameContextInfo {
+    rub_core::model::FrameContextInfo {
+        frame_id: frame_id.to_string(),
+        name: name.map(str::to_string),
+        parent_frame_id: None,
+        target_id: Some("target-1".to_string()),
+        url: Some("https://example.test".to_string()),
+        depth: 0,
+        same_origin_accessible: Some(true),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn sample_main_frame_context() -> rub_core::model::FrameContextInfo {
+    let mut frame = sample_frame_context("main", None);
+    frame.url = Some("https://example.com".to_string());
+    frame
+}
+
+#[cfg(test)]
+pub(crate) fn sample_button_element(index: u32, text: &str) -> Element {
+    Element {
+        index,
+        tag: rub_core::model::ElementTag::Button,
+        text: text.to_string(),
+        attributes: HashMap::new(),
+        element_ref: Some(format!("frame-main:{index}")),
+        target_id: None,
+        bounding_box: None,
+        ax_info: None,
+        listeners: None,
+        depth: Some(0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_snapshot_index_lookup, clone_snapshot_elements_by_index};
-    use rub_core::model::{
-        Element, ElementTag, FrameContextInfo, ScrollPosition, Snapshot, SnapshotProjection,
+    use super::{
+        build_snapshot_index_lookup, clone_snapshot_elements_by_index, sample_button_element,
+        sample_frame_context,
     };
-    use std::collections::HashMap;
+    use rub_core::model::{Element, ScrollPosition, Snapshot, SnapshotProjection};
 
     #[test]
     fn clone_snapshot_elements_by_index_preserves_requested_order() {
@@ -63,15 +130,7 @@ mod tests {
         Snapshot {
             snapshot_id: "snap-lookup".to_string(),
             dom_epoch: 1,
-            frame_context: FrameContextInfo {
-                frame_id: "frame-main".to_string(),
-                name: Some("main".to_string()),
-                parent_frame_id: None,
-                target_id: Some("target-1".to_string()),
-                url: Some("https://example.test".to_string()),
-                depth: 0,
-                same_origin_accessible: Some(true),
-            },
+            frame_context: sample_frame_context("frame-main", Some("main")),
             frame_lineage: vec!["frame-main".to_string()],
             url: "https://example.test".to_string(),
             title: "Example".to_string(),
@@ -101,17 +160,6 @@ mod tests {
     }
 
     fn sample_element(index: u32, text: &str) -> Element {
-        Element {
-            index,
-            tag: ElementTag::Button,
-            text: text.to_string(),
-            attributes: HashMap::new(),
-            element_ref: Some(format!("frame-main:{index}")),
-            target_id: None,
-            bounding_box: None,
-            ax_info: None,
-            listeners: None,
-            depth: Some(0),
-        }
+        sample_button_element(index, text)
     }
 }

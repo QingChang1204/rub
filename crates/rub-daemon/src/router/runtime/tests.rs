@@ -26,30 +26,9 @@ use rub_core::model::{
 };
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 fn test_router() -> crate::router::DaemonRouter {
-    let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
-        rub_cdp::browser::BrowserLaunchOptions {
-            headless: true,
-            ignore_cert_errors: false,
-            user_data_dir: None,
-            managed_profile_ephemeral: false,
-            download_dir: None,
-            profile_directory: None,
-            hide_infobars: true,
-            stealth: true,
-        },
-    ));
-    let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
-        manager,
-        Arc::new(AtomicU64::new(0)),
-        rub_cdp::humanize::HumanizeConfig {
-            enabled: false,
-            speed: rub_cdp::humanize::HumanizeSpeed::Normal,
-        },
-    ));
-    crate::router::DaemonRouter::new(adapter)
+    crate::test_support::daemon_router()
 }
 
 #[tokio::test]
@@ -131,7 +110,7 @@ async fn handoff_unavailable_rejects_start_and_complete() {
 fn project_network_rule_uses_canonical_action_and_pattern_fields_only() {
     let rule = NetworkRule {
         id: 7,
-        status: rub_core::model::NetworkRuleStatus::Active,
+        status: NetworkRuleStatus::Active,
         spec: NetworkRuleSpec::HeaderOverride {
             url_pattern: "https://example.com/*".to_string(),
             headers: std::collections::BTreeMap::from([(
@@ -647,7 +626,7 @@ async fn cookies_set_accepts_missing_optional_domain() {
 fn intercept_subject_helpers_are_machine_facing() {
     let rule = NetworkRule {
         id: 3,
-        status: rub_core::model::NetworkRuleStatus::Active,
+        status: NetworkRuleStatus::Active,
         spec: NetworkRuleSpec::Rewrite {
             url_pattern: "https://example.com/*".to_string(),
             target_base: "http://localhost:3000/mock".to_string(),

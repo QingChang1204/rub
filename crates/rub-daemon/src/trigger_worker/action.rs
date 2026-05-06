@@ -6,6 +6,8 @@ use crate::workflow_assets::{
     annotate_workflow_asset_path_state, load_named_workflow_spec_with_authority,
     resolve_named_workflow_path, workflow_asset_path_state,
 };
+use rub_core::automation_timeout::command_additional_timeout_ms;
+use rub_core::model::{FrameContextStatus, ReadinessStatus};
 
 pub(super) async fn fire_trigger(
     router: &Arc<DaemonRouter>,
@@ -113,7 +115,7 @@ async fn fire_browser_command_trigger(
                 .with_command_id(command_id)
                 .map_err(|reason| {
                     ErrorEnvelope::new(
-                        rub_core::error::ErrorCode::IpcProtocolError,
+                        ErrorCode::IpcProtocolError,
                         format!("trigger action command_id is not protocol-valid: {reason}"),
                     )
                     .with_context(trigger_action_failure_context(
@@ -200,7 +202,7 @@ async fn fire_workflow_trigger(
             .with_command_id(command_id)
             .map_err(|reason| {
                 ErrorEnvelope::new(
-                    rub_core::error::ErrorCode::IpcProtocolError,
+                    ErrorCode::IpcProtocolError,
                     format!("trigger action command_id is not protocol-valid: {reason}"),
                 )
             })?,
@@ -352,32 +354,23 @@ fn ensure_trigger_response_success(
 }
 
 fn augment_trigger_error_context(
-    mut error: ErrorEnvelope,
+    error: ErrorEnvelope,
     trigger: &TriggerInfo,
     phase: &'static str,
 ) -> ErrorEnvelope {
-    let mut context = error
-        .context
-        .take()
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    let trigger_context = serde_json::json!({
-        "trigger_id": trigger.id,
-        "phase": phase,
-        "source_tab_target_id": trigger.source_tab.target_id,
-        "source_frame_id": trigger.source_tab.frame_id,
-        "target_tab_target_id": trigger.target_tab.target_id,
-        "target_frame_id": trigger.target_tab.frame_id,
-        "action_kind": trigger.action.kind,
-        "action_command": trigger.action.command,
-    });
-    if let Some(trigger_object) = trigger_context.as_object() {
-        for (key, value) in trigger_object {
-            context.entry(key.clone()).or_insert_with(|| value.clone());
-        }
-    }
-    error.context = Some(serde_json::Value::Object(context));
-    error
+    merge_trigger_error_context(
+        error,
+        serde_json::json!({
+            "trigger_id": trigger.id,
+            "phase": phase,
+            "source_tab_target_id": trigger.source_tab.target_id,
+            "source_frame_id": trigger.source_tab.frame_id,
+            "target_tab_target_id": trigger.target_tab.target_id,
+            "target_frame_id": trigger.target_tab.frame_id,
+            "action_kind": trigger.action.kind,
+            "action_command": trigger.action.command,
+        }),
+    )
 }
 
 fn missing_error_envelope() -> ErrorEnvelope {
@@ -408,9 +401,7 @@ pub(super) fn trigger_target_continuity_failure(
 ) -> Option<(&'static str, &'static str)> {
     if matches!(
         frame_runtime.status,
-        rub_core::model::FrameContextStatus::Unknown
-            | rub_core::model::FrameContextStatus::Stale
-            | rub_core::model::FrameContextStatus::Degraded
+        FrameContextStatus::Unknown | FrameContextStatus::Stale | FrameContextStatus::Degraded
     ) || frame_runtime.current_frame.is_none()
     {
         return Some((
@@ -429,7 +420,7 @@ pub(super) fn trigger_target_continuity_failure(
             "Trigger target continuity fence failed: frame context no longer matches the target tab authority",
         ));
     }
-    if matches!(readiness.status, rub_core::model::ReadinessStatus::Degraded) {
+    if matches!(readiness.status, ReadinessStatus::Degraded) {
         return Some((
             "continuity_readiness_degraded",
             "Trigger target continuity fence failed: readiness surface degraded",
@@ -519,31 +510,8 @@ mod continuity_tests {
 
     #[test]
     fn target_continuity_fails_when_frame_runtime_is_stale() {
-        let frame_runtime = FrameRuntimeInfo {
-            status: FrameContextStatus::Stale,
-            current_frame: Some(FrameContextInfo {
-                frame_id: "missing-frame".to_string(),
-                name: None,
-                parent_frame_id: None,
-                target_id: None,
-                url: None,
-                depth: 0,
-                same_origin_accessible: None,
-            }),
-            primary_frame: None,
-            frame_lineage: vec!["missing-frame".to_string()],
-            degraded_reason: Some("selected_frame_not_found".to_string()),
-        };
-        let readiness = ReadinessInfo {
-            status: ReadinessStatus::Active,
-            route_stability: RouteStability::Stable,
-            loading_present: false,
-            skeleton_present: false,
-            overlay_state: OverlayState::None,
-            document_ready_state: Some("complete".to_string()),
-            blocking_signals: Vec::new(),
-            degraded_reason: None,
-        };
+        let frame_runtime = stale_frame_runtime();
+        let readiness = active_readiness();
 
         assert_eq!(
             trigger_target_continuity_failure("tab-target", &frame_runtime, &readiness),
@@ -553,12 +521,45 @@ mod continuity_tests {
             ))
         );
     }
+
+    fn stale_frame_runtime() -> FrameRuntimeInfo {
+        FrameRuntimeInfo {
+            status: FrameContextStatus::Stale,
+            current_frame: Some(stale_frame_context()),
+            primary_frame: None,
+            frame_lineage: vec!["missing-frame".to_string()],
+            degraded_reason: Some("selected_frame_not_found".to_string()),
+        }
+    }
+
+    fn stale_frame_context() -> FrameContextInfo {
+        FrameContextInfo {
+            frame_id: "missing-frame".to_string(),
+            name: None,
+            parent_frame_id: None,
+            target_id: None,
+            url: None,
+            depth: 0,
+            same_origin_accessible: None,
+        }
+    }
+
+    fn active_readiness() -> ReadinessInfo {
+        ReadinessInfo {
+            status: ReadinessStatus::Active,
+            route_stability: RouteStability::Stable,
+            loading_present: false,
+            skeleton_present: false,
+            overlay_state: OverlayState::None,
+            document_ready_state: Some("complete".to_string()),
+            blocking_signals: Vec::new(),
+            degraded_reason: None,
+        }
+    }
 }
 
 fn trigger_action_timeout_ms(command: &str, args: &serde_json::Value) -> u64 {
-    TRIGGER_ACTION_BASE_TIMEOUT_MS.saturating_add(
-        rub_core::automation_timeout::command_additional_timeout_ms(command, args),
-    )
+    TRIGGER_ACTION_BASE_TIMEOUT_MS.saturating_add(command_additional_timeout_ms(command, args))
 }
 
 fn apply_trigger_frame_override(args: &mut serde_json::Value, frame_id: Option<&str>) {
@@ -584,7 +585,7 @@ pub(super) fn trigger_action_command_id(
     trigger: &TriggerInfo,
     evidence: &TriggerEvidenceInfo,
 ) -> String {
-    let identity_key = super::trigger_evidence_consumption_key(evidence);
+    let identity_key = trigger_evidence_consumption_key(evidence);
     format!(
         "trigger:{}:{}",
         trigger.id,

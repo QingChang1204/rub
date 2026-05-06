@@ -1,8 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rub_core::command::{
     CommandEffectClass, DomEpochPolicy, TimeoutRecoverySurface, command_metadata_for_args,
@@ -101,21 +100,8 @@ impl DaemonRouter {
         let permit = self
             .acquire_fifo_permit(command, request_id, deadline, state)
             .await?;
-        if state.is_shutdown_requested() {
-            return Err(IpcResponse::error(
-                request_id,
-                ErrorEnvelope::new(
-                    ErrorCode::SessionBusy,
-                    format!(
-                        "Session '{}' is draining for shutdown; command '{}' is temporarily rejected",
-                        state.session_name, command
-                    ),
-                )
-                .with_context(serde_json::json!({
-                    "command": command,
-                    "reason": "session_shutting_down_after_queue_wait",
-                })),
-            ));
+        if let Some(response) = reject_after_queue_wait_if_shutdown(command, request_id, state) {
+            return Err(response);
         }
         if let Some(response) =
             handoff_blocked_response_for_command(command, state, request_id).await
@@ -163,21 +149,8 @@ impl DaemonRouter {
                 return Err(queue_timeout_response(command, request_id, deadline));
             }
         };
-        if state.is_shutdown_requested() {
-            return Err(IpcResponse::error(
-                request_id,
-                ErrorEnvelope::new(
-                    ErrorCode::SessionBusy,
-                    format!(
-                        "Session '{}' is draining for shutdown; command '{}' is temporarily rejected",
-                        state.session_name, command
-                    ),
-                )
-                .with_context(serde_json::json!({
-                    "command": command,
-                    "reason": "session_shutting_down_after_queue_wait",
-                })),
-            ));
+        if let Some(response) = reject_after_queue_wait_if_shutdown(command, request_id, state) {
+            return Err(response);
         }
         if let Some(response) =
             handoff_blocked_response_for_command(command, state, request_id).await
@@ -521,25 +494,21 @@ impl DaemonRouter {
                 Ok(data) => IpcResponse::success(&request_id, data),
                 Err(error) => IpcResponse::error(&request_id, error.into_envelope()),
             };
-            return DispatchPreparation::Final(Box::new(
-                super::transaction::PendingResponseCommit::new(
-                    request, response, true, false, None,
-                ),
-            ));
+            return DispatchPreparation::Final(Box::new(PendingResponseCommit::new(
+                request, response, true, false, None,
+            )));
         }
 
         if let Some(response) =
             preflight_rejection_response(&request, &preflight, state, in_process_dispatch)
         {
-            return DispatchPreparation::Final(Box::new(
-                super::transaction::PendingResponseCommit::new(
-                    request,
-                    response,
-                    preflight.internal_command,
-                    false,
-                    None,
-                ),
-            ));
+            return DispatchPreparation::Final(Box::new(PendingResponseCommit::new(
+                request,
+                response,
+                preflight.internal_command,
+                false,
+                None,
+            )));
         }
 
         match prepare_command_dispatch(&request, state, preflight).await {
@@ -579,6 +548,21 @@ fn automation_shutdown_rejection(state: &Arc<SessionState>, command: &str) -> Er
     }))
 }
 
+fn reject_after_queue_wait_if_shutdown(
+    command: &str,
+    request_id: &str,
+    state: &Arc<SessionState>,
+) -> Option<IpcResponse> {
+    if state.is_shutdown_requested() {
+        Some(IpcResponse::error(
+            request_id,
+            automation_shutdown_rejection(state, command),
+        ))
+    } else {
+        None
+    }
+}
+
 async fn apply_execution_timeout_authority_fence(request: &IpcRequest, state: &Arc<SessionState>) {
     if command_may_have_dom_commit_after_timeout(request) {
         state.mark_pending_external_dom_change();
@@ -608,10 +592,7 @@ fn dialog_action_commits_epoch(request: &IpcRequest) -> bool {
         )
 }
 
-fn automation_queue_timeout_rejection(
-    command: &str,
-    queue_wait_budget: std::time::Duration,
-) -> ErrorEnvelope {
+fn automation_queue_timeout_rejection(command: &str, queue_wait_budget: Duration) -> ErrorEnvelope {
     ErrorEnvelope::new(
         ErrorCode::IpcTimeout,
         format!(

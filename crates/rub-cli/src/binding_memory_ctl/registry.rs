@@ -81,9 +81,9 @@ pub(crate) fn mutate_binding_and_remembered_alias_registries<T>(
             let remembered_changed = remembered_registry != original_remembered_registry;
             if binding_changed && remembered_changed {
                 return Err(RubError::domain_with_context(
-                    rub_core::error::ErrorCode::InvalidInput,
+                    ErrorCode::InvalidInput,
                     "Binding registry and remembered alias registry cannot be mutated in the same local transaction",
-                    serde_json::json!({
+                    json!({
                         "reason": "cross_registry_atomic_mutation_unsupported",
                         "binding_registry_path": binding_path.display().to_string(),
                         "remembered_alias_registry_path": remembered_path.display().to_string(),

@@ -12,7 +12,7 @@ use rub_ipc::handshake::{
     SocketSessionIdentityConfirmation as SocketIdentityConfirmation,
     confirm_daemon_session_identity,
 };
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -775,7 +775,7 @@ fn socket_identity_confirmation(
 }
 
 pub(super) fn sweep_stale_test_homes() {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     for root in rub_daemon::rub_paths::temp_roots() {
         let Ok(entries) = std::fs::read_dir(root) else {
             continue;
@@ -825,14 +825,14 @@ pub(super) fn kill_process_tree_from_roots(roots: &[u32]) {
 
     let snapshot = process_snapshot();
     let children_by_parent = {
-        let mut map: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+        let mut map: HashMap<u32, Vec<u32>> = HashMap::new();
         for (pid, ppid) in &snapshot {
             map.entry(*ppid).or_default().push(*pid);
         }
         map
     };
 
-    let mut all_pids = std::collections::BTreeSet::new();
+    let mut all_pids = BTreeSet::new();
     let mut stack = roots.to_vec();
     while let Some(pid) = stack.pop() {
         if !all_pids.insert(pid) {

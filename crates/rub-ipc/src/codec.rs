@@ -124,27 +124,10 @@ impl NdJsonCodec {
         loop {
             let (consume_len, done) = {
                 let chunk = reader.fill_buf().await?;
-                if chunk.is_empty() {
-                    if frame.is_empty() {
-                        return Ok(None);
-                    }
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "NDJSON frame terminated before newline commit fence",
-                    )
-                    .into());
+                if chunk.is_empty() && frame.is_empty() {
+                    return Ok(None);
                 }
-
-                if let Some(newline_pos) = chunk.iter().position(|byte| *byte == b'\n') {
-                    let slice = &chunk[..newline_pos];
-                    ensure_payload_within_limit(frame.len() + slice.len())?;
-                    frame.extend_from_slice(slice);
-                    (newline_pos + 1, true)
-                } else {
-                    ensure_payload_within_limit(frame.len() + chunk.len())?;
-                    frame.extend_from_slice(chunk);
-                    (chunk.len(), false)
-                }
+                append_chunk_to_frame(&mut frame, chunk)?
             };
 
             reader.consume(consume_len);
@@ -164,27 +147,10 @@ impl NdJsonCodec {
         loop {
             let (consume_len, done) = {
                 let chunk = reader.fill_buf()?;
-                if chunk.is_empty() {
-                    if frame.is_empty() {
-                        return Ok(None);
-                    }
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "NDJSON frame terminated before newline commit fence",
-                    )
-                    .into());
+                if chunk.is_empty() && frame.is_empty() {
+                    return Ok(None);
                 }
-
-                if let Some(newline_pos) = chunk.iter().position(|byte| *byte == b'\n') {
-                    let slice = &chunk[..newline_pos];
-                    ensure_payload_within_limit(frame.len() + slice.len())?;
-                    frame.extend_from_slice(slice);
-                    (newline_pos + 1, true)
-                } else {
-                    ensure_payload_within_limit(frame.len() + chunk.len())?;
-                    frame.extend_from_slice(chunk);
-                    (chunk.len(), false)
-                }
+                append_chunk_to_frame(&mut frame, chunk)?
             };
 
             reader.consume(consume_len);
@@ -202,6 +168,29 @@ fn ensure_payload_within_limit(payload_json_len: usize) -> Result<(), std::io::E
         return Err(oversized_frame_io_error(MAX_FRAME_BYTES));
     }
     Ok(())
+}
+
+fn append_chunk_to_frame(
+    frame: &mut Vec<u8>,
+    chunk: &[u8],
+) -> Result<(usize, bool), std::io::Error> {
+    if chunk.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "NDJSON frame terminated before newline commit fence",
+        ));
+    }
+
+    if let Some(newline_pos) = chunk.iter().position(|byte| *byte == b'\n') {
+        let slice = &chunk[..newline_pos];
+        ensure_payload_within_limit(frame.len() + slice.len())?;
+        frame.extend_from_slice(slice);
+        Ok((newline_pos + 1, true))
+    } else {
+        ensure_payload_within_limit(frame.len() + chunk.len())?;
+        frame.extend_from_slice(chunk);
+        Ok((chunk.len(), false))
+    }
 }
 
 #[cfg(test)]

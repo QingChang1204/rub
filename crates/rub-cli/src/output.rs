@@ -242,7 +242,7 @@ pub fn format_cli_success(
     command: &str,
     session: &str,
     rub_home: &Path,
-    data: serde_json::Value,
+    data: Value,
     pretty: bool,
     trace_mode: InteractionTraceMode,
 ) -> String {
@@ -290,7 +290,7 @@ fn interaction_effect_failure_result(result: &CommandResult) -> Option<CommandRe
 
 fn interaction_effect_failure_envelope(
     command: &str,
-    data: &serde_json::Value,
+    data: &Value,
     confirmation_status: InteractionConfirmationStatus,
 ) -> ErrorEnvelope {
     let interaction = data

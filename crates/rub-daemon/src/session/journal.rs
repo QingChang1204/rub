@@ -16,14 +16,14 @@ use crate::workflow_capture::WorkflowCaptureDeliveryState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PostCommitJournalEntry {
-    journal_state: serde_json::Value,
+    journal_state: Value,
     session_id: String,
     session_name: String,
     command: String,
     command_id: Option<String>,
     request_id: String,
-    request: serde_json::Value,
-    response: serde_json::Value,
+    request: Value,
+    response: Value,
     #[serde(
         default = "workflow_capture_delivery_delivered",
         skip_serializing_if = "workflow_capture_delivery_is_delivered"
@@ -187,7 +187,7 @@ fn redacted_post_commit_response(
 }
 
 #[cfg(test)]
-fn read_durable_journal_entries(path: &Path) -> io::Result<Vec<serde_json::Value>> {
+fn read_durable_journal_entries(path: &Path) -> io::Result<Vec<Value>> {
     let bytes = std::fs::read(path)?;
     let contents = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = contents
@@ -198,7 +198,7 @@ fn read_durable_journal_entries(path: &Path) -> io::Result<Vec<serde_json::Value
     let last_index = lines.len().saturating_sub(1);
     let mut entries = Vec::with_capacity(lines.len());
     for (index, line) in lines.iter().enumerate() {
-        match serde_json::from_str::<serde_json::Value>(line) {
+        match serde_json::from_str::<Value>(line) {
             Ok(value) => entries.push(value),
             Err(_error) if index == last_index => break,
             Err(error) => {
@@ -266,9 +266,9 @@ impl SessionState {
         self.post_commit_journal_failures.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn post_commit_journal_projection(&self) -> serde_json::Value {
+    pub(crate) fn post_commit_journal_projection(&self) -> Value {
         let failure_count = self.post_commit_journal_failure_count();
-        serde_json::json!({
+        json!({
             "surface": "post_commit_journal",
             "authority": "session.post_commit_journal",
             "status": if failure_count == 0 { "active" } else { "degraded" },
@@ -301,9 +301,7 @@ impl SessionState {
     }
 
     #[cfg(test)]
-    pub(crate) fn read_post_commit_journal_entries_for_tests(
-        &self,
-    ) -> io::Result<Vec<serde_json::Value>> {
+    pub(crate) fn read_post_commit_journal_entries_for_tests(&self) -> io::Result<Vec<Value>> {
         let path = self.post_commit_journal_path();
         if !path.exists() {
             return Ok(Vec::new());

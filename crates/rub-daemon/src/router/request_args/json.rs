@@ -59,6 +59,52 @@ where
     })
 }
 
+pub(crate) fn copy_semantic_raw_field(
+    args: &serde_json::Value,
+    key: &str,
+    projected: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if let Some(value) = args.get(key) {
+        projected.insert(key.to_string(), value.clone());
+    }
+}
+
+pub(crate) fn lookup_json_path<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut current = value;
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return None;
+        }
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
+pub(crate) fn canonical_json_batch_root(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    let items = value.get("items")?;
+    array_or_string_json_root(items)
+}
+
+pub(crate) fn array_or_string_json_root(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    match value {
+        serde_json::Value::Array(_) | serde_json::Value::String(_) => Some(value),
+        _ => None,
+    }
+}
+
+pub(crate) fn first_canonical_json_root<'a>(
+    root: &'a serde_json::Value,
+    candidates: &[&str],
+) -> Option<&'a serde_json::Value> {
+    candidates.iter().find_map(|candidate| {
+        lookup_json_path(root, candidate)
+            .and_then(|value| canonical_json_batch_root(value).or(array_or_string_json_root(value)))
+    })
+}
+
 pub(crate) fn required_string_arg(
     args: &serde_json::Value,
     name: &str,

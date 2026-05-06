@@ -1,4 +1,5 @@
 use super::*;
+use rub_core::model::ObservedNetworkRequestRecord;
 
 #[derive(Clone)]
 pub(super) struct PendingRequest {
@@ -422,10 +423,8 @@ pub(super) fn unknown_request_method() -> String {
     String::new()
 }
 
-pub(super) fn build_request_record(
-    pending: &PendingRequest,
-) -> rub_core::model::ObservedNetworkRequestRecord {
-    rub_core::model::ObservedNetworkRequestRecord {
+pub(super) fn build_request_record(pending: &PendingRequest) -> ObservedNetworkRequestRecord {
+    ObservedNetworkRequestRecord {
         request_id: pending.request_id.clone(),
         lifecycle: pending.lifecycle,
         url: pending.url.clone(),

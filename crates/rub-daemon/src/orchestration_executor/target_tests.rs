@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use crate::orchestration_runtime::projected_orchestration_session;
 use crate::session::SessionState;
@@ -9,9 +8,8 @@ use rub_core::model::{
     FrameContextInfo, FrameContextStatus, FrameRuntimeInfo, HumanVerificationHandoffInfo,
     HumanVerificationHandoffStatus, IntegrationMode, IntegrationRuntimeInfo,
     IntegrationRuntimeStatus, IntegrationSurface, OrchestrationAddressInfo,
-    OrchestrationSessionAvailability, OverlayState, ReadinessInfo, ReadinessStatus, RouteStability,
-    SessionAccessibility, TabInfo, TakeoverRuntimeInfo, TakeoverRuntimeStatus,
-    TakeoverVisibilityMode,
+    OrchestrationSessionAvailability, ReadinessInfo, SessionAccessibility, TabInfo,
+    TakeoverRuntimeInfo, TakeoverRuntimeStatus, TakeoverVisibilityMode,
 };
 use rub_ipc::codec::NdJsonCodec;
 
@@ -20,7 +18,6 @@ use super::{
     orchestration_target_continuity_failure, orchestration_target_dispatch_command_id,
     orchestration_target_dispatch_request, resolve_target_session, target_continuity_phase_request,
 };
-use crate::router::DaemonRouter;
 use rub_ipc::protocol::IpcRequest;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -34,7 +31,33 @@ fn queue_test_connection(socket_path: &std::path::Path) -> UnixStream {
     server
 }
 
+fn main_frame_context() -> FrameContextInfo {
+    FrameContextInfo {
+        frame_id: "main-frame".to_string(),
+        name: Some("main".to_string()),
+        parent_frame_id: None,
+        target_id: Some("tab-target".to_string()),
+        url: Some("https://example.test".to_string()),
+        depth: 0,
+        same_origin_accessible: Some(true),
+    }
+}
+
+fn ready_readiness() -> ReadinessInfo {
+    serde_json::from_value(serde_json::json!({
+        "status": "active",
+        "route_stability": "stable",
+        "loading_present": false,
+        "skeleton_present": false,
+        "overlay_state": "none",
+        "document_ready_state": "complete",
+        "blocking_signals": [],
+    }))
+    .expect("readiness fixture should parse")
+}
+
 fn runtime_summary() -> OrchestrationTargetRuntimeSummary {
+    let main_frame = main_frame_context();
     OrchestrationTargetRuntimeSummary {
         integration_runtime: IntegrationRuntimeInfo {
             mode: IntegrationMode::Normal,
@@ -53,37 +76,12 @@ fn runtime_summary() -> OrchestrationTargetRuntimeSummary {
         },
         frame_runtime: FrameRuntimeInfo {
             status: FrameContextStatus::Top,
-            current_frame: Some(FrameContextInfo {
-                frame_id: "main-frame".to_string(),
-                name: Some("main".to_string()),
-                parent_frame_id: None,
-                target_id: Some("tab-target".to_string()),
-                url: Some("https://example.test".to_string()),
-                depth: 0,
-                same_origin_accessible: Some(true),
-            }),
-            primary_frame: Some(FrameContextInfo {
-                frame_id: "main-frame".to_string(),
-                name: Some("main".to_string()),
-                parent_frame_id: None,
-                target_id: Some("tab-target".to_string()),
-                url: Some("https://example.test".to_string()),
-                depth: 0,
-                same_origin_accessible: Some(true),
-            }),
+            current_frame: Some(main_frame.clone()),
+            primary_frame: Some(main_frame),
             frame_lineage: vec!["main-frame".to_string()],
             degraded_reason: None,
         },
-        readiness_state: ReadinessInfo {
-            status: ReadinessStatus::Active,
-            route_stability: RouteStability::Stable,
-            loading_present: false,
-            skeleton_present: false,
-            overlay_state: OverlayState::None,
-            document_ready_state: Some("complete".to_string()),
-            blocking_signals: Vec::new(),
-            degraded_reason: None,
-        },
+        readiness_state: ready_readiness(),
         human_verification_handoff: HumanVerificationHandoffInfo {
             status: HumanVerificationHandoffStatus::Unavailable,
             automation_paused: false,
@@ -346,28 +344,8 @@ fn resolve_target_session_rejects_visible_but_non_addressable_session() {
     );
 }
 
-fn test_router() -> DaemonRouter {
-    let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
-        rub_cdp::browser::BrowserLaunchOptions {
-            headless: true,
-            ignore_cert_errors: false,
-            user_data_dir: None,
-            managed_profile_ephemeral: false,
-            download_dir: None,
-            profile_directory: None,
-            hide_infobars: true,
-            stealth: true,
-        },
-    ));
-    let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
-        manager,
-        Arc::new(AtomicU64::new(0)),
-        rub_cdp::humanize::HumanizeConfig {
-            enabled: false,
-            speed: rub_cdp::humanize::HumanizeSpeed::Normal,
-        },
-    ));
-    DaemonRouter::new(adapter)
+fn test_router() -> crate::router::DaemonRouter {
+    crate::test_support::daemon_router()
 }
 
 #[tokio::test]

@@ -426,27 +426,42 @@ impl DownloadRuntimeState {
         self.active_order.retain(|existing| existing != &guid);
         self.completed_order.retain(|existing| existing != &guid);
         self.active_order.push_back(guid);
-        while self.active_order.len() > ACTIVE_DOWNLOAD_LIMIT {
-            if let Some(oldest) = self.active_order.pop_front()
-                && !self.completed_order.iter().any(|guid| guid == &oldest)
-            {
-                self.entries.remove(&oldest);
-                self.entry_event_sequence.remove(&oldest);
-            }
-        }
+        trim_download_order(
+            &mut self.active_order,
+            ACTIVE_DOWNLOAD_LIMIT,
+            &self.completed_order,
+            &mut self.entries,
+            &mut self.entry_event_sequence,
+        );
     }
 
     fn move_to_completed(&mut self, guid: String) {
         self.active_order.retain(|existing| existing != &guid);
         self.completed_order.retain(|existing| existing != &guid);
         self.completed_order.push_back(guid);
-        while self.completed_order.len() > COMPLETED_DOWNLOAD_LIMIT {
-            if let Some(oldest) = self.completed_order.pop_front()
-                && !self.active_order.iter().any(|guid| guid == &oldest)
-            {
-                self.entries.remove(&oldest);
-                self.entry_event_sequence.remove(&oldest);
-            }
+        trim_download_order(
+            &mut self.completed_order,
+            COMPLETED_DOWNLOAD_LIMIT,
+            &self.active_order,
+            &mut self.entries,
+            &mut self.entry_event_sequence,
+        );
+    }
+}
+
+fn trim_download_order(
+    order: &mut VecDeque<String>,
+    limit: usize,
+    retained_elsewhere: &VecDeque<String>,
+    entries: &mut HashMap<String, DownloadEntry>,
+    entry_event_sequence: &mut HashMap<String, u64>,
+) {
+    while order.len() > limit {
+        if let Some(oldest) = order.pop_front()
+            && !retained_elsewhere.iter().any(|guid| guid == &oldest)
+        {
+            entries.remove(&oldest);
+            entry_event_sequence.remove(&oldest);
         }
     }
 }

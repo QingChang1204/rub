@@ -2,6 +2,7 @@ use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::{dom::EventDocumentUpdated, page::EventFrameNavigated};
 use rub_core::error::{ErrorCode, RubError};
 use std::fmt::{Debug, Display};
+use std::future::Future;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 use tracing::warn;
@@ -12,7 +13,8 @@ use super::runtime::{
     refresh_identity_self_probe,
 };
 use super::{
-    PageHookFlag, PageHookInstallState, PageHookResult, required_runtime_hooks_commit_ready,
+    EpochCallback, PageHookFlag, PageHookInstallState, PageHookResult,
+    required_runtime_hooks_commit_ready,
 };
 use crate::listener_generation::{is_current_generation, next_listener_event};
 
@@ -461,7 +463,7 @@ async fn install_auxiliary_page_hook<F, Fut, T, E>(
     op: F,
 ) where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T, E>>,
+    Fut: Future<Output = Result<T, E>>,
     E: Display,
 {
     if state.contains(spec.hook) {
@@ -491,7 +493,7 @@ async fn install_critical_page_hook<F, Fut, T, E>(
     op: F,
 ) where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T, E>>,
+    Fut: Future<Output = Result<T, E>>,
     E: Debug,
 {
     if state.contains(hook) {
@@ -547,11 +549,12 @@ async fn install_frame_listener(
                 if event.frame.parent_id.is_some() {
                     continue;
                 }
-                if !projection_authority_commit_in_progress(&projection_context)
-                    && let Some(callback) = callback_store.lock().await.as_ref().cloned()
-                {
-                    callback(Some(page.target_id().as_ref()));
-                }
+                publish_epoch_callback_if_committed(
+                    &callback_store,
+                    &projection_context,
+                    page.target_id().as_ref(),
+                )
+                .await;
                 refresh_identity_self_probe(&page, &projection_context).await;
                 probe_runtime_state_for_active_page(page.clone(), &projection_context).await;
             }
@@ -602,11 +605,12 @@ async fn install_document_listener(
                 if !projection_generation_current(&projection_context) {
                     break;
                 }
-                if !projection_authority_commit_in_progress(&projection_context)
-                    && let Some(callback) = callback_store.lock().await.as_ref().cloned()
-                {
-                    callback(Some(page.target_id().as_ref()));
-                }
+                publish_epoch_callback_if_committed(
+                    &callback_store,
+                    &projection_context,
+                    page.target_id().as_ref(),
+                )
+                .await;
                 probe_runtime_state_for_active_page(page.clone(), &projection_context).await;
             }
             invalidate_page_hook_if_current_generation(
@@ -621,6 +625,19 @@ async fn install_document_listener(
         state.mark(PageHookFlag::DocumentListener);
     } else {
         outcome.mark_critical_failure(PageHookFlag::DocumentListener, required_runtime_hook_mask);
+    }
+}
+
+async fn publish_epoch_callback_if_committed(
+    callback_store: &tokio::sync::Mutex<Option<EpochCallback>>,
+    projection_context: &ProjectionContext,
+    target_id: &str,
+) {
+    if projection_authority_commit_in_progress(projection_context) {
+        return;
+    }
+    if let Some(callback) = callback_store.lock().await.as_ref().cloned() {
+        callback(Some(target_id));
     }
 }
 
@@ -886,7 +903,7 @@ fn page_hook_install_poll_delay(poll_count: u32) -> Duration {
 async fn page_hook_with_timeout<F, Fut, T, E>(label: &'static str, op: F) -> PageHookResult<T, E>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T, E>>,
+    Fut: Future<Output = Result<T, E>>,
 {
     match tokio::time::timeout(PAGE_HOOK_TIMEOUT, op()).await {
         Ok(result) => PageHookResult::Completed(result),

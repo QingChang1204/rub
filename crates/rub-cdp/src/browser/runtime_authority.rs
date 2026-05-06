@@ -2,7 +2,7 @@ use super::*;
 use crate::identity_coverage::IdentityCoverageRegistry;
 use crate::request_correlation::CORRELATION_BROWSER_AUTHORITY_REBUILD_FAILED_REASON;
 use crate::tab_projection::{CommittedTabProjection, LocalActiveTargetAuthority};
-use rub_core::model::DialogRuntimeStatus;
+use rub_core::model::{DialogInterceptPolicy, DialogRuntimeInfo, DialogRuntimeStatus};
 
 const BROWSER_AUTHORITY_REBUILD_FAILED_REASON: &str = "browser_authority_rebuild_failed";
 const PREVIOUS_AUTHORITY_CLEANUP_FAILED_AFTER_RELEASE_REASON: &str =
@@ -17,9 +17,9 @@ pub(super) struct BrowserAuthoritySnapshot {
     managed_profile: Option<ManagedProfileDir>,
     tab_projection: CommittedTabProjection,
     local_active_target_authority: Option<LocalActiveTargetAuthority>,
-    dialog_runtime: rub_core::model::DialogRuntimeInfo,
+    dialog_runtime: DialogRuntimeInfo,
     download_runtime: crate::downloads::DownloadRuntimeProjectionState,
-    dialog_intercept: Option<rub_core::model::DialogInterceptPolicy>,
+    dialog_intercept: Option<DialogInterceptPolicy>,
     network_rule_runtime: NetworkRuleRuntime,
     request_correlation: RequestCorrelationRegistry,
     observatory_pending_registries:
@@ -29,7 +29,7 @@ pub(super) struct BrowserAuthoritySnapshot {
 
 #[derive(Clone)]
 pub(super) struct BrowserRuntimeFallbackSnapshot {
-    dialog_runtime: rub_core::model::DialogRuntimeInfo,
+    dialog_runtime: DialogRuntimeInfo,
     download_runtime: crate::downloads::DownloadRuntimeProjectionState,
     network_rule_runtime: NetworkRuleRuntime,
     request_correlation: RequestCorrelationRegistry,
@@ -307,7 +307,7 @@ impl BrowserManager {
 
     pub(super) async fn degraded_dialog_runtime_after_failed_authority_rebuild(
         &self,
-    ) -> Option<rub_core::model::DialogRuntimeInfo> {
+    ) -> Option<DialogRuntimeInfo> {
         let runtime = self.dialog_runtime.read().await.clone();
         let degraded_for_failed_rebuild =
             runtime.degraded_reason.as_deref().is_some_and(|reason| {
@@ -326,7 +326,7 @@ impl BrowserManager {
     fn maybe_fail_generation_bound_runtime_reconcile_for_test(&self) -> Result<(), RubError> {
         if self
             .force_generation_bound_runtime_reconcile_failure
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
+            .swap(false, Ordering::SeqCst)
         {
             return Err(RubError::domain(
                 ErrorCode::BrowserLaunchFailed,
@@ -340,7 +340,7 @@ impl BrowserManager {
     fn maybe_fail_previous_authority_release_for_test(&self) -> Result<(), RubError> {
         if self
             .force_previous_authority_release_failure
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
+            .swap(false, Ordering::SeqCst)
         {
             return Err(RubError::domain(
                 ErrorCode::BrowserLaunchFailed,
@@ -354,7 +354,7 @@ impl BrowserManager {
     fn maybe_fail_current_authority_release_for_test(&self) -> Result<(), RubError> {
         if self
             .force_current_authority_release_failure
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
+            .swap(false, Ordering::SeqCst)
         {
             return Err(RubError::domain(
                 ErrorCode::BrowserLaunchFailed,
@@ -368,7 +368,7 @@ impl BrowserManager {
     fn maybe_fail_managed_profile_ownership_commit_for_test(&self) -> Result<(), RubError> {
         if self
             .force_managed_profile_ownership_commit_failure
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
+            .swap(false, Ordering::SeqCst)
         {
             return Err(RubError::domain(
                 ErrorCode::BrowserLaunchFailed,
@@ -413,7 +413,7 @@ impl BrowserManager {
         browser: Arc<Browser>,
         listener_generation: ListenerGeneration,
     ) {
-        let callbacks = crate::browser::runtime_callbacks::guard_download_callbacks_for_commit(
+        let callbacks = runtime_callbacks::guard_download_callbacks_for_commit(
             self.download_callbacks.lock().await.clone(),
             self.authority_commit_in_progress.clone(),
             self.runtime_callback_reconfigure_in_progress.clone(),
@@ -441,7 +441,7 @@ impl BrowserManager {
     }
 
     pub(super) async fn replay_download_runtime_projection_to_callbacks(&self) {
-        let callbacks = crate::browser::runtime_callbacks::guard_download_callbacks_for_commit(
+        let callbacks = runtime_callbacks::guard_download_callbacks_for_commit(
             self.download_callbacks.lock().await.clone(),
             self.authority_commit_in_progress.clone(),
             self.runtime_callback_reconfigure_in_progress.clone(),
@@ -461,7 +461,7 @@ impl BrowserManager {
     }
 
     pub(super) async fn replay_dialog_runtime_projection_to_callbacks(&self) {
-        let callbacks = crate::browser::runtime_callbacks::guard_dialog_callbacks_for_commit(
+        let callbacks = runtime_callbacks::guard_dialog_callbacks_for_commit(
             self.dialog_callbacks.lock().await.clone(),
             self.authority_commit_in_progress.clone(),
             self.runtime_callback_reconfigure_in_progress.clone(),
@@ -478,7 +478,7 @@ impl BrowserManager {
     pub(super) async fn replay_runtime_state_projection_to_callbacks(&self) {
         #[cfg(test)]
         self.runtime_state_replay_attempt_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_add(1, Ordering::SeqCst);
 
         let Some(browser) = self.browser.lock().await.clone() else {
             return;
@@ -827,7 +827,7 @@ impl BrowserManager {
                             });
                         }
                         Err(error) => {
-                            tracing::warn!(
+                            warn!(
                                 url = %url,
                                 error = %error,
                                 "Managed browser authority reconnect failed; falling back to relaunch"
@@ -979,11 +979,11 @@ impl BrowserManager {
     ) -> Result<(), RubError> {
         self.set_authority_commit_in_progress(true);
         self.authority_release_in_progress
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .store(true, Ordering::SeqCst);
         let result = self.release_current_browser_authority().await;
         self.bump_listener_generation();
         self.authority_release_in_progress
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+            .store(false, Ordering::SeqCst);
         self.set_authority_commit_in_progress(false);
         result
     }
@@ -1000,7 +1000,7 @@ impl BrowserManager {
         release_result
     }
 
-    fn snapshot_dialog_intercept_state(&self) -> Option<rub_core::model::DialogInterceptPolicy> {
+    fn snapshot_dialog_intercept_state(&self) -> Option<DialogInterceptPolicy> {
         match self.dialog_intercept.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => {
@@ -1008,7 +1008,7 @@ impl BrowserManager {
                 let snapshot = guard.clone();
                 drop(guard);
                 self.dialog_intercept.clear_poison();
-                tracing::warn!(
+                warn!(
                     "Recovered poisoned dialog intercept state while snapshotting browser authority"
                 );
                 snapshot
@@ -1016,10 +1016,7 @@ impl BrowserManager {
         }
     }
 
-    fn restore_dialog_intercept_state(
-        &self,
-        policy: Option<rub_core::model::DialogInterceptPolicy>,
-    ) {
+    fn restore_dialog_intercept_state(&self, policy: Option<DialogInterceptPolicy>) {
         match self.dialog_intercept.lock() {
             Ok(mut guard) => {
                 *guard = policy;
@@ -1028,7 +1025,7 @@ impl BrowserManager {
                 let mut guard = poisoned.into_inner();
                 *guard = policy;
                 self.dialog_intercept.clear_poison();
-                tracing::warn!(
+                warn!(
                     "Recovered poisoned dialog intercept state while restoring browser authority"
                 );
             }
@@ -1176,38 +1173,38 @@ impl BrowserManager {
     #[cfg(test)]
     pub(super) fn force_previous_authority_release_failure(&self) {
         self.force_previous_authority_release_failure
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .store(true, Ordering::SeqCst);
     }
 
     #[cfg(test)]
     pub(super) fn force_current_authority_release_failure(&self) {
         self.force_current_authority_release_failure
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .store(true, Ordering::SeqCst);
     }
 
     #[cfg(test)]
     pub(super) fn force_generation_bound_runtime_reconcile_failure(&self) {
         self.force_generation_bound_runtime_reconcile_failure
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .store(true, Ordering::SeqCst);
     }
 
     #[cfg(test)]
     pub(super) fn force_managed_profile_ownership_commit_failure(&self) {
         self.force_managed_profile_ownership_commit_failure
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .store(true, Ordering::SeqCst);
     }
 
     #[cfg(test)]
     pub(super) fn set_force_required_page_hook_install_failure(&self, enabled: bool) {
         self.force_required_page_hook_install_failure
-            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+            .store(enabled, Ordering::SeqCst);
     }
 
     #[cfg(test)]
     async fn maybe_pause_authority_commit_after_projection_for_test(&self) {
         if !self
             .pause_authority_commit_after_projection
-            .load(std::sync::atomic::Ordering::SeqCst)
+            .load(Ordering::SeqCst)
         {
             return;
         }
@@ -1218,7 +1215,7 @@ impl BrowserManager {
     #[cfg(test)]
     pub(super) fn pause_authority_commit_after_projection(&self) {
         self.pause_authority_commit_after_projection
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .store(true, Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -1229,19 +1226,23 @@ impl BrowserManager {
     #[cfg(test)]
     pub(super) fn resume_paused_authority_commit(&self) {
         self.pause_authority_commit_after_projection
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+            .store(false, Ordering::SeqCst);
         self.resume_authority_commit.notify_waiters();
     }
 }
 
 fn append_runtime_degraded_reason(existing: Option<String>, reason: &str) -> Option<String> {
-    match existing {
-        None => Some(reason.to_string()),
-        Some(existing) if existing.split(',').any(|current| current.trim() == reason) => {
-            Some(existing)
-        }
-        Some(existing) => Some(format!("{existing},{reason}")),
+    let Some(existing) = existing else {
+        return Some(reason.to_string());
+    };
+    if existing
+        .split(',')
+        .map(str::trim)
+        .any(|current| current == reason)
+    {
+        return Some(existing);
     }
+    Some(format!("{existing},{reason}"))
 }
 
 #[cfg(test)]

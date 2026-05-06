@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::commands::{ElementAddressArgs, ExplainSubcommand};
 use rub_core::error::{ErrorCode, RubError};
@@ -8,8 +8,8 @@ use serde_json::{Map, Value, json};
 
 pub(crate) fn project_explain(
     subcommand: &ExplainSubcommand,
-    rub_home: &std::path::Path,
-) -> Result<serde_json::Value, RubError> {
+    rub_home: &Path,
+) -> Result<Value, RubError> {
     match subcommand {
         ExplainSubcommand::Extract { spec, file } => {
             let raw = resolve_extract_source(spec.as_deref(), file.as_deref())?;
@@ -138,7 +138,7 @@ fn resolve_extract_source(spec: Option<&str>, file: Option<&str>) -> Result<Stri
                         "Failed to read explain extract spec file {}: {error}",
                         resolved.display()
                     ),
-                    serde_json::json!({
+                    json!({
                         "path": resolved.display().to_string(),
                         "surface": "explain.extract.file",
                     }),
@@ -493,6 +493,7 @@ mod tests {
     use crate::commands::ExplainSubcommand;
     use rub_core::error::ErrorCode;
     use serde_json::{Value, json};
+    use std::path::Path;
 
     #[test]
     fn explain_extract_projects_normalized_spec() {
@@ -501,7 +502,7 @@ mod tests {
                 spec: Some(r#"{"title":"h1","items":{"collection":"li.item","fields":{"name":{"kind":"text"}}}}"#.to_string()),
                 file: None,
             },
-            std::path::Path::new("/tmp/nonexistent-rub-home-for-explain"),
+            Path::new("/tmp/nonexistent-rub-home-for-explain"),
         )
         .expect("explain extract should project");
 
@@ -520,7 +521,7 @@ mod tests {
                 spec: Some(r#"{"title":{"unknown_key":true}}"#.to_string()),
                 file: None,
             },
-            std::path::Path::new("/tmp/nonexistent-rub-home-for-explain"),
+            Path::new("/tmp/nonexistent-rub-home-for-explain"),
         )
         .expect_err("invalid explain extract should fail");
         let envelope = error.into_envelope();

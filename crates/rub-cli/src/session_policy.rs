@@ -1,9 +1,6 @@
 use crate::commands::EffectiveCli;
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
-use std::path::PathBuf;
-
 mod identity;
 mod projection;
 mod request;
@@ -34,8 +31,6 @@ use self::validation::{attachment_identity_matches_request, launch_policy_matche
 
 #[cfg(test)]
 use crate::commands::Commands;
-#[cfg(test)]
-use crate::commands::RequestedLaunchPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ConnectionRequest {
@@ -58,35 +53,9 @@ pub(crate) enum ConnectionRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::effective_cli_with_default_home as cli_with;
     use rub_core::error::ErrorCode;
     use rub_core::model::{ConnectionTarget, LaunchPolicyInfo};
-
-    fn cli_with(command: Commands) -> EffectiveCli {
-        EffectiveCli {
-            session: "default".to_string(),
-            session_id: None,
-            rub_home: PathBuf::from("/tmp/rub-test"),
-            timeout: 30_000,
-            headed: false,
-            ignore_cert_errors: false,
-            user_data_dir: None,
-            hide_infobars: true,
-            json_pretty: false,
-            verbose: false,
-            trace: false,
-            command,
-            cdp_url: None,
-            connect: false,
-            profile: None,
-            profile_resolved_path: None,
-            use_alias: None,
-            no_stealth: false,
-            humanize: false,
-            humanize_speed: "normal".to_string(),
-            requested_launch_policy: RequestedLaunchPolicy::default(),
-            effective_launch_policy: RequestedLaunchPolicy::default(),
-        }
-    }
 
     #[test]
     fn parse_connection_request_rejects_conflicting_flags() {

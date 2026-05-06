@@ -269,13 +269,3 @@ fn nonzero_u64(value: u64) -> Option<u64> {
 fn age_from_uptime(current_uptime_ms: u64, event_uptime_ms: u64) -> Option<u64> {
     (event_uptime_ms != 0).then_some(current_uptime_ms.saturating_sub(event_uptime_ms))
 }
-
-fn atomic_max_u32(target: &AtomicU32, candidate: u32) {
-    let mut current = target.load(Ordering::SeqCst);
-    while candidate > current {
-        match target.compare_exchange(current, candidate, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => return,
-            Err(observed) => current = observed,
-        }
-    }
-}

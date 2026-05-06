@@ -394,13 +394,9 @@ async fn terminate_browser_profile_residue(processes: &HashSet<u32>) {
 }
 
 fn signal_processes(processes: &HashSet<u32>, signal: i32) {
-    if processes.is_empty() {
-        return;
-    }
-
-    for pid in processes {
+    for pid in processes.iter().copied() {
         unsafe {
-            libc::kill(*pid as i32, signal);
+            libc::kill(pid as i32, signal);
         }
     }
 }
@@ -569,7 +565,7 @@ mod tests {
     use rub_core::managed_profile::{
         has_temp_owned_managed_profile_marker, sync_temp_owned_managed_profile_marker,
     };
-    use rub_core::process::{ProcessInfo, extract_flag_value, parse_process_snapshot_line};
+    use rub_core::process::ProcessInfo;
     use std::collections::HashSet;
     use std::path::PathBuf;
 
@@ -977,37 +973,6 @@ mod tests {
             },
         );
         assert_eq!(residue, HashSet::from([601]));
-    }
-
-    #[test]
-    fn extract_flag_value_handles_quoted_paths_with_spaces() {
-        let inline =
-            r#"Google Chrome --user-data-dir="/tmp/rub chrome 100" --remote-debugging-port=0"#;
-        assert_eq!(
-            extract_flag_value(inline, "--user-data-dir"),
-            Some("/tmp/rub chrome 100".to_string())
-        );
-
-        let separated =
-            r#"Google Chrome --user-data-dir "/tmp/rub chrome 200" --remote-debugging-port=0"#;
-        assert_eq!(
-            extract_flag_value(separated, "--user-data-dir"),
-            Some("/tmp/rub chrome 200".to_string())
-        );
-    }
-
-    #[test]
-    fn process_snapshot_line_preserves_command_with_embedded_spaces() {
-        let parsed = parse_process_snapshot_line(
-            r#"  123  1 Google Chrome --user-data-dir="/tmp/rub chrome 300" --remote-debugging-port=0"#,
-        )
-        .expect("snapshot line should parse");
-        assert_eq!(parsed.pid, 123);
-        assert_eq!(parsed.ppid, 1);
-        assert_eq!(
-            extract_flag_value(&parsed.command, "--user-data-dir"),
-            Some("/tmp/rub chrome 300".to_string())
-        );
     }
 
     #[tokio::test]

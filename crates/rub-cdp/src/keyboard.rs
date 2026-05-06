@@ -2,6 +2,7 @@ use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{KeyCombo, Modifier};
+use std::future::Future;
 use std::sync::Arc;
 use tokio::time::Duration;
 
@@ -116,7 +117,7 @@ pub(crate) async fn type_text_with_pre_dispatch_guard<G, Fut>(
 ) -> Result<(), RubError>
 where
     G: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<(), RubError>>,
+    Fut: Future<Output = Result<(), RubError>>,
 {
     let (delay_min, delay_max) = if humanize.enabled {
         humanize.speed.typing_delay_range()

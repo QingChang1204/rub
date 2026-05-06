@@ -137,6 +137,26 @@ fn should_normalize_close_selector_resolution_error(
     )
 }
 
+fn compatibility_degraded_close_selector_error_is_skippable(
+    error: &RubError,
+    compatibility_degraded_owned: &Option<CompatibilityDegradedOwnedSession>,
+) -> bool {
+    compatibility_degraded_owned
+        .as_ref()
+        .is_some_and(|degraded| should_normalize_close_selector_resolution_error(error, degraded))
+}
+
+fn close_selector_error_allows_next_candidate(
+    error: &RubError,
+    compatibility_degraded_owned: &Option<CompatibilityDegradedOwnedSession>,
+) -> bool {
+    close_selector_handshake_transport_failed(error)
+        || compatibility_degraded_close_selector_error_is_skippable(
+            error,
+            compatibility_degraded_owned,
+        )
+}
+
 fn close_selector_authority_resolution_error(
     requested_attachment_identity: &str,
     candidate_entries: &[rub_daemon::session::RegistryEntry],
@@ -395,17 +415,13 @@ pub(crate) async fn resolve_existing_close_target_by_attachment_identity_until(
             "close_selector_socket_identity_read_failed",
         ) {
             Ok(identity) => identity,
-            Err(error) if close_selector_handshake_transport_failed(&error) => continue,
-            Err(error)
-                if compatibility_degraded_owned
-                    .as_ref()
-                    .is_some_and(|degraded| {
-                        should_normalize_close_selector_resolution_error(&error, degraded)
-                    }) =>
-            {
-                continue;
+            Err(error) => {
+                if close_selector_error_allows_next_candidate(&error, compatibility_degraded_owned)
+                {
+                    continue;
+                }
+                return Err(error);
             }
-            Err(error) => return Err(error),
         };
         let (mut client, _attribution) = match connect_ipc_with_retry_until(
             &socket_path,
@@ -428,11 +444,10 @@ pub(crate) async fn resolve_existing_close_target_by_attachment_identity_until(
                 continue;
             }
             Err(failure)
-                if compatibility_degraded_owned
-                    .as_ref()
-                    .is_some_and(|degraded| {
-                        should_normalize_close_selector_resolution_error(&failure.error, degraded)
-                    }) =>
+                if compatibility_degraded_close_selector_error_is_skippable(
+                    &failure.error,
+                    compatibility_degraded_owned,
+                ) =>
             {
                 continue;
             }
@@ -455,17 +470,13 @@ pub(crate) async fn resolve_existing_close_target_by_attachment_identity_until(
         .await
         {
             Ok(handshake) => handshake,
-            Err(error) if close_selector_handshake_transport_failed(&error) => continue,
-            Err(error)
-                if compatibility_degraded_owned
-                    .as_ref()
-                    .is_some_and(|degraded| {
-                        should_normalize_close_selector_resolution_error(&error, degraded)
-                    }) =>
-            {
-                continue;
+            Err(error) => {
+                if close_selector_error_allows_next_candidate(&error, compatibility_degraded_owned)
+                {
+                    continue;
+                }
+                return Err(error);
             }
-            Err(error) => return Err(error),
         };
         verify_socket_path_identity(&socket_path, socket_identity, &identity_spec)?;
         if handshake.daemon_session_id != entry.session_id {
@@ -534,7 +545,7 @@ mod tests {
         should_normalize_close_existing_connect_error,
         should_normalize_close_selector_resolution_error,
     };
-    use rub_core::error::{ErrorCode, RubError};
+    use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
     use rub_core::model::LaunchPolicyInfo;
     use rub_daemon::rub_paths::RubPaths;
     use rub_daemon::session::{RegistryData, RegistryEntry, write_registry};
@@ -549,6 +560,73 @@ mod tests {
 
     fn temp_home() -> PathBuf {
         std::env::temp_dir().join(format!("rub-close-existing-{}", Uuid::now_v7()))
+    }
+
+    fn compatibility_degraded_owned_reason(envelope: &ErrorEnvelope) -> Option<&serde_json::Value> {
+        compatibility_degraded_reason(envelope, "compatibility_degraded_owned", None)
+    }
+
+    fn first_compatibility_degraded_owned_session_reason(
+        envelope: &ErrorEnvelope,
+    ) -> Option<&serde_json::Value> {
+        compatibility_degraded_reason(envelope, "compatibility_degraded_owned_sessions", Some(0))
+    }
+
+    fn compatibility_degraded_reason<'a>(
+        envelope: &'a ErrorEnvelope,
+        field: &str,
+        index: Option<usize>,
+    ) -> Option<&'a serde_json::Value> {
+        let value = envelope.context.as_ref().and_then(|ctx| ctx.get(field))?;
+        index
+            .and_then(|index| value.get(index))
+            .unwrap_or(value)
+            .get("reason")
+    }
+
+    async fn serve_handshake_responses(
+        listener: UnixListener,
+        request_id: &'static str,
+        daemon_session_id: &'static str,
+        attachment_identity: Option<&'static str>,
+    ) {
+        loop {
+            let Ok(Ok((stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
+                    .await
+            else {
+                break;
+            };
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let Some(request): Option<serde_json::Value> =
+                NdJsonCodec::read(&mut reader).await.unwrap()
+            else {
+                continue;
+            };
+            assert_eq!(request["command"], "_handshake");
+            assert_eq!(
+                request["command_id"],
+                serde_json::json!(rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID)
+            );
+            let mut data = serde_json::json!({
+                "daemon_session_id": daemon_session_id,
+                "launch_policy": {
+                    "headless": true,
+                    "ignore_cert_errors": false,
+                    "hide_infobars": false
+                }
+            });
+            if let Some(identity) = attachment_identity {
+                data["attachment_identity"] = serde_json::json!(identity);
+            }
+            let response = IpcResponse::success(request_id, data)
+                .with_command_id(rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID)
+                .expect("handshake probe command_id must be valid")
+                .with_daemon_session_id(daemon_session_id)
+                .expect("daemon_session_id must be valid");
+            let _ = NdJsonCodec::write(&mut writer, &response).await;
+        }
     }
 
     #[test]
@@ -608,11 +686,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            envelope
-                .context
-                .as_ref()
-                .and_then(|ctx| ctx.get("compatibility_degraded_owned"))
-                .and_then(|value| value.get("reason")),
+            compatibility_degraded_owned_reason(&envelope),
             Some(&serde_json::json!("protocol_incompatible"))
         );
     }
@@ -636,12 +710,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            envelope
-                .context
-                .as_ref()
-                .and_then(|ctx| ctx.get("compatibility_degraded_owned_sessions"))
-                .and_then(|value| value.get(0))
-                .and_then(|value| value.get("reason")),
+            first_compatibility_degraded_owned_session_reason(&envelope),
             Some(&serde_json::json!("hard_cut_release_pending"))
         );
     }
@@ -758,88 +827,18 @@ mod tests {
         )
         .unwrap();
 
-        let default_server = tokio::spawn(async move {
-            loop {
-                let Ok(Ok((stream, _))) = tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    default_listener.accept(),
-                )
-                .await
-                else {
-                    break;
-                };
-                let (reader, mut writer) = stream.into_split();
-                let mut reader = BufReader::new(reader);
-                let Some(request): Option<serde_json::Value> =
-                    NdJsonCodec::read(&mut reader).await.unwrap()
-                else {
-                    continue;
-                };
-                assert_eq!(request["command"], "_handshake");
-                assert_eq!(
-                    request["command_id"],
-                    serde_json::json!(rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID)
-                );
-                let response = IpcResponse::success(
-                    "handshake-default",
-                    serde_json::json!({
-                        "daemon_session_id": "sess-default",
-                        "launch_policy": {
-                            "headless": true,
-                            "ignore_cert_errors": false,
-                            "hide_infobars": false
-                        },
-                        "attachment_identity": "profile:/tmp/a/Profile 1"
-                    }),
-                )
-                .with_command_id(rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID)
-                .expect("handshake probe command_id must be valid")
-                .with_daemon_session_id("sess-default")
-                .expect("daemon_session_id must be valid");
-                let _ = NdJsonCodec::write(&mut writer, &response).await;
-            }
-        });
-        let work_server = tokio::spawn(async move {
-            loop {
-                let Ok(Ok((stream, _))) = tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    work_listener.accept(),
-                )
-                .await
-                else {
-                    break;
-                };
-                let (reader, mut writer) = stream.into_split();
-                let mut reader = BufReader::new(reader);
-                let Some(request): Option<serde_json::Value> =
-                    NdJsonCodec::read(&mut reader).await.unwrap()
-                else {
-                    continue;
-                };
-                assert_eq!(request["command"], "_handshake");
-                assert_eq!(
-                    request["command_id"],
-                    serde_json::json!(rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID)
-                );
-                let response = IpcResponse::success(
-                    "handshake-work",
-                    serde_json::json!({
-                        "daemon_session_id": "sess-work",
-                        "launch_policy": {
-                            "headless": true,
-                            "ignore_cert_errors": false,
-                            "hide_infobars": false
-                        },
-                        "attachment_identity": "profile:/tmp/b/Profile 2"
-                    }),
-                )
-                .with_command_id(rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID)
-                .expect("handshake probe command_id must be valid")
-                .with_daemon_session_id("sess-work")
-                .expect("daemon_session_id must be valid");
-                let _ = NdJsonCodec::write(&mut writer, &response).await;
-            }
-        });
+        let default_server = tokio::spawn(serve_handshake_responses(
+            default_listener,
+            "handshake-default",
+            "sess-default",
+            Some("profile:/tmp/a/Profile 1"),
+        ));
+        let work_server = tokio::spawn(serve_handshake_responses(
+            work_listener,
+            "handshake-work",
+            "sess-work",
+            Some("profile:/tmp/b/Profile 2"),
+        ));
 
         let resolved = resolve_existing_close_target_by_attachment_identity_until(
             &home,
@@ -903,44 +902,12 @@ mod tests {
         )
         .unwrap();
 
-        let server = tokio::spawn(async move {
-            loop {
-                let Ok(Ok((stream, _))) =
-                    tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
-                        .await
-                else {
-                    break;
-                };
-                let (reader, mut writer) = stream.into_split();
-                let mut reader = BufReader::new(reader);
-                let Some(request): Option<serde_json::Value> =
-                    NdJsonCodec::read(&mut reader).await.unwrap()
-                else {
-                    continue;
-                };
-                assert_eq!(request["command"], "_handshake");
-                assert_eq!(
-                    request["command_id"],
-                    serde_json::json!(rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID)
-                );
-                let response = IpcResponse::success(
-                    "handshake",
-                    serde_json::json!({
-                        "daemon_session_id": "sess-actual",
-                        "launch_policy": {
-                            "headless": true,
-                            "ignore_cert_errors": false,
-                            "hide_infobars": false
-                        }
-                    }),
-                )
-                .with_command_id(rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID)
-                .expect("handshake probe command_id must be valid")
-                .with_daemon_session_id("sess-actual")
-                .expect("daemon_session_id must be valid");
-                let _ = NdJsonCodec::write(&mut writer, &response).await;
-            }
-        });
+        let server = tokio::spawn(serve_handshake_responses(
+            listener,
+            "handshake",
+            "sess-actual",
+            None,
+        ));
 
         let error = close_existing_session_targeted_until(
             &home,

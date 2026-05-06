@@ -27,6 +27,14 @@ use super::rule::{
 };
 use crate::router::{RouterFenceDisposition, TransactionDeadline};
 
+enum OrchestrationExecuteReadiness {
+    Ready {
+        runtime: Box<OrchestrationRuntimeInfo>,
+        rule: Box<OrchestrationRuleInfo>,
+    },
+    Finished(serde_json::Value),
+}
+
 pub(super) async fn cmd_orchestration_execute(
     router: &DaemonRouter,
     id: u32,
@@ -104,73 +112,10 @@ async fn cmd_orchestration_execute_with_router_fence_disposition(
     router_fence_disposition: RouterFenceDisposition,
 ) -> Result<serde_json::Value, RubError> {
     refresh_orchestration_runtime(state).await;
-    let mut runtime = state.orchestration_runtime().await;
-    ensure_orchestration_execution_available(&runtime)?;
-    let mut rule = state.orchestration_rule(id).await.ok_or_else(|| {
-        RubError::domain(
-            ErrorCode::InvalidInput,
-            format!("Orchestration rule id {id} is not present in the current registry"),
-        )
-    })?;
-    if !matches!(rule.status, OrchestrationRuleStatus::Armed) {
-        return Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            format!(
-                "Orchestration rule id {id} must be 'armed' before execute; current status is '{}'",
-                orchestration_status_name(rule.status),
-            ),
-        ));
-    }
-    if orchestration_rule_in_cooldown(&rule) {
-        let result = blocked_cooldown_result(&rule);
-        let outcome_commit = state
-            .record_orchestration_outcome(
-                id,
-                Some(rule.lifecycle_generation),
-                rule.last_condition_evidence.clone(),
-                result.clone(),
-            )
-            .await;
-        let runtime = state.orchestration_runtime().await;
-        let rule = runtime
-            .rules
-            .iter()
-            .find(|entry| entry.id == id)
-            .cloned()
-            .or_else(|| match &outcome_commit {
-                OrchestrationOutcomeCommit::Applied(Some(rule))
-                | OrchestrationOutcomeCommit::Stale(Some(rule)) => Some(rule.clone()),
-                OrchestrationOutcomeCommit::Applied(None)
-                | OrchestrationOutcomeCommit::Stale(None) => None,
-            })
-            .ok_or_else(|| {
-                RubError::Internal(format!(
-                    "Orchestration rule id {id} disappeared while recording cooldown outcome"
-                ))
-            })?;
-        let lifecycle_commit = matches!(outcome_commit, OrchestrationOutcomeCommit::Stale(_))
-            .then_some("stale_rule_generation");
-
-        return Ok(orchestration_payload(
-            orchestration_rule_subject(id),
-            serde_json::json!({
-                "rule": rule,
-                "execution": result,
-                "lifecycle_commit": lifecycle_commit,
-            }),
-            &runtime,
-        ));
-    }
-    if rule.unavailable_reason.is_some() {
-        return Err(RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            format!("Orchestration rule id {id} is currently unavailable"),
-            serde_json::json!({
-                "reason": "orchestration_rule_unavailable",
-                "unavailable_reason": rule.unavailable_reason,
-            }),
-        ));
-    }
+    let rule = match orchestration_execute_readiness(state, id).await? {
+        OrchestrationExecuteReadiness::Ready { rule, .. } => *rule,
+        OrchestrationExecuteReadiness::Finished(payload) => return Ok(payload),
+    };
 
     let _active_execution_fence = acquire_manual_orchestration_execution_fence_if_remote(
         router,
@@ -181,73 +126,10 @@ async fn cmd_orchestration_execute_with_router_fence_disposition(
     )
     .await?;
     refresh_orchestration_runtime(state).await;
-    runtime = state.orchestration_runtime().await;
-    ensure_orchestration_execution_available(&runtime)?;
-    rule = state.orchestration_rule(id).await.ok_or_else(|| {
-        RubError::domain(
-            ErrorCode::InvalidInput,
-            format!("Orchestration rule id {id} is not present in the current registry"),
-        )
-    })?;
-    if !matches!(rule.status, OrchestrationRuleStatus::Armed) {
-        return Err(RubError::domain(
-            ErrorCode::InvalidInput,
-            format!(
-                "Orchestration rule id {id} must be 'armed' before execute; current status is '{}'",
-                orchestration_status_name(rule.status),
-            ),
-        ));
-    }
-    if orchestration_rule_in_cooldown(&rule) {
-        let result = blocked_cooldown_result(&rule);
-        let outcome_commit = state
-            .record_orchestration_outcome(
-                id,
-                Some(rule.lifecycle_generation),
-                rule.last_condition_evidence.clone(),
-                result.clone(),
-            )
-            .await;
-        runtime = state.orchestration_runtime().await;
-        let rule = runtime
-            .rules
-            .iter()
-            .find(|entry| entry.id == id)
-            .cloned()
-            .or_else(|| match &outcome_commit {
-                OrchestrationOutcomeCommit::Applied(Some(rule))
-                | OrchestrationOutcomeCommit::Stale(Some(rule)) => Some(rule.clone()),
-                OrchestrationOutcomeCommit::Applied(None)
-                | OrchestrationOutcomeCommit::Stale(None) => None,
-            })
-            .ok_or_else(|| {
-                RubError::Internal(format!(
-                    "Orchestration rule id {id} disappeared while recording cooldown outcome"
-                ))
-            })?;
-        let lifecycle_commit = matches!(outcome_commit, OrchestrationOutcomeCommit::Stale(_))
-            .then_some("stale_rule_generation");
-
-        return Ok(orchestration_payload(
-            orchestration_rule_subject(id),
-            serde_json::json!({
-                "rule": rule,
-                "execution": result,
-                "lifecycle_commit": lifecycle_commit,
-            }),
-            &runtime,
-        ));
-    }
-    if rule.unavailable_reason.is_some() {
-        return Err(RubError::domain_with_context(
-            ErrorCode::InvalidInput,
-            format!("Orchestration rule id {id} is currently unavailable"),
-            serde_json::json!({
-                "reason": "orchestration_rule_unavailable",
-                "unavailable_reason": rule.unavailable_reason,
-            }),
-        ));
-    }
+    let (runtime, rule) = match orchestration_execute_readiness(state, id).await? {
+        OrchestrationExecuteReadiness::Ready { runtime, rule } => (*runtime, *rule),
+        OrchestrationExecuteReadiness::Finished(payload) => return Ok(payload),
+    };
     let execution_evidence =
         capture_manual_orchestration_condition_evidence(router, state, &runtime, &rule, deadline)
             .await?;
@@ -300,6 +182,86 @@ async fn cmd_orchestration_execute_with_router_fence_disposition(
         }),
         &runtime,
     ))
+}
+
+async fn orchestration_execute_readiness(
+    state: &Arc<SessionState>,
+    id: u32,
+) -> Result<OrchestrationExecuteReadiness, RubError> {
+    let runtime = state.orchestration_runtime().await;
+    ensure_orchestration_execution_available(&runtime)?;
+    let rule = state.orchestration_rule(id).await.ok_or_else(|| {
+        RubError::domain(
+            ErrorCode::InvalidInput,
+            format!("Orchestration rule id {id} is not present in the current registry"),
+        )
+    })?;
+    if !matches!(rule.status, OrchestrationRuleStatus::Armed) {
+        return Err(RubError::domain(
+            ErrorCode::InvalidInput,
+            format!(
+                "Orchestration rule id {id} must be 'armed' before execute; current status is '{}'",
+                orchestration_status_name(rule.status),
+            ),
+        ));
+    }
+    if orchestration_rule_in_cooldown(&rule) {
+        let result = blocked_cooldown_result(&rule);
+        let outcome_commit = state
+            .record_orchestration_outcome(
+                id,
+                Some(rule.lifecycle_generation),
+                rule.last_condition_evidence.clone(),
+                result.clone(),
+            )
+            .await;
+        let runtime = state.orchestration_runtime().await;
+        let rule = runtime
+            .rules
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+            .or_else(|| match &outcome_commit {
+                OrchestrationOutcomeCommit::Applied(Some(rule))
+                | OrchestrationOutcomeCommit::Stale(Some(rule)) => Some(rule.clone()),
+                OrchestrationOutcomeCommit::Applied(None)
+                | OrchestrationOutcomeCommit::Stale(None) => None,
+            })
+            .ok_or_else(|| {
+                RubError::Internal(format!(
+                    "Orchestration rule id {id} disappeared while recording cooldown outcome"
+                ))
+            })?;
+        let lifecycle_commit = matches!(outcome_commit, OrchestrationOutcomeCommit::Stale(_))
+            .then_some("stale_rule_generation");
+
+        return Ok(OrchestrationExecuteReadiness::Finished(
+            orchestration_payload(
+                orchestration_rule_subject(id),
+                serde_json::json!({
+                    "rule": rule,
+                    "execution": result,
+                    "lifecycle_commit": lifecycle_commit,
+                }),
+                &runtime,
+            ),
+        ));
+    }
+    if rule.unavailable_reason.is_some() {
+        return Err(RubError::domain_with_context(
+            ErrorCode::InvalidInput,
+            format!("Orchestration rule id {id} is currently unavailable"),
+            serde_json::json!({
+                "reason": "orchestration_rule_unavailable",
+                "unavailable_reason": rule.unavailable_reason,
+            }),
+        ));
+    }
+
+    Ok(OrchestrationExecuteReadiness::Ready {
+        runtime: Box::new(runtime),
+        rule: Box::new(rule),
+    })
 }
 
 async fn capture_manual_orchestration_condition_evidence(
@@ -604,6 +566,7 @@ async fn update_orchestration_status_with_router_fence_disposition(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_router;
     use super::{
         acquire_manual_orchestration_execution_fence_if_remote,
         capture_manual_orchestration_condition_evidence,
@@ -613,9 +576,9 @@ mod tests {
         update_orchestration_status_with_router_fence_disposition,
     };
     use crate::orchestration_probe::OrchestrationProbeResult;
-    use crate::router::{DaemonRouter, RouterFenceDisposition, TransactionDeadline};
+    use crate::router::{RouterFenceDisposition, TransactionDeadline};
     use crate::session::SessionState;
-    use rub_core::error::ErrorCode;
+    use rub_core::error::{ErrorCode, ErrorEnvelope};
     use rub_core::model::{
         OrchestrationAddressInfo, OrchestrationExecutionPolicyInfo, OrchestrationMode,
         OrchestrationRuleInfo, OrchestrationRuleStatus, OrchestrationRuntimeInfo,
@@ -626,7 +589,6 @@ mod tests {
     use rub_ipc::protocol::{IpcRequest, IpcResponse};
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::BufReader;
@@ -690,28 +652,12 @@ mod tests {
         rule
     }
 
-    fn test_router() -> DaemonRouter {
-        let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
-            rub_cdp::browser::BrowserLaunchOptions {
-                headless: true,
-                ignore_cert_errors: false,
-                user_data_dir: None,
-                managed_profile_ephemeral: false,
-                download_dir: None,
-                profile_directory: None,
-                hide_infobars: true,
-                stealth: true,
-            },
-        ));
-        let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
-            manager,
-            Arc::new(AtomicU64::new(0)),
-            rub_cdp::humanize::HumanizeConfig {
-                enabled: false,
-                speed: rub_cdp::humanize::HumanizeSpeed::Normal,
-            },
-        ));
-        DaemonRouter::new(adapter)
+    fn error_context_str<'a>(error: &'a ErrorEnvelope, pointer: &str) -> Option<&'a str> {
+        error
+            .context
+            .as_ref()
+            .and_then(|value| value.pointer(pointer))
+            .and_then(|value| value.as_str())
     }
 
     fn addressable_session(
@@ -865,28 +811,15 @@ mod tests {
 
         assert_eq!(error.code, ErrorCode::SessionBusy);
         assert_eq!(
-            error
-                .context
-                .as_ref()
-                .and_then(|value| value.get("reason"))
-                .and_then(|value| value.as_str()),
+            error_context_str(&error, "/reason"),
             Some("orchestration_source_session_not_addressable")
         );
         assert_eq!(
-            error
-                .context
-                .as_ref()
-                .and_then(|value| value.get("user_data_dir"))
-                .and_then(|value| value.as_str()),
+            error_context_str(&error, "/user_data_dir"),
             Some("/tmp/rub-source-profile")
         );
         assert_eq!(
-            error
-                .context
-                .as_ref()
-                .and_then(|value| value.get("user_data_dir_state"))
-                .and_then(|value| value.get("path_kind"))
-                .and_then(|value| value.as_str()),
+            error_context_str(&error, "/user_data_dir_state/path_kind"),
             Some("managed_user_data_directory")
         );
     }
@@ -902,7 +835,7 @@ mod tests {
         ));
         let runtime = OrchestrationRuntimeInfo::default();
         let deadline = TransactionDeadline::new(1);
-        std::thread::sleep(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
 
         let error = capture_manual_orchestration_condition_evidence(
             &router,
@@ -963,7 +896,7 @@ mod tests {
             .expect("cooldown rule should register");
 
         let deadline = TransactionDeadline::new(1);
-        std::thread::sleep(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
 
         let payload = cmd_orchestration_execute(&router, rule.id, deadline, &state)
             .await
@@ -1084,7 +1017,7 @@ mod tests {
             .expect("held transaction should acquire");
 
         let deadline = TransactionDeadline::new(1);
-        std::thread::sleep(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
         let error = acquire_manual_orchestration_execution_fence_if_remote(
             &router,
             &state,
@@ -1127,7 +1060,7 @@ mod tests {
             .expect("held transaction should acquire");
 
         let deadline = TransactionDeadline::new(1);
-        std::thread::sleep(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
         let error = update_orchestration_status_with_router_fence_disposition(
             &router,
             registered.id,
@@ -1252,8 +1185,9 @@ mod tests {
         .await
         .expect_err("manual execute should reuse the current router transaction instead of timing out on queue reentry");
         let envelope = error.into_envelope();
-        assert!(
-            envelope.code != ErrorCode::IpcTimeout,
+        assert_ne!(
+            envelope.code,
+            ErrorCode::IpcTimeout,
             "manual execute should fail for target/probe authority, not queue reentry: {envelope:?}"
         );
     }

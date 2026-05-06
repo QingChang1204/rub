@@ -36,18 +36,7 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> DiffResult {
             }
             matched_old_indices.insert(old_el.index);
 
-            let changes = compute_field_changes(old_el, new_el);
-            if changes.is_empty() {
-                unchanged_count += 1;
-            } else {
-                let semantic_kinds = semantic_kinds_for_changes(&changes);
-                changed.push(ChangedElement {
-                    index: new_el.index,
-                    tag: new_el.tag,
-                    semantic_kinds,
-                    changes,
-                });
-            }
+            push_changed_or_count_unchanged(old_el, new_el, &mut changed, &mut unchanged_count);
         } else {
             let fallback_match = old.elements.iter().find(|oe| {
                 oe.element_ref.is_none()
@@ -59,18 +48,7 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> DiffResult {
 
             if let Some(oe) = fallback_match {
                 matched_old_indices.insert(oe.index);
-                let changes = compute_field_changes(oe, new_el);
-                if changes.is_empty() {
-                    unchanged_count += 1;
-                } else {
-                    let semantic_kinds = semantic_kinds_for_changes(&changes);
-                    changed.push(ChangedElement {
-                        index: new_el.index,
-                        tag: new_el.tag,
-                        semantic_kinds,
-                        changes,
-                    });
-                }
+                push_changed_or_count_unchanged(oe, new_el, &mut changed, &mut unchanged_count);
             } else {
                 added.push(DiffElement {
                     index: new_el.index,
@@ -107,6 +85,26 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> DiffResult {
         changed,
         unchanged_count,
         summary,
+    }
+}
+
+fn push_changed_or_count_unchanged(
+    old_el: &Element,
+    new_el: &Element,
+    changed: &mut Vec<ChangedElement>,
+    unchanged_count: &mut u32,
+) {
+    let changes = compute_field_changes(old_el, new_el);
+    if changes.is_empty() {
+        *unchanged_count += 1;
+    } else {
+        let semantic_kinds = semantic_kinds_for_changes(&changes);
+        changed.push(ChangedElement {
+            index: new_el.index,
+            tag: new_el.tag,
+            semantic_kinds,
+            changes,
+        });
     }
 }
 
@@ -300,7 +298,8 @@ fn append_ax_change(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rub_core::model::{ElementTag, FrameContextInfo, ScrollPosition, SnapshotProjection};
+    use crate::snapshot_lookup::sample_main_frame_context;
+    use rub_core::model::{ElementTag, ScrollPosition, SnapshotProjection};
 
     fn element(index: u32, text: &str, element_ref: Option<&str>) -> Element {
         Element {
@@ -321,15 +320,7 @@ mod tests {
         Snapshot {
             snapshot_id: snapshot_id.to_string(),
             dom_epoch: 1,
-            frame_context: FrameContextInfo {
-                frame_id: "main".to_string(),
-                name: None,
-                parent_frame_id: None,
-                target_id: Some("target-1".to_string()),
-                url: Some("https://example.com".to_string()),
-                depth: 0,
-                same_origin_accessible: Some(true),
-            },
+            frame_context: sample_main_frame_context(),
             frame_lineage: vec!["main".to_string()],
             url: "https://example.com".to_string(),
             title: "Example".to_string(),

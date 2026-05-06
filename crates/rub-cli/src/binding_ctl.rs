@@ -144,18 +144,25 @@ pub(crate) fn binding_path_state(
     }
 }
 
+fn dependent_remembered_aliases(
+    registry: &rub_core::model::RememberedBindingAliasRegistryData,
+    binding_alias: &str,
+) -> Vec<String> {
+    registry
+        .aliases
+        .iter()
+        .filter(|record| record.binding_alias == binding_alias)
+        .map(|record| record.alias.clone())
+        .collect()
+}
+
 fn rename_binding_alias(rub_home: &Path, alias: &str, new_alias: &str) -> Result<Value, RubError> {
     let alias = normalize_binding_alias(alias)?;
     let new_alias = normalize_binding_alias(new_alias)?;
     crate::binding_memory_ctl::mutate_binding_and_remembered_alias_registries(
         rub_home,
         |registry, remembered_registry| {
-            let dependent_aliases = remembered_registry
-                .aliases
-                .iter()
-                .filter(|record| record.binding_alias == alias)
-                .map(|record| record.alias.clone())
-                .collect::<Vec<_>>();
+            let dependent_aliases = dependent_remembered_aliases(remembered_registry, &alias);
             if !dependent_aliases.is_empty() {
                 return Err(RubError::domain_with_context(
                     ErrorCode::InvalidInput,
@@ -210,12 +217,7 @@ fn remove_binding_alias(rub_home: &Path, alias: &str) -> Result<Value, RubError>
     crate::binding_memory_ctl::mutate_binding_and_remembered_alias_registries(
         rub_home,
         |registry, remembered_registry| {
-            let dependent_aliases = remembered_registry
-                .aliases
-                .iter()
-                .filter(|record| record.binding_alias == normalized)
-                .map(|record| record.alias.clone())
-                .collect::<Vec<_>>();
+            let dependent_aliases = dependent_remembered_aliases(remembered_registry, &normalized);
             if !dependent_aliases.is_empty() {
                 return Err(RubError::domain_with_context(
                     ErrorCode::InvalidInput,

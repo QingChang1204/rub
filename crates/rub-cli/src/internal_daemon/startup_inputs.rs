@@ -97,40 +97,13 @@ pub(super) async fn resolve_startup_inputs(
 #[cfg(test)]
 mod tests {
     use super::resolve_startup_inputs;
-    use crate::commands::{Commands, EffectiveCli, RequestedLaunchPolicy};
+    use crate::commands::Commands;
     use crate::daemon_ctl::AuthoritativeStartupInputs;
     use crate::session_policy::ConnectionRequest;
-    use std::path::PathBuf;
+    use crate::test_support::effective_cli_with_default_home as cli_with;
     use tokio::sync::Mutex;
 
     static STARTUP_INPUTS_ENV_LOCK: Mutex<()> = Mutex::const_new(());
-
-    fn cli_with(command: Commands) -> EffectiveCli {
-        EffectiveCli {
-            session: "default".to_string(),
-            session_id: None,
-            rub_home: PathBuf::from("/tmp/rub-test"),
-            timeout: 30_000,
-            headed: false,
-            ignore_cert_errors: false,
-            user_data_dir: None,
-            hide_infobars: true,
-            json_pretty: false,
-            verbose: false,
-            trace: false,
-            command,
-            cdp_url: None,
-            connect: false,
-            profile: None,
-            profile_resolved_path: None,
-            use_alias: None,
-            no_stealth: false,
-            humanize: false,
-            humanize_speed: "normal".to_string(),
-            requested_launch_policy: RequestedLaunchPolicy::default(),
-            effective_launch_policy: RequestedLaunchPolicy::default(),
-        }
-    }
 
     struct StartupInputsEnvGuard {
         previous: Option<std::ffi::OsString>,

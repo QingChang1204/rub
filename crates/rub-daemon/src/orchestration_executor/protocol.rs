@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 use rub_core::model::OrchestrationSessionInfo;
-use rub_core::recovery_contract::target_replay_or_spent_tombstone_contract;
+use rub_core::recovery_contract::{
+    ipc_possible_commit_recovery_reason, target_replay_or_spent_tombstone_contract,
+};
 use rub_ipc::client::{IpcClient, IpcClientError};
 use rub_ipc::protocol::{IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse, ResponseStatus};
 use serde::de::DeserializeOwned;
@@ -407,59 +409,11 @@ pub(super) fn align_orchestration_timeout_authority(
 }
 
 fn align_embedded_timeout_authority(request: &mut IpcRequest) {
-    let embedded_timeout_ms = match request.command.as_str() {
-        "wait" => Some(
-            request
-                .timeout_ms
-                .saturating_sub(IPC_REPLAY_TIMEOUT_BUFFER_MS),
-        ),
-        "inspect"
-            if request
-                .args
-                .get("sub")
-                .and_then(|value| value.as_str())
-                .is_some_and(|sub| sub == "network")
-                && request
-                    .args
-                    .get("wait")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false) =>
-        {
-            Some(
-                request
-                    .timeout_ms
-                    .saturating_sub(IPC_REPLAY_TIMEOUT_BUFFER_MS),
-            )
-        }
-        "inspect"
-            if request
-                .args
-                .get("sub")
-                .and_then(|value| value.as_str())
-                .is_some_and(|sub| sub == "list")
-                && request.args.get("wait_timeout_ms").is_some() =>
-        {
-            Some(
-                request
-                    .timeout_ms
-                    .saturating_sub(IPC_REPLAY_TIMEOUT_BUFFER_MS),
-            )
-        }
-        "download"
-            if request
-                .args
-                .get("sub")
-                .and_then(|value| value.as_str())
-                .is_some_and(|sub| sub == "wait" || sub == "save") =>
-        {
-            Some(
-                request
-                    .timeout_ms
-                    .saturating_sub(IPC_REPLAY_TIMEOUT_BUFFER_MS),
-            )
-        }
-        _ => None,
-    };
+    let embedded_timeout_ms = command_owns_embedded_timeout_authority(request).then(|| {
+        request
+            .timeout_ms
+            .saturating_sub(IPC_REPLAY_TIMEOUT_BUFFER_MS)
+    });
 
     if let Some(timeout_ms) = embedded_timeout_ms
         && let Some(object) = request.args.as_object_mut()
@@ -477,6 +431,38 @@ fn align_embedded_timeout_authority(request: &mut IpcRequest) {
             object.insert("wait_timeout_ms".to_string(), serde_json::json!(timeout_ms));
         }
     }
+}
+
+fn command_owns_embedded_timeout_authority(request: &IpcRequest) -> bool {
+    match request.command.as_str() {
+        "wait" => true,
+        "inspect" if request_sub_is(request, "network") => request
+            .args
+            .get("wait")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        "inspect" if request_sub_is(request, "list") => {
+            request.args.get("wait_timeout_ms").is_some()
+        }
+        "download" => request_sub_is_any(request, &["wait", "save"]),
+        _ => false,
+    }
+}
+
+fn request_sub_is(request: &IpcRequest, expected: &str) -> bool {
+    request
+        .args
+        .get("sub")
+        .and_then(|value| value.as_str())
+        .is_some_and(|sub| sub == expected)
+}
+
+fn request_sub_is_any(request: &IpcRequest, expected: &[&str]) -> bool {
+    request
+        .args
+        .get("sub")
+        .and_then(|value| value.as_str())
+        .is_some_and(|sub| expected.contains(&sub))
 }
 
 fn orchestration_timeout_budget_exhausted_error(
@@ -551,29 +537,8 @@ fn orchestration_recoverable_transport_reason(error: &IpcClientError) -> Option<
     }
 }
 
-fn orchestration_recoverable_protocol_reason(
-    envelope: &rub_core::error::ErrorEnvelope,
-) -> Option<&'static str> {
-    match envelope
-        .context
-        .as_ref()
-        .and_then(|context| context.get("reason"))
-        .and_then(|value| value.as_str())
-    {
-        Some("ipc_request_write_transport_failure_after_possible_commit") => {
-            Some("request_write_transport_failure_after_possible_commit")
-        }
-        Some("ipc_request_write_timeout_after_possible_commit") => {
-            Some("request_write_timeout_after_possible_commit")
-        }
-        Some("ipc_response_timeout_after_request_commit") => {
-            Some("response_timeout_after_request_commit")
-        }
-        Some("ipc_response_transport_failure_after_request_commit") => {
-            Some("response_transport_failure_after_request_commit")
-        }
-        _ => None,
-    }
+fn orchestration_recoverable_protocol_reason(envelope: &ErrorEnvelope) -> Option<&'static str> {
+    ipc_possible_commit_recovery_reason(envelope)
 }
 
 fn orchestration_transport_error(error: &IpcClientError) -> Option<&std::io::Error> {
@@ -584,18 +549,20 @@ fn orchestration_transport_error(error: &IpcClientError) -> Option<&std::io::Err
 }
 
 fn classify_orchestration_transport(error: &std::io::Error) -> Option<&'static str> {
-    match error.kind() {
-        std::io::ErrorKind::ConnectionRefused => Some("connection_refused"),
-        std::io::ErrorKind::ConnectionReset => Some("connection_reset"),
-        std::io::ErrorKind::ConnectionAborted => Some("connection_aborted"),
-        std::io::ErrorKind::TimedOut => Some("timed_out"),
-        std::io::ErrorKind::Interrupted => Some("interrupted"),
-        std::io::ErrorKind::WouldBlock => Some("would_block"),
-        std::io::ErrorKind::BrokenPipe => Some("broken_pipe"),
-        std::io::ErrorKind::UnexpectedEof => Some("unexpected_eof"),
-        std::io::ErrorKind::NotFound => Some("socket_not_found"),
-        _ => None,
-    }
+    const TRANSIENT_IO_REASONS: &[(std::io::ErrorKind, &str)] = &[
+        (std::io::ErrorKind::ConnectionRefused, "connection_refused"),
+        (std::io::ErrorKind::ConnectionReset, "connection_reset"),
+        (std::io::ErrorKind::ConnectionAborted, "connection_aborted"),
+        (std::io::ErrorKind::TimedOut, "timed_out"),
+        (std::io::ErrorKind::Interrupted, "interrupted"),
+        (std::io::ErrorKind::WouldBlock, "would_block"),
+        (std::io::ErrorKind::BrokenPipe, "broken_pipe"),
+        (std::io::ErrorKind::UnexpectedEof, "unexpected_eof"),
+        (std::io::ErrorKind::NotFound, "socket_not_found"),
+    ];
+    TRANSIENT_IO_REASONS
+        .iter()
+        .find_map(|(kind, reason)| (*kind == error.kind()).then_some(*reason))
 }
 
 fn orchestration_dispatch_context(
@@ -805,17 +772,12 @@ where
             )
         })
         .and_then(|data| {
-            serde_json::from_value::<T>(data).map_err(|error| {
-                ErrorEnvelope::new(
-                    ErrorCode::IpcProtocolError,
-                    format!("Failed to decode {invalid_payload_subject}: {error}"),
-                )
-                .with_context(serde_json::json!({
-                    "reason": invalid_payload_reason,
-                    "session_id": session.session_id,
-                    "session_name": session.session_name,
-                }))
-            })
+            decode_orchestration_payload_value(
+                data,
+                session,
+                invalid_payload_reason,
+                invalid_payload_subject,
+            )
         })
 }
 
@@ -844,18 +806,35 @@ where
             )
         })
         .and_then(|payload| {
-            serde_json::from_value::<T>(payload).map_err(|error| {
-                ErrorEnvelope::new(
-                    ErrorCode::IpcProtocolError,
-                    format!("Failed to decode {invalid_payload_subject}: {error}"),
-                )
-                .with_context(serde_json::json!({
-                    "reason": invalid_payload_reason,
-                    "session_id": session.session_id,
-                    "session_name": session.session_name,
-                }))
-            })
+            decode_orchestration_payload_value(
+                payload,
+                session,
+                invalid_payload_reason,
+                invalid_payload_subject,
+            )
         })
+}
+
+fn decode_orchestration_payload_value<T>(
+    payload: serde_json::Value,
+    session: &OrchestrationSessionInfo,
+    invalid_payload_reason: &str,
+    invalid_payload_subject: &str,
+) -> Result<T, ErrorEnvelope>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value::<T>(payload).map_err(|error| {
+        ErrorEnvelope::new(
+            ErrorCode::IpcProtocolError,
+            format!("Failed to decode {invalid_payload_subject}: {error}"),
+        )
+        .with_context(serde_json::json!({
+            "reason": invalid_payload_reason,
+            "session_id": session.session_id,
+            "session_name": session.session_name,
+        }))
+    })
 }
 
 pub(crate) fn decode_orchestration_success_result_items<T>(

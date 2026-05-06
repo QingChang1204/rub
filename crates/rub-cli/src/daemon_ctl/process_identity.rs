@@ -7,8 +7,6 @@ use rub_ipc::handshake::{
 };
 use rub_ipc::protocol::IPC_PROTOCOL_VERSION;
 
-use rub_daemon::rub_paths::RubPaths;
-
 pub(crate) fn process_matches_registry_entry_for_termination(
     rub_home: &Path,
     entry: &rub_daemon::session::RegistryEntry,
@@ -21,7 +19,7 @@ pub(crate) fn process_matches_registry_entry_for_termination(
     )? {
         return Ok(false);
     }
-    let runtime_committed = runtime_commit_matches_registry_entry(rub_home, entry);
+    let runtime_committed = super::registry_entry_runtime_commit_matches(rub_home, entry);
     let compatibility_owned = entry.ipc_protocol_version != IPC_PROTOCOL_VERSION;
     Ok(socket_identity_authorizes_registry_termination(
         socket_identity_confirmation(Path::new(&entry.socket_path), &entry.session_id)?,
@@ -118,22 +116,6 @@ fn socket_identity_confirmation(
     expected_session_id: &str,
 ) -> std::io::Result<SocketIdentityConfirmation> {
     confirm_daemon_session_identity(socket_path, expected_session_id)
-}
-
-fn runtime_commit_matches_registry_entry(
-    rub_home: &Path,
-    entry: &rub_daemon::session::RegistryEntry,
-) -> bool {
-    let runtime = RubPaths::new(rub_home).session_runtime(&entry.session_name, &entry.session_id);
-    let pid_matches = std::fs::read_to_string(runtime.pid_path())
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
-        == Some(entry.pid);
-    let committed_matches = std::fs::read_to_string(runtime.startup_committed_path())
-        .ok()
-        .is_some_and(|raw| raw.trim() == entry.session_id);
-    let socket_matches = Path::new(&entry.socket_path) == runtime.socket_path();
-    pid_matches && committed_matches && socket_matches
 }
 
 #[cfg(test)]

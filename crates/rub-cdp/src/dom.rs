@@ -286,17 +286,7 @@ async fn extract_raw_elements(
         .execute(build_contextual_evaluate_params(script, context_id, false)?)
         .await
         .map_err(|e| RubError::Internal(format!("Element extraction failed: {e}")))?;
-    let elements_str = elements_json
-        .result
-        .result
-        .value
-        .as_ref()
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| {
-            RubError::Internal("Element extraction returned no JSON string".to_string())
-        })?;
-    serde_json::from_str(elements_str)
-        .map_err(|e| RubError::Internal(format!("Element JSON parse failed: {e}")))
+    parse_extracted_elements_payload(elements_json.result.result.value.as_ref())
 }
 
 async fn extract_raw_elements_with_command_line(
@@ -309,15 +299,15 @@ async fn extract_raw_elements_with_command_line(
         .execute(params)
         .await
         .map_err(|e| RubError::Internal(format!("Element extraction failed: {e}")))?;
-    let elements_str = response
-        .result
-        .result
-        .value
-        .as_ref()
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| {
-            RubError::Internal("Element extraction returned no JSON string".to_string())
-        })?;
+    parse_extracted_elements_payload(response.result.result.value.as_ref())
+}
+
+fn parse_extracted_elements_payload(
+    value: Option<&serde_json::Value>,
+) -> Result<ExtractedElementsPayload, RubError> {
+    let elements_str = value.and_then(|value| value.as_str()).ok_or_else(|| {
+        RubError::Internal("Element extraction returned no JSON string".to_string())
+    })?;
     serde_json::from_str(elements_str)
         .map_err(|e| RubError::Internal(format!("Element JSON parse failed: {e}")))
 }

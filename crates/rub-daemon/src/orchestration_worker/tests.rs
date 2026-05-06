@@ -22,36 +22,14 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use uuid::Uuid;
 
-use crate::router::DaemonRouter;
 use crate::rub_paths::RubPaths;
 use crate::session::{NetworkRequestBaseline, RegistryEntry, SessionState, write_registry};
 use rub_ipc::protocol::IPC_PROTOCOL_VERSION;
 
-fn test_router() -> Arc<DaemonRouter> {
-    let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
-        rub_cdp::browser::BrowserLaunchOptions {
-            headless: true,
-            ignore_cert_errors: false,
-            user_data_dir: None,
-            managed_profile_ephemeral: false,
-            download_dir: None,
-            profile_directory: None,
-            hide_infobars: true,
-            stealth: true,
-        },
-    ));
-    let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
-        manager,
-        Arc::new(AtomicU64::new(0)),
-        rub_cdp::humanize::HumanizeConfig {
-            enabled: false,
-            speed: rub_cdp::humanize::HumanizeSpeed::Normal,
-        },
-    ));
-    Arc::new(DaemonRouter::new(adapter))
+fn test_router() -> Arc<crate::router::DaemonRouter> {
+    crate::test_support::daemon_router_arc()
 }
 
 fn temp_home(label: &str) -> PathBuf {
@@ -109,6 +87,95 @@ fn rule(id: u32, status: OrchestrationRuleStatus) -> OrchestrationRuleInfo {
         last_condition_evidence: None,
         last_result: None,
     }
+}
+
+fn network_req1_condition() -> TriggeredOrchestrationCondition {
+    TriggeredOrchestrationCondition {
+        evidence: TriggerEvidenceInfo {
+            summary: "network_request_matched:req-1".to_string(),
+            fingerprint: Some("req-1".to_string()),
+        },
+        evidence_key: "network_request_matched:req-1::req-1".to_string(),
+        network_progress: None,
+    }
+}
+
+fn pending_condition_policy(
+    rule: &OrchestrationRuleInfo,
+    preserved_triggered: Option<TriggeredOrchestrationCondition>,
+) -> PendingOrchestrationConditionPolicy {
+    PendingOrchestrationConditionPolicy {
+        preserved_triggered,
+        requires_revalidation_after_queue: false,
+        rule_semantics_fingerprint: orchestration_rule_semantics_fingerprint(rule),
+        rule_lifecycle_generation: rule.lifecycle_generation,
+    }
+}
+
+fn pending_reservation_for_rule(
+    rule: &OrchestrationRuleInfo,
+    fallback_network_progress: Option<OrchestrationNetworkProgress>,
+    preserved_triggered: Option<TriggeredOrchestrationCondition>,
+) -> PendingOrchestrationReservation {
+    PendingOrchestrationReservation {
+        attempt_id: 1,
+        fallback_network_progress,
+        condition_policy: pending_condition_policy(rule, preserved_triggered),
+        task: tokio::spawn(async {}),
+    }
+}
+
+fn pending_network_completion_state(
+    live_rule: &OrchestrationRuleInfo,
+) -> (
+    HashMap<u32, OrchestrationWorkerEntry>,
+    HashMap<u32, PendingOrchestrationReservation>,
+) {
+    (
+        HashMap::from([(
+            live_rule.id,
+            OrchestrationWorkerEntry {
+                last_status: OrchestrationRuleStatus::Armed,
+                network_cursor: 0,
+                network_cursor_primed: false,
+                observatory_drop_count: 0,
+                latched_evidence_key: None,
+            },
+        )]),
+        HashMap::from([(
+            live_rule.id,
+            pending_reservation_for_rule(
+                live_rule,
+                Some(OrchestrationNetworkProgress {
+                    next_cursor: 9,
+                    observed_drop_count: 2,
+                }),
+                Some(network_req1_condition()),
+            ),
+        )]),
+    )
+}
+
+async fn assert_foreground_transaction_acquires(
+    router: &Arc<crate::router::DaemonRouter>,
+    state: &Arc<SessionState>,
+    label: &'static str,
+    timeout_message: &'static str,
+    acquire_message: &'static str,
+) {
+    let foreground = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        router.begin_automation_transaction_with_wait_budget(
+            state,
+            label,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(5),
+        ),
+    )
+    .await
+    .expect(timeout_message)
+    .expect(acquire_message);
+    drop(foreground);
 }
 
 #[test]
@@ -485,19 +552,14 @@ async fn ready_orchestration_reservation_completion_releases_idle_queue_permit()
     .await;
 
     assert!(pending_reservations.is_empty());
-    let foreground = tokio::time::timeout(
-        std::time::Duration::from_millis(50),
-        router.begin_automation_transaction_with_wait_budget(
-            &state,
-            "foreground_after_completion",
-            std::time::Duration::from_secs(1),
-            std::time::Duration::from_millis(5),
-        ),
+    assert_foreground_transaction_acquires(
+        &router,
+        &state,
+        "foreground_after_completion",
+        "foreground request should not remain blocked behind drained completion",
+        "foreground request should acquire after drained completion",
     )
-    .await
-    .expect("foreground request should not remain blocked behind drained completion")
-    .expect("foreground request should acquire after drained completion");
-    drop(foreground);
+    .await;
 }
 
 #[tokio::test]
@@ -519,17 +581,7 @@ async fn pending_network_request_orchestration_is_not_re_evaluated_during_queue_
     network_rule.condition.kind = TriggerConditionKind::NetworkRequest;
     let mut pending_reservations = HashMap::from([(
         7_u32,
-        PendingOrchestrationReservation {
-            attempt_id: 1,
-            fallback_network_progress: None,
-            condition_policy: PendingOrchestrationConditionPolicy {
-                preserved_triggered: None,
-                requires_revalidation_after_queue: false,
-                rule_semantics_fingerprint: orchestration_rule_semantics_fingerprint(&network_rule),
-                rule_lifecycle_generation: network_rule.lifecycle_generation,
-            },
-            task: tokio::spawn(async {}),
-        },
+        pending_reservation_for_rule(&network_rule, None, None),
     )]);
     let (reservation_tx, _reservation_rx) =
         tokio::sync::mpsc::unbounded_channel::<CompletedOrchestrationReservation>();
@@ -560,17 +612,7 @@ async fn reconcile_pending_network_request_orchestration_drops_semantics_drift()
 
     let mut pending_reservations = HashMap::from([(
         live_rule.id,
-        PendingOrchestrationReservation {
-            attempt_id: 1,
-            fallback_network_progress: None,
-            condition_policy: PendingOrchestrationConditionPolicy {
-                preserved_triggered: None,
-                requires_revalidation_after_queue: false,
-                rule_semantics_fingerprint: orchestration_rule_semantics_fingerprint(&stale_rule),
-                rule_lifecycle_generation: stale_rule.lifecycle_generation,
-            },
-            task: tokio::spawn(async {}),
-        },
+        pending_reservation_for_rule(&stale_rule, None, None),
     )]);
 
     reconcile_pending_orchestration_reservations(&[live_rule], &mut pending_reservations);
@@ -614,19 +656,7 @@ async fn complete_network_request_orchestration_reservation_fails_closed_on_sema
         &mut worker_entry,
         transaction,
         None,
-        PendingOrchestrationConditionPolicy {
-            preserved_triggered: Some(TriggeredOrchestrationCondition {
-                evidence: TriggerEvidenceInfo {
-                    summary: "network_request_matched:req-1".to_string(),
-                    fingerprint: Some("req-1".to_string()),
-                },
-                evidence_key: "network_request_matched:req-1::req-1".to_string(),
-                network_progress: None,
-            }),
-            requires_revalidation_after_queue: false,
-            rule_semantics_fingerprint: orchestration_rule_semantics_fingerprint(&stale_rule),
-            rule_lifecycle_generation: stale_rule.lifecycle_generation,
-        },
+        pending_condition_policy(&stale_rule, Some(network_req1_condition())),
     )
     .await
     .expect("reservation completion should fail closed, not error");
@@ -844,19 +874,7 @@ async fn remote_orchestration_reservation_retains_active_execution_fence_until_c
         &mut worker_entry,
         transaction,
         None,
-        PendingOrchestrationConditionPolicy {
-            preserved_triggered: Some(TriggeredOrchestrationCondition {
-                evidence: TriggerEvidenceInfo {
-                    summary: "network_request_matched:req-1".to_string(),
-                    fingerprint: Some("req-1".to_string()),
-                },
-                evidence_key: "network_request_matched:req-1::req-1".to_string(),
-                network_progress: None,
-            }),
-            requires_revalidation_after_queue: false,
-            rule_semantics_fingerprint: orchestration_rule_semantics_fingerprint(&live_rule),
-            rule_lifecycle_generation: live_rule.lifecycle_generation,
-        },
+        pending_condition_policy(&live_rule, Some(network_req1_condition())),
     )
     .await
     .expect("reservation completion should succeed")
@@ -877,23 +895,18 @@ async fn remote_orchestration_reservation_retains_active_execution_fence_until_c
         Ok(_) => panic!("remote orchestration reservation must retain the execution fence"),
         Err(error) => error,
     };
-    assert_eq!(blocked.code, rub_core::error::ErrorCode::IpcTimeout);
+    assert_eq!(blocked.code, ErrorCode::IpcTimeout);
 
     drop(reserved);
 
-    let foreground = tokio::time::timeout(
-        std::time::Duration::from_millis(50),
-        router.begin_automation_transaction_with_wait_budget(
-            &state,
-            "foreground_after_remote_orchestration_release",
-            std::time::Duration::from_secs(1),
-            std::time::Duration::from_millis(5),
-        ),
+    assert_foreground_transaction_acquires(
+        &router,
+        &state,
+        "foreground_after_remote_orchestration_release",
+        "foreground request should complete",
+        "foreground request should acquire after remote reservation drops",
     )
-    .await
-    .expect("foreground request should complete")
-    .expect("foreground request should acquire after remote reservation drops");
-    drop(foreground);
+    .await;
 }
 
 #[tokio::test]
@@ -918,40 +931,7 @@ async fn shutdown_orchestration_reservation_completion_drops_owned_transaction_w
         .begin_automation_reservation_transaction_owned(&state, "queued_orchestration")
         .await
         .expect("queued orchestration reservation should acquire immediately in test");
-    let mut worker_state = std::collections::HashMap::from([(
-        live_rule.id,
-        OrchestrationWorkerEntry {
-            last_status: OrchestrationRuleStatus::Armed,
-            network_cursor: 0,
-            network_cursor_primed: false,
-            observatory_drop_count: 0,
-            latched_evidence_key: None,
-        },
-    )]);
-    let mut pending_reservations = std::collections::HashMap::from([(
-        live_rule.id,
-        PendingOrchestrationReservation {
-            attempt_id: 1,
-            fallback_network_progress: Some(OrchestrationNetworkProgress {
-                next_cursor: 9,
-                observed_drop_count: 2,
-            }),
-            condition_policy: PendingOrchestrationConditionPolicy {
-                preserved_triggered: Some(TriggeredOrchestrationCondition {
-                    evidence: TriggerEvidenceInfo {
-                        summary: "network_request_matched:req-1".to_string(),
-                        fingerprint: Some("req-1".to_string()),
-                    },
-                    evidence_key: "network_request_matched:req-1::req-1".to_string(),
-                    network_progress: None,
-                }),
-                requires_revalidation_after_queue: false,
-                rule_semantics_fingerprint: orchestration_rule_semantics_fingerprint(&live_rule),
-                rule_lifecycle_generation: live_rule.lifecycle_generation,
-            },
-            task: tokio::spawn(async {}),
-        },
-    )]);
+    let (mut worker_state, mut pending_reservations) = pending_network_completion_state(&live_rule);
     let (reservation_tx, mut reservation_rx) =
         tokio::sync::mpsc::unbounded_channel::<CompletedOrchestrationReservation>();
     state.request_shutdown();
@@ -1017,40 +997,7 @@ async fn handoff_orchestration_reservation_completion_blocks_execution_after_que
         .begin_automation_reservation_transaction_owned(&state, "queued_orchestration")
         .await
         .expect("queued orchestration reservation should acquire immediately in test");
-    let mut worker_state = std::collections::HashMap::from([(
-        live_rule.id,
-        OrchestrationWorkerEntry {
-            last_status: OrchestrationRuleStatus::Armed,
-            network_cursor: 0,
-            network_cursor_primed: false,
-            observatory_drop_count: 0,
-            latched_evidence_key: None,
-        },
-    )]);
-    let mut pending_reservations = std::collections::HashMap::from([(
-        live_rule.id,
-        PendingOrchestrationReservation {
-            attempt_id: 1,
-            fallback_network_progress: Some(OrchestrationNetworkProgress {
-                next_cursor: 9,
-                observed_drop_count: 2,
-            }),
-            condition_policy: PendingOrchestrationConditionPolicy {
-                preserved_triggered: Some(TriggeredOrchestrationCondition {
-                    evidence: TriggerEvidenceInfo {
-                        summary: "network_request_matched:req-1".to_string(),
-                        fingerprint: Some("req-1".to_string()),
-                    },
-                    evidence_key: "network_request_matched:req-1::req-1".to_string(),
-                    network_progress: None,
-                }),
-                requires_revalidation_after_queue: false,
-                rule_semantics_fingerprint: orchestration_rule_semantics_fingerprint(&live_rule),
-                rule_lifecycle_generation: live_rule.lifecycle_generation,
-            },
-            task: tokio::spawn(async {}),
-        },
-    )]);
+    let (mut worker_state, mut pending_reservations) = pending_network_completion_state(&live_rule);
     let (reservation_tx, mut reservation_rx) =
         tokio::sync::mpsc::unbounded_channel::<CompletedOrchestrationReservation>();
     state.set_handoff_available(true).await;

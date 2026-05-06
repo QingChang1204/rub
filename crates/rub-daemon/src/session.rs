@@ -55,16 +55,16 @@ pub use self::registry::{
 };
 use rub_core::model::{
     ConnectionTarget, ConsoleErrorEvent, DialogKind, DialogRuntimeInfo, DialogRuntimeStatus,
-    DownloadEntry, DownloadEvent, DownloadMode, DownloadRuntimeInfo, DownloadRuntimeStatus,
-    DownloadState, FrameInventoryEntry, FrameRuntimeInfo, HumanVerificationHandoffInfo,
-    IntegrationRuntimeInfo, IntegrationRuntimeStatus, InterferenceRecoveryAction,
-    InterferenceRecoveryResult, InterferenceRuntimeInfo, NetworkFailureEvent,
-    NetworkRequestLifecycle, NetworkRequestRecord, NetworkRule, NetworkRuleSpec, NetworkRuleStatus,
-    OrchestrationResultInfo, OrchestrationRuleInfo, OrchestrationRuleStatus,
-    OrchestrationTraceProjection, PageErrorEvent, ReadinessInfo, ReadinessStatus,
-    RequestSummaryEvent, RuntimeObservatoryEvent, RuntimeObservatoryInfo, RuntimeObservatoryStatus,
-    RuntimeStateSnapshot, Snapshot, StateInspectorInfo, StateInspectorStatus, TabInfo,
-    TakeoverRuntimeInfo, TakeoverTransitionKind, TakeoverTransitionResult,
+    DownloadEvent, DownloadMode, DownloadRuntimeInfo, DownloadRuntimeStatus, DownloadState,
+    FrameInventoryEntry, FrameRuntimeInfo, HumanVerificationHandoffInfo, IntegrationRuntimeInfo,
+    IntegrationRuntimeStatus, InterferenceRecoveryAction, InterferenceRecoveryResult,
+    InterferenceRuntimeInfo, NetworkFailureEvent, NetworkRequestLifecycle, NetworkRequestRecord,
+    NetworkRule, NetworkRuleSpec, NetworkRuleStatus, OrchestrationResultInfo,
+    OrchestrationRuleInfo, OrchestrationRuleStatus, OrchestrationTraceProjection, PageErrorEvent,
+    ReadinessInfo, ReadinessStatus, RequestSummaryEvent, RuntimeObservatoryEvent,
+    RuntimeObservatoryInfo, RuntimeObservatoryStatus, RuntimeStateSnapshot, Snapshot,
+    StateInspectorInfo, StateInspectorStatus, TabInfo, TakeoverRuntimeInfo, TakeoverTransitionKind,
+    TakeoverTransitionResult,
 };
 use rub_core::storage::{StorageMutationKind, StorageRuntimeInfo, StorageSnapshot};
 
@@ -174,6 +174,16 @@ pub(crate) struct BrowserEventIngressTelemetry {
     pub(crate) last_critical_soft_limit_cross_uptime_ms: AtomicU64,
 }
 
+pub(crate) fn atomic_max_u32(target: &AtomicU32, candidate: u32) {
+    let mut current = target.load(Ordering::SeqCst);
+    while candidate > current {
+        match target.compare_exchange(current, candidate, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// Per-session in-memory state. Authority for session lifecycle.
 pub struct SessionState {
     pub session_id: String,
@@ -245,12 +255,7 @@ pub struct SessionState {
 
 impl SessionState {
     pub fn new(name: impl Into<String>, rub_home: PathBuf, user_data_dir: Option<String>) -> Self {
-        Self::new_with_id(
-            name,
-            self::registry::new_session_id(),
-            rub_home,
-            user_data_dir,
-        )
+        Self::new_with_id(name, new_session_id(), rub_home, user_data_dir)
     }
 
     pub fn new_with_id(

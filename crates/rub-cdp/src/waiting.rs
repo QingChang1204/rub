@@ -509,7 +509,7 @@ fn title_wait_script(value: &str) -> Result<String, RubError> {
 mod cache_tests {
     use super::WaitFrameContextCache;
     use crate::frame_runtime::ResolvedFrameContext;
-    use rub_core::model::FrameContextInfo;
+    use crate::snapshot_lookup::sample_frame_context;
 
     #[test]
     fn wait_frame_context_cache_reuses_same_requested_frame() {
@@ -533,15 +533,7 @@ mod cache_tests {
 
     fn sample_context(frame_id: &str, execution_context_id: Option<i64>) -> ResolvedFrameContext {
         ResolvedFrameContext {
-            frame: FrameContextInfo {
-                frame_id: frame_id.to_string(),
-                name: Some(frame_id.to_string()),
-                parent_frame_id: None,
-                target_id: Some("target-1".to_string()),
-                url: Some("https://example.test".to_string()),
-                depth: 0,
-                same_origin_accessible: Some(true),
-            },
+            frame: sample_frame_context(frame_id, Some(frame_id)),
             lineage: vec![frame_id.to_string()],
             execution_context_id: execution_context_id
                 .map(chromiumoxide::cdp::js_protocol::runtime::ExecutionContextId::new),

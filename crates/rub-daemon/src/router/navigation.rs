@@ -1,14 +1,16 @@
+use super::frame_scope::{effective_request_frame_id, semantic_replay_orchestration_metadata};
 use super::observation_filter::{
-    apply_observation_projection, attach_observation_projection_metadata,
-    parse_observation_projection,
+    ObservationProjectionMode, apply_observation_projection,
+    attach_observation_projection_metadata, parse_observation_projection,
 };
 use super::observation_scope::{
-    apply_observation_scope, apply_projection_limit, attach_scope_metadata, parse_observation_scope,
+    ObservationScopeMetadata, apply_optional_observation_scope, apply_projection_limit,
+    attach_scope_metadata, parse_observation_scope,
 };
 use super::projection::{
     attach_result, attach_subject, navigation_subject, page_entity, viewport_subject,
 };
-use super::request_args::parse_json_args;
+use super::request_args::{copy_semantic_raw_field, parse_json_args};
 use super::snapshot::build_stable_snapshot;
 use super::state_format::{StateFormat, project_snapshot};
 use super::url_normalization::normalize_open_url;
@@ -20,14 +22,15 @@ mod settle;
 mod tabs;
 
 use self::args::{
-    OpenArgs, ReloadArgs, ScrollArgs, StateArgs, parse_optional_load_strategy,
-    parse_optional_scroll_direction,
+    CloseTabArgs, OpenArgs, ReloadArgs, ScreenshotArgs, ScrollArgs, StateArgs, SwitchArgs,
+    parse_optional_load_strategy, parse_optional_scroll_direction,
 };
 pub(super) use self::screenshot::{
     cmd_screenshot, inline_screenshot_payload_exceeds_limit, write_screenshot_artifact,
 };
 use self::settle::{active_tab_projection, is_page_load_timeout, settle_navigation_projection};
 pub(super) use self::tabs::{cmd_close_tab, cmd_switch, cmd_tabs};
+use rub_core::error::ErrorCode;
 
 fn snapshot_diff_metadata(
     base_snapshot_id: &str,
@@ -138,24 +141,24 @@ pub(super) async fn cmd_state(
 
     if diff_base_id.is_some() && !matches!(format, StateFormat::Snapshot) {
         return Err(RubError::domain(
-            rub_core::error::ErrorCode::InvalidInput,
+            ErrorCode::InvalidInput,
             "state --diff cannot be combined with --format",
         ));
     }
     if matches!(format, StateFormat::A11y)
         && matches!(
             observation_projection.mode,
-            super::observation_filter::ObservationProjectionMode::Compact
+            ObservationProjectionMode::Compact
         )
     {
         return Err(RubError::domain(
-            rub_core::error::ErrorCode::InvalidInput,
+            ErrorCode::InvalidInput,
             "state --format a11y cannot be combined with --compact",
         ));
     }
     if diff_base_id.is_some() && observation_scope.is_some() {
         return Err(RubError::domain(
-            rub_core::error::ErrorCode::InvalidInput,
+            ErrorCode::InvalidInput,
             "state --diff cannot be combined with observation scoping",
         ));
     }
@@ -166,7 +169,7 @@ pub(super) async fn cmd_state(
         } else {
             limit
         };
-    let mut snapshot = build_stable_snapshot(
+    let snapshot = build_stable_snapshot(
         router,
         args,
         state,
@@ -176,16 +179,8 @@ pub(super) async fn cmd_state(
         listeners,
     )
     .await?;
-    let mut scoped_metadata = None::<(rub_core::observation::ObservationScope, u32, u32)>;
-    if let Some(scope) = observation_scope.as_ref() {
-        let scoped = apply_observation_scope(router, snapshot, scope).await?;
-        scoped_metadata = Some((
-            scoped.scope.clone(),
-            scoped.scope_total_count,
-            scoped.scope_match_count,
-        ));
-        snapshot = scoped.snapshot;
-    }
+    let (mut snapshot, scoped_metadata): (_, Option<ObservationScopeMetadata>) =
+        apply_optional_observation_scope(router, snapshot, observation_scope.as_ref()).await?;
 
     if viewport {
         let (vw, vh) = router.browser.viewport_dimensions().await?;
@@ -213,13 +208,13 @@ pub(super) async fn cmd_state(
     if let Some(base_id) = diff_base_id {
         let old_snapshot = state.get_snapshot(base_id).await.ok_or_else(|| {
             RubError::domain(
-                rub_core::error::ErrorCode::StaleSnapshot,
+                ErrorCode::StaleSnapshot,
                 format!("Snapshot '{base_id}' not found in cache"),
             )
         })?;
         if old_snapshot.frame_context.frame_id != snapshot.frame_context.frame_id {
             return Err(RubError::domain_with_context(
-                rub_core::error::ErrorCode::InvalidInput,
+                ErrorCode::InvalidInput,
                 "state --diff cannot compare snapshots captured from different frame contexts",
                 snapshot_diff_mismatch_context(
                     base_id,
@@ -287,8 +282,7 @@ pub(super) async fn cmd_scroll(
     let parsed: ScrollArgs = parse_json_args(args, "scroll")?;
     let direction = parse_optional_scroll_direction(parsed.direction.as_deref(), "direction")?;
     let amount = parsed.amount;
-    let selected_frame_id =
-        super::frame_scope::effective_request_frame_id(router, args, state).await?;
+    let selected_frame_id = effective_request_frame_id(router, args, state).await?;
     let position = router
         .browser
         .scroll(selected_frame_id.as_deref(), direction, amount)
@@ -481,9 +475,7 @@ pub(crate) fn semantic_replay_args(
             copy_semantic_raw_field(args, "scope_first", &mut projected);
             copy_semantic_raw_field(args, "scope_last", &mut projected);
             copy_semantic_raw_field(args, "scope_nth", &mut projected);
-            if let Some(orchestration) =
-                super::frame_scope::semantic_replay_orchestration_metadata(args)
-            {
+            if let Some(orchestration) = semantic_replay_orchestration_metadata(args) {
                 projected.insert("_orchestration".to_string(), orchestration);
             }
             Some(serde_json::Value::Object(projected))
@@ -503,7 +495,7 @@ pub(crate) fn semantic_replay_args(
             }))
         }
         "screenshot" => {
-            let parsed: self::args::ScreenshotArgs = parse_json_args(args, "screenshot").ok()?;
+            let parsed: ScreenshotArgs = parse_json_args(args, "screenshot").ok()?;
             Some(serde_json::json!({
                 "full": parsed.full,
                 "highlight": parsed.highlight,
@@ -511,29 +503,19 @@ pub(crate) fn semantic_replay_args(
             }))
         }
         "switch" => {
-            let parsed: self::args::SwitchArgs = parse_json_args(args, "switch").ok()?;
+            let parsed: SwitchArgs = parse_json_args(args, "switch").ok()?;
             Some(serde_json::json!({
                 "index": parsed.index,
                 "wait_after": args.get("wait_after").cloned(),
             }))
         }
         "close-tab" => {
-            let parsed: self::args::CloseTabArgs = parse_json_args(args, "close-tab").ok()?;
+            let parsed: CloseTabArgs = parse_json_args(args, "close-tab").ok()?;
             Some(serde_json::json!({
                 "index": parsed.index,
             }))
         }
         _ => None,
-    }
-}
-
-fn copy_semantic_raw_field(
-    args: &serde_json::Value,
-    key: &str,
-    projected: &mut serde_json::Map<String, serde_json::Value>,
-) {
-    if let Some(value) = args.get(key) {
-        projected.insert(key.to_string(), value.clone());
     }
 }
 

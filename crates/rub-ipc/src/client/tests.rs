@@ -5,7 +5,7 @@ use rub_core::error::{ErrorCode, ErrorEnvelope};
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::time::Duration;
+use tokio::time::{Duration, timeout};
 
 fn oversized_request() -> IpcRequest {
     IpcRequest::new(
@@ -17,6 +17,38 @@ fn oversized_request() -> IpcRequest {
     )
 }
 
+async fn serve_doctor_success(listener: UnixListener) {
+    let (stream, _) = listener.accept().await.expect("accept");
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let request: IpcRequest = NdJsonCodec::read(&mut reader)
+        .await
+        .expect("read request")
+        .expect("request");
+    assert_eq!(request.command, "doctor");
+    let response = IpcResponse::success("req-1", serde_json::json!({"ok": true}))
+        .with_command_id(
+            request
+                .command_id
+                .clone()
+                .expect("doctor requests should carry command_id"),
+        )
+        .expect("request command_id should remain protocol-valid");
+    NdJsonCodec::write(&mut writer, &response)
+        .await
+        .expect("write response");
+}
+
+fn protocol_context<'a>(
+    error: &'a super::IpcClientError,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    error
+        .protocol_envelope()
+        .and_then(|envelope| envelope.context.as_ref())
+        .and_then(|ctx| ctx.get(key))
+}
+
 #[tokio::test]
 async fn client_is_single_use() {
     let socket_dir = std::env::temp_dir().join(format!("rubipc-{}", uuid::Uuid::now_v7()));
@@ -24,27 +56,7 @@ async fn client_is_single_use() {
     let socket_path = socket_dir.join("ipc.sock");
     let listener = UnixListener::bind(&socket_path).expect("bind listener");
 
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
-        let request: IpcRequest = NdJsonCodec::read(&mut reader)
-            .await
-            .expect("read request")
-            .expect("request");
-        assert_eq!(request.command, "doctor");
-        let response = IpcResponse::success("req-1", serde_json::json!({"ok": true}))
-            .with_command_id(
-                request
-                    .command_id
-                    .clone()
-                    .expect("doctor requests should carry command_id"),
-            )
-            .expect("request command_id should remain protocol-valid");
-        NdJsonCodec::write(&mut writer, &response)
-            .await
-            .expect("write response");
-    });
+    let server = tokio::spawn(serve_doctor_success(listener));
 
     let mut client = IpcClient::deferred(&socket_path);
     let request = IpcRequest::new("doctor", serde_json::json!({}), 1_000);
@@ -149,10 +161,7 @@ async fn client_rejects_mismatched_response_command_id() {
         .expect_err("mismatched command_id response should fail");
     assert!(error.to_string().contains("command_id mismatch"));
     assert_eq!(
-        error
-            .protocol_envelope()
-            .and_then(|envelope| envelope.context.as_ref())
-            .and_then(|ctx| ctx.get("request_committed")),
+        protocol_context(&error, "request_committed"),
         Some(&serde_json::json!(true))
     );
 
@@ -233,10 +242,7 @@ async fn client_rejects_missing_response_command_id_for_non_compat_request() {
         Some("ipc_response_missing_command_id")
     );
     assert_eq!(
-        error
-            .protocol_envelope()
-            .and_then(|envelope| envelope.context.as_ref())
-            .and_then(|ctx| ctx.get("request_committed")),
+        protocol_context(&error, "request_committed"),
         Some(&serde_json::json!(true))
     );
 
@@ -460,8 +466,7 @@ async fn bound_client_rejects_conflicting_explicit_daemon_authority() {
     let listener = UnixListener::bind(&socket_path).expect("bind listener");
 
     let server = tokio::spawn(async move {
-        let accepted =
-            tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept()).await;
+        let accepted = timeout(Duration::from_millis(200), listener.accept()).await;
         assert!(
             accepted.is_err(),
             "client-side authority mismatch must fail closed before opening a socket"
@@ -505,27 +510,7 @@ async fn deferred_client_connect_failure_does_not_consume_single_use_authority()
     );
 
     let listener = UnixListener::bind(&socket_path).expect("bind listener");
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
-        let request: IpcRequest = NdJsonCodec::read(&mut reader)
-            .await
-            .expect("read request")
-            .expect("request");
-        assert_eq!(request.command, "doctor");
-        let response = IpcResponse::success("req-1", serde_json::json!({"ok": true}))
-            .with_command_id(
-                request
-                    .command_id
-                    .clone()
-                    .expect("doctor requests should carry command_id"),
-            )
-            .expect("request command_id should remain protocol-valid");
-        NdJsonCodec::write(&mut writer, &response)
-            .await
-            .expect("write response");
-    });
+    let server = tokio::spawn(serve_doctor_success(listener));
 
     let response = client
         .send(&request)
@@ -563,33 +548,13 @@ async fn deferred_client_oversized_request_fails_before_spending_socket_authorit
         Some("oversized_ndjson_request")
     );
 
-    let accepted = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+    let accepted = timeout(Duration::from_millis(200), listener.accept()).await;
     assert!(
         accepted.is_err(),
         "oversized request must fail before opening the deferred socket"
     );
 
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
-        let request: IpcRequest = NdJsonCodec::read(&mut reader)
-            .await
-            .expect("read request")
-            .expect("request");
-        assert_eq!(request.command, "doctor");
-        let response = IpcResponse::success("req-1", serde_json::json!({"ok": true}))
-            .with_command_id(
-                request
-                    .command_id
-                    .clone()
-                    .expect("doctor requests should carry command_id"),
-            )
-            .expect("request command_id should remain protocol-valid");
-        NdJsonCodec::write(&mut writer, &response)
-            .await
-            .expect("write response");
-    });
+    let server = tokio::spawn(serve_doctor_success(listener));
 
     let response = client
         .send(&IpcRequest::new("doctor", serde_json::json!({}), 1_000))
@@ -609,27 +574,7 @@ async fn connected_client_oversized_request_does_not_consume_single_use_stream_a
     let socket_path = socket_dir.join("ipc.sock");
     let listener = UnixListener::bind(&socket_path).expect("bind listener");
 
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
-        let request: IpcRequest = NdJsonCodec::read(&mut reader)
-            .await
-            .expect("read request")
-            .expect("request");
-        assert_eq!(request.command, "doctor");
-        let response = IpcResponse::success("req-1", serde_json::json!({"ok": true}))
-            .with_command_id(
-                request
-                    .command_id
-                    .clone()
-                    .expect("doctor requests should carry command_id"),
-            )
-            .expect("request command_id should remain protocol-valid");
-        NdJsonCodec::write(&mut writer, &response)
-            .await
-            .expect("write response");
-    });
+    let server = tokio::spawn(serve_doctor_success(listener));
 
     let mut client = IpcClient::connect(&socket_path).await.expect("connect");
     let error = client
@@ -703,10 +648,7 @@ async fn client_surfaces_structured_response_contract_errors() {
         Some("invalid_ipc_response_contract")
     );
     assert_eq!(
-        error
-            .protocol_envelope()
-            .and_then(|envelope| envelope.context.as_ref())
-            .and_then(|ctx| ctx.get("request_committed")),
+        protocol_context(&error, "request_committed"),
         Some(&serde_json::json!(true))
     );
 
@@ -1029,8 +971,7 @@ async fn client_rejects_invalid_non_compat_request_contract_before_connect() {
     let listener = UnixListener::bind(&socket_path).expect("bind listener");
 
     let server = tokio::spawn(async move {
-        let accepted =
-            tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept()).await;
+        let accepted = timeout(Duration::from_millis(200), listener.accept()).await;
         assert!(
             accepted.is_err(),
             "invalid non-compat request must fail locally before opening a socket"

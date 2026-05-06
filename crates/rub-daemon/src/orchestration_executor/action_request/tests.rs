@@ -8,22 +8,25 @@ use crate::session::SessionState;
 use rub_core::error::ErrorCode;
 use rub_core::model::{
     OrchestrationAddressInfo, OrchestrationExecutionPolicyInfo, OrchestrationMode,
-    OrchestrationRuleInfo, OrchestrationRuleStatus, OrchestrationRuntimeInfo, TriggerConditionKind,
-    TriggerConditionSpec,
+    OrchestrationRuleInfo, OrchestrationRuleStatus, OrchestrationRuntimeInfo,
+    OrchestrationSessionAvailability, TriggerConditionKind, TriggerConditionSpec,
 };
+use rub_ipc::protocol::IPC_PROTOCOL_VERSION;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::time::Duration;
+use uuid::Uuid;
 
 #[test]
 fn source_materialization_wait_budget_tracks_declared_workflow_timeout() {
     let home = std::env::temp_dir().join(format!(
         "rub-orchestration-timeout-budget-{}",
-        uuid::Uuid::now_v7()
+        Uuid::now_v7()
     ));
     let workflows = home.join("workflows");
-    std::fs::create_dir_all(&workflows).unwrap();
-    std::fs::write(
+    fs::create_dir_all(&workflows).unwrap();
+    fs::write(
         workflows.join("delayed_rule.json"),
         serde_json::to_string(&serde_json::json!({
             "steps": [
@@ -62,16 +65,16 @@ fn source_materialization_wait_budget_tracks_declared_workflow_timeout() {
 
     assert_eq!(budget, ORCHESTRATION_ACTION_BASE_TIMEOUT_MS + 12_000);
 
-    let _ = std::fs::remove_dir_all(home);
+    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn source_materialization_wait_budget_rejects_timeout_sensitive_source_var_paths() {
     let home = std::env::temp_dir().join(format!(
         "rub-orchestration-timeout-authority-{}",
-        uuid::Uuid::now_v7()
+        Uuid::now_v7()
     ));
-    std::fs::create_dir_all(home.join("workflows")).unwrap();
+    fs::create_dir_all(home.join("workflows")).unwrap();
 
     let action = TriggerActionSpec {
         kind: TriggerActionKind::Workflow,
@@ -104,16 +107,16 @@ fn source_materialization_wait_budget_rejects_timeout_sensitive_source_var_paths
     );
     assert_eq!(context["path"], "$[0].args.timeout_ms");
 
-    let _ = std::fs::remove_dir_all(home);
+    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn source_materialization_wait_budget_rejects_dynamic_commands() {
     let home = std::env::temp_dir().join(format!(
         "rub-orchestration-timeout-command-authority-{}",
-        uuid::Uuid::now_v7()
+        Uuid::now_v7()
     ));
-    std::fs::create_dir_all(home.join("workflows")).unwrap();
+    fs::create_dir_all(home.join("workflows")).unwrap();
 
     let action = TriggerActionSpec {
         kind: TriggerActionKind::Workflow,
@@ -146,16 +149,16 @@ fn source_materialization_wait_budget_rejects_dynamic_commands() {
     );
     assert_eq!(context["path"], "$[0].command");
 
-    let _ = std::fs::remove_dir_all(home);
+    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn source_materialization_wait_budget_rejects_structured_nested_fill_spec_timeout_authority() {
     let home = std::env::temp_dir().join(format!(
         "rub-orchestration-timeout-structured-fill-spec-{}",
-        uuid::Uuid::now_v7()
+        Uuid::now_v7()
     ));
-    std::fs::create_dir_all(home.join("workflows")).unwrap();
+    fs::create_dir_all(home.join("workflows")).unwrap();
 
     let action = TriggerActionSpec {
         kind: TriggerActionKind::Workflow,
@@ -190,7 +193,7 @@ fn source_materialization_wait_budget_rejects_structured_nested_fill_spec_timeou
     );
     assert_eq!(context["path"], "$[0].args.spec[0].wait_after.timeout_ms");
 
-    let _ = std::fs::remove_dir_all(home);
+    let _ = fs::remove_dir_all(home);
 }
 
 #[tokio::test]
@@ -201,12 +204,12 @@ async fn source_var_dispatch_fails_closed_when_outer_deadline_is_exhausted() {
         42,
         "/tmp/rub-nonexistent-source.sock".to_string(),
         false,
-        rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
-        rub_core::model::OrchestrationSessionAvailability::Addressable,
+        IPC_PROTOCOL_VERSION.to_string(),
+        OrchestrationSessionAvailability::Addressable,
         None,
     );
     let outer_deadline = TransactionDeadline::new(5);
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
 
     let error = dispatch_to_source_session_for_workflow_bindings(
         &session,
@@ -230,27 +233,7 @@ async fn source_var_dispatch_fails_closed_when_outer_deadline_is_exhausted() {
 }
 
 fn test_router() -> DaemonRouter {
-    let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
-        rub_cdp::browser::BrowserLaunchOptions {
-            headless: true,
-            ignore_cert_errors: false,
-            user_data_dir: None,
-            managed_profile_ephemeral: false,
-            download_dir: None,
-            profile_directory: None,
-            hide_infobars: true,
-            stealth: true,
-        },
-    ));
-    let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
-        manager,
-        Arc::new(AtomicU64::new(0)),
-        rub_cdp::humanize::HumanizeConfig {
-            enabled: false,
-            speed: rub_cdp::humanize::HumanizeSpeed::Normal,
-        },
-    ));
-    DaemonRouter::new(adapter)
+    crate::test_support::daemon_router()
 }
 
 fn local_source_rule() -> OrchestrationRuleInfo {
@@ -305,7 +288,7 @@ async fn local_source_var_resolution_fails_closed_when_outer_deadline_is_exhaust
         None,
     ));
     let deadline = TransactionDeadline::new(1);
-    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
 
     let error = resolve_orchestration_workflow_source_bindings(
         &router,

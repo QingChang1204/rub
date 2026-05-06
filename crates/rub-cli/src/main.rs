@@ -13,15 +13,19 @@ mod harvest_ctl;
 mod inspect_list_help_ctl;
 mod internal_daemon;
 mod local_asset_paths;
+mod local_asset_writes;
 mod local_registry;
 mod main_dispatch;
 mod main_support;
 mod orchestration_assets;
 mod output;
+mod path_normalization;
 mod persisted_artifacts;
 mod secret_ctl;
 mod session_policy;
 mod teardown_ctl;
+#[cfg(test)]
+mod test_support;
 mod timeout_budget;
 mod workflow_assets;
 mod workflow_params;
@@ -41,6 +45,7 @@ use self::main_support::{handle_sessions, use_alias_local_surface_error};
 use clap::Parser;
 use clap::error::ErrorKind as ClapErrorKind;
 use commands::{Cli, Commands};
+use rub_core::error::{ErrorCode, ErrorEnvelope};
 use session_policy::{
     materialize_connection_request_with_deadline, requested_attachment_identity,
     requires_existing_session_validation,
@@ -63,22 +68,16 @@ async fn main() {
         }
         Err(error) => {
             let message = error.to_string();
-            println!(
-                "{}",
-                output::format_cli_error(
-                    "parse",
-                    "default",
-                    rub_core::error::ErrorEnvelope::new(
-                        rub_core::error::ErrorCode::InvalidInput,
-                        message.trim().to_string(),
-                    )
+            exit_with_cli_error(
+                "parse",
+                "default",
+                ErrorEnvelope::new(ErrorCode::InvalidInput, message.trim().to_string())
                     .with_context(serde_json::json!({
                         "reason": "cli_parse_error",
                     })),
-                    false,
-                )
+                false,
+                2,
             );
-            std::process::exit(2);
         }
     };
     let session_name = parsed.session.clone();
@@ -86,18 +85,13 @@ async fn main() {
     let command_name = parsed.command.canonical_name().to_string();
     let cli = match parsed.effective() {
         Ok(cli) => cli,
-        Err(error) => {
-            println!(
-                "{}",
-                output::format_cli_error(
-                    command_name.as_str(),
-                    &session_name,
-                    error.into_envelope(),
-                    pretty,
-                )
-            );
-            std::process::exit(1);
-        }
+        Err(error) => exit_with_cli_error(
+            command_name.as_str(),
+            &session_name,
+            error.into_envelope(),
+            pretty,
+            1,
+        ),
     };
     let rub_home = cli.rub_home.clone();
     let pretty = cli.json_pretty;
@@ -121,18 +115,13 @@ async fn main() {
 
     let binding_execution = match binding_execution_ctl::resolve_command_execution_binding(&cli) {
         Ok(resolved) => resolved,
-        Err(error) => {
-            println!(
-                "{}",
-                output::format_cli_error(
-                    command_name.as_str(),
-                    session,
-                    error.into_envelope(),
-                    pretty,
-                )
-            );
-            std::process::exit(1);
-        }
+        Err(error) => exit_with_cli_error(
+            command_name.as_str(),
+            session,
+            error.into_envelope(),
+            pretty,
+            1,
+        ),
     };
     let binding_execution_projection = binding_execution.projection;
     let binding_execution_connection_request = binding_execution.connection_request_override;
@@ -156,14 +145,13 @@ async fn main() {
     }
 
     if let Err(e) = std::fs::create_dir_all(&rub_home) {
-        let output = output::format_cli_error(
+        exit_with_cli_error(
             command_name.as_str(),
             session,
             rub_home_create_error(&rub_home, &e),
             pretty,
+            1,
         );
-        println!("{output}");
-        std::process::exit(1);
     }
 
     let command_started_at = Instant::now();
@@ -182,19 +170,11 @@ async fn main() {
                 }
                 _ => error.into_envelope(),
             };
-            println!(
-                "{}",
-                output::format_cli_error(command_name.as_str(), session, envelope, pretty,)
-            );
-            std::process::exit(1);
+            exit_with_cli_error(command_name.as_str(), session, envelope, pretty, 1);
         }
     };
     if let Err(envelope) = request.validate_contract() {
-        println!(
-            "{}",
-            output::format_cli_error(command_name.as_str(), session, envelope, pretty,)
-        );
-        std::process::exit(1);
+        exit_with_cli_error(command_name.as_str(), session, envelope, pretty, 1);
     }
     let command_deadline =
         timeout_budget::deadline_from_start(command_started_at, request.timeout_ms);
@@ -204,16 +184,13 @@ async fn main() {
         request.timeout_ms,
         "request_build",
     ) {
-        println!(
-            "{}",
-            output::format_cli_error(
-                command_name.as_str(),
-                session,
-                error.into_envelope(),
-                pretty,
-            )
+        exit_with_cli_error(
+            command_name.as_str(),
+            session,
+            error.into_envelope(),
+            pretty,
+            1,
         );
-        std::process::exit(1);
     }
 
     let connection_request = match resolve_connection_request_for_cli(
@@ -221,18 +198,13 @@ async fn main() {
         binding_execution_connection_request.as_ref(),
     ) {
         Ok(request) => request,
-        Err(error) => {
-            println!(
-                "{}",
-                output::format_cli_error(
-                    command_name.as_str(),
-                    session,
-                    error.into_envelope(),
-                    pretty,
-                )
-            );
-            std::process::exit(1);
-        }
+        Err(error) => exit_with_cli_error(
+            command_name.as_str(),
+            session,
+            error.into_envelope(),
+            pretty,
+            1,
+        ),
     };
     let connection_request = match materialize_connection_request_with_deadline(
         &connection_request,
@@ -242,18 +214,13 @@ async fn main() {
     .await
     {
         Ok(request) => request,
-        Err(error) => {
-            println!(
-                "{}",
-                output::format_cli_error(
-                    command_name.as_str(),
-                    session,
-                    error.into_envelope(),
-                    pretty,
-                )
-            );
-            std::process::exit(1);
-        }
+        Err(error) => exit_with_cli_error(
+            command_name.as_str(),
+            session,
+            error.into_envelope(),
+            pretty,
+            1,
+        ),
     };
 
     let daemon_args = daemon_args(&cli, &connection_request);
@@ -261,18 +228,13 @@ async fn main() {
     // target, otherwise an unreachable `--cdp-url` masks the real
     // fail-closed error with a transport failure.
     let attachment_identity = requested_attachment_identity(&cli, &connection_request);
-    if daemon_ctl::remaining_budget_ms(command_deadline) == 0 {
-        println!(
-            "{}",
-            output::format_cli_error(
-                command_name.as_str(),
-                session,
-                command_timeout_envelope(request.timeout_ms),
-                pretty,
-            )
-        );
-        std::process::exit(1);
-    }
+    exit_if_budget_exhausted(
+        command_name.as_str(),
+        session,
+        command_deadline,
+        request.timeout_ms,
+        pretty,
+    );
     let bootstrap = match daemon_ctl::bootstrap_client(
         &rub_home,
         session,
@@ -288,12 +250,7 @@ async fn main() {
     .await
     {
         Ok(bootstrap) => bootstrap,
-        Err(e) => {
-            let output =
-                output::format_cli_error(command_name.as_str(), session, e.into_envelope(), pretty);
-            println!("{output}");
-            std::process::exit(1);
-        }
+        Err(e) => exit_with_cli_error(command_name.as_str(), session, e.into_envelope(), pretty, 1),
     };
     let mut client = bootstrap.client;
     let connected_to_existing_daemon = bootstrap.connected_to_existing_daemon;
@@ -312,30 +269,22 @@ async fn main() {
             )
             .await
     {
-        println!(
-            "{}",
-            output::format_cli_error(
-                command_name.as_str(),
-                session,
-                error.into_envelope(),
-                pretty,
-            )
+        exit_with_cli_error(
+            command_name.as_str(),
+            session,
+            error.into_envelope(),
+            pretty,
+            1,
         );
-        std::process::exit(1);
     }
 
-    if daemon_ctl::remaining_budget_ms(command_deadline) == 0 {
-        println!(
-            "{}",
-            output::format_cli_error(
-                command_name.as_str(),
-                session,
-                command_timeout_envelope(request.timeout_ms),
-                pretty,
-            )
-        );
-        std::process::exit(1);
-    }
+    exit_if_budget_exhausted(
+        command_name.as_str(),
+        session,
+        command_deadline,
+        request.timeout_ms,
+        pretty,
+    );
 
     match daemon_ctl::send_request_with_replay_recovery(
         &mut client,
@@ -371,16 +320,45 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Err(error) => {
-            let output = output::format_cli_error(
-                command_name.as_str(),
-                session,
-                error.into_envelope(),
-                pretty,
-            );
-            println!("{output}");
-            std::process::exit(1);
-        }
+        Err(error) => exit_with_cli_error(
+            command_name.as_str(),
+            session,
+            error.into_envelope(),
+            pretty,
+            1,
+        ),
+    }
+}
+
+fn exit_with_cli_error(
+    command_name: &str,
+    session: &str,
+    envelope: ErrorEnvelope,
+    pretty: bool,
+    exit_code: i32,
+) -> ! {
+    println!(
+        "{}",
+        output::format_cli_error(command_name, session, envelope, pretty)
+    );
+    std::process::exit(exit_code);
+}
+
+fn exit_if_budget_exhausted(
+    command_name: &str,
+    session: &str,
+    command_deadline: Instant,
+    timeout_ms: u64,
+    pretty: bool,
+) {
+    if daemon_ctl::remaining_budget_ms(command_deadline) == 0 {
+        exit_with_cli_error(
+            command_name,
+            session,
+            command_timeout_envelope(timeout_ms),
+            pretty,
+            1,
+        );
     }
 }
 

@@ -3,8 +3,7 @@
 use rub_core::model::CommandResult;
 
 #[doc(hidden)]
-pub const EXPECTED_STDOUT_SCHEMA_VERSION: &str =
-    rub_core::model::CommandResult::STDOUT_SCHEMA_VERSION;
+pub const EXPECTED_STDOUT_SCHEMA_VERSION: &str = CommandResult::STDOUT_SCHEMA_VERSION;
 
 #[doc(hidden)]
 pub fn stdout_command_allows_missing_command_id(command: &str) -> bool {

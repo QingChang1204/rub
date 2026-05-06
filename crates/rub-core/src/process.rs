@@ -56,13 +56,16 @@ pub fn process_tree(snapshot: &[ProcessInfo], root_pid: u32) -> HashSet<u32> {
     }
 
     let mut tree = HashSet::new();
-    let mut stack = vec![root_pid];
-    while let Some(pid) = stack.pop() {
+    let mut pending = vec![root_pid];
+    let mut cursor = 0;
+    while cursor < pending.len() {
+        let pid = pending[cursor];
+        cursor += 1;
         if !tree.insert(pid) {
             continue;
         }
         if let Some(children) = children_by_parent.get(&pid) {
-            stack.extend(children.iter().copied());
+            pending.extend(children.iter().copied());
         }
     }
     tree

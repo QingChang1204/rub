@@ -10,41 +10,140 @@ use super::{
     DaemonRouter, PendingExternalDomCommit, TransactionDeadline, attach_interaction_projection,
     attach_select_projection, detection_risks,
 };
+use crate::router::projection::ProjectionSignals;
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{
-    IdentityProbeStatus, IdentitySelfProbeInfo, InteractionActuation, InteractionConfirmation,
-    InteractionConfirmationKind, InteractionConfirmationStatus, InteractionOutcome,
-    InteractionSemanticClass, LaunchPolicyInfo, SelectOutcome,
+    AuthState, FrameRuntimeInfo, IdentityProbeStatus, IdentitySelfProbeInfo, InteractionActuation,
+    InteractionConfirmation, InteractionConfirmationKind, InteractionConfirmationStatus,
+    InteractionOutcome, InteractionSemanticClass, LaunchPolicyInfo, NetworkRequestLifecycle,
+    NetworkRequestRecord, OverlayState, ReadinessInfo, ReadinessStatus, RouteStability,
+    RuntimeObservatoryEvent, RuntimeStateSnapshot, SelectOutcome, StateInspectorInfo,
+    StateInspectorStatus,
 };
 use rub_ipc::codec::MAX_FRAME_BYTES;
-use rub_ipc::protocol::{IpcRequest, IpcResponse};
-use std::sync::atomic::AtomicU64;
+use rub_ipc::protocol::{IpcRequest, IpcResponse, ResponseStatus};
+use std::collections::BTreeMap;
 use std::{path::PathBuf, sync::Arc};
 
 use crate::session::{ReplayCommandClaim, SessionState};
 
 fn test_router() -> DaemonRouter {
-    let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
-        rub_cdp::browser::BrowserLaunchOptions {
-            headless: true,
-            ignore_cert_errors: false,
-            user_data_dir: None,
-            managed_profile_ephemeral: false,
-            download_dir: None,
-            profile_directory: None,
-            hide_infobars: true,
-            stealth: true,
+    crate::test_support::daemon_router()
+}
+
+fn test_projection_signals<'a>(
+    frame_runtime: &'a FrameRuntimeInfo,
+    runtime_before: Option<&'a RuntimeStateSnapshot>,
+    runtime_after: Option<&'a RuntimeStateSnapshot>,
+    observatory_events: &'a [RuntimeObservatoryEvent],
+    network_requests: &'a [NetworkRequestRecord],
+    network_authoritative: bool,
+    network_degraded_reason: Option<&'a str>,
+) -> ProjectionSignals<'a> {
+    ProjectionSignals {
+        frame_runtime,
+        runtime_before,
+        runtime_after,
+        interference_before: None,
+        interference_after: None,
+        observatory_events,
+        observatory_authoritative: true,
+        observatory_degraded_reason: None,
+        network_requests,
+        network_authoritative,
+        network_degraded_reason,
+        download_events: &[],
+        download_authoritative: true,
+        download_degraded_reason: None,
+    }
+}
+
+fn signup_request_record() -> NetworkRequestRecord {
+    NetworkRequestRecord {
+        request_id: "req-1".to_string(),
+        sequence: 12,
+        lifecycle: NetworkRequestLifecycle::Completed,
+        url: "https://example.test/api/signup".to_string(),
+        method: "POST".to_string(),
+        tab_target_id: None,
+        status: Some(202),
+        request_headers: BTreeMap::new(),
+        response_headers: BTreeMap::new(),
+        request_body: None,
+        response_body: None,
+        original_url: None,
+        rewritten_url: None,
+        applied_rule_effects: Vec::new(),
+        error_text: None,
+        frame_id: None,
+        resource_type: Some("xhr".to_string()),
+        mime_type: Some("application/json".to_string()),
+    }
+}
+
+fn confirmed_activate_outcome(
+    kind: InteractionConfirmationKind,
+    details: Option<serde_json::Value>,
+) -> InteractionOutcome {
+    InteractionOutcome {
+        semantic_class: InteractionSemanticClass::Activate,
+        element_verified: true,
+        actuation: Some(InteractionActuation::Pointer),
+        confirmation: Some(InteractionConfirmation {
+            status: InteractionConfirmationStatus::Confirmed,
+            kind: Some(kind),
+            details,
+        }),
+    }
+}
+
+fn runtime_state_snapshot(
+    auth_state: AuthState,
+    local_storage_keys: Vec<String>,
+    auth_signals: Vec<String>,
+    route_stability: RouteStability,
+    loading_present: bool,
+    blocking_signals: Vec<String>,
+) -> RuntimeStateSnapshot {
+    RuntimeStateSnapshot {
+        state_inspector: StateInspectorInfo {
+            status: StateInspectorStatus::Active,
+            auth_state,
+            cookie_count: 0,
+            local_storage_keys,
+            session_storage_keys: Vec::new(),
+            auth_signals,
+            degraded_reason: None,
         },
-    ));
-    let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
-        manager,
-        Arc::new(AtomicU64::new(0)),
-        rub_cdp::humanize::HumanizeConfig {
-            enabled: false,
-            speed: rub_cdp::humanize::HumanizeSpeed::Normal,
+        readiness_state: ReadinessInfo {
+            status: ReadinessStatus::Active,
+            route_stability,
+            loading_present,
+            skeleton_present: false,
+            overlay_state: OverlayState::None,
+            document_ready_state: Some("complete".to_string()),
+            blocking_signals,
+            degraded_reason: None,
         },
-    ));
-    DaemonRouter::new(adapter)
+    }
+}
+
+fn response_payload_len(response: &IpcResponse) -> Option<usize> {
+    response
+        .data
+        .as_ref()
+        .and_then(|data| data.get("payload"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::len)
+}
+
+fn response_error_context_str<'a>(response: &'a IpcResponse, key: &str) -> Option<&'a str> {
+    response
+        .error
+        .as_ref()
+        .and_then(|error| error.context.as_ref())
+        .and_then(|context| context.get(key))
+        .and_then(|value| value.as_str())
 }
 
 #[test]
@@ -303,26 +402,11 @@ fn interaction_projection_preserves_confirmation_contract() {
         }),
     };
     let mut value = serde_json::json!({ "index": 1 });
-    let frame_runtime = rub_core::model::FrameRuntimeInfo::default();
+    let frame_runtime = FrameRuntimeInfo::default();
     attach_interaction_projection(
         &mut value,
         &outcome,
-        crate::router::projection::ProjectionSignals {
-            frame_runtime: &frame_runtime,
-            runtime_before: None,
-            runtime_after: None,
-            interference_before: None,
-            interference_after: None,
-            observatory_events: &[],
-            observatory_authoritative: true,
-            observatory_degraded_reason: None,
-            network_requests: &[],
-            network_authoritative: true,
-            network_degraded_reason: None,
-            download_events: &[],
-            download_authoritative: true,
-            download_degraded_reason: None,
-        },
+        test_projection_signals(&frame_runtime, None, None, &[], &[], true, None),
     );
 
     assert_eq!(value["interaction"]["semantic_class"], "toggle_state");
@@ -357,26 +441,11 @@ fn select_projection_preserves_confirmation_contract() {
             "text": "Two"
         }
     });
-    let frame_runtime = rub_core::model::FrameRuntimeInfo::default();
+    let frame_runtime = FrameRuntimeInfo::default();
     attach_select_projection(
         &mut value,
         &outcome,
-        crate::router::projection::ProjectionSignals {
-            frame_runtime: &frame_runtime,
-            runtime_before: None,
-            runtime_after: None,
-            interference_before: None,
-            interference_after: None,
-            observatory_events: &[],
-            observatory_authoritative: true,
-            observatory_degraded_reason: None,
-            network_requests: &[],
-            network_authoritative: true,
-            network_degraded_reason: None,
-            download_events: &[],
-            download_authoritative: true,
-            download_degraded_reason: None,
-        },
+        test_projection_signals(&frame_runtime, None, None, &[], &[], true, None),
     );
 
     assert_eq!(value["interaction"]["semantic_class"], "select_choice");
@@ -398,91 +467,47 @@ fn select_projection_preserves_confirmation_contract() {
 
 #[test]
 fn interaction_projection_attaches_runtime_state_delta() {
-    use rub_core::model::{
-        AuthState, OverlayState, ReadinessInfo, ReadinessStatus, RouteStability,
-        RuntimeStateSnapshot, StateInspectorInfo, StateInspectorStatus,
-    };
-
-    let outcome = InteractionOutcome {
-        semantic_class: InteractionSemanticClass::Activate,
-        element_verified: true,
-        actuation: Some(InteractionActuation::Pointer),
-        confirmation: Some(InteractionConfirmation {
-            status: InteractionConfirmationStatus::Confirmed,
-            kind: Some(InteractionConfirmationKind::PageMutation),
-            details: Some(serde_json::json!({ "context_changed": false })),
-        }),
-    };
-    let before = RuntimeStateSnapshot {
-        state_inspector: StateInspectorInfo {
-            status: StateInspectorStatus::Active,
-            auth_state: AuthState::Anonymous,
-            cookie_count: 0,
-            local_storage_keys: Vec::new(),
-            session_storage_keys: Vec::new(),
-            auth_signals: Vec::new(),
-            degraded_reason: None,
-        },
-        readiness_state: ReadinessInfo {
-            status: ReadinessStatus::Active,
-            route_stability: RouteStability::Stable,
-            loading_present: false,
-            skeleton_present: false,
-            overlay_state: OverlayState::None,
-            document_ready_state: Some("complete".to_string()),
-            blocking_signals: Vec::new(),
-            degraded_reason: None,
-        },
-    };
-    let after = RuntimeStateSnapshot {
-        state_inspector: StateInspectorInfo {
-            status: StateInspectorStatus::Active,
-            auth_state: AuthState::Unknown,
-            cookie_count: 0,
-            local_storage_keys: vec!["authToken".to_string()],
-            session_storage_keys: Vec::new(),
-            auth_signals: vec![
-                "local_storage_present".to_string(),
-                "auth_like_storage_key_present".to_string(),
-            ],
-            degraded_reason: None,
-        },
-        readiness_state: ReadinessInfo {
-            status: ReadinessStatus::Active,
-            route_stability: RouteStability::Transitioning,
-            loading_present: true,
-            skeleton_present: false,
-            overlay_state: OverlayState::None,
-            document_ready_state: Some("complete".to_string()),
-            blocking_signals: vec![
-                "loading_present".to_string(),
-                "route_transitioning".to_string(),
-            ],
-            degraded_reason: None,
-        },
-    };
+    let outcome = confirmed_activate_outcome(
+        InteractionConfirmationKind::PageMutation,
+        Some(serde_json::json!({ "context_changed": false })),
+    );
+    let before = runtime_state_snapshot(
+        AuthState::Anonymous,
+        Vec::new(),
+        Vec::new(),
+        RouteStability::Stable,
+        false,
+        Vec::new(),
+    );
+    let after = runtime_state_snapshot(
+        AuthState::Unknown,
+        vec!["authToken".to_string()],
+        vec![
+            "local_storage_present".to_string(),
+            "auth_like_storage_key_present".to_string(),
+        ],
+        RouteStability::Transitioning,
+        true,
+        vec![
+            "loading_present".to_string(),
+            "route_transitioning".to_string(),
+        ],
+    );
 
     let mut value = serde_json::json!({ "index": 1 });
-    let frame_runtime = rub_core::model::FrameRuntimeInfo::default();
+    let frame_runtime = FrameRuntimeInfo::default();
     attach_interaction_projection(
         &mut value,
         &outcome,
-        crate::router::projection::ProjectionSignals {
-            frame_runtime: &frame_runtime,
-            runtime_before: Some(&before),
-            runtime_after: Some(&after),
-            interference_before: None,
-            interference_after: None,
-            observatory_events: &[],
-            observatory_authoritative: true,
-            observatory_degraded_reason: None,
-            network_requests: &[],
-            network_authoritative: true,
-            network_degraded_reason: None,
-            download_events: &[],
-            download_authoritative: true,
-            download_degraded_reason: None,
-        },
+        test_projection_signals(
+            &frame_runtime,
+            Some(&before),
+            Some(&after),
+            &[],
+            &[],
+            true,
+            None,
+        ),
     );
 
     assert_eq!(
@@ -524,26 +549,11 @@ fn interaction_projection_attaches_context_turnover() {
     };
 
     let mut value = serde_json::json!({ "index": 1 });
-    let frame_runtime = rub_core::model::FrameRuntimeInfo::default();
+    let frame_runtime = FrameRuntimeInfo::default();
     attach_interaction_projection(
         &mut value,
         &outcome,
-        crate::router::projection::ProjectionSignals {
-            frame_runtime: &frame_runtime,
-            runtime_before: None,
-            runtime_after: None,
-            interference_before: None,
-            interference_after: None,
-            observatory_events: &[],
-            observatory_authoritative: true,
-            observatory_degraded_reason: None,
-            network_requests: &[],
-            network_authoritative: true,
-            network_degraded_reason: None,
-            download_events: &[],
-            download_authoritative: true,
-            download_degraded_reason: None,
-        },
+        test_projection_signals(&frame_runtime, None, None, &[], &[], true, None),
     );
 
     assert_eq!(
@@ -567,21 +577,11 @@ fn interaction_projection_attaches_context_turnover() {
 #[test]
 fn interaction_projection_attaches_runtime_observatory_events() {
     use rub_core::model::{
-        ConsoleErrorEvent, InteractionActuation, InteractionConfirmation,
-        InteractionConfirmationKind, InteractionConfirmationStatus, InteractionOutcome,
-        InteractionSemanticClass, RuntimeObservatoryEvent, RuntimeObservatoryEventPayload,
+        ConsoleErrorEvent, InteractionConfirmationKind, RuntimeObservatoryEvent,
+        RuntimeObservatoryEventPayload,
     };
 
-    let outcome = InteractionOutcome {
-        semantic_class: InteractionSemanticClass::Activate,
-        element_verified: true,
-        actuation: Some(InteractionActuation::Pointer),
-        confirmation: Some(InteractionConfirmation {
-            status: InteractionConfirmationStatus::Confirmed,
-            kind: Some(InteractionConfirmationKind::PageMutation),
-            details: None,
-        }),
-    };
+    let outcome = confirmed_activate_outcome(InteractionConfirmationKind::PageMutation, None);
     let events = vec![RuntimeObservatoryEvent {
         sequence: 7,
         payload: RuntimeObservatoryEventPayload::ConsoleError(ConsoleErrorEvent {
@@ -592,26 +592,11 @@ fn interaction_projection_attaches_runtime_observatory_events() {
     }];
 
     let mut value = serde_json::json!({ "index": 1 });
-    let frame_runtime = rub_core::model::FrameRuntimeInfo::default();
+    let frame_runtime = FrameRuntimeInfo::default();
     attach_interaction_projection(
         &mut value,
         &outcome,
-        crate::router::projection::ProjectionSignals {
-            frame_runtime: &frame_runtime,
-            runtime_before: None,
-            runtime_after: None,
-            interference_before: None,
-            interference_after: None,
-            observatory_events: &events,
-            observatory_authoritative: true,
-            observatory_degraded_reason: None,
-            network_requests: &[],
-            network_authoritative: true,
-            network_degraded_reason: None,
-            download_events: &[],
-            download_authoritative: true,
-            download_degraded_reason: None,
-        },
+        test_projection_signals(&frame_runtime, None, None, &events, &[], true, None),
     );
 
     assert_eq!(
@@ -630,23 +615,9 @@ fn interaction_projection_attaches_runtime_observatory_events() {
 
 #[test]
 fn interaction_projection_attaches_network_request_grouping() {
-    use rub_core::model::{
-        InteractionActuation, InteractionConfirmation, InteractionConfirmationKind,
-        InteractionConfirmationStatus, InteractionOutcome, InteractionSemanticClass,
-        NetworkRequestLifecycle, NetworkRequestRecord,
-    };
-    use std::collections::BTreeMap;
+    use rub_core::model::InteractionConfirmationKind;
 
-    let outcome = InteractionOutcome {
-        semantic_class: InteractionSemanticClass::Activate,
-        element_verified: true,
-        actuation: Some(InteractionActuation::Pointer),
-        confirmation: Some(InteractionConfirmation {
-            status: InteractionConfirmationStatus::Confirmed,
-            kind: Some(InteractionConfirmationKind::PageMutation),
-            details: None,
-        }),
-    };
+    let outcome = confirmed_activate_outcome(InteractionConfirmationKind::PageMutation, None);
     let requests = vec![
         NetworkRequestRecord {
             request_id: "req-1".to_string(),
@@ -691,26 +662,11 @@ fn interaction_projection_attaches_network_request_grouping() {
     ];
 
     let mut value = serde_json::json!({ "index": 1 });
-    let frame_runtime = rub_core::model::FrameRuntimeInfo::default();
+    let frame_runtime = FrameRuntimeInfo::default();
     attach_interaction_projection(
         &mut value,
         &outcome,
-        crate::router::projection::ProjectionSignals {
-            frame_runtime: &frame_runtime,
-            runtime_before: None,
-            runtime_after: None,
-            interference_before: None,
-            interference_after: None,
-            observatory_events: &[],
-            observatory_authoritative: true,
-            observatory_degraded_reason: None,
-            network_requests: &requests,
-            network_authoritative: true,
-            network_degraded_reason: None,
-            download_events: &[],
-            download_authoritative: true,
-            download_degraded_reason: None,
-        },
+        test_projection_signals(&frame_runtime, None, None, &[], &requests, true, None),
     );
 
     assert_eq!(
@@ -740,9 +696,7 @@ fn interaction_projection_marks_confirmed_follow_up_activity_for_page_mutation_w
     use rub_core::model::{
         InteractionActuation, InteractionConfirmation, InteractionConfirmationKind,
         InteractionConfirmationStatus, InteractionOutcome, InteractionSemanticClass,
-        NetworkRequestLifecycle, NetworkRequestRecord,
     };
-    use std::collections::BTreeMap;
 
     let outcome = InteractionOutcome {
         semantic_class: InteractionSemanticClass::Activate,
@@ -763,52 +717,18 @@ fn interaction_projection_marks_confirmed_follow_up_activity_for_page_mutation_w
             })),
         }),
     };
-    let requests = vec![NetworkRequestRecord {
-        request_id: "req-1".to_string(),
-        sequence: 12,
-        lifecycle: NetworkRequestLifecycle::Completed,
-        url: "https://example.test/api/signup".to_string(),
-        method: "POST".to_string(),
-        tab_target_id: None,
-        status: Some(202),
-        request_headers: BTreeMap::new(),
-        response_headers: BTreeMap::new(),
-        request_body: None,
-        response_body: None,
-        original_url: None,
-        rewritten_url: None,
-        applied_rule_effects: Vec::new(),
-        error_text: None,
-        frame_id: None,
-        resource_type: Some("xhr".to_string()),
-        mime_type: Some("application/json".to_string()),
-    }];
+    let requests = vec![signup_request_record()];
 
     let mut value = serde_json::json!({
         "result": {
             "gesture": "single"
         }
     });
-    let frame_runtime = rub_core::model::FrameRuntimeInfo::default();
+    let frame_runtime = FrameRuntimeInfo::default();
     attach_interaction_projection(
         &mut value,
         &outcome,
-        crate::router::projection::ProjectionSignals {
-            frame_runtime: &frame_runtime,
-            runtime_before: None,
-            runtime_after: None,
-            interference_before: None,
-            interference_after: None,
-            observatory_events: &[],
-            observatory_authoritative: true,
-            observatory_degraded_reason: None,
-            network_requests: &requests,
-            network_authoritative: true,
-            network_degraded_reason: None,
-            download_events: &[],
-            download_authoritative: true,
-            download_degraded_reason: None,
-        },
+        test_projection_signals(&frame_runtime, None, None, &[], &requests, true, None),
     );
 
     assert_eq!(
@@ -847,9 +767,7 @@ fn interaction_projection_omits_follow_up_activity_when_network_surface_is_not_a
     use rub_core::model::{
         InteractionActuation, InteractionConfirmation, InteractionConfirmationKind,
         InteractionConfirmationStatus, InteractionOutcome, InteractionSemanticClass,
-        NetworkRequestLifecycle, NetworkRequestRecord,
     };
-    use std::collections::BTreeMap;
 
     let outcome = InteractionOutcome {
         semantic_class: InteractionSemanticClass::Activate,
@@ -861,52 +779,26 @@ fn interaction_projection_omits_follow_up_activity_when_network_surface_is_not_a
             details: Some(serde_json::json!({})),
         }),
     };
-    let requests = vec![NetworkRequestRecord {
-        request_id: "req-1".to_string(),
-        sequence: 12,
-        lifecycle: NetworkRequestLifecycle::Completed,
-        url: "https://example.test/api/signup".to_string(),
-        method: "POST".to_string(),
-        tab_target_id: None,
-        status: Some(202),
-        request_headers: BTreeMap::new(),
-        response_headers: BTreeMap::new(),
-        request_body: None,
-        response_body: None,
-        original_url: None,
-        rewritten_url: None,
-        applied_rule_effects: Vec::new(),
-        error_text: None,
-        frame_id: None,
-        resource_type: Some("xhr".to_string()),
-        mime_type: Some("application/json".to_string()),
-    }];
+    let requests = vec![signup_request_record()];
 
     let mut value = serde_json::json!({
         "result": {
             "gesture": "single"
         }
     });
-    let frame_runtime = rub_core::model::FrameRuntimeInfo::default();
+    let frame_runtime = FrameRuntimeInfo::default();
     attach_interaction_projection(
         &mut value,
         &outcome,
-        crate::router::projection::ProjectionSignals {
-            frame_runtime: &frame_runtime,
-            runtime_before: None,
-            runtime_after: None,
-            interference_before: None,
-            interference_after: None,
-            observatory_events: &[],
-            observatory_authoritative: true,
-            observatory_degraded_reason: None,
-            network_requests: &requests,
-            network_authoritative: false,
-            network_degraded_reason: Some("overflow"),
-            download_events: &[],
-            download_authoritative: true,
-            download_degraded_reason: None,
-        },
+        test_projection_signals(
+            &frame_runtime,
+            None,
+            None,
+            &[],
+            &requests,
+            false,
+            Some("overflow"),
+        ),
     );
 
     assert!(value["result"].get("outcome_summary").is_none(), "{value}");
@@ -943,26 +835,11 @@ fn interaction_projection_attaches_observed_effects() {
     }];
 
     let mut value = serde_json::json!({ "index": 1 });
-    let frame_runtime = rub_core::model::FrameRuntimeInfo::default();
+    let frame_runtime = FrameRuntimeInfo::default();
     attach_interaction_projection(
         &mut value,
         &outcome,
-        crate::router::projection::ProjectionSignals {
-            frame_runtime: &frame_runtime,
-            runtime_before: None,
-            runtime_after: None,
-            interference_before: None,
-            interference_after: None,
-            observatory_events: &events,
-            observatory_authoritative: true,
-            observatory_degraded_reason: None,
-            network_requests: &[],
-            network_authoritative: true,
-            network_degraded_reason: None,
-            download_events: &[],
-            download_authoritative: true,
-            download_degraded_reason: None,
-        },
+        test_projection_signals(&frame_runtime, None, None, &events, &[], true, None),
     );
 
     assert_eq!(
@@ -1316,21 +1193,11 @@ async fn replay_after_execution_started_and_response_eviction_fails_closed() {
         Some(ErrorCode::IpcProtocolError)
     );
     assert_eq!(
-        replay
-            .error
-            .as_ref()
-            .and_then(|error| error.context.as_ref())
-            .and_then(|context| context.get("reason"))
-            .and_then(|value| value.as_str()),
+        response_error_context_str(&replay, "reason"),
         Some("replay_command_id_already_spent_original_response_evicted")
     );
     assert_eq!(
-        replay
-            .error
-            .as_ref()
-            .and_then(|error| error.context.as_ref())
-            .and_then(|context| context.get("recovery_contract"))
-            .and_then(|value| value.as_str()),
+        response_error_context_str(&replay, "recovery_contract"),
         Some("already_executed_response_evicted_do_not_rerun")
     );
 }
@@ -1380,17 +1247,9 @@ async fn finalize_response_preserves_oversized_payload_as_committed_truth() {
     let finalized = finalize_response(&request, oversized, false, None, &state).await;
 
     assert_eq!(finalized.command_id.as_deref(), Some("cmd-large"));
-    assert_eq!(finalized.status, rub_ipc::protocol::ResponseStatus::Success);
+    assert_eq!(finalized.status, ResponseStatus::Success);
     assert!(finalized.error.is_none());
-    assert_eq!(
-        finalized
-            .data
-            .as_ref()
-            .and_then(|data| data.get("payload"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::len),
-        Some(rub_ipc::codec::MAX_FRAME_BYTES)
-    );
+    assert_eq!(response_payload_len(&finalized), Some(MAX_FRAME_BYTES));
 }
 
 #[tokio::test]
@@ -1423,7 +1282,7 @@ async fn replay_cache_preserves_oversized_committed_truth_not_transport_projecti
 
     let finalized = finalize_response(&request, oversized, false, Some(replay_owner), &state).await;
     assert_eq!(finalized.command_id.as_deref(), Some("cmd-large-replay"));
-    assert_eq!(finalized.status, rub_ipc::protocol::ResponseStatus::Success);
+    assert_eq!(finalized.status, ResponseStatus::Success);
     assert!(finalized.error.is_none());
 
     let replay = prepare_replay_fence(
@@ -1435,16 +1294,11 @@ async fn replay_cache_preserves_oversized_committed_truth_not_transport_projecti
     .await
     .expect_err("replay should return cached finalized response");
     assert_eq!(replay.command_id.as_deref(), Some("cmd-large-replay"));
-    assert_eq!(replay.status, rub_ipc::protocol::ResponseStatus::Success);
+    assert_eq!(replay.status, ResponseStatus::Success);
     assert!(replay.error.is_none());
     assert_eq!(
-        replay
-            .data
-            .as_ref()
-            .and_then(|data| data.get("payload"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::len),
-        Some(rub_ipc::codec::MAX_FRAME_BYTES),
+        response_payload_len(&replay),
+        Some(MAX_FRAME_BYTES),
         "replay cache must preserve command outcome truth, not the transport overflow projection"
     );
 }
@@ -1490,7 +1344,7 @@ async fn handshake_bypasses_fifo_when_router_is_busy() {
             &state,
         )
         .await;
-    assert_eq!(response.status, rub_ipc::protocol::ResponseStatus::Success);
+    assert_eq!(response.status, ResponseStatus::Success);
     assert_eq!(
         response
             .data
@@ -1515,7 +1369,7 @@ async fn orchestration_target_dispatch_stays_out_of_user_post_commit_projection(
             &state,
         )
         .await;
-    assert_eq!(response.status, rub_ipc::protocol::ResponseStatus::Error);
+    assert_eq!(response.status, ResponseStatus::Error);
     assert_eq!(state.pending_post_commit_projection_count(), 0);
     assert!(
         state.command_history(5).await.entries.is_empty(),

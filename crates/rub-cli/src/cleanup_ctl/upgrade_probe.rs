@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use rub_core::error::{ErrorCode, RubError};
 use rub_daemon::rub_paths::SessionPaths;
 use rub_ipc::client::{IpcClient, IpcClientError};
-use rub_ipc::protocol::{IpcRequest, ResponseStatus, UPGRADE_CHECK_PROBE_COMMAND_ID};
+use rub_ipc::protocol::{IpcRequest, IpcResponse, ResponseStatus, UPGRADE_CHECK_PROBE_COMMAND_ID};
 
 pub(super) fn cleanup_upgrade_status_error(
     code: ErrorCode,
@@ -154,15 +154,10 @@ fn remaining_budget_ms(
     timeout_ms: u64,
     phase: &'static str,
 ) -> Result<u64, RubError> {
-    crate::timeout_budget::remaining_budget_duration(deadline)
-        .map(|remaining| remaining.as_millis().clamp(1, u64::MAX as u128) as u64)
-        .ok_or_else(|| crate::main_support::command_timeout_error(timeout_ms, phase))
+    crate::timeout_budget::remaining_budget_ms_or_timeout(deadline, timeout_ms, phase)
 }
 
-fn cleanup_upgrade_probe_response_error(
-    socket_path: &Path,
-    response: rub_ipc::protocol::IpcResponse,
-) -> RubError {
+fn cleanup_upgrade_probe_response_error(socket_path: &Path, response: IpcResponse) -> RubError {
     if let Some(envelope) = response.error {
         return cleanup_upgrade_status_error(
             envelope.code,
@@ -262,7 +257,7 @@ mod tests {
     fn upgrade_probe_error_response_preserves_socket_path_context() {
         let error = cleanup_upgrade_probe_response_error(
             Path::new("/tmp/rub.sock"),
-            rub_ipc::protocol::IpcResponse::error(
+            IpcResponse::error(
                 "req-1",
                 ErrorEnvelope::new(ErrorCode::DaemonNotRunning, "daemon unavailable").with_context(
                     serde_json::json!({
@@ -285,7 +280,7 @@ mod tests {
     fn upgrade_probe_missing_error_envelope_is_protocol_error() {
         let error = cleanup_upgrade_probe_response_error(
             Path::new("/tmp/rub.sock"),
-            rub_ipc::protocol::IpcResponse {
+            IpcResponse {
                 ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
                 command_id: None,
                 daemon_session_id: None,

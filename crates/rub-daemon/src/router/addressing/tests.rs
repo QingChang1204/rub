@@ -12,8 +12,6 @@ use rub_core::error::ErrorCode;
 use rub_core::locator::{CanonicalLocator, LocatorSelection};
 use rub_core::model::{AXInfo, BoundingBox, Element, ElementTag};
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 #[test]
 fn normalize_locator_text_collapses_whitespace_and_case() {
@@ -67,7 +65,7 @@ fn ambiguous_locator_error_reports_topmost_ordering_policy() {
 #[test]
 fn ambiguous_locator_error_suggests_visible_when_one_candidate_is_visible() {
     let mut visible = element(1, "Username", Some("Username"), Some("main:1"));
-    visible.bounding_box = Some(rub_core::model::BoundingBox {
+    visible.bounding_box = Some(BoundingBox {
         x: 10.0,
         y: 10.0,
         width: 80.0,
@@ -322,7 +320,7 @@ fn visible_ranking_filters_out_candidates_without_visible_bbox() {
     let mut hidden = element(0, "Continue", Some("Continue"), Some("main:10"));
     hidden.bounding_box = None;
     let mut visible = element(1, "Continue", Some("Continue"), Some("main:11"));
-    visible.bounding_box = Some(rub_core::model::BoundingBox {
+    visible.bounding_box = Some(BoundingBox {
         x: 10.0,
         y: 20.0,
         width: 80.0,
@@ -484,27 +482,7 @@ fn snapshot(elements: Vec<Element>) -> rub_core::model::Snapshot {
 }
 
 fn test_router() -> crate::router::DaemonRouter {
-    let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
-        rub_cdp::browser::BrowserLaunchOptions {
-            headless: true,
-            ignore_cert_errors: false,
-            user_data_dir: None,
-            managed_profile_ephemeral: false,
-            download_dir: None,
-            profile_directory: None,
-            hide_infobars: true,
-            stealth: true,
-        },
-    ));
-    let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
-        manager,
-        Arc::new(AtomicU64::new(0)),
-        rub_cdp::humanize::HumanizeConfig {
-            enabled: false,
-            speed: rub_cdp::humanize::HumanizeSpeed::Normal,
-        },
-    ));
-    crate::router::DaemonRouter::new(adapter)
+    crate::test_support::daemon_router()
 }
 
 fn element(index: u32, text: &str, aria_label: Option<&str>, element_ref: Option<&str>) -> Element {

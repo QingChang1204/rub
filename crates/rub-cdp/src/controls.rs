@@ -309,7 +309,7 @@ fn js_string_literal(value: &str) -> Result<String, RubError> {
 
 async fn ensure_control_enabled(
     page: &Arc<Page>,
-    object_id: &chromiumoxide::cdp::js_protocol::runtime::RemoteObjectId,
+    object_id: &RemoteObjectId,
 ) -> Result<(), RubError> {
     let state = crate::js::call_function_returning_string(
         page,

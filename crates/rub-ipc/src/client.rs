@@ -73,11 +73,7 @@ impl IpcClientError {
             "request_commit_state": "possible",
             "command_id_present": request.command_id.is_some(),
         });
-        if let Some(context_object) = context.as_object_mut()
-            && let Some(command_id) = request.command_id.as_ref()
-        {
-            context_object.insert("command_id".to_string(), serde_json::json!(command_id));
-        }
+        add_command_id_context(&mut context, request);
         Self::Protocol(
             ErrorEnvelope::new(
                 ErrorCode::IpcTimeout,
@@ -105,11 +101,7 @@ impl IpcClientError {
             "command_id_present": request.command_id.is_some(),
             "transport_error_kind": format!("{:?}", error.kind()),
         });
-        if let Some(context_object) = context.as_object_mut()
-            && let Some(command_id) = request.command_id.as_ref()
-        {
-            context_object.insert("command_id".to_string(), serde_json::json!(command_id));
-        }
+        add_command_id_context(&mut context, request);
         Self::Protocol(
             ErrorEnvelope::new(
                 ErrorCode::IpcProtocolError,
@@ -132,11 +124,7 @@ impl IpcClientError {
             "request_committed": true,
             "command_id_present": request.command_id.is_some(),
         });
-        if let Some(context_object) = context.as_object_mut()
-            && let Some(command_id) = request.command_id.as_ref()
-        {
-            context_object.insert("command_id".to_string(), serde_json::json!(command_id));
-        }
+        add_command_id_context(&mut context, request);
         Self::Protocol(
             ErrorEnvelope::new(
                 ErrorCode::IpcTimeout,
@@ -198,11 +186,7 @@ impl IpcClientError {
             "request_committed": true,
             "command_id_present": request.command_id.is_some(),
         });
-        if let Some(context_object) = context.as_object_mut()
-            && let Some(command_id) = request.command_id.as_ref()
-        {
-            context_object.insert("command_id".to_string(), serde_json::json!(command_id));
-        }
+        add_command_id_context(&mut context, request);
         Self::Protocol(
             ErrorEnvelope::new(
                 ErrorCode::IpcProtocolError,
@@ -329,6 +313,14 @@ impl Error for IpcClientError {
             Self::Transport(error) => Some(error),
             Self::Protocol(_) => None,
         }
+    }
+}
+
+fn add_command_id_context(context: &mut serde_json::Value, request: &IpcRequest) {
+    if let Some(context_object) = context.as_object_mut()
+        && let Some(command_id) = request.command_id.as_ref()
+    {
+        context_object.insert("command_id".to_string(), serde_json::json!(command_id));
     }
 }
 

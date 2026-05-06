@@ -23,6 +23,7 @@ use crate::timeout_budget::run_with_remaining_budget;
 use crate::workflow_assets;
 use rub_core::error::{ErrorCode, ErrorEnvelope, RubError};
 use rub_core::model::BindingExecutionResolutionInfo;
+use serde_json::Value;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -34,9 +35,9 @@ pub(crate) fn close_command_uses_attachment_selector(cli: &EffectiveCli) -> bool
         || cli.requested_launch_policy.user_data_dir.is_some()
 }
 
-pub(crate) fn close_all_selector_error() -> rub_core::error::RubError {
-    rub_core::error::RubError::domain_with_context(
-        rub_core::error::ErrorCode::InvalidInput,
+pub(crate) fn close_all_selector_error() -> RubError {
+    RubError::domain_with_context(
+        ErrorCode::InvalidInput,
         "close --all does not accept a browser attachment selector",
         serde_json::json!({
             "reason": "close_all_selector_not_supported",
@@ -96,7 +97,7 @@ pub(crate) fn cleanup_compatibility_degraded_owned_error(
     )
 }
 
-fn close_noop_payload() -> serde_json::Value {
+fn close_noop_payload() -> Value {
     serde_json::json!({
         "subject": {
             "kind": "session_browser",
@@ -109,12 +110,56 @@ fn close_noop_payload() -> serde_json::Value {
     })
 }
 
+fn unwrap_or_print_error<T>(
+    command: &str,
+    session: &str,
+    pretty: bool,
+    result: Result<T, RubError>,
+) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            println!(
+                "{}",
+                output::format_cli_error(command, session, error.into_envelope(), pretty)
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+fn print_local_result_or_exit(
+    command: &str,
+    session: &str,
+    rub_home: &Path,
+    pretty: bool,
+    trace_mode: output::InteractionTraceMode,
+    result: Result<Value, RubError>,
+) -> bool {
+    match result {
+        Ok(result) => {
+            println!(
+                "{}",
+                output::format_cli_success(command, session, rub_home, result, pretty, trace_mode)
+            );
+            true
+        }
+        Err(error) => {
+            println!(
+                "{}",
+                output::format_cli_error(command, session, error.into_envelope(), pretty)
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 pub(crate) async fn resolve_close_selector_attachment_identity_until(
     cli: &EffectiveCli,
     request: &ConnectionRequest,
     deadline: Instant,
     timeout_ms: u64,
-) -> Result<Option<String>, rub_core::error::RubError> {
+) -> Result<Option<String>, RubError> {
     run_with_remaining_budget(
         deadline,
         timeout_ms.max(1),
@@ -127,7 +172,7 @@ pub(crate) async fn resolve_close_selector_attachment_identity_until(
 pub(crate) fn resolve_connection_request_for_cli(
     cli: &EffectiveCli,
     override_request: Option<&ConnectionRequest>,
-) -> Result<ConnectionRequest, rub_core::error::RubError> {
+) -> Result<ConnectionRequest, RubError> {
     override_request
         .cloned()
         .map_or_else(|| parse_connection_request(cli), Ok)
@@ -328,29 +373,14 @@ pub(crate) async fn try_handle_prebootstrap_command(
         builder_help: true, ..
     }) = &cli.command
     {
-        match inspect_list_help_ctl::project_inspect_list_builder_help() {
-            Ok(result) => {
-                println!(
-                    "{}",
-                    output::format_cli_success(
-                        "inspect",
-                        session,
-                        rub_home,
-                        result,
-                        pretty,
-                        output_trace_mode(cli),
-                    )
-                );
-                return true;
-            }
-            Err(error) => {
-                println!(
-                    "{}",
-                    output::format_cli_error("inspect", session, error.into_envelope(), pretty)
-                );
-                std::process::exit(1);
-            }
-        }
+        return print_local_result_or_exit(
+            "inspect",
+            session,
+            rub_home,
+            pretty,
+            output_trace_mode(cli),
+            inspect_list_help_ctl::project_inspect_list_builder_help(),
+        );
     }
 
     if matches!(&cli.command, Commands::InternalDaemon) {
@@ -421,51 +451,36 @@ pub(crate) async fn try_handle_prebootstrap_command(
     }
 
     if let Commands::Close { all: false } = &cli.command {
-        let connection_request =
-            match resolve_connection_request_for_cli(cli, binding_execution_connection_request) {
-                Ok(request) => request,
-                Err(error) => {
-                    println!(
-                        "{}",
-                        output::format_cli_error("close", session, error.into_envelope(), pretty)
-                    );
-                    std::process::exit(1);
-                }
-            };
+        let connection_request = unwrap_or_print_error(
+            "close",
+            session,
+            pretty,
+            resolve_connection_request_for_cli(cli, binding_execution_connection_request),
+        );
         let close_deadline = Instant::now() + Duration::from_millis(timeout.max(1));
-        let connection_request = match materialize_connection_request_with_deadline(
-            &connection_request,
-            Some(close_deadline),
-            Some(timeout),
-        )
-        .await
-        {
-            Ok(request) => request,
-            Err(error) => {
-                println!(
-                    "{}",
-                    output::format_cli_error("close", session, error.into_envelope(), pretty)
-                );
-                std::process::exit(1);
-            }
-        };
-        let attachment_identity = match resolve_close_selector_attachment_identity_until(
-            cli,
-            &connection_request,
-            close_deadline,
-            timeout,
-        )
-        .await
-        {
-            Ok(identity) => identity,
-            Err(error) => {
-                println!(
-                    "{}",
-                    output::format_cli_error("close", session, error.into_envelope(), pretty)
-                );
-                std::process::exit(1);
-            }
-        };
+        let connection_request = unwrap_or_print_error(
+            "close",
+            session,
+            pretty,
+            materialize_connection_request_with_deadline(
+                &connection_request,
+                Some(close_deadline),
+                Some(timeout),
+            )
+            .await,
+        );
+        let attachment_identity = unwrap_or_print_error(
+            "close",
+            session,
+            pretty,
+            resolve_close_selector_attachment_identity_until(
+                cli,
+                &connection_request,
+                close_deadline,
+                timeout,
+            )
+            .await,
+        );
         let close_outcome = if let Some(attachment_identity) = attachment_identity {
             match daemon_ctl::resolve_existing_close_target_by_attachment_identity_until(
                 rub_home,
@@ -620,31 +635,16 @@ pub(crate) async fn try_handle_prebootstrap_command(
 
     if matches!(
         &cli.command,
-        Commands::Inspect(crate::commands::InspectSubcommand::Harvest { .. })
+        Commands::Inspect(InspectSubcommand::Harvest { .. })
     ) {
-        match harvest_ctl::inspect_harvest(cli).await {
-            Ok(result) => {
-                println!(
-                    "{}",
-                    output::format_cli_success(
-                        "inspect",
-                        session,
-                        rub_home,
-                        result,
-                        pretty,
-                        output_trace_mode(cli),
-                    )
-                );
-                return true;
-            }
-            Err(error) => {
-                println!(
-                    "{}",
-                    output::format_cli_error("inspect", session, error.into_envelope(), pretty)
-                );
-                std::process::exit(1);
-            }
-        }
+        return print_local_result_or_exit(
+            "inspect",
+            session,
+            rub_home,
+            pretty,
+            output_trace_mode(cli),
+            harvest_ctl::inspect_harvest(cli).await,
+        );
     }
 
     false

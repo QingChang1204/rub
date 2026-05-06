@@ -317,14 +317,7 @@ fn cleanup_failed_external_chrome_spawn(
     profile_dir: &Path,
 ) -> Result<(), String> {
     let pid = child.id();
-    let _ = child.kill();
-    for _ in 0..20 {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(_) => break,
-        }
-    }
+    kill_and_wait_for_child_exit(child);
     reap_external_chrome_processes_for_profile(profile_dir);
     let _ = std::fs::remove_dir_all(profile_dir);
     finalize_failed_external_cleanup_tracking(
@@ -384,6 +377,16 @@ pub fn spawn_external_chrome(
 
 pub fn terminate_external_chrome(child: &mut std::process::Child, profile_dir: &Path) {
     let pid = child.id();
+    kill_and_wait_for_child_exit(child);
+    reap_external_chrome_processes_for_profile(profile_dir);
+    let _ = std::fs::remove_dir_all(profile_dir);
+    match verify_external_chrome_cleanup_complete(pid, profile_dir) {
+        Ok(verification) => apply_external_cleanup_tracking(pid, verification),
+        Err(message) => panic!("{message}"),
+    }
+}
+
+fn kill_and_wait_for_child_exit(child: &mut std::process::Child) {
     let _ = child.kill();
     for _ in 0..20 {
         match child.try_wait() {
@@ -391,12 +394,6 @@ pub fn terminate_external_chrome(child: &mut std::process::Child, profile_dir: &
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(_) => break,
         }
-    }
-    reap_external_chrome_processes_for_profile(profile_dir);
-    let _ = std::fs::remove_dir_all(profile_dir);
-    match verify_external_chrome_cleanup_complete(pid, profile_dir) {
-        Ok(verification) => apply_external_cleanup_tracking(pid, verification),
-        Err(message) => panic!("{message}"),
     }
 }
 

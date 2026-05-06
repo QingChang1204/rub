@@ -1,6 +1,6 @@
 use super::condition::{
-    TriggeredTriggerCondition, evaluate_trigger_condition, network_request_matches,
-    readiness_matches, reconcile_worker_state, storage_snapshot_matches,
+    TriggerNetworkProgress, TriggeredTriggerCondition, evaluate_trigger_condition,
+    network_request_matches, readiness_matches, reconcile_worker_state, storage_snapshot_matches,
 };
 use super::outcome::{classify_trigger_error_status, contextualize_trigger_error};
 use super::{
@@ -16,8 +16,8 @@ use rub_core::locator::CanonicalLocator;
 use rub_core::model::{
     FrameContextInfo, FrameContextStatus, FrameRuntimeInfo, NetworkRequestLifecycle,
     NetworkRequestRecord, OverlayState, ReadinessInfo, ReadinessStatus, RouteStability,
-    TriggerActionKind, TriggerActionSpec, TriggerConditionKind, TriggerConditionSpec, TriggerInfo,
-    TriggerMode, TriggerStatus, TriggerTabBindingInfo,
+    TriggerActionKind, TriggerActionSpec, TriggerConditionKind, TriggerConditionSpec,
+    TriggerEvidenceInfo, TriggerInfo, TriggerMode, TriggerStatus, TriggerTabBindingInfo,
 };
 use rub_core::storage::{StorageArea, StorageSnapshot};
 use serde_json::json;
@@ -25,34 +25,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use uuid::Uuid;
 
-use crate::router::DaemonRouter;
 use crate::session::{NetworkRequestBaseline, SessionState};
 
-fn test_router() -> Arc<DaemonRouter> {
-    let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
-        rub_cdp::browser::BrowserLaunchOptions {
-            headless: true,
-            ignore_cert_errors: false,
-            user_data_dir: None,
-            managed_profile_ephemeral: false,
-            download_dir: None,
-            profile_directory: None,
-            hide_infobars: true,
-            stealth: true,
-        },
-    ));
-    let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
-        manager,
-        Arc::new(AtomicU64::new(0)),
-        rub_cdp::humanize::HumanizeConfig {
-            enabled: false,
-            speed: rub_cdp::humanize::HumanizeSpeed::Normal,
-        },
-    ));
-    Arc::new(DaemonRouter::new(adapter))
+fn test_router() -> Arc<crate::router::DaemonRouter> {
+    crate::test_support::daemon_router_arc()
 }
 
 fn temp_home(label: &str) -> PathBuf {
@@ -123,9 +101,8 @@ fn tab(
     }
 }
 
-#[test]
-fn readiness_matches_accepts_ready_alias_and_document_state() {
-    let readiness = ReadinessInfo {
+fn ready_readiness() -> ReadinessInfo {
+    ReadinessInfo {
         status: ReadinessStatus::Active,
         route_stability: RouteStability::Stable,
         loading_present: false,
@@ -134,7 +111,120 @@ fn readiness_matches_accepts_ready_alias_and_document_state() {
         document_ready_state: Some("complete".to_string()),
         blocking_signals: Vec::new(),
         degraded_reason: None,
-    };
+    }
+}
+
+fn degraded_ready_readiness(reason: &str) -> ReadinessInfo {
+    ReadinessInfo {
+        status: ReadinessStatus::Degraded,
+        degraded_reason: Some(reason.to_string()),
+        ..ready_readiness()
+    }
+}
+
+fn frame_context(
+    frame_id: &str,
+    target_id: Option<&str>,
+    url: Option<&str>,
+    same_origin_accessible: Option<bool>,
+) -> FrameContextInfo {
+    FrameContextInfo {
+        frame_id: frame_id.to_string(),
+        name: (frame_id == "main-frame").then_some("main".to_string()),
+        parent_frame_id: None,
+        target_id: target_id.map(str::to_string),
+        url: url.map(str::to_string),
+        depth: 0,
+        same_origin_accessible,
+    }
+}
+
+fn top_frame_runtime(target_id: &str) -> FrameRuntimeInfo {
+    let frame = frame_context(
+        "main-frame",
+        Some(target_id),
+        Some("https://example.test"),
+        Some(true),
+    );
+    FrameRuntimeInfo {
+        status: FrameContextStatus::Top,
+        current_frame: Some(frame.clone()),
+        primary_frame: Some(frame),
+        frame_lineage: vec!["main-frame".to_string()],
+        degraded_reason: None,
+    }
+}
+
+fn network_req1_triggered() -> TriggeredTriggerCondition {
+    TriggeredTriggerCondition {
+        evidence: TriggerEvidenceInfo {
+            summary: "network_request_matched:req-1".to_string(),
+            fingerprint: Some("req-1".to_string()),
+        },
+        evidence_fingerprint: "req-1".to_string(),
+        network_progress: None,
+    }
+}
+
+fn pending_trigger_policy(
+    expected_lifecycle_generation: u64,
+    fingerprint_source: &TriggerInfo,
+    preserved_triggered: Option<TriggeredTriggerCondition>,
+    requires_revalidation_after_queue: bool,
+) -> PendingTriggerConditionPolicy {
+    PendingTriggerConditionPolicy {
+        expected_lifecycle_generation,
+        preserved_triggered,
+        requires_revalidation_after_queue,
+        rule_semantics_fingerprint: trigger_rule_semantics_fingerprint(fingerprint_source),
+    }
+}
+
+fn pending_trigger_reservation(
+    fingerprint_source: &TriggerInfo,
+    fallback_network_progress: Option<TriggerNetworkProgress>,
+    preserved_triggered: Option<TriggeredTriggerCondition>,
+    requires_revalidation_after_queue: bool,
+) -> PendingTriggerReservation {
+    PendingTriggerReservation {
+        attempt_id: 1,
+        fallback_network_progress,
+        condition_policy: pending_trigger_policy(
+            fingerprint_source.lifecycle_generation,
+            fingerprint_source,
+            preserved_triggered,
+            requires_revalidation_after_queue,
+        ),
+        task: tokio::spawn(async {}),
+    }
+}
+
+fn idle_pending_trigger_reservation() -> PendingTriggerReservation {
+    PendingTriggerReservation {
+        attempt_id: 1,
+        fallback_network_progress: None,
+        condition_policy: PendingTriggerConditionPolicy {
+            expected_lifecycle_generation: 1,
+            preserved_triggered: None,
+            requires_revalidation_after_queue: true,
+            rule_semantics_fingerprint: String::new(),
+        },
+        task: tokio::spawn(async {}),
+    }
+}
+
+fn active_trigger_worker_entry() -> TriggerWorkerEntry {
+    TriggerWorkerEntry {
+        last_status: TriggerStatus::Armed,
+        network_cursor: 0,
+        network_cursor_primed: true,
+        observatory_drop_count: 0,
+    }
+}
+
+#[test]
+fn readiness_matches_accepts_ready_alias_and_document_state() {
+    let readiness = ready_readiness();
 
     assert!(readiness_matches(&readiness, "ready"));
     assert!(readiness_matches(&readiness, "stable"));
@@ -144,16 +234,7 @@ fn readiness_matches_accepts_ready_alias_and_document_state() {
 
 #[test]
 fn readiness_matches_fail_closed_when_readiness_is_degraded() {
-    let readiness = ReadinessInfo {
-        status: ReadinessStatus::Degraded,
-        route_stability: RouteStability::Stable,
-        loading_present: false,
-        skeleton_present: false,
-        overlay_state: OverlayState::None,
-        document_ready_state: Some("complete".to_string()),
-        blocking_signals: Vec::new(),
-        degraded_reason: Some("document_fence_changed".to_string()),
-    };
+    let readiness = degraded_ready_readiness("document_fence_changed");
 
     assert!(!readiness_matches(&readiness, "ready"));
     assert!(!readiness_matches(&readiness, "stable"));
@@ -364,12 +445,12 @@ fn resolve_trigger_workflow_spec_marks_named_workflow_asset_path() {
     let home =
         std::env::temp_dir().join(format!("rub-trigger-workflow-spec-{}", std::process::id()));
     let workflows = home.join("workflows");
-    std::fs::create_dir_all(&workflows).unwrap();
+    fs::create_dir_all(&workflows).unwrap();
     let workflow_path = workflows.join("reply_flow.json");
-    std::fs::write(&workflow_path, r#"[{"command":"doctor","args":{}}]"#).unwrap();
+    fs::write(&workflow_path, r#"[{"command":"doctor","args":{}}]"#).unwrap();
 
     let (_, spec_source) = resolve_trigger_workflow_spec(
-        &serde_json::json!({
+        &json!({
             "workflow_name": "reply_flow",
         })
         .as_object()
@@ -389,7 +470,7 @@ fn resolve_trigger_workflow_spec_marks_named_workflow_asset_path() {
         "trigger_workflow_payload.workflow_name"
     );
 
-    let _ = std::fs::remove_dir_all(home);
+    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
@@ -414,7 +495,7 @@ fn contextualize_trigger_error_preserves_original_authority_and_reason() {
         RubError::domain_with_context(
             ErrorCode::AutomationPaused,
             "operator handoff still active",
-            serde_json::json!({
+            json!({
                 "reason": "automation_paused"
             }),
         ),
@@ -615,7 +696,7 @@ fn degraded_authority_helper_uses_session_busy_without_losing_reason() {
     let envelope = trigger_degraded_authority_error(
         "trigger target continuity fence failed: target tab is not active after switch",
         "continuity_target_not_active",
-        serde_json::json!({
+        json!({
             "target_tab_target_id": "target",
             "target_tab_index": 3,
         }),
@@ -644,29 +725,12 @@ fn degraded_authority_helper_uses_session_busy_without_losing_reason() {
 fn target_continuity_fails_when_frame_runtime_is_stale() {
     let frame_runtime = FrameRuntimeInfo {
         status: FrameContextStatus::Stale,
-        current_frame: Some(FrameContextInfo {
-            frame_id: "missing-frame".to_string(),
-            name: None,
-            parent_frame_id: None,
-            target_id: None,
-            url: None,
-            depth: 0,
-            same_origin_accessible: None,
-        }),
+        current_frame: Some(frame_context("missing-frame", None, None, None)),
         primary_frame: None,
         frame_lineage: vec!["missing-frame".to_string()],
         degraded_reason: Some("selected_frame_not_found".to_string()),
     };
-    let readiness = ReadinessInfo {
-        status: ReadinessStatus::Active,
-        route_stability: RouteStability::Stable,
-        loading_present: false,
-        skeleton_present: false,
-        overlay_state: OverlayState::None,
-        document_ready_state: Some("complete".to_string()),
-        blocking_signals: Vec::new(),
-        degraded_reason: None,
-    };
+    let readiness = ready_readiness();
 
     assert_eq!(
         trigger_target_continuity_failure("tab-target", &frame_runtime, &readiness),
@@ -679,29 +743,7 @@ fn target_continuity_fails_when_frame_runtime_is_stale() {
 
 #[test]
 fn target_continuity_fails_when_readiness_is_degraded() {
-    let frame_runtime = FrameRuntimeInfo {
-        status: FrameContextStatus::Top,
-        current_frame: Some(FrameContextInfo {
-            frame_id: "main-frame".to_string(),
-            name: Some("main".to_string()),
-            parent_frame_id: None,
-            target_id: Some("tab-target".to_string()),
-            url: Some("https://example.test".to_string()),
-            depth: 0,
-            same_origin_accessible: Some(true),
-        }),
-        primary_frame: Some(FrameContextInfo {
-            frame_id: "main-frame".to_string(),
-            name: Some("main".to_string()),
-            parent_frame_id: None,
-            target_id: Some("tab-target".to_string()),
-            url: Some("https://example.test".to_string()),
-            depth: 0,
-            same_origin_accessible: Some(true),
-        }),
-        frame_lineage: vec!["main-frame".to_string()],
-        degraded_reason: None,
-    };
+    let frame_runtime = top_frame_runtime("tab-target");
     let readiness = ReadinessInfo {
         status: ReadinessStatus::Degraded,
         route_stability: RouteStability::Transitioning,
@@ -729,8 +771,8 @@ async fn trigger_cycle_uses_queue_authority_even_with_foreground_in_flight() {
     state
         .in_flight_count
         .store(1, std::sync::atomic::Ordering::SeqCst);
-    let mut worker_state = std::collections::HashMap::new();
-    let mut pending_reservations = std::collections::HashMap::new();
+    let mut worker_state = HashMap::new();
+    let mut pending_reservations = HashMap::new();
     let (reservation_tx, mut reservation_rx) =
         tokio::sync::mpsc::unbounded_channel::<TriggerReservationCompletion>();
     let mut next_reservation_attempt_id = 0_u64;
@@ -766,21 +808,8 @@ async fn ready_trigger_reservation_completion_releases_idle_queue_permit() {
         .begin_automation_reservation_transaction_owned(&state, "queued_trigger")
         .await
         .expect("queued trigger reservation should acquire immediately in test");
-    let mut worker_state = std::collections::HashMap::new();
-    let mut pending_reservations = std::collections::HashMap::from([(
-        7_u32,
-        PendingTriggerReservation {
-            attempt_id: 1,
-            fallback_network_progress: None,
-            condition_policy: PendingTriggerConditionPolicy {
-                expected_lifecycle_generation: 1,
-                preserved_triggered: None,
-                requires_revalidation_after_queue: true,
-                rule_semantics_fingerprint: String::new(),
-            },
-            task: tokio::spawn(async {}),
-        },
-    )]);
+    let mut worker_state = HashMap::new();
+    let mut pending_reservations = HashMap::from([(7_u32, idle_pending_trigger_reservation())]);
     let (reservation_tx, mut reservation_rx) =
         tokio::sync::mpsc::unbounded_channel::<TriggerReservationCompletion>();
     reservation_tx
@@ -828,7 +857,7 @@ async fn shutdown_trigger_reservation_completion_drops_owned_transaction_without
         .begin_automation_reservation_transaction_owned(&state, "queued_trigger")
         .await
         .expect("queued trigger reservation should acquire immediately in test");
-    let mut worker_state = std::collections::HashMap::from([(
+    let mut worker_state = HashMap::from([(
         7_u32,
         TriggerWorkerEntry {
             last_status: TriggerStatus::Armed,
@@ -837,20 +866,7 @@ async fn shutdown_trigger_reservation_completion_drops_owned_transaction_without
             observatory_drop_count: 0,
         },
     )]);
-    let mut pending_reservations = std::collections::HashMap::from([(
-        7_u32,
-        PendingTriggerReservation {
-            attempt_id: 1,
-            fallback_network_progress: None,
-            condition_policy: PendingTriggerConditionPolicy {
-                expected_lifecycle_generation: 1,
-                preserved_triggered: None,
-                requires_revalidation_after_queue: true,
-                rule_semantics_fingerprint: String::new(),
-            },
-            task: tokio::spawn(async {}),
-        },
-    )]);
+    let mut pending_reservations = HashMap::from([(7_u32, idle_pending_trigger_reservation())]);
     let (reservation_tx, mut reservation_rx) =
         tokio::sync::mpsc::unbounded_channel::<TriggerReservationCompletion>();
     state.request_shutdown();
@@ -895,38 +911,18 @@ async fn handoff_trigger_reservation_completion_blocks_execution_after_queue() {
         .begin_automation_reservation_transaction_owned(&state, "queued_trigger")
         .await
         .expect("queued trigger reservation should acquire immediately in test");
-    let mut worker_state = std::collections::HashMap::from([(
+    let mut worker_state = HashMap::from([(trigger.id, active_trigger_worker_entry())]);
+    let mut pending_reservations = HashMap::from([(
         trigger.id,
-        TriggerWorkerEntry {
-            last_status: TriggerStatus::Armed,
-            network_cursor: 0,
-            network_cursor_primed: true,
-            observatory_drop_count: 0,
-        },
-    )]);
-    let mut pending_reservations = std::collections::HashMap::from([(
-        trigger.id,
-        PendingTriggerReservation {
-            attempt_id: 1,
-            fallback_network_progress: Some(super::condition::TriggerNetworkProgress {
+        pending_trigger_reservation(
+            &trigger,
+            Some(TriggerNetworkProgress {
                 next_cursor: 9,
                 observed_drop_count: 2,
             }),
-            condition_policy: PendingTriggerConditionPolicy {
-                expected_lifecycle_generation: trigger.lifecycle_generation,
-                preserved_triggered: Some(TriggeredTriggerCondition {
-                    evidence: rub_core::model::TriggerEvidenceInfo {
-                        summary: "network_request_matched:req-1".to_string(),
-                        fingerprint: Some("req-1".to_string()),
-                    },
-                    evidence_fingerprint: "req-1".to_string(),
-                    network_progress: None,
-                }),
-                requires_revalidation_after_queue: false,
-                rule_semantics_fingerprint: trigger_rule_semantics_fingerprint(&trigger),
-            },
-            task: tokio::spawn(async {}),
-        },
+            Some(network_req1_triggered()),
+            false,
+        ),
     )]);
     let (reservation_tx, mut reservation_rx) =
         tokio::sync::mpsc::unbounded_channel::<TriggerReservationCompletion>();
@@ -997,28 +993,10 @@ async fn pending_network_request_trigger_is_not_re_evaluated_during_queue_wait()
     let browser = router.browser_port();
     let trigger = trigger(TriggerConditionKind::NetworkRequest);
     let tabs: Vec<rub_core::model::TabInfo> = Vec::new();
-    let mut worker_state = std::collections::HashMap::from([(
+    let mut worker_state = HashMap::from([(trigger.id, active_trigger_worker_entry())]);
+    let mut pending_reservations = HashMap::from([(
         trigger.id,
-        TriggerWorkerEntry {
-            last_status: TriggerStatus::Armed,
-            network_cursor: 0,
-            network_cursor_primed: true,
-            observatory_drop_count: 0,
-        },
-    )]);
-    let mut pending_reservations = std::collections::HashMap::from([(
-        trigger.id,
-        PendingTriggerReservation {
-            attempt_id: 1,
-            fallback_network_progress: None,
-            condition_policy: PendingTriggerConditionPolicy {
-                expected_lifecycle_generation: trigger.lifecycle_generation,
-                preserved_triggered: None,
-                requires_revalidation_after_queue: false,
-                rule_semantics_fingerprint: trigger_rule_semantics_fingerprint(&trigger),
-            },
-            task: tokio::spawn(async {}),
-        },
+        pending_trigger_reservation(&trigger, None, None, false),
     )]);
     let (reservation_tx, _reservation_rx) =
         tokio::sync::mpsc::unbounded_channel::<TriggerReservationCompletion>();
@@ -1078,7 +1056,7 @@ async fn consumed_network_request_evidence_skips_new_queue_reservation() {
     let mut trigger = trigger(TriggerConditionKind::NetworkRequest);
     trigger.consumed_evidence_fingerprint = Some("req-1".to_string());
     let tabs: Vec<rub_core::model::TabInfo> = Vec::new();
-    let mut worker_state = std::collections::HashMap::from([(
+    let mut worker_state = HashMap::from([(
         trigger.id,
         TriggerWorkerEntry {
             last_status: TriggerStatus::Armed,
@@ -1087,7 +1065,7 @@ async fn consumed_network_request_evidence_skips_new_queue_reservation() {
             observatory_drop_count: 0,
         },
     )]);
-    let mut pending_reservations = std::collections::HashMap::new();
+    let mut pending_reservations = HashMap::new();
     let (reservation_tx, _reservation_rx) =
         tokio::sync::mpsc::unbounded_channel::<TriggerReservationCompletion>();
     let mut next_reservation_attempt_id = 0_u64;
@@ -1127,19 +1105,9 @@ async fn reconcile_pending_network_request_trigger_reservation_drops_semantics_d
     let mut live_trigger = stale_trigger.clone();
     live_trigger.condition.url_pattern = Some("/new".to_string());
 
-    let mut pending_reservations = std::collections::HashMap::from([(
+    let mut pending_reservations = HashMap::from([(
         live_trigger.id,
-        PendingTriggerReservation {
-            attempt_id: 1,
-            fallback_network_progress: None,
-            condition_policy: PendingTriggerConditionPolicy {
-                expected_lifecycle_generation: stale_trigger.lifecycle_generation,
-                preserved_triggered: None,
-                requires_revalidation_after_queue: false,
-                rule_semantics_fingerprint: trigger_rule_semantics_fingerprint(&stale_trigger),
-            },
-            task: tokio::spawn(async {}),
-        },
+        pending_trigger_reservation(&stale_trigger, None, None, false),
     )]);
 
     reconcile_pending_trigger_reservations(&[live_trigger], &mut pending_reservations);
@@ -1153,19 +1121,9 @@ async fn reconcile_pending_trigger_reservation_drops_lifecycle_generation_drift_
     let mut live_trigger = stale_trigger.clone();
     live_trigger.lifecycle_generation = stale_trigger.lifecycle_generation + 1;
 
-    let mut pending_reservations = std::collections::HashMap::from([(
+    let mut pending_reservations = HashMap::from([(
         live_trigger.id,
-        PendingTriggerReservation {
-            attempt_id: 1,
-            fallback_network_progress: None,
-            condition_policy: PendingTriggerConditionPolicy {
-                expected_lifecycle_generation: stale_trigger.lifecycle_generation,
-                preserved_triggered: None,
-                requires_revalidation_after_queue: true,
-                rule_semantics_fingerprint: trigger_rule_semantics_fingerprint(&stale_trigger),
-            },
-            task: tokio::spawn(async {}),
-        },
+        pending_trigger_reservation(&stale_trigger, None, None, true),
     )]);
 
     reconcile_pending_trigger_reservations(&[live_trigger], &mut pending_reservations);
@@ -1188,35 +1146,10 @@ async fn preserved_network_request_evidence_drops_after_lifecycle_generation_dri
         .begin_automation_reservation_transaction_owned(&state, "queued_trigger")
         .await
         .expect("queued trigger reservation should acquire immediately in test");
-    let mut worker_state = std::collections::HashMap::from([(
+    let mut worker_state = HashMap::from([(trigger.id, active_trigger_worker_entry())]);
+    let mut pending_reservations = HashMap::from([(
         trigger.id,
-        TriggerWorkerEntry {
-            last_status: TriggerStatus::Armed,
-            network_cursor: 0,
-            network_cursor_primed: true,
-            observatory_drop_count: 0,
-        },
-    )]);
-    let mut pending_reservations = std::collections::HashMap::from([(
-        trigger.id,
-        PendingTriggerReservation {
-            attempt_id: 1,
-            fallback_network_progress: None,
-            condition_policy: PendingTriggerConditionPolicy {
-                expected_lifecycle_generation: trigger.lifecycle_generation,
-                preserved_triggered: Some(TriggeredTriggerCondition {
-                    evidence: rub_core::model::TriggerEvidenceInfo {
-                        summary: "network_request_matched:req-1".to_string(),
-                        fingerprint: Some("req-1".to_string()),
-                    },
-                    evidence_fingerprint: "req-1".to_string(),
-                    network_progress: None,
-                }),
-                requires_revalidation_after_queue: false,
-                rule_semantics_fingerprint: trigger_rule_semantics_fingerprint(&trigger),
-            },
-            task: tokio::spawn(async {}),
-        },
+        pending_trigger_reservation(&trigger, None, Some(network_req1_triggered()), false),
     )]);
     let (reservation_tx, mut reservation_rx) =
         tokio::sync::mpsc::unbounded_channel::<TriggerReservationCompletion>();

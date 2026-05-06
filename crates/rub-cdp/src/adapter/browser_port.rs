@@ -6,9 +6,9 @@ use rub_core::error::RubError;
 use rub_core::locator::LiveLocator;
 use rub_core::model::{
     BoundingBox, ContentFindMatch, Cookie, DialogRuntimeInfo, Element, FrameInventoryEntry,
-    FrameRuntimeInfo, HistoryNavigationResult, KeyCombo, LaunchPolicyInfo, LoadStrategy,
-    NetworkRule, Page as RubPage, RuntimeStateSnapshot, ScrollDirection, ScrollPosition,
-    SelectOutcome, Snapshot, TabInfo, WaitCondition,
+    FrameRuntimeInfo, HistoryNavigationResult, InteractionActuation, InteractionSemanticClass,
+    KeyCombo, LaunchPolicyInfo, LoadStrategy, NetworkRule, Page as RubPage, RuntimeStateSnapshot,
+    ScrollDirection, ScrollPosition, SelectOutcome, Snapshot, TabInfo, WaitCondition,
 };
 use rub_core::observation::ObservationScope;
 use rub_core::port::BrowserPort;
@@ -150,6 +150,47 @@ async fn page_for_element_authority(
         })
 }
 
+async fn keyboard_dialog_fallback_outcome(
+    dialog_runtime: &crate::dialogs::SharedDialogRuntime,
+    expected_target_id: &str,
+    fence: &crate::interaction::ActuationFenceOutcome,
+    semantic_class: InteractionSemanticClass,
+    operation: &'static str,
+) -> Option<InteractionOutcome> {
+    if let Some(confirmation) = crate::interaction::dialog_confirmation(
+        dialog_runtime,
+        expected_target_id,
+        &fence.dialog_baseline,
+    )
+    .await
+    {
+        return Some(InteractionOutcome {
+            semantic_class,
+            element_verified: false,
+            actuation: Some(InteractionActuation::Keyboard),
+            confirmation: Some(confirmation),
+        });
+    }
+
+    match fence.fence {
+        crate::interaction::ActuationFence::DialogOpened => Some(InteractionOutcome {
+            semantic_class,
+            element_verified: false,
+            actuation: Some(InteractionActuation::Keyboard),
+            confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
+        }),
+        crate::interaction::ActuationFence::Indeterminate => Some(InteractionOutcome {
+            semantic_class,
+            element_verified: false,
+            actuation: Some(InteractionActuation::Keyboard),
+            confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
+                operation,
+            )),
+        }),
+        crate::interaction::ActuationFence::Completed => None,
+    }
+}
+
 #[async_trait]
 impl BrowserPort for ChromiumAdapter {
     async fn navigate(
@@ -204,24 +245,6 @@ impl BrowserPort for ChromiumAdapter {
         let frame_context = crate::frame_runtime::resolve_frame_context(&page, frame_id).await?;
         crate::evaluation::execute_js_in_context(&page, code, frame_context.execution_context_id)
             .await
-    }
-
-    async fn scroll(
-        &self,
-        frame_id: Option<&str>,
-        direction: ScrollDirection,
-        amount: Option<u32>,
-    ) -> Result<ScrollPosition, RubError> {
-        let page = self.manager.page().await?;
-        let frame_context = crate::frame_runtime::resolve_frame_context(&page, frame_id).await?;
-        crate::page::scroll(
-            &page,
-            frame_context.execution_context_id,
-            direction,
-            amount,
-            &self.humanize,
-        )
-        .await
     }
 
     async fn back(&self, timeout_ms: u64) -> Result<RubPage, RubError> {
@@ -284,6 +307,24 @@ impl BrowserPort for ChromiumAdapter {
         self.manager.clear_dialog_intercept()
     }
 
+    async fn scroll(
+        &self,
+        frame_id: Option<&str>,
+        direction: ScrollDirection,
+        amount: Option<u32>,
+    ) -> Result<ScrollPosition, RubError> {
+        let page = self.manager.page().await?;
+        let frame_context = crate::frame_runtime::resolve_frame_context(&page, frame_id).await?;
+        crate::page::scroll(
+            &page,
+            frame_context.execution_context_id,
+            direction,
+            amount,
+            &self.humanize,
+        )
+        .await
+    }
+
     async fn screenshot(&self, full_page: bool) -> Result<Vec<u8>, RubError> {
         let page = self.manager.page().await?;
         crate::page::screenshot(&page, full_page).await
@@ -328,43 +369,16 @@ impl BrowserPort for ChromiumAdapter {
             &expected_target_id,
         )
         .await?;
-        if let Some(confirmation) = crate::interaction::dialog_confirmation(
+        if let Some(outcome) = keyboard_dialog_fallback_outcome(
             &dialog_runtime,
             &expected_target_id,
-            &fence.dialog_baseline,
+            &fence,
+            InteractionSemanticClass::InvokeWorkflow,
+            "send_keys",
         )
         .await
         {
-            return Ok(InteractionOutcome {
-                semantic_class: rub_core::model::InteractionSemanticClass::InvokeWorkflow,
-                element_verified: false,
-                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
-                confirmation: Some(confirmation),
-            });
-        }
-        if matches!(
-            fence.fence,
-            crate::interaction::ActuationFence::DialogOpened
-        ) {
-            return Ok(InteractionOutcome {
-                semantic_class: rub_core::model::InteractionSemanticClass::InvokeWorkflow,
-                element_verified: false,
-                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
-                confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
-            });
-        }
-        if matches!(
-            fence.fence,
-            crate::interaction::ActuationFence::Indeterminate
-        ) {
-            return Ok(InteractionOutcome {
-                semantic_class: rub_core::model::InteractionSemanticClass::InvokeWorkflow,
-                element_verified: false,
-                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
-                confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
-                    "send_keys",
-                )),
-            });
+            return Ok(outcome);
         }
         let confirmation = crate::interaction::confirm_key_combo(
             &page,
@@ -374,9 +388,9 @@ impl BrowserPort for ChromiumAdapter {
         )
         .await;
         Ok(InteractionOutcome {
-            semantic_class: rub_core::model::InteractionSemanticClass::InvokeWorkflow,
+            semantic_class: InteractionSemanticClass::InvokeWorkflow,
             element_verified: false,
-            actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+            actuation: Some(InteractionActuation::Keyboard),
             confirmation: Some(confirmation),
         })
     }
@@ -412,43 +426,16 @@ impl BrowserPort for ChromiumAdapter {
             &expected_target_id,
         )
         .await?;
-        if let Some(confirmation) = crate::interaction::dialog_confirmation(
+        if let Some(outcome) = keyboard_dialog_fallback_outcome(
             &dialog_runtime,
             &expected_target_id,
-            &fence.dialog_baseline,
+            &fence,
+            InteractionSemanticClass::InvokeWorkflow,
+            "send_keys_in_frame",
         )
         .await
         {
-            return Ok(InteractionOutcome {
-                semantic_class: rub_core::model::InteractionSemanticClass::InvokeWorkflow,
-                element_verified: false,
-                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
-                confirmation: Some(confirmation),
-            });
-        }
-        if matches!(
-            fence.fence,
-            crate::interaction::ActuationFence::DialogOpened
-        ) {
-            return Ok(InteractionOutcome {
-                semantic_class: rub_core::model::InteractionSemanticClass::InvokeWorkflow,
-                element_verified: false,
-                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
-                confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
-            });
-        }
-        if matches!(
-            fence.fence,
-            crate::interaction::ActuationFence::Indeterminate
-        ) {
-            return Ok(InteractionOutcome {
-                semantic_class: rub_core::model::InteractionSemanticClass::InvokeWorkflow,
-                element_verified: false,
-                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
-                confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
-                    "send_keys_in_frame",
-                )),
-            });
+            return Ok(outcome);
         }
         let confirmation = crate::interaction::confirm_key_combo_in_context(
             &page,
@@ -459,9 +446,9 @@ impl BrowserPort for ChromiumAdapter {
         )
         .await;
         Ok(InteractionOutcome {
-            semantic_class: rub_core::model::InteractionSemanticClass::InvokeWorkflow,
+            semantic_class: InteractionSemanticClass::InvokeWorkflow,
             element_verified: false,
-            actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+            actuation: Some(InteractionActuation::Keyboard),
             confirmation: Some(confirmation),
         })
     }
@@ -484,43 +471,16 @@ impl BrowserPort for ChromiumAdapter {
             &expected_target_id,
         )
         .await?;
-        if let Some(confirmation) = crate::interaction::dialog_confirmation(
+        if let Some(outcome) = keyboard_dialog_fallback_outcome(
             &dialog_runtime,
             &expected_target_id,
-            &fence.dialog_baseline,
+            &fence,
+            InteractionSemanticClass::SetValue,
+            "type_text",
         )
         .await
         {
-            return Ok(InteractionOutcome {
-                semantic_class: rub_core::model::InteractionSemanticClass::SetValue,
-                element_verified: false,
-                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
-                confirmation: Some(confirmation),
-            });
-        }
-        if matches!(
-            fence.fence,
-            crate::interaction::ActuationFence::DialogOpened
-        ) {
-            return Ok(InteractionOutcome {
-                semantic_class: rub_core::model::InteractionSemanticClass::SetValue,
-                element_verified: false,
-                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
-                confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
-            });
-        }
-        if matches!(
-            fence.fence,
-            crate::interaction::ActuationFence::Indeterminate
-        ) {
-            return Ok(InteractionOutcome {
-                semantic_class: rub_core::model::InteractionSemanticClass::SetValue,
-                element_verified: false,
-                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
-                confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
-                    "type_text",
-                )),
-            });
+            return Ok(outcome);
         }
         let confirmation = crate::interaction::confirm_typed_text(
             &page,
@@ -531,9 +491,9 @@ impl BrowserPort for ChromiumAdapter {
         )
         .await;
         Ok(InteractionOutcome {
-            semantic_class: rub_core::model::InteractionSemanticClass::SetValue,
+            semantic_class: InteractionSemanticClass::SetValue,
             element_verified: false,
-            actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+            actuation: Some(InteractionActuation::Keyboard),
             confirmation: Some(confirmation),
         })
     }
@@ -579,43 +539,16 @@ impl BrowserPort for ChromiumAdapter {
             &expected_target_id,
         )
         .await?;
-        if let Some(confirmation) = crate::interaction::dialog_confirmation(
+        if let Some(outcome) = keyboard_dialog_fallback_outcome(
             &dialog_runtime,
             &expected_target_id,
-            &fence.dialog_baseline,
+            &fence,
+            InteractionSemanticClass::SetValue,
+            "type_text_in_frame",
         )
         .await
         {
-            return Ok(InteractionOutcome {
-                semantic_class: rub_core::model::InteractionSemanticClass::SetValue,
-                element_verified: false,
-                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
-                confirmation: Some(confirmation),
-            });
-        }
-        if matches!(
-            fence.fence,
-            crate::interaction::ActuationFence::DialogOpened
-        ) {
-            return Ok(InteractionOutcome {
-                semantic_class: rub_core::model::InteractionSemanticClass::SetValue,
-                element_verified: false,
-                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
-                confirmation: Some(crate::interaction::unconfirmed_dialog_opening()),
-            });
-        }
-        if matches!(
-            fence.fence,
-            crate::interaction::ActuationFence::Indeterminate
-        ) {
-            return Ok(InteractionOutcome {
-                semantic_class: rub_core::model::InteractionSemanticClass::SetValue,
-                element_verified: false,
-                actuation: Some(rub_core::model::InteractionActuation::Keyboard),
-                confirmation: Some(crate::interaction::indeterminate_actuation_confirmation(
-                    "type_text_in_frame",
-                )),
-            });
+            return Ok(outcome);
         }
         let confirmation = crate::interaction::confirm_typed_text_in_context(
             &page,
@@ -627,9 +560,9 @@ impl BrowserPort for ChromiumAdapter {
         )
         .await;
         Ok(InteractionOutcome {
-            semantic_class: rub_core::model::InteractionSemanticClass::SetValue,
+            semantic_class: InteractionSemanticClass::SetValue,
             element_verified: false,
-            actuation: Some(rub_core::model::InteractionActuation::Keyboard),
+            actuation: Some(InteractionActuation::Keyboard),
             confirmation: Some(confirmation),
         })
     }

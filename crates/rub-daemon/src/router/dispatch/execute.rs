@@ -1,5 +1,11 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
+use super::super::policy::{
+    command_invalidates_cached_snapshots_without_epoch_bump,
+    response_dom_epoch as policy_response_dom_epoch,
+};
 use super::super::timeout::execute_wait_command;
 use super::super::timeout_projection::{
     post_wait_partial_commit_timeout_projection, record_post_wait_partial_commit_timeout_projection,
@@ -200,9 +206,7 @@ pub(super) fn execute_named_command_with_fence<'a>(
     args: &'a serde_json::Value,
     deadline: TransactionDeadline,
     state: &'a Arc<SessionState>,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<serde_json::Value, RubError>> + Send + 'a>,
-> {
+) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, RubError>> + Send + 'a>> {
     Box::pin(async move {
         validate_wait_after_args_if_requested(command, args)?;
         let outcome = match dispatch_named_command(router, command, args, deadline, state).await {
@@ -252,7 +256,7 @@ fn response_dom_epoch(
     state: &Arc<SessionState>,
     pending_external_dom_commit: PendingExternalDomCommit,
 ) -> Option<u64> {
-    super::super::policy::response_dom_epoch(command, args, state, pending_external_dom_commit)
+    policy_response_dom_epoch(command, args, state, pending_external_dom_commit)
 }
 
 pub(super) async fn apply_same_epoch_snapshot_cache_fence(
@@ -260,8 +264,7 @@ pub(super) async fn apply_same_epoch_snapshot_cache_fence(
     args: &serde_json::Value,
     state: &Arc<SessionState>,
 ) {
-    if super::super::policy::command_invalidates_cached_snapshots_without_epoch_bump(command, args)
-    {
+    if command_invalidates_cached_snapshots_without_epoch_bump(command, args) {
         state.clear_all_snapshots().await;
     }
 }
@@ -271,7 +274,7 @@ fn same_epoch_viewport_error_requires_cache_fence(
     args: &serde_json::Value,
     error: &RubError,
 ) -> bool {
-    super::super::policy::command_invalidates_cached_snapshots_without_epoch_bump(command, args)
+    command_invalidates_cached_snapshots_without_epoch_bump(command, args)
         && !matches!(error, RubError::Domain(envelope) if envelope.code == ErrorCode::InvalidInput)
 }
 
@@ -296,19 +299,9 @@ fn merge_same_epoch_viewport_side_effect_context(
     command: &str,
 ) -> Option<serde_json::Value> {
     let side_effect = same_epoch_viewport_side_effect_contract(command);
-    match existing {
-        Some(serde_json::Value::Object(mut object)) => {
-            object.insert("same_epoch_viewport_side_effect".to_string(), side_effect);
-            Some(serde_json::Value::Object(object))
-        }
-        Some(other) => Some(serde_json::json!({
-            "previous_context": other,
-            "same_epoch_viewport_side_effect": side_effect,
-        })),
-        None => Some(serde_json::json!({
-            "same_epoch_viewport_side_effect": side_effect,
-        })),
-    }
+    let mut object = context_object(existing);
+    object.insert("same_epoch_viewport_side_effect".to_string(), side_effect);
+    Some(serde_json::Value::Object(object))
 }
 
 #[cfg(test)]
@@ -319,7 +312,7 @@ async fn apply_post_dispatch_same_epoch_fence_before_post_wait<F>(
     post_wait: F,
 ) -> Result<serde_json::Value, RubError>
 where
-    F: std::future::Future<Output = Result<serde_json::Value, RubError>>,
+    F: Future<Output = Result<serde_json::Value, RubError>>,
 {
     apply_same_epoch_snapshot_cache_fence(command, args, state).await;
     post_wait.await
@@ -360,15 +353,7 @@ fn merge_post_wait_partial_commit_context(
     committed_projection: serde_json::Value,
     dom_epoch: Option<u64>,
 ) -> Option<serde_json::Value> {
-    let mut object = match base {
-        Some(serde_json::Value::Object(existing)) => existing,
-        Some(other) => {
-            let mut object = serde_json::Map::new();
-            object.insert("previous_context".to_string(), other);
-            object
-        }
-        None => serde_json::Map::new(),
-    };
+    let mut object = context_object(base);
     if let serde_json::Value::Object(extra) =
         post_wait_partial_commit_timeout_projection(command, committed_projection, dom_epoch)
     {
@@ -377,6 +362,18 @@ fn merge_post_wait_partial_commit_context(
         }
     }
     Some(serde_json::Value::Object(object))
+}
+
+fn context_object(base: Option<serde_json::Value>) -> serde_json::Map<String, serde_json::Value> {
+    if let Some(value) = base {
+        if let serde_json::Value::Object(object) = value {
+            object
+        } else {
+            serde_json::Map::from_iter([("previous_context".to_string(), value)])
+        }
+    } else {
+        serde_json::Map::new()
+    }
 }
 
 #[cfg(test)]
@@ -404,15 +401,7 @@ mod tests {
         Snapshot {
             snapshot_id: snapshot_id.to_string(),
             dom_epoch: 0,
-            frame_context: FrameContextInfo {
-                frame_id: "frame-main".to_string(),
-                name: Some("main".to_string()),
-                parent_frame_id: None,
-                target_id: Some("target-1".to_string()),
-                url: Some("https://example.test".to_string()),
-                depth: 0,
-                same_origin_accessible: Some(true),
-            },
+            frame_context: test_frame_context(),
             frame_lineage: vec!["frame-main".to_string()],
             url: "https://example.test".to_string(),
             title: "Example".to_string(),
@@ -434,6 +423,19 @@ mod tests {
             },
             viewport_filtered: None,
             viewport_count: None,
+        }
+    }
+
+    fn test_frame_context() -> FrameContextInfo {
+        let frame_id = String::from("frame-main");
+        FrameContextInfo {
+            name: Some(String::from("main")),
+            frame_id,
+            parent_frame_id: None,
+            target_id: Some(String::from("target-1")),
+            url: Some(String::from("https://example.test")),
+            depth: 0,
+            same_origin_accessible: Some(true),
         }
     }
 

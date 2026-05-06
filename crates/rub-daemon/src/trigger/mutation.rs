@@ -49,46 +49,19 @@ impl TriggerRuntimeState {
 
     pub fn update_status(&mut self, id: u32, status: TriggerStatus) -> Option<TriggerInfo> {
         let preserved_network_baseline = self.network_request_baselines.get(&id).copied();
-        let trigger = {
-            let trigger = self
-                .projection
-                .triggers
-                .iter_mut()
-                .find(|trigger| trigger.id == id)?;
-            trigger.status = status;
-            trigger.lifecycle_generation = trigger.lifecycle_generation.saturating_add(1);
-            trigger.clone()
-        };
-        self.commit_network_request_baseline(&trigger, preserved_network_baseline);
-        let kind = match status {
-            TriggerStatus::Paused => Some(TriggerEventKind::Paused),
-            TriggerStatus::Armed => Some(TriggerEventKind::Resumed),
-            _ => None,
-        };
-        if let Some(kind) = kind {
-            self.push_event(TriggerEventInfo {
-                sequence: 0,
-                kind,
-                trigger_id: Some(trigger.id),
-                summary: format!(
-                    "trigger {} {}",
-                    trigger.id,
-                    match kind {
-                        TriggerEventKind::Paused => "paused",
-                        TriggerEventKind::Resumed => "resumed",
-                        _ => "updated",
-                    }
-                ),
-                unavailable_reason: trigger.unavailable_reason.clone(),
-                evidence: trigger.last_condition_evidence.clone(),
-                result: trigger.last_action_result.clone(),
-            });
-        }
-        self.refresh_status();
-        Some(trigger)
+        self.update_status_with_baseline(id, status, preserved_network_baseline)
     }
 
     pub(crate) fn update_status_with_network_baseline(
+        &mut self,
+        id: u32,
+        status: TriggerStatus,
+        network_baseline: Option<NetworkRequestBaseline>,
+    ) -> Option<TriggerInfo> {
+        self.update_status_with_baseline(id, status, network_baseline)
+    }
+
+    fn update_status_with_baseline(
         &mut self,
         id: u32,
         status: TriggerStatus,

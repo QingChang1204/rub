@@ -1,7 +1,7 @@
 use super::*;
 use crate::dialogs::DialogCallbacks;
 use crate::downloads::DownloadCallbacks;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone)]
 struct RuntimeCallbackReconfigureSnapshot<T> {
@@ -111,7 +111,7 @@ impl BrowserManager {
         {
             if self
                 .force_reconcile_runtime_callbacks_failure
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
+                .swap(false, Ordering::SeqCst)
             {
                 return Err(RubError::domain(
                     ErrorCode::InternalError,
@@ -134,7 +134,7 @@ impl BrowserManager {
     #[cfg(test)]
     pub(super) fn force_runtime_callback_reconcile_failure(&self) {
         self.force_reconcile_runtime_callbacks_failure
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .store(true, Ordering::SeqCst);
     }
 
     pub(super) async fn invalidate_runtime_callback_page_hooks(&self) {
@@ -185,8 +185,8 @@ impl BrowserManager {
 
 pub(super) fn guard_download_callbacks_for_commit(
     callbacks: DownloadCallbacks,
-    authority_commit_in_progress: Arc<std::sync::atomic::AtomicBool>,
-    runtime_callback_reconfigure_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    authority_commit_in_progress: Arc<AtomicBool>,
+    runtime_callback_reconfigure_in_progress: Arc<AtomicBool>,
 ) -> DownloadCallbacks {
     DownloadCallbacks {
         on_runtime: callbacks.on_runtime.map(|callback| {
@@ -233,8 +233,8 @@ pub(super) fn guard_download_callbacks_for_commit(
 
 pub(super) fn guard_dialog_callbacks_for_commit(
     callbacks: DialogCallbacks,
-    authority_commit_in_progress: Arc<std::sync::atomic::AtomicBool>,
-    runtime_callback_reconfigure_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    authority_commit_in_progress: Arc<AtomicBool>,
+    runtime_callback_reconfigure_in_progress: Arc<AtomicBool>,
 ) -> DialogCallbacks {
     DialogCallbacks {
         on_runtime: callbacks.on_runtime.map(|callback| {

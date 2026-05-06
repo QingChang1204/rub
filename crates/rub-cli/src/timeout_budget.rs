@@ -8,6 +8,7 @@ use crate::commands::ExplainSubcommand;
 use crate::commands::{Commands, EffectiveCli, ElementAddressArgs};
 use rub_core::error::{ErrorCode, RubError};
 use rub_ipc::protocol::IpcRequest;
+use std::time::Instant;
 
 pub(crate) use self::budget::WAIT_IPC_BUFFER_MS;
 #[cfg(test)]
@@ -37,6 +38,16 @@ use self::workflow_budget::{
 use rub_core::DEFAULT_WAIT_AFTER_TIMEOUT_MS;
 
 const ATOMIC_FILL_ROLLBACK_RESERVE_MS_PER_STEP: u64 = 1_000;
+
+pub(crate) fn remaining_budget_ms_or_timeout(
+    deadline: Instant,
+    timeout_ms: u64,
+    phase: &'static str,
+) -> Result<u64, RubError> {
+    remaining_budget_duration(deadline)
+        .map(|remaining| remaining.as_millis().clamp(1, u64::MAX as u128) as u64)
+        .ok_or_else(|| crate::main_support::command_timeout_error(timeout_ms, phase))
+}
 
 pub(crate) fn embedded_timeout_budget_ms(request: &IpcRequest) -> Option<u64> {
     match request.command.as_str() {

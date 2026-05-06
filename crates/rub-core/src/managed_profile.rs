@@ -78,11 +78,7 @@ pub fn managed_profile_paths_equivalent(left: &Path, right: &Path) -> bool {
         return false;
     }
 
-    if std::fs::canonicalize(left)
-        .ok()
-        .zip(std::fs::canonicalize(right).ok())
-        .is_some_and(|(left, right)| left == right)
-    {
+    if canonical_paths_equal(left, right) {
         return true;
     }
 
@@ -112,11 +108,23 @@ pub fn sync_temp_owned_managed_profile_marker(
         return Ok(());
     }
 
-    match std::fs::remove_file(marker) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+    remove_file_if_exists(&marker)
+}
+
+fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error);
     }
+    Ok(())
+}
+
+fn canonical_paths_equal(left: &Path, right: &Path) -> bool {
+    std::fs::canonicalize(left)
+        .ok()
+        .zip(std::fs::canonicalize(right).ok())
+        .is_some_and(|(left, right)| left == right)
 }
 
 fn managed_profile_identity_suffix(path: &Path) -> Option<PathBuf> {
@@ -131,10 +139,13 @@ fn managed_profile_identity_suffix(path: &Path) -> Option<PathBuf> {
 }
 
 fn normalize_private_alias(path: &Path) -> PathBuf {
-    if let Ok(stripped) = path.strip_prefix("/private") {
-        PathBuf::from("/").join(stripped)
+    let Ok(stripped) = path.strip_prefix("/private") else {
+        return path.to_path_buf();
+    };
+    if stripped.as_os_str().is_empty() {
+        PathBuf::from("/")
     } else {
-        path.to_path_buf()
+        Path::new("/").join(stripped)
     }
 }
 

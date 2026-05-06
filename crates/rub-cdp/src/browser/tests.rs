@@ -3,11 +3,20 @@ use super::control::{
     stale_pending_dialog_target_error,
 };
 use super::*;
+use crate::tab_projection::{
+    CommittedTabProjection, LocalActiveTargetAuthority, PageHookInstallState,
+};
+use DialogCallbacks;
+use DownloadCallbacks;
+use IdentityPolicy;
+use RuntimeStateCallbacks;
+use resolve_managed_profile_dir;
 use rub_core::model::{
-    ConnectionTarget, DownloadMode, DownloadRuntimeInfo, DownloadRuntimeStatus, DownloadState,
-    IdentityProbeStatus, IdentitySelfProbeInfo, NetworkRule, NetworkRuleEffect,
+    ConnectionTarget, DialogRuntimeInfo, DownloadMode, DownloadRuntimeInfo, DownloadRuntimeStatus,
+    DownloadState, IdentityProbeStatus, IdentitySelfProbeInfo, NetworkRule, NetworkRuleEffect,
     NetworkRuleEffectKind, NetworkRuleSpec, NetworkRuleStatus, TabActiveAuthority,
 };
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::time::{Duration, timeout};
 
@@ -724,7 +733,7 @@ async fn failed_relaunch_after_stale_browser_authority_preserves_degraded_runtim
         None,
     );
     let delivered_download_runtime = Arc::new(StdMutex::new(Vec::<DownloadRuntimeInfo>::new()));
-    *manager.download_callbacks.lock().await = crate::downloads::DownloadCallbacks {
+    *manager.download_callbacks.lock().await = DownloadCallbacks {
         on_runtime: {
             let delivered_download_runtime = delivered_download_runtime.clone();
             Some(Arc::new(move |update| {
@@ -1046,7 +1055,7 @@ async fn failed_relaunch_after_stale_browser_authority_without_page_projection_p
         });
         runtime.last_dialog = runtime.pending_dialog.clone();
     }
-    *manager.tab_projection.lock().await = crate::tab_projection::CommittedTabProjection::empty();
+    *manager.tab_projection.lock().await = CommittedTabProjection::empty();
 
     owner
         .close()
@@ -1488,14 +1497,14 @@ async fn elevate_to_visible_rejects_external_sessions() {
 #[tokio::test]
 async fn runtime_state_callback_setter_surfaces_reconcile_failures() {
     let manager = BrowserManager::new(options());
-    *manager.runtime_state_callbacks.lock().await = crate::runtime_state::RuntimeStateCallbacks {
-        allocate_sequence: Some(std::sync::Arc::new(|| 7)),
-        on_snapshot: Some(std::sync::Arc::new(|_, _, _, _| {})),
+    *manager.runtime_state_callbacks.lock().await = RuntimeStateCallbacks {
+        allocate_sequence: Some(Arc::new(|| 7)),
+        on_snapshot: Some(Arc::new(|_, _, _, _| {})),
     };
     manager.force_runtime_callback_reconcile_failure();
 
     let error = manager
-        .set_runtime_state_callbacks(crate::runtime_state::RuntimeStateCallbacks::default())
+        .set_runtime_state_callbacks(RuntimeStateCallbacks::default())
         .await
         .expect_err("runtime-state callback setter should surface reconcile failure");
     assert_eq!(error.into_envelope().code, ErrorCode::InternalError);
@@ -1507,7 +1516,7 @@ async fn runtime_state_callback_reconfigure_replays_after_commit_fence_clears() 
     let manager = BrowserManager::new(options());
 
     manager
-        .set_runtime_state_callbacks(crate::runtime_state::RuntimeStateCallbacks {
+        .set_runtime_state_callbacks(RuntimeStateCallbacks {
             allocate_sequence: Some(Arc::new(|| 1)),
             on_snapshot: Some(Arc::new(|_, _, _, _| {})),
         })
@@ -1521,7 +1530,7 @@ async fn runtime_state_callback_reconfigure_replays_after_commit_fence_clears() 
     assert_eq!(
         manager
             .runtime_state_replay_attempt_count
-            .load(std::sync::atomic::Ordering::SeqCst),
+            .load(Ordering::SeqCst),
         1,
         "runtime-state callback install must schedule a post-fence active-page replay"
     );
@@ -1617,14 +1626,14 @@ async fn dialog_and_download_callback_setters_surface_reconcile_failures() {
     let manager = BrowserManager::new(options());
     manager.force_runtime_callback_reconcile_failure();
     let dialog_error = manager
-        .set_dialog_callbacks(crate::dialogs::DialogCallbacks::default())
+        .set_dialog_callbacks(DialogCallbacks::default())
         .await
         .expect_err("dialog callback setter should surface reconcile failure");
     assert_eq!(dialog_error.into_envelope().code, ErrorCode::InternalError);
 
     manager.force_runtime_callback_reconcile_failure();
     let download_error = manager
-        .set_download_callbacks(crate::downloads::DownloadCallbacks::default())
+        .set_download_callbacks(DownloadCallbacks::default())
         .await
         .expect_err("download callback setter should surface reconcile failure");
     assert_eq!(
@@ -1638,9 +1647,9 @@ async fn dialog_callback_reconfigure_holds_success_path_commit_fence_until_recon
     let manager = BrowserManager::new(options());
     manager.page_hook_states.lock().await.insert(
         "target-1".to_string(),
-        crate::tab_projection::PageHookInstallState::completed_runtime_callback_hooks_for_test(),
+        PageHookInstallState::completed_runtime_callback_hooks_for_test(),
     );
-    *manager.dialog_callbacks.lock().await = crate::dialogs::DialogCallbacks {
+    *manager.dialog_callbacks.lock().await = DialogCallbacks {
         on_runtime: Some(Arc::new(|_| {})),
         on_opened: None,
         on_closed: None,
@@ -1650,7 +1659,7 @@ async fn dialog_callback_reconfigure_holds_success_path_commit_fence_until_recon
 
     let reconfigure = async {
         manager
-            .set_dialog_callbacks(crate::dialogs::DialogCallbacks::default())
+            .set_dialog_callbacks(DialogCallbacks::default())
             .await
     };
     let observe_fence = async {
@@ -1723,10 +1732,8 @@ async fn non_dialog_callback_reconfigure_replays_failed_rebuild_runtime_fallback
     );
     let fallback = manager.snapshot_browser_runtime_fallback().await;
 
-    let delivered_dialog = Arc::new(StdMutex::new(
-        Vec::<rub_core::model::DialogRuntimeInfo>::new(),
-    ));
-    *manager.dialog_callbacks.lock().await = crate::dialogs::DialogCallbacks {
+    let delivered_dialog = Arc::new(StdMutex::new(Vec::<DialogRuntimeInfo>::new()));
+    *manager.dialog_callbacks.lock().await = DialogCallbacks {
         on_runtime: {
             let delivered_dialog = delivered_dialog.clone();
             Some(Arc::new(move |update| {
@@ -1741,7 +1748,7 @@ async fn non_dialog_callback_reconfigure_replays_failed_rebuild_runtime_fallback
         on_listener_ended: None,
     };
     let delivered_download = Arc::new(StdMutex::new(Vec::<DownloadRuntimeInfo>::new()));
-    *manager.download_callbacks.lock().await = crate::downloads::DownloadCallbacks {
+    *manager.download_callbacks.lock().await = DownloadCallbacks {
         on_runtime: {
             let delivered_download = delivered_download.clone();
             Some(Arc::new(move |update| {
@@ -1758,7 +1765,7 @@ async fn non_dialog_callback_reconfigure_replays_failed_rebuild_runtime_fallback
     manager.force_pause_runtime_callback_reconfigure_before_reconcile();
     let reconfigure = async {
         manager
-            .set_runtime_state_callbacks(crate::runtime_state::RuntimeStateCallbacks::default())
+            .set_runtime_state_callbacks(RuntimeStateCallbacks::default())
             .await
     };
     let observe_fence = async {
@@ -1881,10 +1888,8 @@ async fn failed_non_dialog_callback_reconfigure_replays_failed_rebuild_runtime_f
     );
     let fallback = manager.snapshot_browser_runtime_fallback().await;
 
-    let delivered_dialog = Arc::new(StdMutex::new(
-        Vec::<rub_core::model::DialogRuntimeInfo>::new(),
-    ));
-    *manager.dialog_callbacks.lock().await = crate::dialogs::DialogCallbacks {
+    let delivered_dialog = Arc::new(StdMutex::new(Vec::<DialogRuntimeInfo>::new()));
+    *manager.dialog_callbacks.lock().await = DialogCallbacks {
         on_runtime: {
             let delivered_dialog = delivered_dialog.clone();
             Some(Arc::new(move |update| {
@@ -1899,7 +1904,7 @@ async fn failed_non_dialog_callback_reconfigure_replays_failed_rebuild_runtime_f
         on_listener_ended: None,
     };
     let delivered_download = Arc::new(StdMutex::new(Vec::<DownloadRuntimeInfo>::new()));
-    *manager.download_callbacks.lock().await = crate::downloads::DownloadCallbacks {
+    *manager.download_callbacks.lock().await = DownloadCallbacks {
         on_runtime: {
             let delivered_download = delivered_download.clone();
             Some(Arc::new(move |update| {
@@ -1917,7 +1922,7 @@ async fn failed_non_dialog_callback_reconfigure_replays_failed_rebuild_runtime_f
     manager.force_runtime_callback_reconcile_failure();
     let reconfigure = async {
         manager
-            .set_runtime_state_callbacks(crate::runtime_state::RuntimeStateCallbacks::default())
+            .set_runtime_state_callbacks(RuntimeStateCallbacks::default())
             .await
     };
     let observe_fence = async {
@@ -2358,12 +2363,12 @@ async fn download_callback_reconfigure_rolls_back_generation_bound_page_hooks() 
     let manager = BrowserManager::new(options());
     manager.page_hook_states.lock().await.insert(
         "target-1".to_string(),
-        crate::tab_projection::PageHookInstallState::completed_runtime_callback_hooks_for_test(),
+        PageHookInstallState::completed_runtime_callback_hooks_for_test(),
     );
     manager.force_runtime_callback_reconcile_failure();
 
     let error = manager
-        .set_download_callbacks(crate::downloads::DownloadCallbacks::default())
+        .set_download_callbacks(DownloadCallbacks::default())
         .await
         .expect_err("download callback reconcile should surface failure");
     assert_eq!(error.into_envelope().code, ErrorCode::InternalError);
@@ -2403,7 +2408,7 @@ async fn download_callback_reconfigure_replays_current_runtime_projection() {
 
     let delivered = Arc::new(StdMutex::new(Vec::<DownloadRuntimeInfo>::new()));
     manager
-        .set_download_callbacks(crate::downloads::DownloadCallbacks {
+        .set_download_callbacks(DownloadCallbacks {
             on_runtime: {
                 let delivered = delivered.clone();
                 Some(Arc::new(move |update| {
@@ -2458,7 +2463,7 @@ async fn download_runtime_replay_waits_for_authority_commit_fence_to_clear() {
     );
 
     let delivered = Arc::new(StdMutex::new(Vec::<DownloadRuntimeInfo>::new()));
-    *manager.download_callbacks.lock().await = crate::downloads::DownloadCallbacks {
+    *manager.download_callbacks.lock().await = DownloadCallbacks {
         on_runtime: {
             let delivered = delivered.clone();
             Some(Arc::new(move |update| {
@@ -2474,7 +2479,7 @@ async fn download_runtime_replay_waits_for_authority_commit_fence_to_clear() {
 
     manager
         .authority_commit_in_progress
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+        .store(true, Ordering::SeqCst);
     manager
         .replay_download_runtime_projection_to_callbacks()
         .await;
@@ -2488,7 +2493,7 @@ async fn download_runtime_replay_waits_for_authority_commit_fence_to_clear() {
 
     manager
         .authority_commit_in_progress
-        .store(false, std::sync::atomic::Ordering::SeqCst);
+        .store(false, Ordering::SeqCst);
     manager
         .replay_download_runtime_projection_to_callbacks()
         .await;
@@ -2532,10 +2537,8 @@ async fn dialog_runtime_replay_waits_for_authority_commit_fence_to_clear() {
         runtime.last_dialog = runtime.pending_dialog.clone();
     }
 
-    let delivered = Arc::new(StdMutex::new(
-        Vec::<rub_core::model::DialogRuntimeInfo>::new(),
-    ));
-    *manager.dialog_callbacks.lock().await = crate::dialogs::DialogCallbacks {
+    let delivered = Arc::new(StdMutex::new(Vec::<DialogRuntimeInfo>::new()));
+    *manager.dialog_callbacks.lock().await = DialogCallbacks {
         on_runtime: {
             let delivered = delivered.clone();
             Some(Arc::new(move |update| {
@@ -2552,7 +2555,7 @@ async fn dialog_runtime_replay_waits_for_authority_commit_fence_to_clear() {
 
     manager
         .authority_commit_in_progress
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+        .store(true, Ordering::SeqCst);
     manager
         .replay_dialog_runtime_projection_to_callbacks()
         .await;
@@ -2566,7 +2569,7 @@ async fn dialog_runtime_replay_waits_for_authority_commit_fence_to_clear() {
 
     manager
         .authority_commit_in_progress
-        .store(false, std::sync::atomic::Ordering::SeqCst);
+        .store(false, Ordering::SeqCst);
     manager
         .replay_dialog_runtime_projection_to_callbacks()
         .await;
@@ -2679,10 +2682,8 @@ async fn replace_browser_authority_rolls_back_when_previous_release_fails() {
         Some(64),
         None,
     );
-    let delivered_dialog_runtime = Arc::new(StdMutex::new(
-        Vec::<rub_core::model::DialogRuntimeInfo>::new(),
-    ));
-    *manager.dialog_callbacks.lock().await = crate::dialogs::DialogCallbacks {
+    let delivered_dialog_runtime = Arc::new(StdMutex::new(Vec::<DialogRuntimeInfo>::new()));
+    *manager.dialog_callbacks.lock().await = DialogCallbacks {
         on_runtime: {
             let delivered_dialog_runtime = delivered_dialog_runtime.clone();
             Some(Arc::new(move |update| {
@@ -2742,9 +2743,8 @@ async fn replace_browser_authority_rolls_back_when_previous_release_fails() {
         active_target_id: Some(previous_target.clone()),
         active_target_authority: Some(TabActiveAuthority::LocalFallback),
     };
-    *manager.local_active_target_authority.lock().await = Some(
-        crate::tab_projection::LocalActiveTargetAuthority::new(previous_target.clone()),
-    );
+    *manager.local_active_target_authority.lock().await =
+        Some(LocalActiveTargetAuthority::new(previous_target.clone()));
 
     manager.force_previous_authority_release_failure();
     let error = manager
@@ -3092,13 +3092,12 @@ async fn failed_replacement_ownership_commit_restores_previous_managed_profile_a
         .expect("previous continuity authority");
 
     let replacement_options = options();
-    let replacement_profile = crate::managed_browser::resolve_managed_profile_dir(
+    let replacement_profile = resolve_managed_profile_dir(
         replacement_options.user_data_dir.clone(),
         replacement_options.profile_directory.clone(),
         replacement_options.managed_profile_ephemeral,
     );
-    let replacement_identity_policy =
-        crate::identity_policy::IdentityPolicy::from_options(&replacement_options);
+    let replacement_identity_policy = IdentityPolicy::from_options(&replacement_options);
     let (replacement_browser, replacement_page) =
         crate::runtime::launch_managed_browser(&replacement_options, &replacement_identity_policy)
             .await
@@ -3201,10 +3200,8 @@ async fn replace_browser_authority_resets_generation_bound_runtime_state_on_comm
             tab_target_id: Some(previous_target_id.clone()),
         });
     }
-    let delivered_dialog_runtime = Arc::new(StdMutex::new(
-        Vec::<rub_core::model::DialogRuntimeInfo>::new(),
-    ));
-    *manager.dialog_callbacks.lock().await = crate::dialogs::DialogCallbacks {
+    let delivered_dialog_runtime = Arc::new(StdMutex::new(Vec::<DialogRuntimeInfo>::new()));
+    *manager.dialog_callbacks.lock().await = DialogCallbacks {
         on_runtime: {
             let delivered_dialog_runtime = delivered_dialog_runtime.clone();
             Some(Arc::new(move |update| {
@@ -3268,7 +3265,7 @@ async fn replace_browser_authority_resets_generation_bound_runtime_state_on_comm
     assert!(
         manager
             .runtime_state_replay_attempt_count
-            .load(std::sync::atomic::Ordering::SeqCst)
+            .load(Ordering::SeqCst)
             >= 1,
         "replacement authority commit must schedule a post-fence runtime-state replay"
     );

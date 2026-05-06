@@ -13,7 +13,10 @@ use chromiumoxide::cdp::browser_protocol::target::{
     CloseTargetParams, EventTargetCreated, EventTargetDestroyed, EventTargetInfoChanged, TargetId,
 };
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{
     Arc, RwLock as StdRwLock,
     atomic::{AtomicBool, Ordering},
@@ -109,7 +112,7 @@ pub struct BrowserManager {
     #[cfg(test)]
     managed_browser_test_permit: Arc<Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
     #[cfg(test)]
-    force_reconcile_runtime_callbacks_failure: Arc<std::sync::atomic::AtomicBool>,
+    force_reconcile_runtime_callbacks_failure: Arc<AtomicBool>,
     #[cfg(test)]
     pause_runtime_callback_reconfigure_before_reconcile: Arc<AtomicBool>,
     #[cfg(test)]
@@ -117,17 +120,17 @@ pub struct BrowserManager {
     #[cfg(test)]
     resume_runtime_callback_reconfigure: Arc<tokio::sync::Notify>,
     #[cfg(test)]
-    force_previous_authority_release_failure: Arc<std::sync::atomic::AtomicBool>,
+    force_previous_authority_release_failure: Arc<AtomicBool>,
     #[cfg(test)]
-    force_current_authority_release_failure: Arc<std::sync::atomic::AtomicBool>,
+    force_current_authority_release_failure: Arc<AtomicBool>,
     #[cfg(test)]
-    runtime_state_replay_attempt_count: Arc<std::sync::atomic::AtomicUsize>,
+    runtime_state_replay_attempt_count: Arc<AtomicUsize>,
     #[cfg(test)]
-    force_generation_bound_runtime_reconcile_failure: Arc<std::sync::atomic::AtomicBool>,
+    force_generation_bound_runtime_reconcile_failure: Arc<AtomicBool>,
     #[cfg(test)]
-    force_managed_profile_ownership_commit_failure: Arc<std::sync::atomic::AtomicBool>,
+    force_managed_profile_ownership_commit_failure: Arc<AtomicBool>,
     #[cfg(test)]
-    force_required_page_hook_install_failure: Arc<std::sync::atomic::AtomicBool>,
+    force_required_page_hook_install_failure: Arc<AtomicBool>,
     #[cfg(test)]
     pause_authority_commit_after_projection: Arc<AtomicBool>,
     #[cfg(test)]
@@ -195,9 +198,7 @@ impl BrowserManager {
             #[cfg(test)]
             managed_browser_test_permit: Arc::new(Mutex::new(None)),
             #[cfg(test)]
-            force_reconcile_runtime_callbacks_failure: Arc::new(
-                std::sync::atomic::AtomicBool::new(false),
-            ),
+            force_reconcile_runtime_callbacks_failure: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             pause_runtime_callback_reconfigure_before_reconcile: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -205,27 +206,17 @@ impl BrowserManager {
             #[cfg(test)]
             resume_runtime_callback_reconfigure: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
-            force_previous_authority_release_failure: Arc::new(std::sync::atomic::AtomicBool::new(
-                false,
-            )),
+            force_previous_authority_release_failure: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
-            force_current_authority_release_failure: Arc::new(std::sync::atomic::AtomicBool::new(
-                false,
-            )),
+            force_current_authority_release_failure: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
-            runtime_state_replay_attempt_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            runtime_state_replay_attempt_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
-            force_generation_bound_runtime_reconcile_failure: Arc::new(
-                std::sync::atomic::AtomicBool::new(false),
-            ),
+            force_generation_bound_runtime_reconcile_failure: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
-            force_managed_profile_ownership_commit_failure: Arc::new(
-                std::sync::atomic::AtomicBool::new(false),
-            ),
+            force_managed_profile_ownership_commit_failure: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
-            force_required_page_hook_install_failure: Arc::new(std::sync::atomic::AtomicBool::new(
-                false,
-            )),
+            force_required_page_hook_install_failure: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             pause_authority_commit_after_projection: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -365,7 +356,7 @@ impl BrowserManager {
     ) -> bool
     where
         F: FnOnce() -> Fut + Send,
-        Fut: std::future::Future<Output = bool> + Send,
+        Fut: Future<Output = bool> + Send,
     {
         if !self.runtime_state_callback_publish_allowed(listener_generation) {
             return false;
@@ -597,9 +588,7 @@ impl BrowserManager {
                 let mut guard = poisoned.into_inner();
                 *guard = None;
                 self.dialog_intercept.clear_poison();
-                tracing::warn!(
-                    "Recovered poisoned dialog intercept state during browser authority reset"
-                );
+                warn!("Recovered poisoned dialog intercept state during browser authority reset");
             }
         }
     }

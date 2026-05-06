@@ -23,16 +23,7 @@ impl RuntimeObservatoryState {
         let record = authoritative_request_record(record, next_sequence);
         self.request_records.insert(request_id.clone(), record);
         self.request_order.push_back(request_id);
-        while self.request_order.len() > OBSERVATORY_REQUEST_RECORD_LIMIT {
-            if let Some(oldest) = self.request_order.pop_front() {
-                if let Some(evicted) = self.request_records.remove(&oldest) {
-                    self.last_evicted_request_sequence =
-                        self.last_evicted_request_sequence.max(evicted.sequence);
-                }
-                self.dropped_request_record_count =
-                    self.dropped_request_record_count.saturating_add(1);
-            }
-        }
+        self.trim_request_records();
     }
 
     #[cfg(test)]
@@ -54,16 +45,7 @@ impl RuntimeObservatoryState {
         record.sequence = next_sequence;
         self.request_records.insert(request_id.clone(), record);
         self.request_order.push_back(request_id);
-        while self.request_order.len() > OBSERVATORY_REQUEST_RECORD_LIMIT {
-            if let Some(oldest) = self.request_order.pop_front() {
-                if let Some(evicted) = self.request_records.remove(&oldest) {
-                    self.last_evicted_request_sequence =
-                        self.last_evicted_request_sequence.max(evicted.sequence);
-                }
-                self.dropped_request_record_count =
-                    self.dropped_request_record_count.saturating_add(1);
-            }
-        }
+        self.trim_request_records();
     }
 
     pub fn request_record(&self, request_id: &str) -> Option<NetworkRequestRecord> {
@@ -129,6 +111,42 @@ impl RuntimeObservatoryState {
             .collect()
     }
 
+    fn request_window_degraded_reason(
+        &self,
+        cursor: u64,
+        ingress_drop_count: u64,
+        last_observed_ingress_drop_count: u64,
+    ) -> Option<String> {
+        let cursor_lost_to_eviction = cursor < self.last_evicted_request_sequence;
+        let ingress_loss_moved = ingress_drop_count > last_observed_ingress_drop_count;
+        if cursor_lost_to_eviction {
+            Some("network_request_ring_overflow".to_string())
+        } else if ingress_loss_moved {
+            Some("network_request_ingress_overflow".to_string())
+        } else if self
+            .degraded_reason
+            .as_deref()
+            .is_some_and(|reason| reason != "network_request_ring_overflow")
+        {
+            self.degraded_reason.clone()
+        } else {
+            None
+        }
+    }
+
+    fn trim_request_records(&mut self) {
+        while self.request_order.len() > OBSERVATORY_REQUEST_RECORD_LIMIT {
+            if let Some(oldest) = self.request_order.pop_front() {
+                if let Some(evicted) = self.request_records.remove(&oldest) {
+                    self.last_evicted_request_sequence =
+                        self.last_evicted_request_sequence.max(evicted.sequence);
+                }
+                self.dropped_request_record_count =
+                    self.dropped_request_record_count.saturating_add(1);
+            }
+        }
+    }
+
     pub(crate) fn request_window_after(
         &self,
         cursor: u64,
@@ -141,21 +159,11 @@ impl RuntimeObservatoryState {
             .map(|record| record.sequence)
             .max()
             .unwrap_or_else(|| self.request_cursor());
-        let cursor_lost_to_eviction = cursor < self.last_evicted_request_sequence;
-        let ingress_loss_moved = ingress_drop_count > last_observed_ingress_drop_count;
-        let degraded_reason = if cursor_lost_to_eviction {
-            Some("network_request_ring_overflow".to_string())
-        } else if ingress_loss_moved {
-            Some("network_request_ingress_overflow".to_string())
-        } else if self
-            .degraded_reason
-            .as_deref()
-            .is_some_and(|reason| reason != "network_request_ring_overflow")
-        {
-            self.degraded_reason.clone()
-        } else {
-            None
-        };
+        let degraded_reason = self.request_window_degraded_reason(
+            cursor,
+            ingress_drop_count,
+            last_observed_ingress_drop_count,
+        );
         NetworkRequestWindow {
             records,
             next_cursor,
@@ -177,21 +185,11 @@ impl RuntimeObservatoryState {
             .map(|record| record.sequence)
             .max()
             .unwrap_or(end_cursor);
-        let cursor_lost_to_eviction = cursor < self.last_evicted_request_sequence;
-        let ingress_loss_moved = ingress_drop_count > last_observed_ingress_drop_count;
-        let degraded_reason = if cursor_lost_to_eviction {
-            Some("network_request_ring_overflow".to_string())
-        } else if ingress_loss_moved {
-            Some("network_request_ingress_overflow".to_string())
-        } else if self
-            .degraded_reason
-            .as_deref()
-            .is_some_and(|reason| reason != "network_request_ring_overflow")
-        {
-            self.degraded_reason.clone()
-        } else {
-            None
-        };
+        let degraded_reason = self.request_window_degraded_reason(
+            cursor,
+            ingress_drop_count,
+            last_observed_ingress_drop_count,
+        );
         NetworkRequestWindow {
             records,
             next_cursor,

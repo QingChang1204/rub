@@ -35,3 +35,6 @@ pub mod workflow_assets;
 pub mod workflow_capture;
 pub mod workflow_params;
 pub mod workflow_policy;
+
+#[cfg(test)]
+mod test_support;

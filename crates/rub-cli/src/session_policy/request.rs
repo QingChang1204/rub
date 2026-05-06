@@ -210,37 +210,11 @@ pub(crate) async fn materialize_connection_request_with_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{Commands, RequestedLaunchPolicy};
+    use crate::commands::Commands;
+    use crate::test_support::effective_cli_with_default_home as cli_with;
     use rub_core::error::ErrorCode;
     use std::path::Path;
     use std::time::Duration;
-
-    fn cli_with(command: Commands) -> EffectiveCli {
-        EffectiveCli {
-            session: "default".to_string(),
-            session_id: None,
-            rub_home: std::path::PathBuf::from("/tmp/rub-test"),
-            timeout: 30_000,
-            headed: false,
-            ignore_cert_errors: false,
-            user_data_dir: None,
-            hide_infobars: true,
-            json_pretty: false,
-            verbose: false,
-            trace: false,
-            command,
-            cdp_url: None,
-            connect: false,
-            profile: None,
-            profile_resolved_path: None,
-            use_alias: None,
-            no_stealth: false,
-            humanize: false,
-            humanize_speed: "normal".to_string(),
-            requested_launch_policy: RequestedLaunchPolicy::default(),
-            effective_launch_policy: RequestedLaunchPolicy::default(),
-        }
-    }
 
     #[tokio::test]
     async fn materialize_connection_request_times_out_when_deadline_is_exhausted() {

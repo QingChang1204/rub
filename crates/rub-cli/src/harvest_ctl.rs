@@ -206,20 +206,7 @@ pub(crate) async fn inspect_harvest(cli: &EffectiveCli) -> Result<serde_json::Va
                         name: source.source_name,
                         row: source.source_row,
                     },
-                    page: FollowPageExtractPageInfo {
-                        final_url: open_data
-                            .get("result")
-                            .and_then(|value| value.get("page"))
-                            .and_then(|value| value.get("final_url"))
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string),
-                        title: open_data
-                            .get("result")
-                            .and_then(|value| value.get("page"))
-                            .and_then(|value| value.get("title"))
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string),
-                    },
+                    page: follow_page_info(&open_data),
                     result: extract_data
                         .get("result")
                         .and_then(|value| value.get("fields"))
@@ -238,20 +225,7 @@ pub(crate) async fn inspect_harvest(cli: &EffectiveCli) -> Result<serde_json::Va
                         name: source.source_name,
                         row: source.source_row,
                     },
-                    page: FollowPageExtractPageInfo {
-                        final_url: open_data
-                            .get("result")
-                            .and_then(|value| value.get("page"))
-                            .and_then(|value| value.get("final_url"))
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string),
-                        title: open_data
-                            .get("result")
-                            .and_then(|value| value.get("page"))
-                            .and_then(|value| value.get("title"))
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string),
-                    },
+                    page: follow_page_info(&open_data),
                     result: None,
                     error: Some(error),
                 });
@@ -386,6 +360,20 @@ fn harvest_timeout_envelope(timeout_ms: u64) -> ErrorEnvelope {
         "reason": "inspect_harvest_timeout_budget_exhausted",
         "timeout_ms": timeout_ms,
     }))
+}
+
+fn follow_page_info(open_data: &serde_json::Value) -> FollowPageExtractPageInfo {
+    let page = open_data.get("result").and_then(|value| value.get("page"));
+    FollowPageExtractPageInfo {
+        final_url: page
+            .and_then(|value| value.get("final_url"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        title: page
+            .and_then(|value| value.get("title"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    }
 }
 
 fn harvest_deadline_exhausted(error: &ErrorEnvelope) -> bool {

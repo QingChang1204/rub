@@ -225,7 +225,7 @@ pub(crate) fn force_kill_registry_entry_process(
         &entry.session_name,
         Some(entry.session_id.as_str()),
         entry.pid,
-    )? || !runtime_commit_matches_registry_entry(rub_home, entry)
+    )? || !super::registry_entry_runtime_commit_matches(rub_home, entry)
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -238,22 +238,6 @@ pub(crate) fn force_kill_registry_entry_process(
         ));
     }
     force_kill_process(entry.pid)
-}
-
-fn runtime_commit_matches_registry_entry(
-    rub_home: &Path,
-    entry: &rub_daemon::session::RegistryEntry,
-) -> bool {
-    let runtime = RubPaths::new(rub_home).session_runtime(&entry.session_name, &entry.session_id);
-    let pid_matches = std::fs::read_to_string(runtime.pid_path())
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
-        == Some(entry.pid);
-    let committed_matches = std::fs::read_to_string(runtime.startup_committed_path())
-        .ok()
-        .is_some_and(|raw| raw.trim() == entry.session_id);
-    let socket_matches = Path::new(&entry.socket_path) == runtime.socket_path();
-    pid_matches && committed_matches && socket_matches
 }
 
 pub(crate) fn registry_authority_snapshot(

@@ -2,7 +2,7 @@ use rub_core::error::RubError;
 use rub_core::recovery_contract::session_post_commit_journal_recovery_contract;
 use rub_daemon::rub_paths::RubPaths;
 use rub_ipc::client::IpcClient;
-use rub_ipc::protocol::IpcRequest;
+use rub_ipc::protocol::{IpcRequest, IpcResponse};
 use serde_json::Value;
 use std::path::Path;
 use std::time::Instant;
@@ -22,7 +22,7 @@ pub(crate) async fn send_existing_request_with_replay_recovery(
     rub_home: &Path,
     session: &str,
     original_daemon_session_id: Option<&str>,
-) -> Result<rub_ipc::protocol::IpcResponse, RubError> {
+) -> Result<IpcResponse, RubError> {
     send_request_with_replay_strategy(
         client,
         request,
@@ -38,7 +38,7 @@ pub(crate) async fn send_request_with_replay_recovery(
     request: &IpcRequest,
     deadline: Instant,
     recovery: ReplayRecoveryContext<'_>,
-) -> Result<rub_ipc::protocol::IpcResponse, RubError> {
+) -> Result<IpcResponse, RubError> {
     send_request_with_replay_strategy(
         client,
         request,
@@ -60,7 +60,7 @@ pub(crate) struct ReplayRecoveryContext<'a> {
 }
 
 struct ReplayAttempt<'a> {
-    started: std::time::Instant,
+    started: Instant,
     command_id: &'a str,
     retry_reason: &'static str,
     original_timeout_ms: u64,
@@ -145,8 +145,8 @@ impl<'a> ReplaySendLifecycle<'a> {
         self,
         client: &mut IpcClient,
         request: &IpcRequest,
-    ) -> Result<rub_ipc::protocol::IpcResponse, RubError> {
-        let started = std::time::Instant::now();
+    ) -> Result<IpcResponse, RubError> {
+        let started = Instant::now();
         let request = bind_request_to_daemon_authority(request, self.original_daemon_session_id);
         let original_timeout_ms = request.timeout_ms;
         let request = self.project_initial_request(&request)?;
@@ -175,7 +175,7 @@ impl<'a> ReplaySendLifecycle<'a> {
         request: &IpcRequest,
         started: Instant,
         original_timeout_ms: u64,
-    ) -> Result<rub_ipc::protocol::IpcResponse, RubError> {
+    ) -> Result<IpcResponse, RubError> {
         let Some(command_id) = request.command_id.as_deref() else {
             return Err(ipc_transport_error(transport_error, None, None));
         };
@@ -296,18 +296,10 @@ impl<'a> ReplaySendLifecycle<'a> {
                                 .replay_recovery_context(attempt.original_daemon_session_id),
                         })),
                     )),
-                    Err(reconnect_error) => Err(ipc_transport_error(
+                    Err(reconnect_error) => Err(self.replay_reconnect_failed_error(
                         transport_error,
-                        Some(attempt.command_id),
-                        Some(serde_json::json!({
-                            "reason": "ipc_replay_reconnect_failed",
-                            "retry_reason": attempt.retry_reason,
-                            "original_daemon_session_id": attempt.original_daemon_session_id,
-                            "elapsed_ms": attempt.elapsed_ms(),
-                            "reconnect_error": reconnect_error.into_envelope(),
-                            "recovery_contract": self
-                                .replay_recovery_context(attempt.original_daemon_session_id),
-                        })),
+                        attempt,
+                        reconnect_error,
                     )),
                 }
             }
@@ -315,21 +307,30 @@ impl<'a> ReplaySendLifecycle<'a> {
                 .reconnect_bootstrap_client(recovery, attempt)
                 .await
                 .map_err(|reconnect_error| {
-                    ipc_transport_error(
-                        transport_error,
-                        Some(attempt.command_id),
-                        Some(serde_json::json!({
-                            "reason": "ipc_replay_reconnect_failed",
-                            "retry_reason": attempt.retry_reason,
-                            "original_daemon_session_id": attempt.original_daemon_session_id,
-                            "elapsed_ms": attempt.elapsed_ms(),
-                            "reconnect_error": reconnect_error.into_envelope(),
-                            "recovery_contract": self
-                                .replay_recovery_context(attempt.original_daemon_session_id),
-                        })),
-                    )
+                    self.replay_reconnect_failed_error(transport_error, attempt, reconnect_error)
                 }),
         }
+    }
+
+    fn replay_reconnect_failed_error(
+        &self,
+        transport_error: &(dyn std::error::Error + 'static),
+        attempt: &ReplayAttempt<'_>,
+        reconnect_error: RubError,
+    ) -> RubError {
+        ipc_transport_error(
+            transport_error,
+            Some(attempt.command_id),
+            Some(serde_json::json!({
+                "reason": "ipc_replay_reconnect_failed",
+                "retry_reason": attempt.retry_reason,
+                "original_daemon_session_id": attempt.original_daemon_session_id,
+                "elapsed_ms": attempt.elapsed_ms(),
+                "reconnect_error": reconnect_error.into_envelope(),
+                "recovery_contract": self
+                    .replay_recovery_context(attempt.original_daemon_session_id),
+            })),
+        )
     }
 
     async fn reconnect_bootstrap_client(
@@ -405,7 +406,7 @@ async fn send_request_with_replay_strategy(
     deadline: Instant,
     original_daemon_session_id: Option<&str>,
     strategy: ReplayReconnectStrategy<'_>,
-) -> Result<rub_ipc::protocol::IpcResponse, RubError> {
+) -> Result<IpcResponse, RubError> {
     ReplaySendLifecycle {
         deadline,
         original_daemon_session_id,

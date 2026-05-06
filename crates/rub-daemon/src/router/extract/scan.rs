@@ -226,14 +226,7 @@ pub(super) fn lookup_json_path<'a>(
     value: &'a serde_json::Value,
     path: &str,
 ) -> Option<&'a serde_json::Value> {
-    let mut current = value;
-    for segment in path.split('.') {
-        if segment.is_empty() {
-            return None;
-        }
-        current = current.get(segment)?;
-    }
-    Some(current)
+    crate::router::request_args::lookup_json_path(value, path)
 }
 
 fn collection_row_matches_wait_probe(

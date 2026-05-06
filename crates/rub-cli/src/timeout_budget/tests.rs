@@ -6,10 +6,10 @@ use super::{
 use crate::commands::{
     BindingSubcommand, Commands, CookiesSubcommand, EffectiveCli, ElementAddressArgs,
     ExplainSubcommand, InspectSubcommand, InterceptSubcommand, ObservationProjectionArgs,
-    ObservationScopeArgs, OrchestrationSubcommand, RequestedLaunchPolicy, RuntimeSubcommand,
-    SecretSubcommand, StateFormatArg, StorageSubcommand, TakeoverSubcommand, TriggerSubcommand,
-    WaitAfterArgs,
+    ObservationScopeArgs, OrchestrationSubcommand, RuntimeSubcommand, SecretSubcommand,
+    StateFormatArg, StorageSubcommand, TakeoverSubcommand, TriggerSubcommand, WaitAfterArgs,
 };
+use crate::test_support::{effective_cli, effective_cli_with_default_home};
 use rub_core::DEFAULT_WAIT_AFTER_TIMEOUT_MS;
 use rub_core::error::ErrorCode;
 use rub_ipc::protocol::MAX_IPC_TIMEOUT_MS;
@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 fn cli_with(command: Commands) -> EffectiveCli {
-    cli_with_with_home(command, PathBuf::from("/tmp/rub-test"))
+    effective_cli_with_default_home(command)
 }
 
 #[test]
@@ -133,30 +133,101 @@ fn build_request_rejects_final_inspect_list_scan_timeout_expansion() {
 }
 
 fn cli_with_with_home(command: Commands, rub_home: PathBuf) -> EffectiveCli {
-    EffectiveCli {
-        session: "default".to_string(),
-        session_id: None,
-        rub_home,
-        timeout: 30_000,
-        headed: false,
-        ignore_cert_errors: false,
-        user_data_dir: None,
-        hide_infobars: true,
-        json_pretty: false,
-        verbose: false,
-        trace: false,
-        command,
-        cdp_url: None,
-        connect: false,
-        profile: None,
-        profile_resolved_path: None,
-        use_alias: None,
-        no_stealth: false,
-        humanize: false,
-        humanize_speed: "normal".to_string(),
-        requested_launch_policy: RequestedLaunchPolicy::default(),
-        effective_launch_policy: RequestedLaunchPolicy::default(),
+    effective_cli(command, rub_home)
+}
+
+fn wait_visible_cli(timeout: u64) -> EffectiveCli {
+    cli_with(Commands::Wait {
+        selector: Some(".ready".to_string()),
+        target_text: None,
+        role: None,
+        label: None,
+        testid: None,
+        text: None,
+        description_contains: None,
+        url_contains: None,
+        title_contains: None,
+        first: false,
+        last: false,
+        nth: None,
+        timeout,
+        state: "visible".to_string(),
+    })
+}
+
+fn pipe_file_cli(path: &Path) -> EffectiveCli {
+    cli_with(Commands::Pipe {
+        spec: None,
+        file: Some(path.display().to_string()),
+        workflow: None,
+        list_workflows: false,
+        vars: Vec::new(),
+        wait_after: WaitAfterArgs::default(),
+    })
+}
+
+fn fill_file_cli(path: &Path) -> EffectiveCli {
+    cli_with(Commands::Fill {
+        spec: None,
+        file: Some(path.display().to_string()),
+        validate: false,
+        atomic: false,
+        snapshot: None,
+        submit_index: None,
+        submit_selector: None,
+        submit_target_text: None,
+        submit_ref: None,
+        submit_role: None,
+        submit_label: None,
+        submit_testid: None,
+        submit_first: false,
+        submit_last: false,
+        submit_nth: None,
+        wait_after: WaitAfterArgs::default(),
+    })
+}
+
+fn snapshot_target_text_args() -> ElementAddressArgs {
+    ElementAddressArgs {
+        snapshot: Some("snap-123".to_string()),
+        element_ref: None,
+        selector: None,
+        target_text: Some("New Topic".to_string()),
+        role: None,
+        label: None,
+        testid: None,
+        visible: false,
+        prefer_enabled: false,
+        topmost: false,
+        first: false,
+        last: false,
+        nth: Some(2),
     }
+}
+
+fn empty_inspect_list_subcommand(builder_help: bool) -> InspectSubcommand {
+    InspectSubcommand::List {
+        builder_help,
+        spec: None,
+        file: None,
+        collection: None,
+        row_scope: None,
+        field: Vec::new(),
+        snapshot: None,
+        scan_until: None,
+        scan_key: None,
+        max_scrolls: None,
+        scroll_amount: None,
+        settle_ms: None,
+        stall_limit: None,
+        wait_field: None,
+        wait_contains: None,
+        wait_timeout: None,
+    }
+}
+
+fn inspect_list_builder_help_cli() -> EffectiveCli {
+    cli_with(Commands::Inspect(empty_inspect_list_subcommand(true)))
 }
 
 fn normalize_test_path(path: &Path) -> PathBuf {
@@ -175,22 +246,7 @@ fn normalize_test_path(path: &Path) -> PathBuf {
 
 #[test]
 fn wait_request_uses_wait_timeout_plus_ipc_buffer() {
-    let cli = cli_with(Commands::Wait {
-        selector: Some(".ready".to_string()),
-        target_text: None,
-        role: None,
-        label: None,
-        testid: None,
-        text: None,
-        description_contains: None,
-        url_contains: None,
-        title_contains: None,
-        first: false,
-        last: false,
-        nth: None,
-        timeout: 12_000,
-        state: "visible".to_string(),
-    });
+    let cli = wait_visible_cli(12_000);
 
     let request = build_request(&cli).expect("wait request should build");
     assert_eq!(request.timeout_ms, 12_000 + WAIT_IPC_BUFFER_MS);
@@ -199,22 +255,7 @@ fn wait_request_uses_wait_timeout_plus_ipc_buffer() {
 
 #[test]
 fn shrinking_wait_request_timeout_updates_embedded_wait_budget() {
-    let cli = cli_with(Commands::Wait {
-        selector: Some(".ready".to_string()),
-        target_text: None,
-        role: None,
-        label: None,
-        testid: None,
-        text: None,
-        description_contains: None,
-        url_contains: None,
-        title_contains: None,
-        first: false,
-        last: false,
-        nth: None,
-        timeout: 12_000,
-        state: "visible".to_string(),
-    });
+    let cli = wait_visible_cli(12_000);
 
     let mut request = build_request(&cli).expect("wait request should build");
     request.timeout_ms = 2_000 + WAIT_IPC_BUFFER_MS;
@@ -385,7 +426,7 @@ fn align_embedded_timeout_authority_shrinks_download_save_timeout_with_request_b
 
     let mut request = build_request(&cli).expect("download save request should build");
     request.timeout_ms = 5_000 + WAIT_IPC_BUFFER_MS;
-    super::align_embedded_timeout_authority(&mut request);
+    align_embedded_timeout_authority(&mut request);
 
     assert_eq!(request.args["timeout_ms"], serde_json::json!(5_000));
 }
@@ -413,7 +454,7 @@ fn align_embedded_timeout_authority_shrinks_inspect_list_wait_timeout_with_reque
 
     let mut request = build_request(&cli).expect("inspect list wait request should build");
     request.timeout_ms = 5_000 + WAIT_IPC_BUFFER_MS;
-    super::align_embedded_timeout_authority(&mut request);
+    align_embedded_timeout_authority(&mut request);
 
     assert_eq!(request.args["wait_timeout_ms"], serde_json::json!(5_000));
 }
@@ -569,14 +610,7 @@ fn pipe_file_request_loads_spec_and_records_file_source() {
     fs::write(&path, "[{\"command\":\"doctor\",\"args\":{}}]")
         .expect("pipe spec file should be written");
 
-    let cli = cli_with(Commands::Pipe {
-        spec: None,
-        file: Some(path.display().to_string()),
-        workflow: None,
-        list_workflows: false,
-        vars: Vec::new(),
-        wait_after: WaitAfterArgs::default(),
-    });
+    let cli = pipe_file_cli(&path);
 
     let request = build_request(&cli).expect("pipe request should build");
     assert_eq!(
@@ -609,14 +643,7 @@ fn pipe_file_request_missing_file_reports_path_context() {
     let path = std::env::temp_dir().join(format!("rub-pipe-missing-{}.json", uuid::Uuid::now_v7()));
     let _ = fs::remove_file(&path);
 
-    let cli = cli_with(Commands::Pipe {
-        spec: None,
-        file: Some(path.display().to_string()),
-        workflow: None,
-        list_workflows: false,
-        vars: Vec::new(),
-        wait_after: WaitAfterArgs::default(),
-    });
+    let cli = pipe_file_cli(&path);
 
     let error = build_request(&cli).expect_err("missing pipe file should be rejected");
     let envelope = error.into_envelope();
@@ -634,24 +661,7 @@ fn fill_file_request_loads_spec_and_records_file_source() {
     let path = std::env::temp_dir().join(format!("rub-fill-spec-{}.json", uuid::Uuid::now_v7()));
     fs::write(&path, r##"[{"selector":"#name","value":"Ada"}]"##).expect("fill spec file");
 
-    let cli = cli_with(Commands::Fill {
-        spec: None,
-        file: Some(path.display().to_string()),
-        validate: false,
-        atomic: false,
-        snapshot: None,
-        submit_index: None,
-        submit_selector: None,
-        submit_target_text: None,
-        submit_ref: None,
-        submit_role: None,
-        submit_label: None,
-        submit_testid: None,
-        submit_first: false,
-        submit_last: false,
-        submit_nth: None,
-        wait_after: WaitAfterArgs::default(),
-    });
+    let cli = fill_file_cli(&path);
 
     let request = build_request(&cli).expect("fill request should build");
     assert_eq!(
@@ -680,24 +690,7 @@ fn fill_file_request_missing_file_reports_path_context() {
     let path = std::env::temp_dir().join(format!("rub-fill-missing-{}.json", uuid::Uuid::now_v7()));
     let _ = fs::remove_file(&path);
 
-    let cli = cli_with(Commands::Fill {
-        spec: None,
-        file: Some(path.display().to_string()),
-        validate: false,
-        atomic: false,
-        snapshot: None,
-        submit_index: None,
-        submit_selector: None,
-        submit_target_text: None,
-        submit_ref: None,
-        submit_role: None,
-        submit_label: None,
-        submit_testid: None,
-        submit_first: false,
-        submit_last: false,
-        submit_nth: None,
-        wait_after: WaitAfterArgs::default(),
-    });
+    let cli = fill_file_cli(&path);
 
     let error = build_request(&cli).expect_err("missing fill file should be rejected");
     let envelope = error.into_envelope();
@@ -902,21 +895,7 @@ fn explain_extract_is_local_only_projection() {
 fn explain_locator_projects_to_find_without_selection() {
     let cli = cli_with(Commands::Explain {
         subcommand: ExplainSubcommand::Locator {
-            target: ElementAddressArgs {
-                snapshot: Some("snap-123".to_string()),
-                element_ref: None,
-                selector: None,
-                target_text: Some("New Topic".to_string()),
-                role: None,
-                label: None,
-                testid: None,
-                visible: false,
-                prefer_enabled: false,
-                topmost: false,
-                first: false,
-                last: false,
-                nth: Some(2),
-            },
+            target: snapshot_target_text_args(),
         },
     });
 
@@ -932,21 +911,7 @@ fn explain_locator_projects_to_find_without_selection() {
 #[test]
 fn find_explain_projects_to_find_without_selection() {
     let cli = cli_with(Commands::Find {
-        target: ElementAddressArgs {
-            snapshot: Some("snap-123".to_string()),
-            element_ref: None,
-            selector: None,
-            target_text: Some("New Topic".to_string()),
-            role: None,
-            label: None,
-            testid: None,
-            visible: false,
-            prefer_enabled: false,
-            topmost: false,
-            first: false,
-            last: false,
-            nth: Some(2),
-        },
+        target: snapshot_target_text_args(),
         content: false,
         explain: true,
         limit: None,
@@ -967,21 +932,7 @@ fn find_explain_projects_to_find_without_selection() {
 #[test]
 fn find_explain_rejects_limit_because_explain_needs_full_candidate_set() {
     let cli = cli_with(Commands::Find {
-        target: ElementAddressArgs {
-            snapshot: Some("snap-123".to_string()),
-            element_ref: None,
-            selector: None,
-            target_text: Some("New Topic".to_string()),
-            role: None,
-            label: None,
-            testid: None,
-            visible: false,
-            prefer_enabled: false,
-            topmost: false,
-            first: false,
-            last: false,
-            nth: Some(2),
-        },
+        target: snapshot_target_text_args(),
         content: false,
         explain: true,
         limit: Some(5),
@@ -1344,7 +1295,7 @@ fn upload_request_resolves_input_path_before_ipc() {
 
 #[test]
 fn storage_set_defaults_to_local_area() {
-    let cli = cli_with(Commands::Storage(crate::commands::StorageSubcommand::Set {
+    let cli = cli_with(Commands::Storage(StorageSubcommand::Set {
         key: "token".to_string(),
         value: "abc".to_string(),
         area: None,
@@ -1568,24 +1519,7 @@ fn inspect_harvest_is_handled_locally() {
 
 #[test]
 fn inspect_list_builder_help_is_local_only_projection() {
-    let cli = cli_with(Commands::Inspect(InspectSubcommand::List {
-        builder_help: true,
-        spec: None,
-        file: None,
-        collection: None,
-        row_scope: None,
-        field: Vec::new(),
-        snapshot: None,
-        scan_until: None,
-        scan_key: None,
-        max_scrolls: None,
-        scroll_amount: None,
-        settle_ms: None,
-        stall_limit: None,
-        wait_field: None,
-        wait_contains: None,
-        wait_timeout: None,
-    }));
+    let cli = inspect_list_builder_help_cli();
 
     let error = build_request(&cli).expect_err("inspect list built-in help should stay local");
     let envelope = error.into_envelope();
@@ -2333,23 +2267,21 @@ fn state_request_uses_positional_format_alias_when_explicit_flag_is_absent() {
 
 #[test]
 fn inspect_page_request_reuses_state_projection_args() {
-    let cli = cli_with(Commands::Inspect(
-        crate::commands::InspectSubcommand::Page {
-            limit: Some(10),
-            format: Some(StateFormatArg::Compact),
-            a11y: false,
-            viewport: true,
-            listeners: true,
-            scope: ObservationScopeArgs {
-                selector: Some("#content".to_string()),
-                ..ObservationScopeArgs::default()
-            },
-            projection: ObservationProjectionArgs {
-                depth: Some(2),
-                ..ObservationProjectionArgs::default()
-            },
+    let cli = cli_with(Commands::Inspect(InspectSubcommand::Page {
+        limit: Some(10),
+        format: Some(StateFormatArg::Compact),
+        a11y: false,
+        viewport: true,
+        listeners: true,
+        scope: ObservationScopeArgs {
+            selector: Some("#content".to_string()),
+            ..ObservationScopeArgs::default()
         },
-    ));
+        projection: ObservationProjectionArgs {
+            depth: Some(2),
+            ..ObservationProjectionArgs::default()
+        },
+    }));
 
     let request = build_request(&cli).expect("inspect page request should build");
     assert_eq!(request.command, "inspect");

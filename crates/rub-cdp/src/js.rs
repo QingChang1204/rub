@@ -5,6 +5,18 @@ use chromiumoxide::cdp::js_protocol::runtime::{
 use rub_core::error::{ErrorCode, RubError};
 use std::sync::Arc;
 
+macro_rules! execute_evaluate {
+    ($page:expr, $params:expr) => {{
+        let response = $page
+            .execute($params)
+            .await
+            .map_err(|e| RubError::Internal(format!("Evaluate failed: {e}")))?;
+        let evaluated = response.result;
+        ensure_no_runtime_exception("Evaluate", evaluated.exception_details)?;
+        evaluated.result
+    }};
+}
+
 pub(crate) async fn call_function(
     page: &Arc<Page>,
     object_id: &RemoteObjectId,
@@ -112,19 +124,14 @@ pub(crate) async fn evaluate_returning_object_id_in_context(
     if let Some(context_id) = context_id {
         builder = builder.context_id(context_id);
     }
-    let response = page
-        .execute(
-            builder
-                .build()
-                .map_err(|e| RubError::Internal(format!("Build evaluate params failed: {e}")))?,
-        )
-        .await
-        .map_err(|e| RubError::Internal(format!("Evaluate failed: {e}")))?;
-    ensure_no_runtime_exception("Evaluate", response.result.exception_details)?;
+    let response = execute_evaluate!(
+        page,
+        builder
+            .build()
+            .map_err(|e| RubError::Internal(format!("Build evaluate params failed: {e}")))?
+    );
 
     response
-        .result
-        .result
         .object_id
         .ok_or_else(|| RubError::Internal("Evaluate did not return an objectId".to_string()))
 }
@@ -133,24 +140,7 @@ pub(crate) async fn evaluate_returning_string(
     page: &Arc<Page>,
     expression: &str,
 ) -> Result<String, RubError> {
-    let response = page
-        .execute(
-            EvaluateParams::builder()
-                .expression(expression)
-                .await_promise(true)
-                .return_by_value(true)
-                .build()
-                .map_err(|e| RubError::Internal(format!("Build evaluate params failed: {e}")))?,
-        )
-        .await
-        .map_err(|e| RubError::Internal(format!("Evaluate failed: {e}")))?;
-    ensure_no_runtime_exception("Evaluate", response.result.exception_details)?;
-
-    match response.result.result.value {
-        Some(serde_json::Value::String(value)) => Ok(value),
-        Some(serde_json::Value::Null) | None => Ok(String::new()),
-        Some(other) => Ok(other.to_string()),
-    }
+    evaluate_returning_string_in_context(page, None, expression).await
 }
 
 pub(crate) async fn evaluate_returning_string_in_context(
@@ -165,17 +155,18 @@ pub(crate) async fn evaluate_returning_string_in_context(
     if let Some(context_id) = context_id {
         builder = builder.context_id(context_id);
     }
-    let response = page
-        .execute(
-            builder
-                .build()
-                .map_err(|e| RubError::Internal(format!("Build evaluate params failed: {e}")))?,
-        )
-        .await
-        .map_err(|e| RubError::Internal(format!("Evaluate failed: {e}")))?;
-    ensure_no_runtime_exception("Evaluate", response.result.exception_details)?;
+    let response = execute_evaluate!(
+        page,
+        builder
+            .build()
+            .map_err(|e| RubError::Internal(format!("Build evaluate params failed: {e}")))?
+    );
 
-    match response.result.result.value {
+    evaluate_value_to_string(response.value)
+}
+
+fn evaluate_value_to_string(value: Option<serde_json::Value>) -> Result<String, RubError> {
+    match value {
         Some(serde_json::Value::String(value)) => Ok(value),
         Some(serde_json::Value::Null) | None => Ok(String::new()),
         Some(other) => Ok(other.to_string()),

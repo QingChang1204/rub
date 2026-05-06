@@ -218,32 +218,30 @@ async fn http_get_text_until(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let url_no_scheme = url.strip_prefix("http://").ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "URL must start with http://")
-    })?;
+    let url_no_scheme = url
+        .strip_prefix("http://")
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "URL must start with http://"))?;
     let (host_port, path) = url_no_scheme.split_once('/').unwrap_or((url_no_scheme, ""));
     let path = format!("/{path}");
 
     let mut stream =
         tokio::time::timeout(remaining_budget(deadline)?, TcpStream::connect(host_port))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP connect timed out"))??;
+            .map_err(|_| io::Error::new(ErrorKind::TimedOut, "HTTP connect timed out"))??;
     let request = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
     tokio::time::timeout(
         remaining_budget(deadline)?,
         stream.write_all(request.as_bytes()),
     )
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP request write timed out"))??;
+    .map_err(|_| io::Error::new(ErrorKind::TimedOut, "HTTP request write timed out"))??;
 
     let mut response = Vec::new();
     let mut chunk = [0_u8; 2048];
     loop {
         let read = tokio::time::timeout(remaining_budget(deadline)?, stream.read(&mut chunk))
             .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "HTTP response read timed out")
-            })??;
+            .map_err(|_| io::Error::new(ErrorKind::TimedOut, "HTTP response read timed out"))??;
 
         let eof_reached = read == 0;
         if !eof_reached {

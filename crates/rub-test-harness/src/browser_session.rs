@@ -189,10 +189,10 @@ pub fn resolve_test_rub_binary_path(
         return path.to_string();
     }
     let manifest = manifest_dir.unwrap_or_default();
-    let workspace = std::path::Path::new(&manifest)
+    let workspace = Path::new(&manifest)
         .parent()
         .and_then(|p| p.parent())
-        .unwrap_or(std::path::Path::new("."));
+        .unwrap_or(Path::new("."));
     let path = workspace.join("target/debug/rub");
     path.to_string_lossy().to_string()
 }

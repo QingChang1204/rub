@@ -564,19 +564,20 @@ fn topmost_hit_test_finalizer_fails_closed_when_any_candidate_loses_snapshot_aut
 
 #[test]
 fn topmost_hit_test_finalizer_fails_closed_on_geometry_authority_loss() {
+    let candidate = Element {
+        index: 1,
+        tag: ElementTag::Button,
+        text: "Bottom".to_string(),
+        attributes: HashMap::new(),
+        element_ref: Some(format!("{}:{}", "frame-1", 7)),
+        target_id: Some(String::from("target-1")),
+        bounding_box: None,
+        ax_info: None,
+        listeners: None,
+        depth: None,
+    };
     let error = finalize_hit_test_ranking(
-        vec![Element {
-            index: 1,
-            tag: ElementTag::Button,
-            text: "Bottom".to_string(),
-            attributes: HashMap::new(),
-            element_ref: Some("frame-1:7".to_string()),
-            target_id: Some("target-1".to_string()),
-            bounding_box: None,
-            ax_info: None,
-            listeners: None,
-            depth: None,
-        }],
+        vec![candidate],
         Some(top_level_geometry_authority_error(
             "top_level_hit_test_parent_chain_unavailable",
         )),

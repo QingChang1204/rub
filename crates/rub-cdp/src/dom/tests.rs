@@ -3,6 +3,7 @@ use super::{
     normalize_snapshot_limit, projected_element_ref, scripts::extract_elements_script,
 };
 use crate::frame_runtime::{FrameDocumentFence, ResolvedFrameContext};
+use crate::snapshot_lookup::sample_main_frame_context;
 use rub_core::model::{Element, ElementTag, FrameContextInfo, ScrollPosition, Snapshot};
 use rub_core::port::DEFAULT_SNAPSHOT_LIMIT;
 use std::collections::HashMap;
@@ -148,15 +149,7 @@ fn highlight_overlay_script_avoids_inner_html_assignment() {
     let snapshot = Snapshot {
         snapshot_id: "snap-1".to_string(),
         dom_epoch: 1,
-        frame_context: FrameContextInfo {
-            frame_id: "main".to_string(),
-            name: None,
-            parent_frame_id: None,
-            target_id: Some("target-1".to_string()),
-            url: Some("https://example.com".to_string()),
-            depth: 0,
-            same_origin_accessible: Some(true),
-        },
+        frame_context: sample_main_frame_context(),
         frame_lineage: vec!["main".to_string()],
         url: "https://example.com".to_string(),
         title: "Example".to_string(),

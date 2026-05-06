@@ -3,9 +3,9 @@ mod observation;
 mod preflight;
 
 pub(crate) use confirmation::{
-    ActuationFence, ActuationResultFenceOutcome, DialogFenceBaseline, await_actuation_or_dialog,
-    await_actuation_result_or_dialog, confirm_click, confirm_click_xy, confirm_hover,
-    confirm_input, confirm_key_combo, confirm_key_combo_in_context, confirm_select,
+    ActuationFence, ActuationFenceOutcome, ActuationResultFenceOutcome, DialogFenceBaseline,
+    await_actuation_or_dialog, await_actuation_result_or_dialog, confirm_click, confirm_click_xy,
+    confirm_hover, confirm_input, confirm_key_combo, confirm_key_combo_in_context, confirm_select,
     confirm_typed_text, confirm_typed_text_in_context, confirm_upload, dialog_confirmation,
     indeterminate_actuation_confirmation, unconfirmed_dialog_opening,
 };
@@ -33,9 +33,8 @@ mod tests {
     };
     use chromiumoxide::cdp::js_protocol::runtime::ExecutionContextId;
 
-    #[test]
-    fn page_mutated_detects_dom_fingerprint_changes() {
-        let before = PageObservation {
+    fn sample_page_observation() -> PageObservation {
+        PageObservation {
             available: true,
             url: Some("https://example.com".to_string()),
             title: Some("Example".to_string()),
@@ -44,7 +43,12 @@ mod tests {
             text_length: Some(12),
             markup_hash: Some(99),
             context_replaced: false,
-        };
+        }
+    }
+
+    #[test]
+    fn page_mutated_detects_dom_fingerprint_changes() {
+        let before = sample_page_observation();
         let after = PageObservation {
             text_hash: Some(11),
             ..before.clone()
@@ -54,16 +58,7 @@ mod tests {
 
     #[test]
     fn page_mutated_detects_markup_only_changes() {
-        let before = PageObservation {
-            available: true,
-            url: Some("https://example.com".to_string()),
-            title: Some("Example".to_string()),
-            element_count: Some(3),
-            text_hash: Some(10),
-            text_length: Some(12),
-            markup_hash: Some(99),
-            context_replaced: false,
-        };
+        let before = sample_page_observation();
         let after = PageObservation {
             markup_hash: Some(100),
             ..before.clone()
@@ -73,16 +68,7 @@ mod tests {
 
     #[test]
     fn page_probe_loss_is_degraded_not_confirmed_mutation() {
-        let before = PageObservation {
-            available: true,
-            url: Some("https://example.com".to_string()),
-            title: Some("Example".to_string()),
-            element_count: Some(3),
-            text_hash: Some(10),
-            text_length: Some(12),
-            markup_hash: Some(99),
-            context_replaced: false,
-        };
+        let before = sample_page_observation();
         let after = PageObservation {
             available: false,
             url: None,

@@ -5,9 +5,12 @@ use chromiumoxide::Page;
 use chromiumoxide::cdp::js_protocol::runtime::{ExecutionContextId, RemoteObjectId};
 use rub_core::error::RubError;
 use rub_core::model::{
-    ElementTag, InteractionConfirmation, InteractionConfirmationKind, InteractionConfirmationStatus,
+    ElementTag, InteractionConfirmation, InteractionConfirmationKind,
+    InteractionConfirmationStatus, PendingDialogInfo,
 };
+use serde::Serialize;
 use serde_json::json;
+use std::future::Future;
 use std::sync::Arc;
 use tokio::time::{Duration, Instant};
 use tracing::info;
@@ -17,11 +20,11 @@ use self::support::{
 };
 pub(crate) use self::value::{confirm_input, confirm_select, confirm_upload};
 use super::observation::{
-    ActiveInteractionBaseline, InteractionBaseline, active_element_changed, active_element_matches,
-    confirmation_observation_degraded, element_state_changed, observe_active_element,
-    observe_active_element_in_context, observe_element, observe_page, observe_page_in_context,
-    observe_related_page, page_changed, page_mutated, typed_effect_contradicted,
-    typed_effect_observed,
+    ActiveElementObservation, ActiveInteractionBaseline, InteractionBaseline,
+    active_element_changed, active_element_matches, confirmation_observation_degraded,
+    element_state_changed, observe_active_element, observe_active_element_in_context,
+    observe_element, observe_page, observe_page_in_context, observe_related_page, page_changed,
+    page_mutated, typed_effect_contradicted, typed_effect_observed,
 };
 use crate::dialogs::{SharedDialogRuntime, pending_dialog_for_target};
 
@@ -66,7 +69,7 @@ pub(crate) async fn capture_dialog_fence_baseline(
 }
 
 fn dialog_is_new_since_baseline(
-    dialog: &rub_core::model::PendingDialogInfo,
+    dialog: &PendingDialogInfo,
     baseline: &DialogFenceBaseline,
 ) -> bool {
     baseline.previous_opened_at.as_deref() != Some(dialog.opened_at.as_str())
@@ -76,9 +79,50 @@ async fn pending_dialog_for_target_since(
     dialog_runtime: &SharedDialogRuntime,
     expected_target_id: &str,
     baseline: &DialogFenceBaseline,
-) -> Option<rub_core::model::PendingDialogInfo> {
+) -> Option<PendingDialogInfo> {
     let dialog = pending_dialog_for_target(dialog_runtime, expected_target_id).await?;
     dialog_is_new_since_baseline(&dialog, baseline).then_some(dialog)
+}
+
+fn dialog_confirmation_details(dialog: PendingDialogInfo) -> serde_json::Value {
+    json!({
+        "kind": dialog.kind,
+        "message": dialog.message,
+        "url": dialog.url,
+        "frame_id": dialog.frame_id,
+        "default_prompt": dialog.default_prompt,
+        "opened_at": dialog.opened_at,
+    })
+}
+
+fn active_page_observation_details(
+    before_active: Option<&ActiveElementObservation>,
+    after_active: Option<&ActiveElementObservation>,
+    before_page: impl Serialize,
+    after_page: impl Serialize,
+) -> serde_json::Value {
+    json!({
+        "before_active": before_active.map(|active| &active.observation),
+        "after_active": after_active.map(|active| &active.observation),
+        "before_page": before_page,
+        "after_page": after_page,
+    })
+}
+
+fn typed_active_page_observation_details(
+    typed_text: &str,
+    before_active: Option<&ActiveElementObservation>,
+    after_active: Option<&ActiveElementObservation>,
+    before_page: impl Serialize,
+    after_page: impl Serialize,
+) -> serde_json::Value {
+    json!({
+        "typed_text": typed_text,
+        "before_active": before_active.map(|active| &active.observation),
+        "after_active": after_active.map(|active| &active.observation),
+        "before_page": before_page,
+        "after_page": after_page,
+    })
 }
 
 pub(crate) async fn await_actuation_or_dialog<F>(
@@ -88,7 +132,7 @@ pub(crate) async fn await_actuation_or_dialog<F>(
     expected_target_id: &str,
 ) -> Result<ActuationFenceOutcome, RubError>
 where
-    F: std::future::Future<Output = Result<(), RubError>> + Send + 'static,
+    F: Future<Output = Result<(), RubError>> + Send + 'static,
 {
     let outcome =
         await_actuation_result_or_dialog(actuation, dialog_runtime, label, expected_target_id)
@@ -106,7 +150,7 @@ pub(crate) async fn await_actuation_result_or_dialog<F, T>(
     expected_target_id: &str,
 ) -> Result<ActuationResultFenceOutcome<T>, RubError>
 where
-    F: std::future::Future<Output = Result<T, RubError>> + Send + 'static,
+    F: Future<Output = Result<T, RubError>> + Send + 'static,
     T: Send + 'static,
 {
     let dialog_baseline = capture_dialog_fence_baseline(&dialog_runtime, expected_target_id).await;
@@ -172,14 +216,7 @@ pub(crate) async fn dialog_confirmation(
     Some(InteractionConfirmation {
         status: InteractionConfirmationStatus::Confirmed,
         kind: Some(InteractionConfirmationKind::DialogOpened),
-        details: Some(json!({
-            "kind": dialog.kind,
-            "message": dialog.message,
-            "url": dialog.url,
-            "frame_id": dialog.frame_id,
-            "default_prompt": dialog.default_prompt,
-            "opened_at": dialog.opened_at,
-        })),
+        details: Some(dialog_confirmation_details(dialog)),
     })
 }
 
@@ -223,14 +260,7 @@ pub(crate) async fn confirm_click(
         {
             return confirmed(
                 InteractionConfirmationKind::DialogOpened,
-                json!({
-                    "kind": dialog.kind,
-                    "message": dialog.message,
-                    "url": dialog.url,
-                    "frame_id": dialog.frame_id,
-                    "default_prompt": dialog.default_prompt,
-                    "opened_at": dialog.opened_at,
-                }),
+                dialog_confirmation_details(dialog),
             );
         }
 
@@ -356,14 +386,7 @@ pub(crate) async fn confirm_click_xy(
         {
             return confirmed(
                 InteractionConfirmationKind::DialogOpened,
-                json!({
-                    "kind": dialog.kind,
-                    "message": dialog.message,
-                    "url": dialog.url,
-                    "frame_id": dialog.frame_id,
-                    "default_prompt": dialog.default_prompt,
-                    "opened_at": dialog.opened_at,
-                }),
+                dialog_confirmation_details(dialog),
             );
         }
 
@@ -607,21 +630,21 @@ pub(crate) async fn confirm_key_combo_in_context(
             ) {
                 return degraded(
                     Some(InteractionConfirmationKind::ElementStateChange),
-                    json!({
-                        "before_active": before_active.as_ref().map(|active| &active.observation),
-                        "after_active": after_active.as_ref().map(|active| &active.observation),
-                        "before_page": before_page,
-                        "after_page": after_page,
-                    }),
+                    active_page_observation_details(
+                        before_active.as_ref(),
+                        after_active.as_ref(),
+                        before_page,
+                        after_page,
+                    ),
                 );
             }
 
-            return unconfirmed(json!({
-                "before_active": before_active.as_ref().map(|active| &active.observation),
-                "after_active": after_active.as_ref().map(|active| &active.observation),
-                "before_page": before_page,
-                "after_page": after_page,
-            }));
+            return unconfirmed(active_page_observation_details(
+                before_active.as_ref(),
+                after_active.as_ref(),
+                before_page,
+                after_page,
+            ));
         }
 
         sleep_observation_step(&mut poll_count).await;
@@ -714,13 +737,13 @@ pub(crate) async fn confirm_typed_text_in_context(
             ) {
                 return degraded(
                     Some(InteractionConfirmationKind::ValueApplied),
-                    json!({
-                        "typed_text": typed_text,
-                        "before_active": before_active.as_ref().map(|active| &active.observation),
-                        "after_active": after_active.as_ref().map(|active| &active.observation),
-                        "before_page": before_page,
-                        "after_page": after_page,
-                    }),
+                    typed_active_page_observation_details(
+                        typed_text,
+                        before_active.as_ref(),
+                        after_active.as_ref(),
+                        before_page,
+                        after_page,
+                    ),
                 );
             }
 
@@ -738,13 +761,13 @@ pub(crate) async fn confirm_typed_text_in_context(
                 );
             }
 
-            return unconfirmed(json!({
-                "typed_text": typed_text,
-                "before_active": before_active.as_ref().map(|active| &active.observation),
-                "after_active": after_active.as_ref().map(|active| &active.observation),
-                "before_page": before_page,
-                "after_page": after_page,
-            }));
+            return unconfirmed(typed_active_page_observation_details(
+                typed_text,
+                before_active.as_ref(),
+                after_active.as_ref(),
+                before_page,
+                after_page,
+            ));
         }
 
         sleep_observation_step(&mut poll_count).await;

@@ -1,12 +1,11 @@
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rub_core::error::ErrorCode;
 use rub_core::error::RubError;
 use rub_daemon::rub_paths::RubPaths;
 use rub_ipc::client::IpcClient;
-use serde_json::json;
+use serde_json::{Value, json};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
@@ -744,51 +743,51 @@ fn annotate_failed_startup_cleanup(
         .unwrap_or_default();
     context.insert(
         "startup_fallback_browser_cleanup_attempted".to_string(),
-        serde_json::json!(true),
+        json!(true),
     );
     context.insert(
         "startup_fallback_browser_cleanup_succeeded".to_string(),
-        serde_json::json!(cleanup_summary.browser_cleanup_succeeded),
+        json!(cleanup_summary.browser_cleanup_succeeded),
     );
     context.insert(
         "startup_fallback_browser_cleanup_proof_retained".to_string(),
-        serde_json::json!(cleanup_summary.browser_cleanup_proof_retained),
+        json!(cleanup_summary.browser_cleanup_proof_retained),
     );
     context.insert(
         "startup_fallback_cleanup_timed_out".to_string(),
-        serde_json::json!(cleanup_summary.cleanup_timeout_exhausted),
+        json!(cleanup_summary.cleanup_timeout_exhausted),
     );
     if let Some(proof) = cleanup_summary.browser_cleanup_authority {
         context.insert(
             "startup_fallback_browser_cleanup_authority".to_string(),
-            serde_json::to_value(proof).unwrap_or(serde_json::Value::Null),
+            serde_json::to_value(proof).unwrap_or(Value::Null),
         );
     }
     if let Some(error) = cleanup_summary.browser_cleanup_error {
         context.insert(
             "startup_fallback_browser_cleanup_error".to_string(),
-            serde_json::json!(error),
+            json!(error),
         );
     }
     if let Some(error) = cleanup_summary.browser_cleanup_proof_clear_error {
         context.insert(
             "startup_fallback_browser_cleanup_proof_clear_error".to_string(),
-            serde_json::json!(error),
+            json!(error),
         );
     }
     if let Some(phase) = cleanup_summary.cleanup_timeout_phase {
         context.insert(
             "startup_fallback_cleanup_timeout_phase".to_string(),
-            serde_json::json!(phase),
+            json!(phase),
         );
     }
     if let Some(timeout_ms) = cleanup_summary.cleanup_timeout_ms {
         context.insert(
             "startup_fallback_cleanup_timeout_ms".to_string(),
-            serde_json::json!(timeout_ms),
+            json!(timeout_ms),
         );
     }
-    envelope.context = Some(serde_json::Value::Object(context));
+    envelope.context = Some(Value::Object(context));
     RubError::Domain(envelope)
 }
 
@@ -799,6 +798,19 @@ mod tests {
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::now_v7()))
+    }
+
+    fn write_managed_profile_cleanup_proof(cleanup_file: &Path, profile_dir: &Path) {
+        crate::daemon_ctl::write_startup_cleanup_proof_at(
+            cleanup_file,
+            &StartupCleanupProof {
+                kind: StartupCleanupAuthorityKind::ManagedBrowserProfileFallback,
+                managed_user_data_dir: profile_dir.display().to_string(),
+                managed_profile_directory: Some("Profile 3".to_string()),
+                ephemeral: false,
+            },
+        )
+        .expect("write startup cleanup proof");
     }
 
     #[test]
@@ -880,16 +892,7 @@ mod tests {
         let cleanup_file = temp_path("rub-startup-cleanup-proof");
         let profile_dir = temp_path("rub-startup-cleanup-profile");
         std::fs::create_dir_all(&profile_dir).expect("create profile dir");
-        crate::daemon_ctl::write_startup_cleanup_proof_at(
-            &cleanup_file,
-            &StartupCleanupProof {
-                kind: StartupCleanupAuthorityKind::ManagedBrowserProfileFallback,
-                managed_user_data_dir: profile_dir.display().to_string(),
-                managed_profile_directory: Some("Profile 3".to_string()),
-                ephemeral: false,
-            },
-        )
-        .expect("write startup cleanup proof");
+        write_managed_profile_cleanup_proof(&cleanup_file, &profile_dir);
 
         let (attempted, succeeded, _authority, error, retained, clear_error) =
             cleanup_startup_fallback_browser_authority_for_test(&cleanup_file).await;
@@ -908,16 +911,7 @@ mod tests {
     async fn startup_fallback_cleanup_retains_proof_when_cleanup_fails() {
         let cleanup_file = temp_path("rub-startup-cleanup-proof");
         let profile_dir = temp_path("rub-startup-cleanup-profile");
-        crate::daemon_ctl::write_startup_cleanup_proof_at(
-            &cleanup_file,
-            &StartupCleanupProof {
-                kind: StartupCleanupAuthorityKind::ManagedBrowserProfileFallback,
-                managed_user_data_dir: profile_dir.display().to_string(),
-                managed_profile_directory: Some("Profile 3".to_string()),
-                ephemeral: false,
-            },
-        )
-        .expect("write startup cleanup proof");
+        write_managed_profile_cleanup_proof(&cleanup_file, &profile_dir);
         force_startup_fallback_cleanup_failure_for_test(&profile_dir);
 
         let (attempted, succeeded, _authority, error, retained, clear_error) =
@@ -937,16 +931,7 @@ mod tests {
     async fn startup_fallback_cleanup_retains_proof_when_command_deadline_is_exhausted() {
         let cleanup_file = temp_path("rub-startup-cleanup-proof");
         let profile_dir = temp_path("rub-startup-cleanup-profile");
-        crate::daemon_ctl::write_startup_cleanup_proof_at(
-            &cleanup_file,
-            &StartupCleanupProof {
-                kind: StartupCleanupAuthorityKind::ManagedBrowserProfileFallback,
-                managed_user_data_dir: profile_dir.display().to_string(),
-                managed_profile_directory: Some("Profile 3".to_string()),
-                ephemeral: false,
-            },
-        )
-        .expect("write startup cleanup proof");
+        write_managed_profile_cleanup_proof(&cleanup_file, &profile_dir);
 
         let (
             attempted,

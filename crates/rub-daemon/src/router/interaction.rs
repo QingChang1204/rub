@@ -12,12 +12,14 @@ use self::projection::{
 };
 use super::addressing::resolve_element;
 use super::artifacts::annotate_path_reference_state;
+use super::frame_scope::{effective_interaction_frame_id, semantic_replay_orchestration_metadata};
 use super::projection::{
     attach_result, attach_subject, coordinates_subject, element_subject, focused_frame_subject,
 };
 use super::request_args::{locator_json, parse_json_args};
 use super::*;
 use crate::router::timeout_projection::record_mutating_possible_commit_timeout_projection;
+use rub_core::error::ErrorCode;
 use rub_core::recovery_contract::interaction_possible_commit_contract as build_interaction_possible_commit_contract;
 
 pub(super) async fn cmd_click(
@@ -181,8 +183,7 @@ pub(super) async fn cmd_keys(
     let parsed: KeysArgs = parse_json_args(args, "keys")?;
     let combo = rub_core::model::KeyCombo::parse(&parsed.keys)?;
     let baseline = capture_interaction_baseline(router, state).await;
-    let selected_frame_id =
-        super::frame_scope::effective_interaction_frame_id(router, args, state).await?;
+    let selected_frame_id = effective_interaction_frame_id(router, args, state).await?;
     record_interaction_possible_commit_timeout_projection("keys", args);
     let outcome = router
         .browser
@@ -258,12 +259,11 @@ async fn cmd_text_entry(
         }
     } else if clear {
         return Err(RubError::domain(
-            rub_core::error::ErrorCode::InvalidInput,
+            ErrorCode::InvalidInput,
             "`type --clear` requires a target locator or index in the current baseline",
         ));
     } else {
-        let selected_frame_id =
-            super::frame_scope::effective_interaction_frame_id(router, raw_args, state).await?;
+        let selected_frame_id = effective_interaction_frame_id(router, raw_args, state).await?;
         attach_subject(
             &mut data,
             focused_frame_subject(selected_frame_id.as_deref()),
@@ -428,9 +428,7 @@ pub(crate) fn semantic_replay_args(
                 if let Some(snapshot_id) = args.get("snapshot_id") {
                     projected.insert("snapshot_id".to_string(), snapshot_id.clone());
                 }
-                if let Some(orchestration) =
-                    super::frame_scope::semantic_replay_orchestration_metadata(args)
-                {
+                if let Some(orchestration) = semantic_replay_orchestration_metadata(args) {
                     projected.insert("_orchestration".to_string(), orchestration);
                 }
             }
@@ -446,9 +444,7 @@ pub(crate) fn semantic_replay_args(
             if let Some(wait_after) = args.get("wait_after") {
                 projected.insert("wait_after".to_string(), wait_after.clone());
             }
-            if let Some(orchestration) =
-                super::frame_scope::semantic_replay_orchestration_metadata(args)
-            {
+            if let Some(orchestration) = semantic_replay_orchestration_metadata(args) {
                 projected.insert("_orchestration".to_string(), orchestration);
             }
             Some(serde_json::Value::Object(projected))
@@ -465,9 +461,7 @@ pub(crate) fn semantic_replay_args(
             if let Some(wait_after) = args.get("wait_after") {
                 projected.insert("wait_after".to_string(), wait_after.clone());
             }
-            if let Some(orchestration) =
-                super::frame_scope::semantic_replay_orchestration_metadata(args)
-            {
+            if let Some(orchestration) = semantic_replay_orchestration_metadata(args) {
                 projected.insert("_orchestration".to_string(), orchestration);
             }
             Some(serde_json::Value::Object(projected))
@@ -482,9 +476,7 @@ pub(crate) fn semantic_replay_args(
             if let Some(wait_after) = args.get("wait_after") {
                 projected.insert("wait_after".to_string(), wait_after.clone());
             }
-            if let Some(orchestration) =
-                super::frame_scope::semantic_replay_orchestration_metadata(args)
-            {
+            if let Some(orchestration) = semantic_replay_orchestration_metadata(args) {
                 projected.insert("_orchestration".to_string(), orchestration);
             }
             Some(serde_json::Value::Object(projected))
@@ -500,9 +492,7 @@ pub(crate) fn semantic_replay_args(
             if let Some(wait_after) = args.get("wait_after") {
                 projected.insert("wait_after".to_string(), wait_after.clone());
             }
-            if let Some(orchestration) =
-                super::frame_scope::semantic_replay_orchestration_metadata(args)
-            {
+            if let Some(orchestration) = semantic_replay_orchestration_metadata(args) {
                 projected.insert("_orchestration".to_string(), orchestration);
             }
             Some(serde_json::Value::Object(projected))
@@ -518,9 +508,7 @@ pub(crate) fn semantic_replay_args(
             if let Some(wait_after) = args.get("wait_after") {
                 projected.insert("wait_after".to_string(), wait_after.clone());
             }
-            if let Some(orchestration) =
-                super::frame_scope::semantic_replay_orchestration_metadata(args)
-            {
+            if let Some(orchestration) = semantic_replay_orchestration_metadata(args) {
                 projected.insert("_orchestration".to_string(), orchestration);
             }
             Some(serde_json::Value::Object(projected))

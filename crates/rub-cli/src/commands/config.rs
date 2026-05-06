@@ -6,7 +6,7 @@ use rub_daemon::rub_paths::{
 };
 use rub_ipc::protocol::MAX_IPC_TIMEOUT_MS;
 use serde::Deserialize;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use super::Commands;
 
@@ -336,59 +336,7 @@ fn parse_session_name(value: &str) -> Result<String, String> {
 }
 
 fn normalize_rub_home_path(path: impl AsRef<Path>) -> PathBuf {
-    let path = path.as_ref();
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    };
-    let normalized = collapse_path_components(&absolute);
-    if let Ok(canonical) = normalized.canonicalize() {
-        return canonical;
-    }
-    if let Some(canonicalized) = canonicalize_existing_ancestor(&normalized) {
-        return canonicalized;
-    }
-    normalized
-}
-
-fn collapse_path_components(path: &Path) -> PathBuf {
-    let mut normalized = if path.is_absolute() {
-        PathBuf::from("/")
-    } else {
-        PathBuf::new()
-    };
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => {}
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    normalized
-}
-
-fn canonicalize_existing_ancestor(path: &Path) -> Option<PathBuf> {
-    let mut probe = path;
-    let mut suffix = Vec::new();
-
-    while !probe.exists() {
-        let component = probe.file_name()?.to_os_string();
-        suffix.push(component);
-        probe = probe.parent()?;
-    }
-
-    let mut canonical = probe.canonicalize().ok()?;
-    for component in suffix.iter().rev() {
-        canonical.push(component);
-    }
-    Some(collapse_path_components(&canonical))
+    crate::path_normalization::canonical_existing_or_normalized_absolute_path(path)
 }
 
 fn config_path_state(path_kind: &str) -> PathReferenceState {
@@ -682,7 +630,7 @@ mod tests {
         let error = load_file_config(&home)
             .expect_err("invalid toml should fail")
             .into_envelope();
-        assert_eq!(error.code, rub_core::error::ErrorCode::InvalidInput);
+        assert_eq!(error.code, ErrorCode::InvalidInput);
         let context = error.context.expect("config error context");
         assert_eq!(context["reason"], "invalid_config_toml");
         assert_eq!(
@@ -707,7 +655,7 @@ mod tests {
         let error = load_file_config(&home)
             .expect_err("directory config path should fail")
             .into_envelope();
-        assert_eq!(error.code, rub_core::error::ErrorCode::InvalidInput);
+        assert_eq!(error.code, ErrorCode::InvalidInput);
         let context = error.context.expect("config read error context");
         assert_eq!(context["reason"], "config_read_failed");
         assert_eq!(context["path_state"]["path_kind"], "config_toml_file");

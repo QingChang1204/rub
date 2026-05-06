@@ -507,8 +507,8 @@ fn normalize_dialog_kind(event: &EventJavascriptDialogOpening) -> DialogKind {
 mod tests {
     use super::{
         BrowserDialogOpening, ClosedCallback, DialogCallbacks, DialogRuntimeInfo,
-        DialogRuntimeStatus, OpeningCallback, RuntimeCallback, apply_dialog_runtime_status,
-        clear_stale_pending_dialog_for_live_targets,
+        DialogRuntimeStatus, OpeningCallback, RuntimeCallback, SharedDialogRuntime,
+        apply_dialog_runtime_status, clear_stale_pending_dialog_for_live_targets,
         clear_stale_pending_dialog_for_live_targets_if, commit_dialog_hook_install_projection,
         new_shared_dialog_runtime, pending_dialog_for_target, pending_dialog_matches_target,
         publish_dialog_closed, publish_dialog_intercept_failure, publish_dialog_opening,
@@ -520,6 +520,37 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     };
+
+    fn pending_dialog_info(
+        message: &str,
+        url: &str,
+        target_id: Option<&str>,
+        opened_at: &str,
+    ) -> PendingDialogInfo {
+        PendingDialogInfo {
+            kind: DialogKind::Alert,
+            message: message.to_string(),
+            url: url.to_string(),
+            tab_target_id: target_id.map(str::to_string),
+            frame_id: None,
+            default_prompt: None,
+            has_browser_handler: true,
+            opened_at: opened_at.to_string(),
+        }
+    }
+
+    async fn set_active_pending_dialog(
+        runtime: &SharedDialogRuntime,
+        message: &str,
+        url: &str,
+        target_id: Option<&str>,
+        opened_at: &str,
+    ) {
+        let mut state = runtime.write().await;
+        state.status = DialogRuntimeStatus::Active;
+        state.pending_dialog = Some(pending_dialog_info(message, url, target_id, opened_at));
+        state.last_dialog = state.pending_dialog.clone();
+    }
 
     #[test]
     fn empty_callbacks_report_empty() {
@@ -564,16 +595,12 @@ mod tests {
         {
             let mut state = runtime.write().await;
             state.status = DialogRuntimeStatus::Active;
-            state.pending_dialog = Some(rub_core::model::PendingDialogInfo {
-                kind: DialogKind::Alert,
-                message: "Background dialog".to_string(),
-                url: "https://example.com".to_string(),
-                tab_target_id: Some("target-1".to_string()),
-                frame_id: None,
-                default_prompt: None,
-                has_browser_handler: true,
-                opened_at: "2026-01-01T00:00:00Z".to_string(),
-            });
+            state.pending_dialog = Some(pending_dialog_info(
+                "Background dialog",
+                "https://example.com",
+                Some("target-1"),
+                "2026-01-01T00:00:00Z",
+            ));
             state.last_dialog = state.pending_dialog.clone();
         }
 
@@ -594,16 +621,12 @@ mod tests {
         let runtime = new_shared_dialog_runtime();
         {
             let mut state = runtime.write().await;
-            state.pending_dialog = Some(rub_core::model::PendingDialogInfo {
-                kind: DialogKind::Alert,
-                message: "Background dialog".to_string(),
-                url: "https://example.com".to_string(),
-                tab_target_id: Some("target-1".to_string()),
-                frame_id: None,
-                default_prompt: None,
-                has_browser_handler: true,
-                opened_at: "2026-01-01T00:00:00Z".to_string(),
-            });
+            state.pending_dialog = Some(pending_dialog_info(
+                "Background dialog",
+                "https://example.com",
+                Some("target-1"),
+                "2026-01-01T00:00:00Z",
+            ));
         }
 
         let matching = pending_dialog_for_target(&runtime, "target-1")
@@ -621,21 +644,14 @@ mod tests {
     #[tokio::test]
     async fn stale_pending_dialog_target_is_cleared_and_degraded_when_tab_authority_is_gone() {
         let runtime = new_shared_dialog_runtime();
-        {
-            let mut state = runtime.write().await;
-            state.status = DialogRuntimeStatus::Active;
-            state.pending_dialog = Some(rub_core::model::PendingDialogInfo {
-                kind: DialogKind::Alert,
-                message: "Detached dialog".to_string(),
-                url: "https://example.com".to_string(),
-                tab_target_id: Some("target-1".to_string()),
-                frame_id: None,
-                default_prompt: None,
-                has_browser_handler: true,
-                opened_at: "2026-01-01T00:00:00Z".to_string(),
-            });
-            state.last_dialog = state.pending_dialog.clone();
-        }
+        set_active_pending_dialog(
+            &runtime,
+            "Detached dialog",
+            "https://example.com",
+            Some("target-1"),
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
 
         let live_target_ids = HashSet::from(["target-2".to_string()]);
         let projection = clear_stale_pending_dialog_for_live_targets(&runtime, &live_target_ids)
@@ -660,21 +676,14 @@ mod tests {
     #[tokio::test]
     async fn stale_pending_dialog_cleanup_respects_commit_fence_before_mutation() {
         let runtime = new_shared_dialog_runtime();
-        {
-            let mut state = runtime.write().await;
-            state.status = DialogRuntimeStatus::Active;
-            state.pending_dialog = Some(rub_core::model::PendingDialogInfo {
-                kind: DialogKind::Alert,
-                message: "Detached dialog".to_string(),
-                url: "https://example.com".to_string(),
-                tab_target_id: Some("target-1".to_string()),
-                frame_id: None,
-                default_prompt: None,
-                has_browser_handler: true,
-                opened_at: "2026-01-01T00:00:00Z".to_string(),
-            });
-            state.last_dialog = state.pending_dialog.clone();
-        }
+        set_active_pending_dialog(
+            &runtime,
+            "Detached dialog",
+            "https://example.com",
+            Some("target-1"),
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
 
         let live_target_ids = HashSet::from(["target-2".to_string()]);
         assert!(
@@ -700,16 +709,12 @@ mod tests {
         {
             let mut state = runtime.write().await;
             state.status = DialogRuntimeStatus::Active;
-            state.pending_dialog = Some(rub_core::model::PendingDialogInfo {
-                kind: DialogKind::Alert,
-                message: "Still live".to_string(),
-                url: "https://example.com".to_string(),
-                tab_target_id: Some("target-1".to_string()),
-                frame_id: None,
-                default_prompt: None,
-                has_browser_handler: true,
-                opened_at: "2026-01-01T00:00:00Z".to_string(),
-            });
+            state.pending_dialog = Some(pending_dialog_info(
+                "Still live",
+                "https://example.com",
+                Some("target-1"),
+                "2026-01-01T00:00:00Z",
+            ));
         }
 
         let live_target_ids = HashSet::from(["target-1".to_string()]);
@@ -835,21 +840,14 @@ mod tests {
     #[tokio::test]
     async fn publish_dialog_closed_is_suppressed_while_authority_release_is_in_progress() {
         let runtime = new_shared_dialog_runtime();
-        {
-            let mut state = runtime.write().await;
-            state.status = DialogRuntimeStatus::Active;
-            state.pending_dialog = Some(PendingDialogInfo {
-                kind: DialogKind::Alert,
-                message: "old authority dialog".to_string(),
-                url: "https://example.test/dialog".to_string(),
-                tab_target_id: Some("tab-1".to_string()),
-                frame_id: None,
-                default_prompt: None,
-                has_browser_handler: true,
-                opened_at: "2026-04-24T00:00:00Z".to_string(),
-            });
-            state.last_dialog = state.pending_dialog.clone();
-        }
+        set_active_pending_dialog(
+            &runtime,
+            "old authority dialog",
+            "https://example.test/dialog",
+            Some("tab-1"),
+            "2026-04-24T00:00:00Z",
+        )
+        .await;
         let callback_called = Arc::new(AtomicBool::new(false));
         let callback_called_for_callback = callback_called.clone();
         let callback: ClosedCallback = Arc::new(move |_| {
@@ -884,21 +882,14 @@ mod tests {
     #[tokio::test]
     async fn publish_dialog_closed_rechecks_release_fence_after_waiting_for_write_authority() {
         let runtime = new_shared_dialog_runtime();
-        {
-            let mut state = runtime.write().await;
-            state.status = DialogRuntimeStatus::Active;
-            state.pending_dialog = Some(PendingDialogInfo {
-                kind: DialogKind::Alert,
-                message: "old authority dialog".to_string(),
-                url: "https://example.test/dialog".to_string(),
-                tab_target_id: Some("tab-1".to_string()),
-                frame_id: None,
-                default_prompt: None,
-                has_browser_handler: true,
-                opened_at: "2026-04-24T00:00:00Z".to_string(),
-            });
-            state.last_dialog = state.pending_dialog.clone();
-        }
+        set_active_pending_dialog(
+            &runtime,
+            "old authority dialog",
+            "https://example.test/dialog",
+            Some("tab-1"),
+            "2026-04-24T00:00:00Z",
+        )
+        .await;
         let write_guard = runtime.write().await;
         let release_in_progress = Arc::new(AtomicBool::new(false));
         let callback_called = Arc::new(AtomicBool::new(false));
@@ -945,16 +936,12 @@ mod tests {
         {
             let mut state = runtime.write().await;
             state.status = DialogRuntimeStatus::Active;
-            state.pending_dialog = Some(PendingDialogInfo {
-                kind: DialogKind::Alert,
-                message: "blocked".to_string(),
-                url: "https://example.test/dialog".to_string(),
-                tab_target_id: Some("tab-1".to_string()),
-                frame_id: None,
-                default_prompt: None,
-                has_browser_handler: true,
-                opened_at: "2026-04-24T00:00:00Z".to_string(),
-            });
+            state.pending_dialog = Some(pending_dialog_info(
+                "blocked",
+                "https://example.test/dialog",
+                Some("tab-1"),
+                "2026-04-24T00:00:00Z",
+            ));
         }
         let delivered = Arc::new(Mutex::new(Vec::<DialogRuntimeInfo>::new()));
         let delivered_for_callback = delivered.clone();
@@ -1046,31 +1033,11 @@ mod intercept_policy_tests {
             Arc::new(Mutex::new(Some(policy(true, Some("tab-A")))));
 
         // First take — should succeed
-        let taken = {
-            let mut guard = intercept.lock().unwrap();
-            if guard
-                .as_ref()
-                .is_some_and(|p| intercept_policy_matches(p, "tab-A"))
-            {
-                guard.take()
-            } else {
-                None
-            }
-        };
+        let taken = take_matching_intercept_policy(&intercept, "tab-A");
         assert!(taken.is_some(), "first take must succeed");
 
         // Second take on the same tab — slot is empty, must return None
-        let taken_again = {
-            let mut guard = intercept.lock().unwrap();
-            if guard
-                .as_ref()
-                .is_some_and(|p| intercept_policy_matches(p, "tab-A"))
-            {
-                guard.take()
-            } else {
-                None
-            }
-        };
+        let taken_again = take_matching_intercept_policy(&intercept, "tab-A");
         assert!(
             taken_again.is_none(),
             "one-shot: second take must be None — policy must not repeat"

@@ -31,6 +31,11 @@ use command::OrchestrationIdArgs;
 
 const ORCHESTRATION_ADDRESS_TIMEOUT_MS: u64 = 5_000;
 
+#[cfg(test)]
+pub(super) fn test_router() -> DaemonRouter {
+    crate::test_support::daemon_router()
+}
+
 pub(super) async fn cmd_orchestration(
     router: &DaemonRouter,
     args: &serde_json::Value,
@@ -133,17 +138,17 @@ pub(crate) fn orchestration_degraded_authority_error(
     reason: &'static str,
     extra_context: serde_json::Value,
 ) -> ErrorEnvelope {
-    let mut context = serde_json::json!({
-        "reason": reason,
-    });
-    if let (Some(context_object), Some(extra_object)) =
-        (context.as_object_mut(), extra_context.as_object())
-    {
-        for (key, value) in extra_object {
-            context_object.insert(key.clone(), value.clone());
-        }
-    }
-    ErrorEnvelope::new(ErrorCode::SessionBusy, message).with_context(context)
+    let mut context = serde_json::Map::from_iter([(
+        "reason".to_string(),
+        serde_json::Value::String(reason.to_string()),
+    )]);
+    context.extend(extra_context.as_object().into_iter().flat_map(|extra| {
+        extra
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+    }));
+    ErrorEnvelope::new(ErrorCode::SessionBusy, message)
+        .with_context(serde_json::Value::Object(context))
 }
 
 pub(super) async fn cmd_orchestration_workflow_source_vars(
@@ -417,17 +422,16 @@ mod tests {
     use super::{
         OrchestrationIdArgs, cmd_orchestration_probe, cmd_orchestration_tab_frames,
         cmd_orchestration_target_dispatch, cmd_orchestration_workflow_source_vars,
-        command::required_u32_arg, ensure_transport_safe_target_dispatch_request,
+        command::required_u32_arg, ensure_transport_safe_target_dispatch_request, test_router,
     };
+    use crate::router::TransactionDeadline;
     use crate::router::request_args::parse_json_args;
-    use crate::router::{DaemonRouter, TransactionDeadline};
     use crate::session::SessionState;
     use rub_core::error::ErrorCode;
     use rub_core::model::OrchestrationRuntimeInfo;
     use rub_ipc::protocol::IpcRequest;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
     #[test]
@@ -480,30 +484,6 @@ mod tests {
                 "orchestration_target_dispatch_inner_command_internal"
             ))
         );
-    }
-
-    fn test_router() -> DaemonRouter {
-        let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
-            rub_cdp::browser::BrowserLaunchOptions {
-                headless: true,
-                ignore_cert_errors: false,
-                user_data_dir: None,
-                managed_profile_ephemeral: false,
-                download_dir: None,
-                profile_directory: None,
-                hide_infobars: true,
-                stealth: true,
-            },
-        ));
-        let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
-            manager,
-            Arc::new(AtomicU64::new(0)),
-            rub_cdp::humanize::HumanizeConfig {
-                enabled: false,
-                speed: rub_cdp::humanize::HumanizeSpeed::Normal,
-            },
-        ));
-        DaemonRouter::new(adapter)
     }
 
     fn expired_deadline() -> TransactionDeadline {

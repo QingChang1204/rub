@@ -131,6 +131,16 @@ pub fn read_hard_cut_release_pending_proof(
     Ok(Some(proof))
 }
 
+fn remove_file_if_exists(path: impl AsRef<Path>) -> std::io::Result<()> {
+    fs::remove_file(path).or_else(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    })
+}
+
 pub fn clear_hard_cut_release_pending_proof(
     home: &Path,
     session_name: &str,
@@ -138,11 +148,7 @@ pub fn clear_hard_cut_release_pending_proof(
     let path = RubPaths::new(home)
         .session(session_name)
         .hard_cut_release_pending_path();
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
+    remove_file_if_exists(path)
 }
 
 pub fn hard_cut_release_pending_blocks_entry(home: &Path, entry: &RegistryEntry) -> bool {
@@ -185,8 +191,7 @@ fn hard_cut_release_pending_profile_still_held(
     user_data_dir: &str,
 ) -> Result<bool, rub_core::error::RubError> {
     #[cfg(test)]
-    if FORCE_HARD_CUT_RELEASE_PENDING_PROFILE_OBSERVATION_FAILURE.with(|force| force.replace(false))
-    {
+    if FORCE_HARD_CUT_RELEASE_PENDING_PROFILE_OBSERVATION_FAILURE.replace(false) {
         return Err(rub_core::error::RubError::domain(
             rub_core::error::ErrorCode::BrowserLaunchFailed,
             "forced hard-cut release-pending profile observation failure",
@@ -197,7 +202,7 @@ fn hard_cut_release_pending_profile_still_held(
 
 #[cfg(test)]
 pub(crate) fn force_hard_cut_release_pending_profile_observation_failure_for_test() {
-    FORCE_HARD_CUT_RELEASE_PENDING_PROFILE_OBSERVATION_FAILURE.with(|force| force.set(true));
+    FORCE_HARD_CUT_RELEASE_PENDING_PROFILE_OBSERVATION_FAILURE.set(true);
 }
 
 pub fn rfc3339_now() -> String {

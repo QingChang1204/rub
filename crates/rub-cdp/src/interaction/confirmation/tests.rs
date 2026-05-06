@@ -8,6 +8,19 @@ use rub_core::model::{
 };
 use std::time::Duration;
 
+fn pending_dialog_info() -> PendingDialogInfo {
+    PendingDialogInfo {
+        kind: DialogKind::Alert,
+        message: "Hello".to_string(),
+        url: "https://example.test".to_string(),
+        tab_target_id: Some("tab-1".to_string()),
+        frame_id: Some("frame-a".to_string()),
+        default_prompt: None,
+        has_browser_handler: false,
+        opened_at: "2026-01-01T00:00:00Z".to_string(),
+    }
+}
+
 #[test]
 fn observation_poll_delay_uses_bounded_backoff() {
     assert_eq!(observation_poll_delay(0), OBSERVATION_INTERVAL);
@@ -22,16 +35,7 @@ async fn dialog_confirmation_is_target_scoped() {
     let runtime = new_shared_dialog_runtime();
     {
         let mut state = runtime.write().await;
-        state.pending_dialog = Some(PendingDialogInfo {
-            kind: DialogKind::Alert,
-            message: "Hello".to_string(),
-            url: "https://example.test".to_string(),
-            tab_target_id: Some("tab-1".to_string()),
-            frame_id: Some("frame-a".to_string()),
-            default_prompt: None,
-            has_browser_handler: false,
-            opened_at: "2026-01-01T00:00:00Z".to_string(),
-        });
+        state.pending_dialog = Some(pending_dialog_info());
     }
 
     let confirmation = dialog_confirmation(
@@ -71,16 +75,7 @@ async fn dialog_confirmation_ignores_same_target_dialog_from_before_actuation() 
     let runtime = new_shared_dialog_runtime();
     {
         let mut state = runtime.write().await;
-        state.pending_dialog = Some(PendingDialogInfo {
-            kind: DialogKind::Alert,
-            message: "Hello".to_string(),
-            url: "https://example.test".to_string(),
-            tab_target_id: Some("tab-1".to_string()),
-            frame_id: Some("frame-a".to_string()),
-            default_prompt: None,
-            has_browser_handler: false,
-            opened_at: "2026-01-01T00:00:00Z".to_string(),
-        });
+        state.pending_dialog = Some(pending_dialog_info());
     }
 
     assert!(

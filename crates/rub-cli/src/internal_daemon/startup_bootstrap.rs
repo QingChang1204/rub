@@ -1,7 +1,7 @@
 use crate::commands::EffectiveCli;
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 use rub_core::model::PathReferenceState;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::path::Path;
 
 pub(super) const SESSION_ID_ENV: &str = "RUB_SESSION_ID";
@@ -29,15 +29,12 @@ pub(super) fn internal_daemon_path_state(
     }
 }
 
-pub(super) fn rub_home_startup_error(
-    rub_home: &std::path::Path,
-    error: &std::io::Error,
-) -> ErrorEnvelope {
+pub(super) fn rub_home_startup_error(rub_home: &Path, error: &std::io::Error) -> ErrorEnvelope {
     ErrorEnvelope::new(
         ErrorCode::DaemonStartFailed,
         format!("Cannot create RUB_HOME {}: {error}", rub_home.display()),
     )
-    .with_context(serde_json::json!({
+    .with_context(json!({
         "rub_home": rub_home.display().to_string(),
         "rub_home_state": internal_daemon_path_state(
             "cli.internal_daemon.rub_home",
@@ -48,8 +45,8 @@ pub(super) fn rub_home_startup_error(
     }))
 }
 
-pub(super) fn daemon_runtime_error(rub_home: &std::path::Path, message: String) -> ErrorEnvelope {
-    ErrorEnvelope::new(ErrorCode::DaemonStartFailed, message).with_context(serde_json::json!({
+pub(super) fn daemon_runtime_error(rub_home: &Path, message: String) -> ErrorEnvelope {
+    ErrorEnvelope::new(ErrorCode::DaemonStartFailed, message).with_context(json!({
         "rub_home": rub_home.display().to_string(),
         "rub_home_state": internal_daemon_path_state(
             "cli.internal_daemon.rub_home",
@@ -113,7 +110,7 @@ pub(super) fn resolve_startup_session_id() -> Result<String, ErrorEnvelope> {
             ErrorCode::DaemonStartFailed,
             format!("Invalid {SESSION_ID_ENV}: {reason}"),
         )
-        .with_context(serde_json::json!({
+        .with_context(json!({
             "env": SESSION_ID_ENV,
             "session_id": session_id,
             "reason": "invalid_session_id_component",
@@ -130,7 +127,7 @@ pub(super) fn resolve_cli_or_env_session_id(cli: &EffectiveCli) -> Result<String
                 ErrorCode::DaemonStartFailed,
                 format!("Invalid --session-id: {reason}"),
             )
-            .with_context(serde_json::json!({
+            .with_context(json!({
                 "flag": "--session-id",
                 "session_id": session_id,
                 "reason": "invalid_session_id_component",

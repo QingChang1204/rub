@@ -1,6 +1,21 @@
+use super::worker::run_browser_event_worker;
 use super::*;
 use crate::session::protocol::DOWNLOAD_PROGRESS_OVERFLOW_REASON;
-use std::sync::atomic::Ordering;
+use rub_core::model::{DownloadRuntimeInfo, DownloadState};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tokio::sync::mpsc::{Sender, UnboundedSender};
+
+struct BrowserSessionIngressParts {
+    critical_tx: UnboundedSender<BrowserSessionEvent>,
+    progress_tx: Sender<BrowserSessionEvent>,
+    progress_overflow_coordination: Arc<Mutex<()>>,
+    progress_overflow_latched: Arc<AtomicBool>,
+    progress_overflow_latched_generation: Arc<AtomicU64>,
+    progress_overflow_latched_sequence: Arc<AtomicU64>,
+    progress_overflow_reopen_generation: Arc<AtomicU64>,
+    progress_overflow_reopen_sequence: Arc<AtomicU64>,
+}
 
 impl BrowserSessionEventSink {
     pub fn new(state: &Arc<SessionState>) -> Self {
@@ -13,19 +28,19 @@ impl BrowserSessionEventSink {
         let (progress_tx, progress_rx) =
             tokio::sync::mpsc::channel::<BrowserSessionEvent>(progress_capacity);
         let worker_state = state.clone();
-        let progress_overflow_coordination = Arc::new(std::sync::Mutex::new(()));
-        let progress_overflow_latched = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let progress_overflow_latched_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let progress_overflow_latched_sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let progress_overflow_reopen_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let progress_overflow_reopen_sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let progress_overflow_coordination = Arc::new(Mutex::new(()));
+        let progress_overflow_latched = Arc::new(AtomicBool::new(false));
+        let progress_overflow_latched_generation = Arc::new(AtomicU64::new(0));
+        let progress_overflow_latched_sequence = Arc::new(AtomicU64::new(0));
+        let progress_overflow_reopen_generation = Arc::new(AtomicU64::new(0));
+        let progress_overflow_reopen_sequence = Arc::new(AtomicU64::new(0));
         let worker_progress_overflow_latched = progress_overflow_latched.clone();
         let worker_progress_overflow_latched_generation =
             progress_overflow_latched_generation.clone();
         let worker_progress_overflow_latched_sequence = progress_overflow_latched_sequence.clone();
         let worker_progress_overflow_coordination = progress_overflow_coordination.clone();
         tokio::spawn(async move {
-            super::worker::run_browser_event_worker(
+            run_browser_event_worker(
                 worker_state,
                 critical_rx,
                 progress_rx,
@@ -36,17 +51,19 @@ impl BrowserSessionEventSink {
             )
             .await;
         });
-        Self {
-            state: state.clone(),
-            critical_tx,
-            progress_tx,
-            progress_overflow_coordination,
-            progress_overflow_latched,
-            progress_overflow_latched_generation,
-            progress_overflow_latched_sequence,
-            progress_overflow_reopen_generation,
-            progress_overflow_reopen_sequence,
-        }
+        Self::from_ingress_parts(
+            state,
+            BrowserSessionIngressParts {
+                critical_tx,
+                progress_tx,
+                progress_overflow_coordination,
+                progress_overflow_latched,
+                progress_overflow_latched_generation,
+                progress_overflow_latched_sequence,
+                progress_overflow_reopen_generation,
+                progress_overflow_reopen_sequence,
+            },
+        )
     }
 
     #[cfg(test)]
@@ -56,17 +73,7 @@ impl BrowserSessionEventSink {
         let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<BrowserSessionEvent>(1);
         drop(critical_rx);
         drop(progress_rx);
-        Self {
-            state: state.clone(),
-            critical_tx,
-            progress_tx,
-            progress_overflow_coordination: Arc::new(std::sync::Mutex::new(())),
-            progress_overflow_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            progress_overflow_latched_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            progress_overflow_latched_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            progress_overflow_reopen_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            progress_overflow_reopen_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        }
+        Self::closed_parts(state, critical_tx, progress_tx)
     }
 
     #[cfg(test)]
@@ -89,7 +96,7 @@ impl BrowserSessionEventSink {
                 browser_sequence: 0,
                 generation: 0,
                 guid: "__saturated__".to_string(),
-                state: rub_core::model::DownloadState::InProgress,
+                state: DownloadState::InProgress,
                 received_bytes: 0,
                 total_bytes: None,
                 final_path: None,
@@ -97,19 +104,19 @@ impl BrowserSessionEventSink {
             .expect("test queue should accept seed event");
         drop(worker_progress_tx);
         let worker_state = state.clone();
-        let progress_overflow_coordination = Arc::new(std::sync::Mutex::new(()));
-        let progress_overflow_latched = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let progress_overflow_latched_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let progress_overflow_latched_sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let progress_overflow_reopen_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let progress_overflow_reopen_sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let progress_overflow_coordination = Arc::new(Mutex::new(()));
+        let progress_overflow_latched = Arc::new(AtomicBool::new(false));
+        let progress_overflow_latched_generation = Arc::new(AtomicU64::new(0));
+        let progress_overflow_latched_sequence = Arc::new(AtomicU64::new(0));
+        let progress_overflow_reopen_generation = Arc::new(AtomicU64::new(0));
+        let progress_overflow_reopen_sequence = Arc::new(AtomicU64::new(0));
         let worker_progress_overflow_latched = progress_overflow_latched.clone();
         let worker_progress_overflow_latched_generation =
             progress_overflow_latched_generation.clone();
         let worker_progress_overflow_latched_sequence = progress_overflow_latched_sequence.clone();
         let worker_progress_overflow_coordination = progress_overflow_coordination.clone();
         tokio::spawn(async move {
-            super::worker::run_browser_event_worker(
+            run_browser_event_worker(
                 worker_state,
                 critical_rx,
                 worker_progress_rx,
@@ -121,17 +128,19 @@ impl BrowserSessionEventSink {
             .await;
         });
         std::mem::forget(progress_rx);
-        Self {
-            state: state.clone(),
-            critical_tx,
-            progress_tx,
-            progress_overflow_coordination,
-            progress_overflow_latched,
-            progress_overflow_latched_generation,
-            progress_overflow_latched_sequence,
-            progress_overflow_reopen_generation,
-            progress_overflow_reopen_sequence,
-        }
+        Self::from_ingress_parts(
+            state,
+            BrowserSessionIngressParts {
+                critical_tx,
+                progress_tx,
+                progress_overflow_coordination,
+                progress_overflow_latched,
+                progress_overflow_latched_generation,
+                progress_overflow_latched_sequence,
+                progress_overflow_reopen_generation,
+                progress_overflow_reopen_sequence,
+            },
+        )
     }
 
     #[cfg(test)]
@@ -141,16 +150,41 @@ impl BrowserSessionEventSink {
         let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<BrowserSessionEvent>(1);
         std::mem::forget(critical_rx);
         drop(progress_rx);
+        Self::closed_parts(state, critical_tx, progress_tx)
+    }
+
+    #[cfg(test)]
+    fn closed_parts(
+        state: &Arc<SessionState>,
+        critical_tx: UnboundedSender<BrowserSessionEvent>,
+        progress_tx: Sender<BrowserSessionEvent>,
+    ) -> Self {
+        Self::from_ingress_parts(
+            state,
+            BrowserSessionIngressParts {
+                critical_tx,
+                progress_tx,
+                progress_overflow_coordination: Arc::new(Mutex::new(())),
+                progress_overflow_latched: Arc::new(AtomicBool::new(false)),
+                progress_overflow_latched_generation: Arc::new(AtomicU64::new(0)),
+                progress_overflow_latched_sequence: Arc::new(AtomicU64::new(0)),
+                progress_overflow_reopen_generation: Arc::new(AtomicU64::new(0)),
+                progress_overflow_reopen_sequence: Arc::new(AtomicU64::new(0)),
+            },
+        )
+    }
+
+    fn from_ingress_parts(state: &Arc<SessionState>, parts: BrowserSessionIngressParts) -> Self {
         Self {
             state: state.clone(),
-            critical_tx,
-            progress_tx,
-            progress_overflow_coordination: Arc::new(std::sync::Mutex::new(())),
-            progress_overflow_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            progress_overflow_latched_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            progress_overflow_latched_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            progress_overflow_reopen_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            progress_overflow_reopen_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            critical_tx: parts.critical_tx,
+            progress_tx: parts.progress_tx,
+            progress_overflow_coordination: parts.progress_overflow_coordination,
+            progress_overflow_latched: parts.progress_overflow_latched,
+            progress_overflow_latched_generation: parts.progress_overflow_latched_generation,
+            progress_overflow_latched_sequence: parts.progress_overflow_latched_sequence,
+            progress_overflow_reopen_generation: parts.progress_overflow_reopen_generation,
+            progress_overflow_reopen_sequence: parts.progress_overflow_reopen_sequence,
         }
     }
 
@@ -163,11 +197,7 @@ impl BrowserSessionEventSink {
         self.enqueue_with_optional_coordination(event, coordination_guard.is_some());
     }
 
-    pub fn enqueue_download_runtime(
-        &self,
-        generation: u64,
-        runtime: rub_core::model::DownloadRuntimeInfo,
-    ) {
+    pub fn enqueue_download_runtime(&self, generation: u64, runtime: DownloadRuntimeInfo) {
         let _coordination_guard = self
             .progress_overflow_coordination
             .lock()

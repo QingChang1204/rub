@@ -312,47 +312,24 @@ fn orchestration_registration_request_identity(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_router;
     use super::{
         cmd_orchestration_remove_with_router_fence_disposition,
         default_orchestration_registration_key, orchestration_registration_request_identity,
     };
-    use crate::router::{DaemonRouter, RouterFenceDisposition, TransactionDeadline};
+    use crate::router::{RouterFenceDisposition, TransactionDeadline};
     use crate::session::SessionState;
     use rub_core::model::{
-        OrchestrationAddressInfo, OrchestrationExecutionPolicyInfo, OrchestrationRegistrationSpec,
-        OrchestrationRuleInfo, OrchestrationRuleStatus,
+        OrchestrationAddressInfo, OrchestrationExecutionPolicyInfo, OrchestrationMode,
+        OrchestrationRegistrationSpec, OrchestrationRuleInfo, OrchestrationRuleStatus,
+        TriggerConditionKind, TriggerConditionSpec,
     };
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
     fn parse_registration_spec(json: &str) -> OrchestrationRegistrationSpec {
         serde_json::from_str(json).expect("registration spec should parse")
-    }
-
-    fn test_router() -> DaemonRouter {
-        let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
-            rub_cdp::browser::BrowserLaunchOptions {
-                headless: true,
-                ignore_cert_errors: false,
-                user_data_dir: None,
-                managed_profile_ephemeral: false,
-                download_dir: None,
-                profile_directory: None,
-                hide_infobars: true,
-                stealth: true,
-            },
-        ));
-        let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
-            manager,
-            Arc::new(AtomicU64::new(0)),
-            rub_cdp::humanize::HumanizeConfig {
-                enabled: false,
-                speed: rub_cdp::humanize::HumanizeSpeed::Normal,
-            },
-        ));
-        DaemonRouter::new(adapter)
     }
 
     fn resolved_address(
@@ -492,6 +469,40 @@ mod tests {
         }
     }
 
+    fn text_present_ready_condition() -> TriggerConditionSpec {
+        TriggerConditionSpec {
+            kind: TriggerConditionKind::TextPresent,
+            locator: None,
+            text: Some("Ready".to_string()),
+            url_pattern: None,
+            readiness_state: None,
+            method: None,
+            status_code: None,
+            storage_area: None,
+            key: None,
+            value: None,
+        }
+    }
+
+    fn remove_test_rule() -> OrchestrationRuleInfo {
+        OrchestrationRuleInfo {
+            id: 0,
+            status: OrchestrationRuleStatus::Armed,
+            lifecycle_generation: 1,
+            source: resolved_address("sess-source", "source", 0, "SOURCE_TAB"),
+            target: resolved_address("sess-target", "target", 1, "TARGET_TAB"),
+            mode: OrchestrationMode::Once,
+            execution_policy: OrchestrationExecutionPolicyInfo::default(),
+            condition: text_present_ready_condition(),
+            actions: Vec::new(),
+            correlation_key: "corr".to_string(),
+            idempotency_key: "idem".to_string(),
+            unavailable_reason: None,
+            last_condition_evidence: None,
+            last_result: None,
+        }
+    }
+
     #[tokio::test]
     async fn stable_omitted_registration_identity_prevents_duplicate_live_rule_on_retry() {
         let state = SessionState::new(
@@ -560,33 +571,7 @@ mod tests {
             None,
         ));
         let rule = state
-            .register_orchestration_rule(OrchestrationRuleInfo {
-                id: 0,
-                status: OrchestrationRuleStatus::Armed,
-                lifecycle_generation: 1,
-                source: resolved_address("sess-source", "source", 0, "SOURCE_TAB"),
-                target: resolved_address("sess-target", "target", 1, "TARGET_TAB"),
-                mode: rub_core::model::OrchestrationMode::Once,
-                execution_policy: OrchestrationExecutionPolicyInfo::default(),
-                condition: rub_core::model::TriggerConditionSpec {
-                    kind: rub_core::model::TriggerConditionKind::TextPresent,
-                    locator: None,
-                    text: Some("Ready".to_string()),
-                    url_pattern: None,
-                    readiness_state: None,
-                    method: None,
-                    status_code: None,
-                    storage_area: None,
-                    key: None,
-                    value: None,
-                },
-                actions: Vec::new(),
-                correlation_key: "corr".to_string(),
-                idempotency_key: "idem".to_string(),
-                unavailable_reason: None,
-                last_condition_evidence: None,
-                last_result: None,
-            })
+            .register_orchestration_rule(remove_test_rule())
             .await
             .expect("rule should register");
         let held = router
@@ -600,7 +585,7 @@ mod tests {
             .expect("held transaction should acquire");
 
         let deadline = TransactionDeadline::new(1);
-        std::thread::sleep(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
         let error = cmd_orchestration_remove_with_router_fence_disposition(
             &router,
             super::OrchestrationIdArgs {
@@ -629,33 +614,7 @@ mod tests {
             None,
         ));
         let rule = state
-            .register_orchestration_rule(OrchestrationRuleInfo {
-                id: 0,
-                status: OrchestrationRuleStatus::Armed,
-                lifecycle_generation: 1,
-                source: resolved_address("sess-source", "source", 0, "SOURCE_TAB"),
-                target: resolved_address("sess-target", "target", 1, "TARGET_TAB"),
-                mode: rub_core::model::OrchestrationMode::Once,
-                execution_policy: OrchestrationExecutionPolicyInfo::default(),
-                condition: rub_core::model::TriggerConditionSpec {
-                    kind: rub_core::model::TriggerConditionKind::TextPresent,
-                    locator: None,
-                    text: Some("Ready".to_string()),
-                    url_pattern: None,
-                    readiness_state: None,
-                    method: None,
-                    status_code: None,
-                    storage_area: None,
-                    key: None,
-                    value: None,
-                },
-                actions: Vec::new(),
-                correlation_key: "corr".to_string(),
-                idempotency_key: "idem".to_string(),
-                unavailable_reason: None,
-                last_condition_evidence: None,
-                last_result: None,
-            })
+            .register_orchestration_rule(remove_test_rule())
             .await
             .expect("rule should register");
         let _outer_transaction = router

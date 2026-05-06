@@ -15,12 +15,13 @@ use tokio::time::{Duration, Instant, sleep};
 const TEST_BROWSER_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 const TEST_BROWSER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-fn options() -> BrowserLaunchOptions {
+fn adapter_options() -> BrowserLaunchOptions {
     let unique = format!("{}-{}", std::process::id(), uuid::Uuid::now_v7());
+    let temp_dir = std::env::temp_dir();
     BrowserLaunchOptions {
         headless: true,
         ignore_cert_errors: false,
-        user_data_dir: Some(std::env::temp_dir().join(format!("rub-profile-{unique}"))),
+        user_data_dir: Some(temp_dir.join(format!("rub-profile-{unique}"))),
         managed_profile_ephemeral: false,
         download_dir: Some(std::env::temp_dir().join(format!("rub-downloads-{unique}"))),
         profile_directory: Some("Default".to_string()),
@@ -96,7 +97,7 @@ fn snapshot_frame_document_mismatch_rejects_same_frame_after_document_url_drift(
     );
 }
 
-async fn open_second_tab(manager: &BrowserManager, opener: &Arc<chromiumoxide::Page>, url: &str) {
+async fn open_second_tab(manager: &BrowserManager, opener: &Arc<Page>, url: &str) {
     let script = format!(
         "window.open({}, '_blank'); null",
         serde_json::to_string(url).unwrap()
@@ -304,7 +305,7 @@ fn projected_launch_policy_reports_l2_when_humanize_enabled() {
 
 #[tokio::test]
 async fn snapshot_selector_replay_uses_snapshot_tab_authority_after_tab_switch() {
-    let manager = Arc::new(BrowserManager::new(options()));
+    let manager = Arc::new(BrowserManager::new(adapter_options()));
     manager
         .ensure_browser()
         .await
@@ -344,7 +345,7 @@ async fn snapshot_selector_replay_uses_snapshot_tab_authority_after_tab_switch()
 
 #[tokio::test]
 async fn snapshot_bound_read_uses_element_tab_authority_after_tab_switch() {
-    let manager = Arc::new(BrowserManager::new(options()));
+    let manager = Arc::new(BrowserManager::new(adapter_options()));
     manager
         .ensure_browser()
         .await
@@ -389,7 +390,7 @@ async fn snapshot_bound_read_uses_element_tab_authority_after_tab_switch() {
 
 #[tokio::test]
 async fn child_frame_snapshot_replay_preserves_snapshot_tab_authority_after_tab_switch() {
-    let manager = Arc::new(BrowserManager::new(options()));
+    let manager = Arc::new(BrowserManager::new(adapter_options()));
     manager
         .ensure_browser()
         .await
@@ -443,7 +444,7 @@ async fn child_frame_snapshot_replay_preserves_snapshot_tab_authority_after_tab_
 
 #[tokio::test]
 async fn send_keys_in_frame_confirmation_ignores_unrelated_top_page_mutation() {
-    let manager = Arc::new(BrowserManager::new(options()));
+    let manager = Arc::new(BrowserManager::new(adapter_options()));
     manager
         .ensure_browser()
         .await
@@ -486,7 +487,7 @@ async fn send_keys_in_frame_confirmation_ignores_unrelated_top_page_mutation() {
 
 #[tokio::test]
 async fn type_text_in_frame_fails_closed_when_focus_is_stolen_before_dispatch() {
-    let manager = Arc::new(BrowserManager::new(options()));
+    let manager = Arc::new(BrowserManager::new(adapter_options()));
     manager
         .ensure_browser()
         .await

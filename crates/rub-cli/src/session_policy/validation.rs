@@ -29,7 +29,7 @@ pub(crate) async fn validate_existing_session_connection_request(
     request: &ConnectionRequest,
     client: &mut IpcClient,
     expected_daemon_session_id: Option<&str>,
-) -> Result<(), rub_core::error::RubError> {
+) -> Result<(), RubError> {
     validate_existing_session_connection_request_with_deadline(
         cli,
         request,
@@ -49,7 +49,7 @@ pub(crate) async fn validate_existing_session_connection_request_with_deadline(
     expected_daemon_session_id: Option<&str>,
     deadline: Option<Instant>,
     timeout_ms: Option<u64>,
-) -> Result<(), rub_core::error::RubError> {
+) -> Result<(), RubError> {
     if !requires_existing_session_validation(true, request, cli) {
         return Ok(());
     }
@@ -83,31 +83,7 @@ pub(crate) async fn validate_existing_session_connection_request_with_deadline(
     } else {
         requested_attachment_identity(cli, request)
     };
-    if attachment_identity_matches_request(
-        &authority.attachment_identity,
-        requested_attachment_identity.as_deref(),
-        authority.launch_policy.connection_target.as_ref(),
-        request,
-    ) && launch_policy_matches_session_policy(&authority.launch_policy, request, cli)
-    {
-        return Ok(());
-    }
-
-    Err(rub_core::error::RubError::domain_with_context(
-        ErrorCode::InvalidInput,
-        format!(
-            "Session '{}' is already running with a different browser attachment policy. Use a different --session or close the existing daemon first.",
-            cli.session
-        ),
-        serde_json::json!({
-            "requested_attachment_identity": requested_attachment_identity,
-            "current_attachment_identity": authority.attachment_identity,
-            "requested_connection": requested_connection_projection(request),
-            "requested_session_policy": requested_session_policy_projection(request, cli),
-            "current_launch_policy": authority.launch_policy,
-            "daemon_session_id": authority.daemon_session_id,
-        }),
-    ))
+    reject_session_policy_mismatch_if_needed(cli, request, authority, requested_attachment_identity)
 }
 
 pub(crate) async fn validate_existing_session_connection_request_via_authority_probe_with_deadline(
@@ -117,7 +93,7 @@ pub(crate) async fn validate_existing_session_connection_request_via_authority_p
     expected_daemon_session_id: Option<&str>,
     deadline: Instant,
     timeout_ms: u64,
-) -> Result<(), rub_core::error::RubError> {
+) -> Result<(), RubError> {
     if !requires_existing_session_validation(true, request, cli) {
         return Ok(());
     }
@@ -146,6 +122,15 @@ pub(crate) async fn validate_existing_session_connection_request_via_authority_p
     } else {
         requested_attachment_identity(cli, request)
     };
+    reject_session_policy_mismatch_if_needed(cli, request, authority, requested_attachment_identity)
+}
+
+fn reject_session_policy_mismatch_if_needed(
+    cli: &EffectiveCli,
+    request: &ConnectionRequest,
+    authority: ExistingSessionAuthority,
+    requested_attachment_identity: Option<String>,
+) -> Result<(), RubError> {
     if attachment_identity_matches_request(
         &authority.attachment_identity,
         requested_attachment_identity.as_deref(),
@@ -156,7 +141,7 @@ pub(crate) async fn validate_existing_session_connection_request_via_authority_p
         return Ok(());
     }
 
-    Err(rub_core::error::RubError::domain_with_context(
+    Err(RubError::domain_with_context(
         ErrorCode::InvalidInput,
         format!(
             "Session '{}' is already running with a different browser attachment policy. Use a different --session or close the existing daemon first.",
@@ -357,12 +342,14 @@ pub(crate) fn compatibility_launch_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{Commands, RequestedLaunchPolicy};
+    use crate::commands::Commands;
+    use crate::test_support::effective_cli;
     use rub_ipc::client::IpcClient;
     use rub_ipc::handshake::HANDSHAKE_PROBE_COMMAND_ID;
     use rub_ipc::protocol::{IpcRequest, IpcResponse};
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
     use tokio::io::AsyncWriteExt;
@@ -374,35 +361,12 @@ mod tests {
         std::env::temp_dir().join(format!("rsv-{}", Uuid::now_v7()))
     }
 
-    fn cli_with(command: Commands, home: &std::path::Path) -> EffectiveCli {
-        EffectiveCli {
-            session: "default".to_string(),
-            session_id: None,
-            rub_home: home.to_path_buf(),
-            timeout: 30_000,
-            headed: false,
-            ignore_cert_errors: false,
-            user_data_dir: None,
-            hide_infobars: true,
-            json_pretty: false,
-            verbose: false,
-            trace: false,
-            command,
-            cdp_url: None,
-            connect: false,
-            profile: None,
-            profile_resolved_path: None,
-            use_alias: None,
-            no_stealth: false,
-            humanize: false,
-            humanize_speed: "normal".to_string(),
-            requested_launch_policy: RequestedLaunchPolicy::default(),
-            effective_launch_policy: RequestedLaunchPolicy::default(),
-        }
+    fn cli_with(command: Commands, home: &Path) -> EffectiveCli {
+        effective_cli(command, home.to_path_buf())
     }
 
     fn spawn_handshake_server(
-        socket_path: &std::path::Path,
+        socket_path: &Path,
         daemon_session_id: &str,
         attachment_identity: Option<&str>,
     ) -> tokio::task::JoinHandle<()> {

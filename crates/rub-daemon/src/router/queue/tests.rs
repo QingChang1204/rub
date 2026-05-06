@@ -1,52 +1,83 @@
 use super::*;
+use rub_core::model::FrameContextInfo;
+use rub_ipc::protocol::IpcRequest;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 fn test_router() -> Arc<DaemonRouter> {
-    let manager = Arc::new(rub_cdp::browser::BrowserManager::new(
-        rub_cdp::browser::BrowserLaunchOptions {
-            headless: true,
-            ignore_cert_errors: false,
-            user_data_dir: None,
-            managed_profile_ephemeral: false,
-            download_dir: None,
-            profile_directory: None,
-            hide_infobars: true,
-            stealth: true,
-        },
-    ));
-    let adapter = Arc::new(rub_cdp::adapter::ChromiumAdapter::new(
-        manager,
-        Arc::new(AtomicU64::new(0)),
-        rub_cdp::humanize::HumanizeConfig {
-            enabled: false,
-            speed: rub_cdp::humanize::HumanizeSpeed::Normal,
-        },
-    ));
-    Arc::new(DaemonRouter::new(adapter))
+    crate::test_support::daemon_router_arc()
 }
 
 fn temp_home(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("rub-queue-{label}-{}", Uuid::now_v7()))
 }
 
+fn test_frame_context() -> FrameContextInfo {
+    serde_json::from_value(serde_json::json!({
+        "frame_id": "main",
+        "name": "main",
+        "target_id": "target-1",
+        "url": "https://example.com",
+        "depth": 0,
+        "same_origin_accessible": true,
+    }))
+    .expect("frame context fixture should parse")
+}
+
+fn spawn_foreground_request(
+    router: Arc<DaemonRouter>,
+    state: Arc<SessionState>,
+    order_tx: mpsc::UnboundedSender<&'static str>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let guard = router
+            .begin_request_transaction(
+                "later_foreground",
+                "req-later-foreground",
+                TransactionDeadline::new(1_000),
+                &state,
+            )
+            .await
+            .expect("later foreground request should eventually acquire");
+        order_tx
+            .send("foreground")
+            .expect("foreground acquisition order should send");
+        drop(guard);
+    })
+}
+
+fn spawn_releasable_foreground_request(
+    router: Arc<DaemonRouter>,
+    state: Arc<SessionState>,
+    order_tx: mpsc::UnboundedSender<&'static str>,
+    release_rx: oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let guard = router
+            .begin_request_transaction(
+                "later_foreground",
+                "req-later-foreground",
+                TransactionDeadline::new(1_000),
+                &state,
+            )
+            .await
+            .expect("later foreground request should eventually acquire");
+        order_tx
+            .send("foreground")
+            .expect("foreground acquisition order should send");
+        let _ = release_rx.await;
+        drop(guard);
+    })
+}
+
 fn test_snapshot(snapshot_id: &str) -> rub_core::model::Snapshot {
     rub_core::model::Snapshot {
         snapshot_id: snapshot_id.to_string(),
         dom_epoch: 1,
-        frame_context: rub_core::model::FrameContextInfo {
-            frame_id: "main".to_string(),
-            name: Some("main".to_string()),
-            parent_frame_id: None,
-            target_id: Some("target-1".to_string()),
-            url: Some("https://example.com".to_string()),
-            depth: 0,
-            same_origin_accessible: Some(true),
-        },
+        frame_context: test_frame_context(),
         frame_lineage: vec!["main".to_string()],
         url: "https://example.com".to_string(),
         title: "Example".to_string(),
@@ -656,25 +687,12 @@ async fn queued_automation_keeps_fifo_priority_over_later_foreground_arrivals() 
 
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    let foreground_router = router.clone();
-    let foreground_state = state.clone();
-    let foreground_order_tx = order_tx.clone();
-    let foreground_task = tokio::spawn(async move {
-        let guard = foreground_router
-            .begin_request_transaction(
-                "later_foreground",
-                "req-later-foreground",
-                TransactionDeadline::new(1_000),
-                &foreground_state,
-            )
-            .await
-            .expect("later foreground request should eventually acquire");
-        foreground_order_tx
-            .send("foreground")
-            .expect("foreground acquisition order should send");
-        let _ = release_foreground_rx.await;
-        drop(guard);
-    });
+    let foreground_task = spawn_releasable_foreground_request(
+        router.clone(),
+        state.clone(),
+        order_tx.clone(),
+        release_foreground_rx,
+    );
 
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert!(
@@ -761,25 +779,12 @@ async fn bounded_automation_reservation_yields_fifo_priority_after_worker_cycle_
         }))
     );
 
-    let foreground_router = router.clone();
-    let foreground_state = state.clone();
-    let foreground_order_tx = order_tx.clone();
-    let foreground_task = tokio::spawn(async move {
-        let guard = foreground_router
-            .begin_request_transaction(
-                "later_foreground",
-                "req-later-foreground",
-                TransactionDeadline::new(1_000),
-                &foreground_state,
-            )
-            .await
-            .expect("later foreground request should eventually acquire");
-        foreground_order_tx
-            .send("foreground")
-            .expect("foreground acquisition order should send");
-        let _ = release_foreground_rx.await;
-        drop(guard);
-    });
+    let foreground_task = spawn_releasable_foreground_request(
+        router.clone(),
+        state.clone(),
+        order_tx.clone(),
+        release_foreground_rx,
+    );
 
     assert!(
         tokio::time::timeout(Duration::from_millis(5), order_rx.recv())
@@ -814,7 +819,7 @@ async fn external_response_releases_fifo_authority_after_delivery_while_post_com
         temp_home("external-post-commit-fence"),
         None,
     ));
-    let request = rub_ipc::protocol::IpcRequest::new("sessions", serde_json::json!({}), 1_000);
+    let request = IpcRequest::new("sessions", serde_json::json!({}), 1_000);
     state.block_post_commit_journal_for_tests();
 
     let pending = router.dispatch_for_external_delivery(request, &state).await;
@@ -834,23 +839,7 @@ async fn external_response_releases_fifo_authority_after_delivery_while_post_com
     );
 
     let (order_tx, mut order_rx) = mpsc::unbounded_channel();
-    let queued_router = router.clone();
-    let queued_state = state.clone();
-    let queued_task = tokio::spawn(async move {
-        let guard = queued_router
-            .begin_request_transaction(
-                "later_foreground",
-                "req-later-foreground",
-                TransactionDeadline::new(1_000),
-                &queued_state,
-            )
-            .await
-            .expect("later foreground request should eventually acquire");
-        order_tx
-            .send("foreground")
-            .expect("foreground acquisition order should send");
-        drop(guard);
-    });
+    let queued_task = spawn_foreground_request(router.clone(), state.clone(), order_tx);
 
     let acquired = tokio::time::timeout(Duration::from_millis(100), order_rx.recv())
         .await
@@ -882,7 +871,7 @@ async fn delivery_failure_after_commit_keeps_fifo_authority_until_fallback_truth
         temp_home("delivery-failure-fence"),
         None,
     ));
-    let request = rub_ipc::protocol::IpcRequest::new(
+    let request = IpcRequest::new(
         "open",
         serde_json::json!({ "url": "https://example.com" }),
         1_000,
@@ -914,23 +903,7 @@ async fn delivery_failure_after_commit_keeps_fifo_authority_until_fallback_truth
     );
 
     let (order_tx, mut order_rx) = mpsc::unbounded_channel();
-    let queued_router = router.clone();
-    let queued_state = state.clone();
-    let queued_task = tokio::spawn(async move {
-        let guard = queued_router
-            .begin_request_transaction(
-                "later_foreground",
-                "req-later-foreground",
-                TransactionDeadline::new(1_000),
-                &queued_state,
-            )
-            .await
-            .expect("later foreground request should eventually acquire");
-        order_tx
-            .send("foreground")
-            .expect("foreground acquisition order should send");
-        drop(guard);
-    });
+    let queued_task = spawn_foreground_request(router.clone(), state.clone(), order_tx);
 
     assert!(
         tokio::time::timeout(Duration::from_millis(20), order_rx.recv())

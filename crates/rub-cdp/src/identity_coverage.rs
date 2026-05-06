@@ -206,34 +206,26 @@ mod tests {
     #[test]
     fn record_self_probe_merges_with_failure_precedence() {
         let mut registry = IdentityCoverageRegistry::new(&policy());
-        registry.record_self_probe(IdentitySelfProbeInfo {
-            page_main_world: Some(IdentityProbeStatus::Passed),
-            iframe_context: Some(IdentityProbeStatus::Passed),
-            worker_context: Some(IdentityProbeStatus::Unknown),
-            ua_consistency: Some(IdentityProbeStatus::Passed),
-            webgl_surface: Some(IdentityProbeStatus::Passed),
-            canvas_surface: Some(IdentityProbeStatus::Passed),
-            audio_surface: Some(IdentityProbeStatus::Unknown),
-            permissions_surface: Some(IdentityProbeStatus::Passed),
-            viewport_surface: Some(IdentityProbeStatus::Passed),
-            touch_surface: Some(IdentityProbeStatus::Passed),
-            window_metrics_surface: Some(IdentityProbeStatus::Unknown),
-            unsupported_surfaces: vec!["service_worker".to_string()],
-        });
-        registry.record_self_probe(IdentitySelfProbeInfo {
-            page_main_world: Some(IdentityProbeStatus::Passed),
-            iframe_context: Some(IdentityProbeStatus::Failed),
-            worker_context: Some(IdentityProbeStatus::Passed),
-            ua_consistency: Some(IdentityProbeStatus::Passed),
-            webgl_surface: Some(IdentityProbeStatus::Passed),
-            canvas_surface: Some(IdentityProbeStatus::Failed),
-            audio_surface: Some(IdentityProbeStatus::Passed),
-            permissions_surface: Some(IdentityProbeStatus::Failed),
-            viewport_surface: Some(IdentityProbeStatus::Unknown),
-            touch_surface: Some(IdentityProbeStatus::Failed),
-            window_metrics_surface: Some(IdentityProbeStatus::Passed),
-            unsupported_surfaces: vec!["service_worker".to_string()],
-        });
+        registry.record_self_probe(probe_info([
+            IdentityProbeStatus::Passed,
+            IdentityProbeStatus::Unknown,
+            IdentityProbeStatus::Passed,
+            IdentityProbeStatus::Unknown,
+            IdentityProbeStatus::Passed,
+            IdentityProbeStatus::Passed,
+            IdentityProbeStatus::Unknown,
+            IdentityProbeStatus::Unknown,
+        ]));
+        registry.record_self_probe(probe_info([
+            IdentityProbeStatus::Failed,
+            IdentityProbeStatus::Passed,
+            IdentityProbeStatus::Failed,
+            IdentityProbeStatus::Passed,
+            IdentityProbeStatus::Failed,
+            IdentityProbeStatus::Unknown,
+            IdentityProbeStatus::Failed,
+            IdentityProbeStatus::Passed,
+        ]));
 
         let projection = registry.project();
         let self_probe = projection.self_probe.expect("probe should exist");
@@ -261,5 +253,32 @@ mod tests {
             Some(IdentityProbeStatus::Passed)
         );
         assert_eq!(self_probe.unsupported_surfaces, vec!["service_worker"]);
+    }
+
+    fn probe_info(statuses: [IdentityProbeStatus; 8]) -> IdentitySelfProbeInfo {
+        let [
+            iframe_context,
+            worker_context,
+            canvas_surface,
+            audio_surface,
+            permissions_surface,
+            viewport_surface,
+            touch_surface,
+            window_metrics_surface,
+        ] = statuses;
+        IdentitySelfProbeInfo {
+            page_main_world: Some(IdentityProbeStatus::Passed),
+            iframe_context: Some(iframe_context),
+            worker_context: Some(worker_context),
+            ua_consistency: Some(IdentityProbeStatus::Passed),
+            webgl_surface: Some(IdentityProbeStatus::Passed),
+            canvas_surface: Some(canvas_surface),
+            audio_surface: Some(audio_surface),
+            permissions_surface: Some(permissions_surface),
+            viewport_surface: Some(viewport_surface),
+            touch_surface: Some(touch_surface),
+            window_metrics_surface: Some(window_metrics_surface),
+            unsupported_surfaces: vec!["service_worker".to_string()],
+        }
     }
 }

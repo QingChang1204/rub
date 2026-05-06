@@ -1,3 +1,4 @@
+use super::frame_scope::{ensure_request_frame_available, orchestration_frame_override};
 use super::*;
 use rub_core::model::Snapshot;
 const SNAPSHOT_SETTLE_DELAY_MS: u64 = 100;
@@ -106,11 +107,11 @@ pub(super) async fn build_stable_snapshot(
     limit: Option<u32>,
     a11y: bool,
     listeners: bool,
-) -> Result<rub_core::model::Snapshot, RubError> {
-    let explicit_frame_override = super::frame_scope::orchestration_frame_override(args);
+) -> Result<Snapshot, RubError> {
+    let explicit_frame_override = orchestration_frame_override(args);
     crate::runtime_refresh::refresh_live_frame_runtime(&router.browser, state).await;
     let selected_frame_id = if let Some(frame_id) = explicit_frame_override {
-        super::frame_scope::ensure_request_frame_available(router, frame_id).await?;
+        ensure_request_frame_available(router, frame_id).await?;
         Some(frame_id.to_string())
     } else {
         let frame_runtime = state.frame_runtime().await;
@@ -422,15 +423,7 @@ mod tests {
         Snapshot {
             snapshot_id: snapshot_id.to_string(),
             dom_epoch,
-            frame_context: FrameContextInfo {
-                frame_id: "frame-main".to_string(),
-                name: Some("main".to_string()),
-                parent_frame_id: None,
-                target_id: Some("target-1".to_string()),
-                url: Some("https://example.test".to_string()),
-                depth: 0,
-                same_origin_accessible: Some(true),
-            },
+            frame_context: main_frame_context(),
             frame_lineage: vec!["frame-main".to_string()],
             url: "https://example.test".to_string(),
             title: "Example".to_string(),
@@ -452,6 +445,21 @@ mod tests {
             },
             viewport_filtered: None,
             viewport_count: None,
+        }
+    }
+
+    fn main_frame_context() -> FrameContextInfo {
+        let frame_id = "frame-main".to_string();
+        let target_id = Some("target-1".to_string());
+        let url = Some("https://example.test".to_string());
+        FrameContextInfo {
+            frame_id,
+            name: Some("main".to_string()),
+            parent_frame_id: None,
+            target_id,
+            url,
+            depth: 0,
+            same_origin_accessible: Some(true),
         }
     }
 

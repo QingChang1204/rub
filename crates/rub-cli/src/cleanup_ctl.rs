@@ -88,21 +88,15 @@ pub(crate) async fn cleanup_runtime_until(
     cleanup_current_home_stale(rub_home, deadline, timeout_ms, &mut result).await?;
 
     let snapshot = process_snapshot()?;
-    let temp_daemon_sweep_result = {
-        #[cfg(test)]
-        {
-            match maybe_force_temp_daemon_sweep_timeout_for_test(timeout_ms) {
-                Ok(()) => {
-                    sweep_temp_daemons(rub_home, &snapshot, deadline, timeout_ms, &mut result).await
-                }
-                Err(error) => Err(error),
-            }
-        }
-        #[cfg(not(test))]
-        {
-            sweep_temp_daemons(rub_home, &snapshot, deadline, timeout_ms, &mut result).await
-        }
+    #[cfg(test)]
+    let temp_daemon_sweep_result = match maybe_force_temp_daemon_sweep_timeout_for_test(timeout_ms)
+    {
+        Ok(()) => sweep_temp_daemons(rub_home, &snapshot, deadline, timeout_ms, &mut result).await,
+        Err(error) => Err(error),
     };
+    #[cfg(not(test))]
+    let temp_daemon_sweep_result =
+        sweep_temp_daemons(rub_home, &snapshot, deadline, timeout_ms, &mut result).await;
     let (active_temp_homes, active_temp_homes_authority_complete) = match temp_daemon_sweep_result {
         Ok(active_temp_homes) => (active_temp_homes, true),
         Err(error) if best_effort_cleanup_timeout(&error) => {

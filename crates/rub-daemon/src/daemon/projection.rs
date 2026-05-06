@@ -46,11 +46,7 @@ pub(super) fn restore_previous_authority_if_live(
             return Ok(RestorePreviousAuthorityOutcome::SkippedSuperseded);
         }
 
-        if !registry_entry_has_runtime_authority_for_home(home, entry) {
-            data.sessions
-                .retain(|existing| existing.session_id != entry.session_id);
-            store_registry_for_home(home, path, &data)?;
-            cleanup_projections(home, entry);
+        if remove_if_entry_lost_runtime_authority(home, path, &mut data, entry)? {
             return Ok(RestorePreviousAuthorityOutcome::SkippedNotLive);
         }
 
@@ -68,16 +64,28 @@ pub(super) fn restore_previous_authority_if_live(
         restore_pid_projection(home, entry)?;
         restore_startup_commit_marker(home, entry)?;
 
-        if !registry_entry_has_runtime_authority_for_home(home, entry) {
-            data.sessions
-                .retain(|existing| existing.session_id != entry.session_id);
-            store_registry_for_home(home, path, &data)?;
-            cleanup_projections(home, entry);
+        if remove_if_entry_lost_runtime_authority(home, path, &mut data, entry)? {
             return Ok(RestorePreviousAuthorityOutcome::SkippedNotLive);
         }
 
         Ok(RestorePreviousAuthorityOutcome::Restored)
     })
+}
+
+fn remove_if_entry_lost_runtime_authority(
+    home: &Path,
+    registry_path: &Path,
+    data: &mut crate::session::RegistryData,
+    entry: &RegistryEntry,
+) -> std::io::Result<bool> {
+    if registry_entry_has_runtime_authority_for_home(home, entry) {
+        return Ok(false);
+    }
+    data.sessions
+        .retain(|existing| existing.session_id != entry.session_id);
+    store_registry_for_home(home, registry_path, data)?;
+    cleanup_projections(home, entry);
+    Ok(true)
 }
 
 pub(super) fn startup_ready_marker_path() -> Option<PathBuf> {

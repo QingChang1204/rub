@@ -402,26 +402,10 @@ fn blocker_diagnosis_details(
                 "overlay_state": readiness.overlay_state,
                 "blocking_signals": readiness.blocking_signals,
             }));
-            if let Some(current) = &interference.current_interference {
-                details.push(serde_json::json!({
-                    "surface": "runtime.interference",
-                    "kind": current.kind,
-                    "summary": current.summary,
-                    "current_url": current.current_url,
-                    "primary_url": current.primary_url,
-                }));
-            }
+            push_current_interference_detail(&mut details, interference);
         }
         BlockerDiagnosisClass::ProviderGate => {
-            if let Some(current) = &interference.current_interference {
-                details.push(serde_json::json!({
-                    "surface": "runtime.interference",
-                    "kind": current.kind,
-                    "summary": current.summary,
-                    "current_url": current.current_url,
-                    "primary_url": current.primary_url,
-                }));
-            }
+            push_current_interference_detail(&mut details, interference);
             details.push(serde_json::json!({
                 "surface": "runtime.handoff",
                 "status": handoff.status,
@@ -469,6 +453,21 @@ fn blocker_diagnosis_details(
         }
     }
     details
+}
+
+fn push_current_interference_detail(
+    details: &mut Vec<serde_json::Value>,
+    interference: &rub_core::model::InterferenceRuntimeInfo,
+) {
+    if let Some(current) = &interference.current_interference {
+        details.push(serde_json::json!({
+            "surface": "runtime.interference",
+            "kind": current.kind,
+            "summary": current.summary,
+            "current_url": current.current_url,
+            "primary_url": current.primary_url,
+        }));
+    }
 }
 
 fn blocker_diagnosis_readiness_status_name(

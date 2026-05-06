@@ -30,7 +30,7 @@
 #[cfg(test)]
 use crate::connection_hardening::RetryAttribution;
 use rub_ipc::client::IpcClient;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod bootstrap;
 mod close_all;
@@ -45,6 +45,23 @@ mod projection;
 mod registry;
 mod replay;
 mod startup;
+
+pub(crate) fn registry_entry_runtime_commit_matches(
+    rub_home: &Path,
+    entry: &rub_daemon::session::RegistryEntry,
+) -> bool {
+    let runtime = rub_daemon::rub_paths::RubPaths::new(rub_home)
+        .session_runtime(&entry.session_name, &entry.session_id);
+    let pid_matches = std::fs::read_to_string(runtime.pid_path())
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        == Some(entry.pid);
+    let committed_matches = std::fs::read_to_string(runtime.startup_committed_path())
+        .ok()
+        .is_some_and(|raw| raw.trim() == entry.session_id);
+    let socket_matches = Path::new(&entry.socket_path) == runtime.socket_path();
+    pid_matches && committed_matches && socket_matches
+}
 
 #[cfg(test)]
 pub(crate) use self::bootstrap::cleanup_startup_fallback_browser_authority_for_test;

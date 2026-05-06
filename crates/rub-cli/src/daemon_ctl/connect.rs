@@ -17,7 +17,8 @@ use super::{
     DaemonConnection, DaemonCtlPathContext, HandshakePayload, cleanup_stale, daemon_ctl_path_error,
     daemon_ctl_path_state, daemon_ctl_socket_error, fetch_handshake_info,
     fetch_handshake_info_until, latest_definitely_stale_entry_by_name,
-    latest_registry_entry_by_name, registry_entry_by_name, terminate_registry_entry_process,
+    latest_registry_entry_by_name, registry_entry_by_name, registry_entry_runtime_commit_matches,
+    terminate_registry_entry_process,
 };
 
 pub(crate) enum TransientSocketPolicy {
@@ -63,23 +64,10 @@ pub(crate) async fn maybe_upgrade_if_needed(
     if let Some(entry) = authority_entry
         && handshake.daemon_session_id != entry.session_id
     {
-        return Err(RubError::domain_with_context(
-            ErrorCode::IpcProtocolError,
-            format!(
-                "Connected daemon authority for session '{session_name}' did not match the authoritative registry entry"
-            ),
-            serde_json::json!({
-                "reason": "daemon_authority_mismatch",
-                "session": session_name,
-                "registry_session_id": entry.session_id,
-                "handshake_session_id": handshake.daemon_session_id,
-                "socket_path": entry.socket_path,
-                "socket_path_state": daemon_ctl_path_state(
-                    "daemon_ctl.upgrade.registry_entry.socket_path",
-                    "registry_authority_entry",
-                    "session_socket",
-                ),
-            }),
+        return Err(daemon_authority_mismatch_error(
+            session_name,
+            entry,
+            &handshake.daemon_session_id,
         ));
     }
     if let Some(entry) = authority_entry {
@@ -168,6 +156,31 @@ pub(crate) fn validate_handshake_attachment_identity(
             }),
         )),
     }
+}
+
+fn daemon_authority_mismatch_error(
+    session_name: &str,
+    entry: &rub_daemon::session::RegistryEntry,
+    handshake_session_id: &str,
+) -> RubError {
+    RubError::domain_with_context(
+        ErrorCode::IpcProtocolError,
+        format!(
+            "Connected daemon authority for session '{session_name}' did not match the authoritative registry entry"
+        ),
+        serde_json::json!({
+            "reason": "daemon_authority_mismatch",
+            "session": session_name,
+            "registry_session_id": entry.session_id,
+            "handshake_session_id": handshake_session_id,
+            "socket_path": entry.socket_path,
+            "socket_path_state": daemon_ctl_path_state(
+                "daemon_ctl.upgrade.registry_entry.socket_path",
+                "registry_authority_entry",
+                "session_socket",
+            ),
+        }),
+    )
 }
 
 #[cfg(unix)]
@@ -408,15 +421,7 @@ async fn probe_upgrade_check(
         .map_err(|error| upgrade_probe_send_error(session_name, error))?;
     match validate_upgrade_check_response(session_name, response)? {
         UpgradeCheckOutcome::Idle(compatibility) => Ok(compatibility),
-        UpgradeCheckOutcome::Busy => Err(RubError::domain_with_context(
-            ErrorCode::SessionBusy,
-            format!(
-                "Session '{session_name}' is not idle enough to satisfy the hard-cut upgrade fence"
-            ),
-            serde_json::json!({
-                "reason": "daemon_ctl_upgrade_check_not_idle",
-            }),
-        )),
+        UpgradeCheckOutcome::Busy => Err(upgrade_check_busy_error(session_name)),
     }
 }
 
@@ -442,16 +447,20 @@ async fn probe_upgrade_check_until(
         .map_err(|error| upgrade_probe_send_error(session_name, error))?;
     match validate_upgrade_check_response(session_name, response)? {
         UpgradeCheckOutcome::Idle(compatibility) => Ok(compatibility),
-        UpgradeCheckOutcome::Busy => Err(RubError::domain_with_context(
-            ErrorCode::SessionBusy,
-            format!(
-                "Session '{session_name}' is not idle enough to satisfy the hard-cut upgrade fence"
-            ),
-            serde_json::json!({
-                "reason": "daemon_ctl_upgrade_check_not_idle",
-            }),
-        )),
+        UpgradeCheckOutcome::Busy => Err(upgrade_check_busy_error(session_name)),
     }
+}
+
+fn upgrade_check_busy_error(session_name: &str) -> RubError {
+    RubError::domain_with_context(
+        ErrorCode::SessionBusy,
+        format!(
+            "Session '{session_name}' is not idle enough to satisfy the hard-cut upgrade fence"
+        ),
+        serde_json::json!({
+            "reason": "daemon_ctl_upgrade_check_not_idle",
+        }),
+    )
 }
 
 fn validate_upgrade_check_response(
@@ -550,16 +559,10 @@ fn upgrade_check_payload_invalid_error(session_name: &str, data: serde_json::Val
 }
 
 fn upgrade_check_not_idle_error(error: &RubError) -> bool {
-    matches!(
+    domain_error_has_reason(
         error,
-        RubError::Domain(envelope)
-            if envelope.code == ErrorCode::SessionBusy
-                && envelope
-                    .context
-                    .as_ref()
-                    .and_then(|context| context.get("reason"))
-                    .and_then(|value| value.as_str())
-                    == Some("daemon_ctl_upgrade_check_not_idle")
+        ErrorCode::SessionBusy,
+        "daemon_ctl_upgrade_check_not_idle",
     )
 }
 
@@ -607,15 +610,41 @@ fn upgrade_probe_send_error(session_name: &str, error: IpcClientError) -> RubErr
 }
 
 fn transport_reason_from_error(error: &RubError) -> Option<String> {
+    domain_error_context_str(error, "transport_reason").map(str::to_string)
+}
+
+fn domain_error_has_reason(error: &RubError, code: ErrorCode, reason: &str) -> bool {
+    match error {
+        RubError::Domain(envelope) if envelope.code == code => {
+            domain_error_context_str(error, "reason") == Some(reason)
+        }
+        _ => false,
+    }
+}
+
+fn domain_error_context_str<'a>(error: &'a RubError, key: &str) -> Option<&'a str> {
     match error {
         RubError::Domain(envelope) => envelope
             .context
             .as_ref()
-            .and_then(|context| context.get("transport_reason"))
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
+            .and_then(|context| context.get(key))
+            .and_then(|value| value.as_str()),
         _ => None,
     }
+}
+
+fn transport_transient_retry_failure(error: RubError) -> Result<RetryFailure, RubError> {
+    let Some(reason) = transport_reason_from_error(&error) else {
+        return Err(error);
+    };
+    Ok(RetryFailure {
+        error,
+        attribution: RetryAttribution {
+            retry_count: 0,
+            retry_reason: Some(reason),
+        },
+        final_failure_class: ConnectionFailureClass::TransportTransient,
+    })
 }
 
 fn transport_transient_proves_selected_authority_stale(failure: &RetryFailure) -> bool {
@@ -753,41 +782,21 @@ async fn detect_or_connect_hardened_with_budget(
                 };
                 let handshake = match handshake_result {
                     Ok(handshake) => handshake,
-                    Err(error) => {
-                        if let Some(reason) = transport_reason_from_error(&error) {
-                            last_failure = Some(RetryFailure {
-                                error,
-                                attribution: RetryAttribution {
-                                    retry_count: 0,
-                                    retry_reason: Some(reason),
-                                },
-                                final_failure_class: ConnectionFailureClass::TransportTransient,
-                            });
+                    Err(error) => match transport_transient_retry_failure(error) {
+                        Ok(failure) => {
+                            last_failure = Some(failure);
                             continue;
                         }
-                        return Err(error);
-                    }
+                        Err(error) => return Err(error),
+                    },
                 };
                 if let Some(entry) = authority_entry.as_ref()
                     && handshake.daemon_session_id != entry.session_id
                 {
-                    return Err(RubError::domain_with_context(
-                        ErrorCode::IpcProtocolError,
-                        format!(
-                            "Connected daemon authority for session '{session_name}' did not match the authoritative registry entry"
-                        ),
-                        serde_json::json!({
-                            "reason": "daemon_authority_mismatch",
-                            "session": session_name,
-                            "registry_session_id": entry.session_id,
-                            "handshake_session_id": handshake.daemon_session_id,
-                            "socket_path": entry.socket_path,
-                            "socket_path_state": daemon_ctl_path_state(
-                                "daemon_ctl.upgrade.registry_entry.socket_path",
-                                "registry_authority_entry",
-                                "session_socket",
-                            ),
-                        }),
+                    return Err(daemon_authority_mismatch_error(
+                        session_name,
+                        entry,
+                        &handshake.daemon_session_id,
                     ));
                 }
                 if let Some(entry) = authority_entry.as_ref() {
@@ -869,38 +878,29 @@ async fn detect_or_connect_hardened_with_budget(
                             if upgrade_check_not_idle_error(&error) {
                                 return Err(error);
                             }
-                            if let Some(reason) = transport_reason_from_error(&error) {
-                                last_failure = Some(RetryFailure {
-                                    error,
-                                    attribution: RetryAttribution {
-                                        retry_count: 0,
-                                        retry_reason: Some(reason),
-                                    },
-                                    final_failure_class: ConnectionFailureClass::TransportTransient,
-                                });
-                                continue;
+                            match transport_transient_retry_failure(error) {
+                                Ok(failure) => {
+                                    last_failure = Some(failure);
+                                    continue;
+                                }
+                                Err(error) => {
+                                    if domain_error_has_reason(
+                                        &error,
+                                        ErrorCode::IpcProtocolError,
+                                        "daemon_ctl_upgrade_check_payload_invalid",
+                                    ) {
+                                        return Err(error);
+                                    }
+                                    hard_cut_outdated_daemon(
+                                        rub_home,
+                                        session_name,
+                                        entry,
+                                        budget.map(|budget| budget.deadline),
+                                    )
+                                    .await?;
+                                    return Ok(DaemonConnection::NeedStart);
+                                }
                             }
-                            if matches!(
-                                &error,
-                                RubError::Domain(envelope)
-                                    if envelope.code == ErrorCode::IpcProtocolError
-                                        && envelope
-                                            .context
-                                            .as_ref()
-                                            .and_then(|context| context.get("reason"))
-                                            .and_then(|value| value.as_str())
-                                            == Some("daemon_ctl_upgrade_check_payload_invalid")
-                            ) {
-                                return Err(error);
-                            }
-                            hard_cut_outdated_daemon(
-                                rub_home,
-                                session_name,
-                                entry,
-                                budget.map(|budget| budget.deadline),
-                            )
-                            .await?;
-                            return Ok(DaemonConnection::NeedStart);
                         }
                     }
                 }
@@ -1001,19 +1001,10 @@ fn committed_registry_subject_still_owns_runtime(
     rub_home: &Path,
     entry: &rub_daemon::session::RegistryEntry,
 ) -> bool {
-    if !rub_core::process::is_process_alive(entry.pid) {
+    if !is_process_alive(entry.pid) {
         return false;
     }
-    let runtime = RubPaths::new(rub_home).session_runtime(&entry.session_name, &entry.session_id);
-    let pid_matches = std::fs::read_to_string(runtime.pid_path())
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
-        == Some(entry.pid);
-    let committed_matches = std::fs::read_to_string(runtime.startup_committed_path())
-        .ok()
-        .is_some_and(|raw| raw.trim() == entry.session_id);
-    let socket_matches = Path::new(&entry.socket_path) == runtime.socket_path();
-    pid_matches && committed_matches && socket_matches
+    registry_entry_runtime_commit_matches(rub_home, entry)
 }
 
 fn missing_socket_preserves_registry_authority_error(

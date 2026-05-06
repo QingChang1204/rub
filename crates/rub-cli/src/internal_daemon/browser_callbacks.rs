@@ -22,7 +22,7 @@ pub(super) async fn install_browser_callbacks(
 
     let state_for_callback = state.clone();
     browser_manager
-        .set_epoch_callback(std::sync::Arc::new(move |target_id| {
+        .set_epoch_callback(Arc::new(move |target_id| {
             let _ = state_for_callback.observe_external_dom_change(target_id);
         }))
         .await;
@@ -68,7 +68,7 @@ async fn install_observatory_callbacks(
     let network_request_overflowed = Arc::new(AtomicBool::new(false));
     if let Err(error) = browser_manager
         .set_observatory_callbacks(rub_cdp::runtime_observatory::ObservatoryCallbacks {
-            on_console_error: Some(std::sync::Arc::new({
+            on_console_error: Some(Arc::new({
                 let observatory_tx = observatory_tx.clone();
                 let observatory_state = state.clone();
                 let observatory_overflowed = observatory_overflowed.clone();
@@ -81,7 +81,7 @@ async fn install_observatory_callbacks(
                     );
                 }
             })),
-            on_page_error: Some(std::sync::Arc::new({
+            on_page_error: Some(Arc::new({
                 let observatory_tx = observatory_tx.clone();
                 let observatory_state = state.clone();
                 let observatory_overflowed = observatory_overflowed.clone();
@@ -94,7 +94,7 @@ async fn install_observatory_callbacks(
                     );
                 }
             })),
-            on_network_failure: Some(std::sync::Arc::new({
+            on_network_failure: Some(Arc::new({
                 let observatory_tx = observatory_tx.clone();
                 let observatory_state = state.clone();
                 let observatory_overflowed = observatory_overflowed.clone();
@@ -107,7 +107,7 @@ async fn install_observatory_callbacks(
                     );
                 }
             })),
-            on_request_summary: Some(std::sync::Arc::new({
+            on_request_summary: Some(Arc::new({
                 let observatory_tx = observatory_tx.clone();
                 let observatory_state = state.clone();
                 let observatory_overflowed = observatory_overflowed.clone();
@@ -120,7 +120,7 @@ async fn install_observatory_callbacks(
                     );
                 }
             })),
-            on_request_record: Some(std::sync::Arc::new({
+            on_request_record: Some(Arc::new({
                 let observatory_state = state.clone();
                 let network_request_tx = network_request_tx.clone();
                 let network_request_overflowed = network_request_overflowed.clone();
@@ -133,7 +133,7 @@ async fn install_observatory_callbacks(
                     );
                 }
             })),
-            on_runtime_degraded: Some(std::sync::Arc::new({
+            on_runtime_degraded: Some(Arc::new({
                 let observatory_state = state.clone();
                 move |reason| {
                     let observatory_state = observatory_state.clone();
@@ -164,10 +164,10 @@ async fn install_runtime_state_callbacks(
     let runtime_state_browser_manager = browser_manager.clone();
     if let Err(error) = browser_manager
         .set_runtime_state_callbacks(rub_cdp::runtime_state::RuntimeStateCallbacks {
-            allocate_sequence: Some(std::sync::Arc::new(move || {
+            allocate_sequence: Some(Arc::new(move || {
                 runtime_sequence_state.allocate_runtime_state_sequence()
             })),
-            on_snapshot: Some(std::sync::Arc::new(
+            on_snapshot: Some(Arc::new(
                 move |sequence, listener_generation, active_target_id, snapshot| {
                     let state = runtime_state.clone();
                     let browser_manager = runtime_state_browser_manager.clone();
@@ -219,7 +219,7 @@ async fn install_dialog_callbacks(
     let closed_event_sink = browser_event_sink.clone();
     if let Err(error) = browser_manager
         .set_dialog_callbacks(rub_cdp::dialogs::DialogCallbacks {
-            on_runtime: Some(std::sync::Arc::new(move |runtime| {
+            on_runtime: Some(Arc::new(move |runtime| {
                 let browser_sequence = runtime_state.allocate_browser_event_sequence();
                 runtime_event_sink.enqueue(
                     rub_daemon::session::BrowserSessionEvent::DialogRuntime {
@@ -229,7 +229,7 @@ async fn install_dialog_callbacks(
                     },
                 );
             })),
-            on_opened: Some(std::sync::Arc::new(move |event| {
+            on_opened: Some(Arc::new(move |event| {
                 let browser_sequence = opened_state.allocate_browser_event_sequence();
                 opened_event_sink.enqueue(rub_daemon::session::BrowserSessionEvent::DialogOpened {
                     browser_sequence,
@@ -243,7 +243,7 @@ async fn install_dialog_callbacks(
                     has_browser_handler: event.has_browser_handler,
                 });
             })),
-            on_closed: Some(std::sync::Arc::new(move |event| {
+            on_closed: Some(Arc::new(move |event| {
                 let browser_sequence = closed_state.allocate_browser_event_sequence();
                 closed_event_sink.enqueue(rub_daemon::session::BrowserSessionEvent::DialogClosed {
                     browser_sequence,
@@ -275,10 +275,10 @@ async fn install_download_callbacks(
     let progress_event_sink = browser_event_sink.clone();
     if let Err(error) = browser_manager
         .set_download_callbacks(rub_cdp::downloads::DownloadCallbacks {
-            on_runtime: Some(std::sync::Arc::new(move |runtime| {
+            on_runtime: Some(Arc::new(move |runtime| {
                 runtime_event_sink.enqueue_download_runtime(runtime.generation, runtime.runtime);
             })),
-            on_started: Some(std::sync::Arc::new(move |event| {
+            on_started: Some(Arc::new(move |event| {
                 started_event_sink.enqueue_download_started(
                     event.generation,
                     event.guid,
@@ -287,7 +287,7 @@ async fn install_download_callbacks(
                     event.frame_id,
                 );
             })),
-            on_progress: Some(std::sync::Arc::new(move |event| {
+            on_progress: Some(Arc::new(move |event| {
                 progress_event_sink.enqueue_download_progress(
                     event.generation,
                     event.guid,

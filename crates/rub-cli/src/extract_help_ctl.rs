@@ -16,7 +16,7 @@ const EXTRACT_TRANSFORM_VALUES: &[&str] = &[
 pub(crate) fn project_extract_help(
     examples: Option<&str>,
     schema: bool,
-) -> Result<serde_json::Value, RubError> {
+) -> Result<Value, RubError> {
     if schema {
         return Ok(project_extract_schema());
     }
@@ -191,6 +191,7 @@ fn example_validation() -> Value {
 mod tests {
     use super::project_extract_help;
     use rub_core::error::ErrorCode;
+    use serde_json::json;
 
     #[test]
     fn schema_surface_lists_supported_field_shapes() {
@@ -198,11 +199,11 @@ mod tests {
         assert_eq!(result["result"]["kind"], "schema");
         assert_eq!(
             result["result"]["field_descriptor"]["kind_values"],
-            serde_json::json!(["text", "value", "html", "bbox", "attributes", "attribute"])
+            json!(["text", "value", "html", "bbox", "attributes", "attribute"])
         );
         assert_eq!(
             result["result"]["collection_descriptor"]["keys"],
-            serde_json::json!([
+            json!([
                 "collection",
                 "selector",
                 "target_text",
@@ -236,7 +237,7 @@ mod tests {
         let context = envelope.context.expect("examples topic context");
         assert_eq!(
             context["available_topics"],
-            serde_json::json!(["all", "basic", "attribute", "collection", "validation"])
+            json!(["all", "basic", "attribute", "collection", "validation"])
         );
     }
 }

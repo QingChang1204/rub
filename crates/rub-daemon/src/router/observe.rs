@@ -3,14 +3,17 @@ mod projection;
 
 use self::args::{ObserveArgs, parse_observe_limit};
 use self::projection::{build_element_map, capture_screenshot_payload, count_summary_lines};
+use super::frame_scope::semantic_replay_orchestration_metadata;
 use super::observation_filter::{
     ObservationProjectionMode, apply_observation_projection,
     attach_observation_projection_metadata, parse_observation_projection,
 };
 use super::observation_scope::{
-    apply_observation_scope, apply_projection_limit, attach_scope_metadata, parse_observation_scope,
+    ObservationScopeMetadata, apply_optional_observation_scope, apply_projection_limit,
+    attach_scope_metadata, parse_observation_scope,
 };
 use super::projection::{attach_result, attach_subject, snapshot_entity};
+use super::request_args::{copy_semantic_raw_field, parse_json_args};
 use super::snapshot::build_stable_snapshot;
 use super::state_format::{summarize_snapshot_a11y, summarize_snapshot_compact};
 use super::*;
@@ -21,7 +24,7 @@ pub(super) async fn cmd_observe(
     deadline: TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
-    let parsed: ObserveArgs = super::request_args::parse_json_args(args, "observe")?;
+    let parsed: ObserveArgs = parse_json_args(args, "observe")?;
     let limit = parse_observe_limit(parsed.limit)?;
     let full = parsed.full;
     let path = parsed.path.as_deref();
@@ -34,18 +37,10 @@ pub(super) async fn cmd_observe(
         } else {
             limit
         };
-    let mut snapshot =
+    let snapshot =
         build_stable_snapshot(router, args, state, deadline, capture_limit, true, false).await?;
-    let mut scope_metadata = None::<(rub_core::observation::ObservationScope, u32, u32)>;
-    if let Some(scope) = observation_scope.as_ref() {
-        let scoped = apply_observation_scope(router, snapshot, scope).await?;
-        scope_metadata = Some((
-            scoped.scope.clone(),
-            scoped.scope_total_count,
-            scoped.scope_match_count,
-        ));
-        snapshot = scoped.snapshot;
-    }
+    let (mut snapshot, scope_metadata): (_, Option<ObservationScopeMetadata>) =
+        apply_optional_observation_scope(router, snapshot, observation_scope.as_ref()).await?;
     let projection_metadata = apply_observation_projection(&mut snapshot, observation_projection);
     if observation_scope.is_some() || observation_projection.depth_limit.is_some() {
         apply_projection_limit(&mut snapshot, limit);
@@ -212,7 +207,7 @@ pub(super) async fn cmd_observe(
 }
 
 pub(crate) fn semantic_replay_args(args: &serde_json::Value) -> Option<serde_json::Value> {
-    let parsed: ObserveArgs = super::request_args::parse_json_args(args, "observe").ok()?;
+    let parsed: ObserveArgs = parse_json_args(args, "observe").ok()?;
     let mut projected = serde_json::Map::new();
     projected.insert("full".to_string(), serde_json::json!(parsed.full));
     projected.insert("path".to_string(), serde_json::json!(parsed.path));
@@ -227,7 +222,7 @@ pub(crate) fn semantic_replay_args(args: &serde_json::Value) -> Option<serde_jso
     copy_semantic_raw_field(args, "scope_first", &mut projected);
     copy_semantic_raw_field(args, "scope_last", &mut projected);
     copy_semantic_raw_field(args, "scope_nth", &mut projected);
-    if let Some(orchestration) = super::frame_scope::semantic_replay_orchestration_metadata(args) {
+    if let Some(orchestration) = semantic_replay_orchestration_metadata(args) {
         projected.insert("_orchestration".to_string(), orchestration);
     }
     Some(serde_json::Value::Object(projected))
@@ -265,16 +260,6 @@ fn highlight_injection_failure_context(
         context["highlight_cleanup_error"] = serde_json::json!(cleanup_error.to_string());
     }
     context
-}
-
-fn copy_semantic_raw_field(
-    args: &serde_json::Value,
-    key: &str,
-    projected: &mut serde_json::Map<String, serde_json::Value>,
-) {
-    if let Some(value) = args.get(key) {
-        projected.insert(key.to_string(), value.clone());
-    }
 }
 
 #[cfg(test)]
