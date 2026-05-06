@@ -597,8 +597,7 @@ fn command_may_have_dom_commit_after_timeout(request: &IpcRequest) -> bool {
         || (matches!(metadata.dom_epoch_policy, DomEpochPolicy::ArgsDependent)
             && dialog_action_commits_epoch(request))
         || (metadata.effect_class == CommandEffectClass::WorkflowMutation
-            && metadata.timeout_recovery_surface == TimeoutRecoverySurface::PossibleCommit
-            && metadata.dom_epoch_policy == DomEpochPolicy::None)
+            && metadata.timeout_recovery_surface == TimeoutRecoverySurface::PossibleCommit)
 }
 
 fn dialog_action_commits_epoch(request: &IpcRequest) -> bool {

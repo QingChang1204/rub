@@ -46,7 +46,12 @@ pub(super) async fn fire_trigger(
             Err(ErrorEnvelope::new(
                 ErrorCode::InvalidInput,
                 "trigger action.kind is not yet executable in this runtime slice",
-            ))
+            )
+            .with_context(trigger_action_failure_context(
+                trigger,
+                "unsupported_action_kind",
+                None,
+            )))
         }
     }
 }
@@ -63,6 +68,11 @@ async fn fire_browser_command_trigger(
             ErrorCode::InvalidInput,
             "trigger browser_command action is missing action.command",
         )
+        .with_context(trigger_action_failure_context(
+            trigger,
+            "missing_action_command",
+            None,
+        ))
     })?;
     let mut payload = trigger
         .action
@@ -75,6 +85,11 @@ async fn fire_browser_command_trigger(
             ErrorCode::InvalidInput,
             "trigger browser_command action payload must be a JSON object",
         )
+        .with_context(trigger_action_failure_context(
+            trigger,
+            "action_payload_not_object",
+            Some(command),
+        ))
     })?;
     object.insert(
         "_trigger".to_string(),
@@ -101,6 +116,11 @@ async fn fire_browser_command_trigger(
                         rub_core::error::ErrorCode::IpcProtocolError,
                         format!("trigger action command_id is not protocol-valid: {reason}"),
                     )
+                    .with_context(trigger_action_failure_context(
+                        trigger,
+                        "invalid_action_command_id",
+                        Some(dispatch_command),
+                    ))
                 })?
             },
             state,
@@ -109,6 +129,21 @@ async fn fire_browser_command_trigger(
     let data = ensure_trigger_response_success(response, trigger, "action")?;
     ensure_committed_automation_result(command, data.as_ref())?;
     Ok(data)
+}
+
+fn trigger_action_failure_context(
+    trigger: &TriggerInfo,
+    reason: &str,
+    action_command: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "phase": "action",
+        "reason": reason,
+        "action_kind": trigger.action.kind,
+        "action_command": action_command,
+        "target_tab_target_id": trigger.target_tab.target_id,
+        "target_frame_id": trigger.target_tab.frame_id,
+    })
 }
 
 async fn fire_workflow_trigger(

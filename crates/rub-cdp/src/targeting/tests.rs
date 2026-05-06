@@ -1,14 +1,18 @@
 use super::{
     LiveWriteTargetFingerprint, TOP_LEVEL_BOUNDING_BOX_FUNCTION, TOP_LEVEL_HIT_TEST_HELPERS,
     bounding_box_center_distance, bounding_box_match_score, bounding_box_shape_matches,
-    candidate_points, filter_snapshot_elements_by_hit_test, finalize_hit_test_ranking,
-    live_write_target_fingerprint_mismatch, parse_backend_node_id, parse_element_ref_frame_id,
-    snapshot_candidate_match_rank, tag_matches, top_level_geometry_authority_error,
-    top_level_geometry_error_reason, unverified_read_target_error, unverified_write_target_error,
+    candidate_points, ensure_elements_belong_to_snapshot, filter_snapshot_elements_by_hit_test,
+    finalize_hit_test_ranking, live_write_target_fingerprint_mismatch, parse_backend_node_id,
+    parse_element_ref_frame_id, snapshot_candidate_match_rank, tag_matches,
+    top_level_geometry_authority_error, top_level_geometry_error_reason,
+    unverified_read_target_error, unverified_write_target_error,
 };
 use crate::browser::{BrowserLaunchOptions, BrowserManager};
 use rub_core::error::ErrorCode;
-use rub_core::model::{BoundingBox, Element, ElementTag};
+use rub_core::model::{
+    BoundingBox, Element, ElementTag, FrameContextInfo, ScrollPosition, Snapshot,
+    SnapshotProjection,
+};
 use std::collections::HashMap;
 
 fn options() -> BrowserLaunchOptions {
@@ -177,6 +181,74 @@ fn bounding_box_center_distance_reflects_geometric_drift() {
 
     assert_eq!(bounding_box_center_distance(expected, expected), 0.0);
     assert!(bounding_box_center_distance(expected, shifted) > 0.0);
+}
+
+#[test]
+fn hit_test_candidates_must_belong_to_snapshot_authority() {
+    let element = Element {
+        index: 0,
+        tag: ElementTag::Button,
+        text: "Save".to_string(),
+        attributes: HashMap::new(),
+        element_ref: Some("frame-1:10".to_string()),
+        target_id: Some("target-1".to_string()),
+        bounding_box: None,
+        ax_info: None,
+        listeners: None,
+        depth: None,
+    };
+    let snapshot = Snapshot {
+        snapshot_id: "snap-1".to_string(),
+        dom_epoch: 1,
+        frame_context: FrameContextInfo {
+            frame_id: "frame-1".to_string(),
+            name: None,
+            parent_frame_id: None,
+            target_id: Some("target-1".to_string()),
+            url: Some("https://example.test".to_string()),
+            depth: 0,
+            same_origin_accessible: Some(true),
+        },
+        frame_lineage: vec!["frame-1".to_string()],
+        url: "https://example.test".to_string(),
+        title: "Example".to_string(),
+        elements: vec![element.clone()],
+        total_count: 1,
+        truncated: false,
+        scroll: ScrollPosition {
+            x: 0.0,
+            y: 0.0,
+            at_bottom: false,
+        },
+        timestamp: "2026-05-06T00:00:00Z".to_string(),
+        projection: SnapshotProjection {
+            verified: true,
+            js_traversal_count: 1,
+            backend_traversal_count: 1,
+            resolved_ref_count: 1,
+            warning: None,
+        },
+        viewport_filtered: None,
+        viewport_count: None,
+    };
+    let mismatched = Element {
+        text: "Delete".to_string(),
+        ..element
+    };
+
+    let error = ensure_elements_belong_to_snapshot(&snapshot, &[mismatched])
+        .expect_err("candidate from a different projection must fail closed");
+
+    match error {
+        rub_core::error::RubError::Domain(envelope) => {
+            assert_eq!(envelope.code, ErrorCode::StaleSnapshot);
+            assert_eq!(
+                envelope.context.as_ref().unwrap()["reason"],
+                serde_json::json!("element_projection_mismatch")
+            );
+        }
+        other => panic!("expected stale snapshot authority error, got {other:?}"),
+    }
 }
 
 #[test]

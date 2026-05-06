@@ -94,6 +94,8 @@ async fn execution_timeout_fence_marks_possible_dom_commit_and_drops_snapshots()
 #[tokio::test]
 async fn execution_timeout_fence_marks_aggregate_workflow_possible_dom_commit() {
     for command in [
+        "fill",
+        "_trigger_fill",
         "pipe",
         "_trigger_pipe",
         "orchestration",

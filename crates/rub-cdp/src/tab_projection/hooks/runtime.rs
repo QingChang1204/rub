@@ -68,6 +68,7 @@ pub(crate) async fn sync_tabs_projection_with(
     }
 
     let projected = fresh_pages.into_iter().map(Arc::new).collect::<Vec<_>>();
+    let ordered_live_target_ids = ordered_target_ids(&projected);
     let live_target_ids = projected
         .iter()
         .map(|page| page.target_id().as_ref().to_string())
@@ -83,6 +84,7 @@ pub(crate) async fn sync_tabs_projection_with(
         &tab_projection_store,
         projected,
         live_target_ids,
+        ordered_live_target_ids,
         browser_truth_active_target,
     )
     .await
@@ -166,6 +168,7 @@ struct StagedTabsProjectionCommit {
     committed_projection: CommittedTabProjection,
     next_local_active_target_authority: Option<LocalActiveTargetAuthority>,
     live_target_ids: HashSet<String>,
+    ordered_live_target_ids: Vec<String>,
 }
 
 async fn stage_tabs_projection_state_if_current(
@@ -173,6 +176,7 @@ async fn stage_tabs_projection_state_if_current(
     tab_projection_store: &Arc<Mutex<CommittedTabProjection>>,
     projected: Vec<Arc<Page>>,
     live_target_ids: HashSet<String>,
+    ordered_live_target_ids: Vec<String>,
     browser_truth_active_target: Option<TargetId>,
 ) -> Option<StagedTabsProjectionCommit> {
     let projection_store = tab_projection_store.lock().await;
@@ -197,6 +201,7 @@ async fn stage_tabs_projection_state_if_current(
         next_local_active_target_authority: active_target_resolution
             .next_local_active_target_authority,
         live_target_ids,
+        ordered_live_target_ids,
     })
 }
 
@@ -221,6 +226,9 @@ async fn staged_projection_still_current(
         return Ok(false);
     }
     let refreshed_pages = fresh_pages.into_iter().map(Arc::new).collect::<Vec<_>>();
+    if ordered_target_ids(&refreshed_pages) != staged.ordered_live_target_ids {
+        return Ok(false);
+    }
     let refreshed_browser_truth =
         crate::tab_projection::resolve_active_target_from_browser_truth(&refreshed_pages).await;
     let local_active_target_authority = context.local_active_target_authority.lock().await.clone();
@@ -234,6 +242,13 @@ async fn staged_projection_still_current(
             && refreshed_resolution.active_target_authority
                 == staged.committed_projection.active_target_authority,
     )
+}
+
+fn ordered_target_ids(pages: &[Arc<Page>]) -> Vec<String> {
+    pages
+        .iter()
+        .map(|page| page.target_id().as_ref().to_string())
+        .collect()
 }
 
 async fn commit_staged_tabs_projection_state_if_current(

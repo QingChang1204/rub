@@ -24,31 +24,43 @@ pub(crate) async fn next_listener_event<S, T>(
 where
     S: Stream<Item = T> + Unpin,
 {
-    if !is_current_generation(generation_rx, generation) {
-        return None;
+    enum NextEvent<T> {
+        Listener(Option<T>),
+        CurrentGenerationChange,
     }
 
-    let event = tokio::select! {
-        event = listener.next() => event,
-        changed = generation_rx.changed() => {
-            match changed {
-                Ok(()) if is_current_generation(generation_rx, generation) => listener.next().await,
-                Ok(()) | Err(_) => None,
+    loop {
+        if !is_current_generation(generation_rx, generation) {
+            return None;
+        }
+
+        let event = tokio::select! {
+            event = listener.next() => NextEvent::Listener(event),
+            changed = generation_rx.changed() => {
+                match changed {
+                    Ok(()) if is_current_generation(generation_rx, generation) => NextEvent::CurrentGenerationChange,
+                    Ok(()) | Err(_) => return None,
+                }
+            }
+        };
+
+        match event {
+            NextEvent::CurrentGenerationChange => continue,
+            NextEvent::Listener(event) => {
+                if !is_current_generation(generation_rx, generation) {
+                    return None;
+                }
+                return event;
             }
         }
-    };
-
-    if !is_current_generation(generation_rx, generation) {
-        return None;
     }
-
-    event
 }
 
 #[cfg(test)]
 mod tests {
     use super::{is_current_generation, new_listener_generation_channel, next_listener_event};
     use futures::stream;
+    use std::time::Duration;
 
     #[test]
     fn listener_generation_channel_advances_monotonically() {
@@ -71,5 +83,25 @@ mod tests {
 
         let event = next_listener_event(&mut stream, 0, &mut rx).await;
         assert!(event.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_listener_exits_when_generation_bumps_after_unconsumed_current_change() {
+        let (tx, mut rx) = new_listener_generation_channel();
+        tx.send(1).expect("generation update should succeed");
+        let mut stream = stream::pending::<&'static str>();
+        let bump = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            tx.send(2).expect("generation update should succeed");
+        });
+
+        let result = tokio::time::timeout(Duration::from_millis(100), async {
+            next_listener_event(&mut stream, 1, &mut rx).await
+        })
+        .await
+        .expect("stale listener should not wait for a browser event");
+        bump.await.expect("generation bump task should finish");
+
+        assert!(result.is_none());
     }
 }

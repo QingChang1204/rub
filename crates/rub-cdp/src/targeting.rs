@@ -388,9 +388,11 @@ pub(crate) async fn resolve_pointer_point(
 
 pub(crate) async fn filter_snapshot_elements_by_hit_test(
     page: &Arc<Page>,
-    _snapshot: &rub_core::model::Snapshot,
+    snapshot: &rub_core::model::Snapshot,
     elements: &[Element],
 ) -> Result<Vec<Element>, RubError> {
+    ensure_elements_belong_to_snapshot(snapshot, elements)?;
+
     let mut filtered = Vec::with_capacity(elements.len());
     let mut authority_error: Option<RubError> = None;
     let mut lost_snapshot_authority = false;
@@ -421,6 +423,47 @@ pub(crate) async fn filter_snapshot_elements_by_hit_test(
         }
     }
     finalize_hit_test_ranking(filtered, authority_error, lost_snapshot_authority)
+}
+
+fn ensure_elements_belong_to_snapshot(
+    snapshot: &rub_core::model::Snapshot,
+    elements: &[Element],
+) -> Result<(), RubError> {
+    let snapshot_index = crate::snapshot_lookup::build_snapshot_index_lookup(snapshot);
+    for element in elements {
+        let Some(snapshot_element) = snapshot_index.get(&element.index) else {
+            return Err(snapshot_element_authority_error(
+                snapshot,
+                element,
+                "element_index_missing_from_snapshot",
+            ));
+        };
+        if serde_json::to_value(element).ok() != serde_json::to_value(snapshot_element).ok() {
+            return Err(snapshot_element_authority_error(
+                snapshot,
+                element,
+                "element_projection_mismatch",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_element_authority_error(
+    snapshot: &rub_core::model::Snapshot,
+    element: &Element,
+    reason: &str,
+) -> RubError {
+    RubError::domain_with_context(
+        ErrorCode::StaleSnapshot,
+        "Snapshot hit-test candidates must belong to the supplied snapshot authority",
+        serde_json::json!({
+            "reason": reason,
+            "snapshot_id": snapshot.snapshot_id,
+            "element_index": element.index,
+            "element_ref": element.element_ref,
+        }),
+    )
 }
 
 fn is_hit_test_authority_error(error: &RubError) -> bool {
