@@ -16,7 +16,7 @@ use rub_daemon::session::{RegistryData, RegistryEntry, write_registry};
 use rub_ipc::codec::NdJsonCodec;
 use rub_ipc::protocol::IpcResponse;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 static GRACEFUL_KILL_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FALLBACK_KILL_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -123,7 +123,7 @@ fn test_noop_remove_dir(_home: &str) {}
 fn panic_path_home_cleanup_retains_home_for_retry_authority() {
     struct CleanupDuringPanic {
         home: String,
-        result: std::sync::Arc<std::sync::Mutex<Option<CleanupVerification>>>,
+        result: Arc<Mutex<Option<CleanupVerification>>>,
     }
 
     impl Drop for CleanupDuringPanic {
@@ -135,7 +135,7 @@ fn panic_path_home_cleanup_retains_home_for_retry_authority() {
     }
 
     let home = unique_cleanup_home();
-    let verification = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let verification = Arc::new(Mutex::new(None));
     let observed = verification.clone();
 
     let _ = std::panic::catch_unwind(|| {

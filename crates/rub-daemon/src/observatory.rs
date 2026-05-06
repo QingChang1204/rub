@@ -81,6 +81,7 @@ mod tests {
         assert_eq!(projection.recent_console_errors[31].message, "console-39");
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn raw_projection_reports_local_drop_counts_truthfully() {
         let mut state = RuntimeObservatoryState::default();
@@ -393,6 +394,7 @@ mod tests {
         assert_eq!(after_first[1].request_id, "req-3");
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn request_window_after_ignores_sequence_gaps_from_same_request_updates() {
         let mut state = RuntimeObservatoryState::default();
@@ -469,6 +471,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn request_window_after_treats_request_record_eviction_as_non_authoritative() {
         let mut state = RuntimeObservatoryState::default();
@@ -504,6 +507,7 @@ mod tests {
         assert!(!window.records.is_empty());
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn request_window_recovers_authority_after_cursor_advances_past_eviction_boundary() {
         let mut state = RuntimeObservatoryState::default();
@@ -543,6 +547,7 @@ mod tests {
         assert_eq!(window.degraded_reason, None);
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn request_window_keeps_stale_cursor_degraded_after_drop_count_stops_moving() {
         let mut state = RuntimeObservatoryState::default();
@@ -599,6 +604,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn request_record_overflow_does_not_overwrite_stronger_top_level_degraded_reason() {
         let mut state = RuntimeObservatoryState::default();
@@ -766,6 +772,7 @@ mod tests {
         assert_eq!(window.events.len(), 1);
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn observatory_event_window_ignores_request_ring_overflow_when_timeline_authority_holds() {
         let mut state = RuntimeObservatoryState::default();

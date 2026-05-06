@@ -239,6 +239,7 @@ fn find_explain_conflicts_with_limit_in_cli_surface() {
     assert!(rendered.contains("--explain"), "{rendered}");
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn local_projection_surface_marks_extract_examples_and_schema_as_local_only() {
     assert_eq!(

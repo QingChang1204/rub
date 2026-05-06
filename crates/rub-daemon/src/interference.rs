@@ -73,6 +73,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn interference_runtime_state_classifies_and_updates_baseline() {
         let mut state = InterferenceRuntimeState::default();
@@ -98,6 +99,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn interference_runtime_state_primes_missing_baseline_from_active_tab() {
         let mut state = InterferenceRuntimeState::default();
@@ -121,6 +123,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn interference_runtime_state_does_not_prime_baseline_from_interfered_context() {
         let mut state = InterferenceRuntimeState::default();
@@ -144,6 +147,7 @@ mod tests {
         assert!(state.baseline.primary_url.is_none());
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn interference_runtime_state_primes_baseline_only_after_inactive_refresh() {
         let mut state = InterferenceRuntimeState::default();
@@ -188,6 +192,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn interference_runtime_state_does_not_overwrite_existing_baseline() {
         let mut state = InterferenceRuntimeState::default();
@@ -220,6 +225,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn interference_runtime_state_can_adopt_new_primary_context() {
         let mut state = InterferenceRuntimeState::default();

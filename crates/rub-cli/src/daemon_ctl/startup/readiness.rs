@@ -465,7 +465,7 @@ pub async fn wait_for_ready_until(
             break;
         }
         let sleep_for = std::cmp::min(
-            std::time::Duration::from_millis(100),
+            Duration::from_millis(100),
             deadline.saturating_duration_since(now),
         );
         tokio::time::sleep(sleep_for).await;
@@ -676,10 +676,8 @@ async fn connect_ready_client(
         })
         .await;
 
-        match attempt {
-            Ok(Ok((client, daemon_session_id))) => {
-                return Ok((client, daemon_session_id, attribution));
-            }
+        return match attempt {
+            Ok(Ok((client, daemon_session_id))) => Ok((client, daemon_session_id, attribution)),
             Ok(Err(attempt_error)) => {
                 if let Some(reason) = attempt_error.transient_reason.clone()
                     && attribution.retry_count < policy.max_retries
@@ -693,7 +691,7 @@ async fn connect_ready_client(
                     }
                 }
 
-                return Err(RetryFailure {
+                Err(RetryFailure {
                     error: attempt_error.error,
                     attribution,
                     final_failure_class: if attempt_error.transient_reason.is_some() {
@@ -701,15 +699,13 @@ async fn connect_ready_client(
                     } else {
                         attempt_error.final_failure_class
                     },
-                });
+                })
             }
-            Err(_) => {
-                return Err(startup_ready_retry_timeout_failure(
-                    attribution,
-                    &socket_path,
-                ));
-            }
-        }
+            Err(_) => Err(startup_ready_retry_timeout_failure(
+                attribution,
+                &socket_path,
+            )),
+        };
     }
 }
 

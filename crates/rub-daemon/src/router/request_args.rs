@@ -132,6 +132,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn parse_canonical_locator_rejects_ambiguous_selection() {
         let error = parse_canonical_locator(
@@ -153,6 +154,7 @@ mod tests {
         }
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn parse_canonical_locator_rejects_selector_and_ref_mix() {
         let error = parse_canonical_locator(

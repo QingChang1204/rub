@@ -362,7 +362,7 @@ async fn preflight_fill_snapshot_plan(
     state: &Arc<SessionState>,
     deadline: TransactionDeadline,
     snapshot_id: &str,
-    steps: &[super::args::FillStepSpec],
+    steps: &[args::FillStepSpec],
     parsed_args: &FillArgs,
     inheritance_policy: OrchestrationMetadataInheritancePolicy,
 ) -> Result<FillSnapshotPlan, RubError> {

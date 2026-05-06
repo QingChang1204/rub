@@ -18,7 +18,7 @@ pub(super) async fn cmd_exec(
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     let parsed: ExecArgs = parse_json_args(args, "exec")?;
-    let frame_id = super::frame_scope::effective_request_frame_id(router, args, state).await?;
+    let frame_id = frame_scope::effective_request_frame_id(router, args, state).await?;
     record_mutating_possible_commit_timeout_projection(
         "exec",
         serde_json::json!({
@@ -238,6 +238,7 @@ mod tests {
         frames: Vec<FrameInventoryEntry>,
     }
 
+    //noinspection DuplicatedCode
     fn frame_inventory(frame_id: &str) -> FrameInventoryEntry {
         FrameInventoryEntry {
             index: 0,
@@ -300,7 +301,7 @@ mod tests {
             frame_id: Option<&str>,
             _code: &str,
         ) -> Result<serde_json::Value, rub_core::error::RubError> {
-            Ok(serde_json::json!(frame_id.unwrap_or("top")))
+            Ok(json!(frame_id.unwrap_or("top")))
         }
 
         async fn back(&self, _timeout_ms: u64) -> Result<Page, rub_core::error::RubError> {

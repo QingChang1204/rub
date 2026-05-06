@@ -371,6 +371,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn runtime_projection_advances_cursor_for_recovered_download_truth() {
         let mut state = DownloadRuntimeState::default();
@@ -419,6 +420,7 @@ mod tests {
         assert_eq!(events[0].download.state, DownloadState::Completed);
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn repeated_runtime_projection_does_not_reemit_unchanged_download_truth() {
         let mut state = DownloadRuntimeState::default();

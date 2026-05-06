@@ -56,6 +56,7 @@ pub(super) fn apply_field_postprocess(
     )
 }
 
+//noinspection DuplicatedCode
 pub(super) async fn extract_field(
     router: &DaemonRouter,
     snapshot: &rub_core::model::Snapshot,

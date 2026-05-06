@@ -415,6 +415,7 @@ fn orchestration_target_continuity_failure(
     None
 }
 
+//noinspection DuplicatedCode
 fn orchestration_target_degraded_authority_error(
     address: &OrchestrationAddressInfo,
     reason: &'static str,

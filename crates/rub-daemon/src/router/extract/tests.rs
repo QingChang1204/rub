@@ -4,12 +4,12 @@ use super::{
     validate_snapshot_extract_contract,
 };
 use crate::router::extract_postprocess::ExtractValueType;
-use serde_json::json;
+use serde_json::{from_value, json};
 use std::collections::BTreeMap;
 
 #[test]
 fn extract_field_supports_type_shorthand_for_kind() {
-    let field: ExtractFieldSpec = serde_json::from_value(serde_json::json!({
+    let field: ExtractFieldSpec = from_value(json!({
         "selector": "#headline",
         "type": "text"
     }))
@@ -22,7 +22,7 @@ fn extract_field_supports_type_shorthand_for_kind() {
 
 #[test]
 fn extract_field_preserves_value_type_when_kind_is_explicit() {
-    let field: ExtractFieldSpec = serde_json::from_value(serde_json::json!({
+    let field: ExtractFieldSpec = from_value(json!({
         "selector": "#count",
         "kind": "text",
         "transform": "parse_int",
@@ -36,7 +36,7 @@ fn extract_field_preserves_value_type_when_kind_is_explicit() {
 
 #[test]
 fn builder_examples_support_semantic_locators() {
-    let field: ExtractFieldSpec = serde_json::from_value(serde_json::json!({
+    let field: ExtractFieldSpec = from_value(json!({
         "kind": "attribute",
         "attribute": "src",
         "role": "img"
@@ -49,7 +49,7 @@ fn builder_examples_support_semantic_locators() {
     );
     assert_eq!(
         extract_builder_field_examples("hero", &field),
-        Some(serde_json::json!({
+        Some(json!({
             "pick_first": "hero=attribute:src:role:img@first",
             "pick_last": "hero=attribute:src:role:img@last",
             "pick_nth": "hero=attribute:src:role:img@nth(0)",
@@ -60,7 +60,7 @@ fn builder_examples_support_semantic_locators() {
 
 #[test]
 fn extract_field_rejects_unknown_fields() {
-    let error = serde_json::from_value::<ExtractFieldSpec>(serde_json::json!({
+    let error = from_value::<ExtractFieldSpec>(json!({
         "selector": "#headline",
         "kind": "text",
         "knd": "text"
@@ -139,7 +139,7 @@ fn normalize_shorthand_converts_string_values_to_selector_objects() {
 
 #[test]
 fn extract_field_defaults_to_text_kind_when_omitted() {
-    let field: ExtractFieldSpec = serde_json::from_value(json!({
+    let field: ExtractFieldSpec = from_value(json!({
         "selector": "#headline"
     }))
     .expect("extract field without kind should default to text");
@@ -150,7 +150,7 @@ fn extract_field_defaults_to_text_kind_when_omitted() {
 
 #[test]
 fn extract_field_infers_attribute_kind_when_attr_present() {
-    let field: ExtractFieldSpec = serde_json::from_value(json!({
+    let field: ExtractFieldSpec = from_value(json!({
         "selector": "a.main",
         "attr": "href"
     }))
@@ -162,7 +162,7 @@ fn extract_field_infers_attribute_kind_when_attr_present() {
 
 #[test]
 fn extract_field_accepts_attr_as_alias_for_attribute() {
-    let field: ExtractFieldSpec = serde_json::from_value(json!({
+    let field: ExtractFieldSpec = from_value(json!({
         "selector": "img",
         "kind": "attribute",
         "attr": "src"
@@ -215,7 +215,7 @@ fn snapshot_extract_contract_rejects_collection_entries() {
     let fields = BTreeMap::from([(
         "items".to_string(),
         ExtractEntrySpec::Collection(
-            serde_json::from_value(json!({
+            from_value(json!({
                 "selector": ".item",
                 "fields": {
                     "title": {
@@ -242,7 +242,7 @@ fn snapshot_extract_contract_rejects_html_fields() {
     let fields = BTreeMap::from([(
         "html".to_string(),
         ExtractEntrySpec::Field(
-            serde_json::from_value(json!({
+            from_value(json!({
                 "selector": "article",
                 "kind": "html"
             }))

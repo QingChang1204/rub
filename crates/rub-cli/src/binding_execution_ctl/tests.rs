@@ -172,6 +172,7 @@ fn spawn_live_registry_handshake_server(
     })
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn remembered_alias_live_match_reuses_live_session() {
     let home = temp_home();
@@ -229,6 +230,7 @@ fn remembered_alias_live_match_reuses_live_session() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn remembered_alias_live_match_clears_default_user_data_dir_from_reuse_path() {
     let home = temp_home();
@@ -380,7 +382,7 @@ fn remembered_alias_profile_binding_reuses_attachment_identity_without_profile_p
 
     let mut registry = crate::binding_ctl::read_binding_registry(&home).unwrap();
     registry.bindings[0].profile_directory_reference = None;
-    crate::binding_ctl::write_binding_registry(&home, &registry).unwrap();
+    write_binding_registry(&home, &registry).unwrap();
 
     let resolved = resolve_command_execution_binding(&cli(&home))
         .expect("profile binding should reuse attachment identity without projection fallback");
@@ -406,7 +408,7 @@ fn remembered_alias_profile_binding_reuses_captured_attachment_authority_when_cu
 
     let mut registry = crate::binding_ctl::read_binding_registry(&home).unwrap();
     registry.bindings[0].attachment_identity = None;
-    crate::binding_ctl::write_binding_registry(&home, &registry).unwrap();
+    write_binding_registry(&home, &registry).unwrap();
 
     let resolved = resolve_command_execution_binding(&cli(&home))
         .expect("profile binding should reuse capture-time profile authority");

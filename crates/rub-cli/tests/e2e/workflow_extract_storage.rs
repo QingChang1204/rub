@@ -274,10 +274,10 @@ fn t403b_407c_interference_grouped_scenario() {
         "interstitial_navigation",
         "{clicked}"
     );
-    assert!(
+    assert_eq!(
         clicked["error"]["context"]["committed_response_projection"]["interaction"]
-            ["interference"]["before"]["current_interference"]["kind"]
-            == "human_verification_required",
+            ["interference"]["before"]["current_interference"]["kind"],
+        "human_verification_required",
         "{clicked}"
     );
     assert!(
@@ -3029,7 +3029,7 @@ fn t431c_d_download_save_grouped_scenario() {
     let source_path = format!("{home}/assets.json");
     std::fs::write(
         &source_path,
-        serde_json::json!({
+        json!({
             "fields": {
                 "items": [
                     { "note_id": "alpha", "image_url": server.url_for("/assets/a.jpg") },
@@ -3140,7 +3140,7 @@ fn t431c_d_download_save_grouped_scenario() {
     let source_path = format!("{home}/assets-noext.json");
     std::fs::write(
         &source_path,
-        serde_json::json!({
+        json!({
             "fields": {
                 "items": [
                     { "note_id": "alpha", "image_url": server.url_for("/assets/noext") }
@@ -3190,7 +3190,7 @@ fn t431c_d_download_save_grouped_scenario() {
     let source_path = format!("{home}/download-save-autodetect.json");
     std::fs::write(
         &source_path,
-        serde_json::json!({
+        json!({
             "data": {
                 "result": {
                     "items": [
@@ -3228,7 +3228,7 @@ fn t431c_d_download_save_grouped_scenario() {
     );
     assert_eq!(
         saved["data"]["result"]["entries"][0]["status"],
-        serde_json::json!("saved"),
+        json!("saved"),
         "{saved}"
     );
 
@@ -3242,7 +3242,7 @@ fn t431c_d_download_save_grouped_scenario() {
     let source_path = format!("{home}/download-save-relative.json");
     std::fs::write(
         &source_path,
-        serde_json::json!({
+        json!({
             "data": {
                 "result": {
                     "items": [
@@ -3294,7 +3294,7 @@ fn t431c_d_download_save_grouped_scenario() {
     let source_path = format!("{home}/download-save-collision.json");
     std::fs::write(
         &source_path,
-        serde_json::json!({
+        json!({
             "data": {
                 "fields": {
                     "items": [
@@ -3360,7 +3360,7 @@ fn t431c_d_download_save_grouped_scenario() {
     let source_path = format!("{home}/assets-partial.json");
     std::fs::write(
         &source_path,
-        serde_json::json!({
+        json!({
             "fields": {
                 "items": [
                     { "note_id": "alpha", "image_url": server.url_for("/assets/a.jpg") },

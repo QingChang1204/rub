@@ -44,6 +44,7 @@ fn spawn_synthetic_chrome_profile_holder(
         .expect("spawn synthetic Chrome profile holder")
 }
 
+//noinspection DuplicatedCode
 fn ensure_socket_path_parent(path: &std::path::Path) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();
@@ -355,6 +356,7 @@ fn write_registry_preserves_explicit_session_id() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn pending_session_keeps_existing_same_name_authority_until_promoted() {
     let home = temp_home();
@@ -433,6 +435,7 @@ fn live_registry_identity_requires_matching_session_and_home() {
     ));
 }
 
+//noinspection DuplicatedCode
 #[test]
 #[cfg(unix)]
 fn live_registry_identity_requires_socket_handshake() {
@@ -472,6 +475,7 @@ fn live_registry_identity_requires_socket_handshake() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 #[cfg(unix)]
 fn live_registry_identity_requires_matching_handshake_session_id() {
@@ -511,6 +515,7 @@ fn live_registry_identity_requires_matching_handshake_session_id() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 #[cfg(unix)]
 fn live_registry_identity_requires_matching_protocol_version() {
@@ -569,6 +574,7 @@ fn live_registry_identity_requires_matching_protocol_version() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 #[cfg(unix)]
 fn live_registry_identity_rejects_payload_and_protocol_echo_divergence() {
@@ -626,6 +632,7 @@ fn live_registry_identity_rejects_payload_and_protocol_echo_divergence() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 #[cfg(unix)]
 fn live_registry_identity_requires_matching_handshake_command_id() {
@@ -677,6 +684,7 @@ fn live_registry_identity_requires_matching_handshake_command_id() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 #[cfg(unix)]
 fn slow_handshake_is_treated_as_busy_not_dead() {
@@ -716,6 +724,7 @@ fn slow_handshake_is_treated_as_busy_not_dead() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn pending_startup_is_not_live_but_is_explicitly_detectable() {
     let home = temp_home();
@@ -912,6 +921,7 @@ fn hard_cut_release_pending_profile_observation_failure_still_blocks_authority()
     let _ = std::fs::remove_dir_all(profile_dir);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn register_session_replaces_same_session_name_authority() {
     let home = temp_home();
@@ -958,6 +968,7 @@ fn register_session_replaces_same_session_name_authority() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn authoritative_entry_by_session_name_falls_back_to_newest_stale_entry() {
     let home = temp_home();
@@ -1095,6 +1106,7 @@ fn registry_authority_snapshot_classifies_stale_and_uncertain_entries_once() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn latest_entry_by_session_name_orders_by_parsed_timestamp_not_raw_string() {
     let home = temp_home();

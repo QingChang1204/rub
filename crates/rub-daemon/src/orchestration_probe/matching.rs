@@ -19,6 +19,7 @@ pub(super) fn resolve_tab<'a>(
         })
 }
 
+//noinspection DuplicatedCode
 pub(super) fn readiness_matches(
     readiness: &rub_core::model::ReadinessInfo,
     requested: &str,
@@ -84,6 +85,7 @@ pub(super) fn network_request_matches(
     true
 }
 
+//noinspection DuplicatedCode
 pub(super) fn storage_snapshot_matches(
     snapshot: &StorageSnapshot,
     condition: &TriggerConditionSpec,

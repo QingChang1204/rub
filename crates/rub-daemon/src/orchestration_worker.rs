@@ -400,6 +400,7 @@ fn spawn_orchestration_reservation(
     }
 }
 
+//noinspection DuplicatedCode
 async fn handle_orchestration_reservation_completion(
     router: &Arc<DaemonRouter>,
     state: &Arc<SessionState>,
@@ -620,7 +621,7 @@ fn reconcile_pending_orchestration_reservations(
         .filter(|rule| rule.unavailable_reason.is_none())
         .filter(|rule| !orchestration_rule_in_cooldown(rule))
         .map(|rule| (rule.id, orchestration_rule_semantics_fingerprint(rule)))
-        .collect::<std::collections::HashMap<_, _>>();
+        .collect::<HashMap<_, _>>();
     pending_reservations.retain(|rule_id, pending| {
         let keep = live_fingerprints.get(rule_id).is_some_and(|fingerprint| {
             pending.condition_policy.rule_lifecycle_generation

@@ -18,8 +18,7 @@ pub(super) async fn cmd_get_html(
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
     let selector = args.selector.as_deref();
-    let frame_id =
-        super::super::frame_scope::effective_request_frame_id(router, raw_args, state).await?;
+    let frame_id = frame_scope::effective_request_frame_id(router, raw_args, state).await?;
 
     let (subject, html) = if let Some(selector) = selector {
         let locator = CanonicalLocator::Selector {
@@ -97,9 +96,7 @@ pub(super) async fn cmd_inspect_html(
 
     match (locator, args.many, uses_snapshot_authority) {
         (None, false, _) => {
-            let frame_id =
-                super::super::frame_scope::effective_request_frame_id(router, raw_args, state)
-                    .await?;
+            let frame_id = frame_scope::effective_request_frame_id(router, raw_args, state).await?;
             let html = if frame_id.is_some() {
                 let value = router
                     .browser
@@ -147,8 +144,7 @@ pub(super) async fn cmd_inspect_html(
                 "Use --selector, --target-text, --role, --label, or --testid for a live HTML read, or add --snapshot/--index/--ref to stay on snapshot authority",
             )?;
             let selected_frame_id =
-                super::super::frame_scope::effective_request_frame_id(router, raw_args, state)
-                    .await?;
+                frame_scope::effective_request_frame_id(router, raw_args, state).await?;
             Ok(read_payload(
                 live_read_subject("html", &locator, selected_frame_id.as_deref()),
                 scalar_read_result(
@@ -173,8 +169,7 @@ pub(super) async fn cmd_inspect_html(
                 "Use --selector, --target-text, --role, --label, or --testid for a live multi-value HTML read",
             )?;
             let selected_frame_id =
-                super::super::frame_scope::effective_request_frame_id(router, raw_args, state)
-                    .await?;
+                frame_scope::effective_request_frame_id(router, raw_args, state).await?;
             let items = router
                 .browser
                 .query_html_many(selected_frame_id.as_deref(), &locator)

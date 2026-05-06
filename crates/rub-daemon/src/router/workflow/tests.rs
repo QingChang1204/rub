@@ -131,7 +131,7 @@ fn embedded_orchestration_args_preserve_structured_spec() {
 fn automation_step_commit_fence_fails_closed_on_degraded_interaction() {
     let error = ensure_committed_automation_result(
         "click",
-        Some(&serde_json::json!({
+        Some(&json!({
             "interaction": {
                 "confirmation_status": "degraded",
                 "confirmation_kind": "value_applied",
@@ -296,6 +296,7 @@ fn fill_step_locator_args_receive_inherited_frame_metadata_before_resolution() {
     assert_eq!(locator_args["_orchestration"]["frame_id"], "target-frame");
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn snapshot_fill_preflight_uses_element_ref_for_live_step_execution() {
     let step: super::args::FillStepSpec = serde_json::from_value(json!({
@@ -323,6 +324,7 @@ fn snapshot_fill_preflight_uses_element_ref_for_live_step_execution() {
     assert!(args.get("snapshot_id").is_none());
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn snapshot_fill_preflight_accepts_contenteditable_editor_target() {
     let step: super::args::FillStepSpec = serde_json::from_value(json!({
@@ -415,6 +417,7 @@ fn snapshot_fill_preflight_rejects_targets_without_stable_identity() {
     assert_eq!(error.code, ErrorCode::InvalidInput);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn atomic_fill_rollback_uses_prior_text_value() {
     let element = Element {
@@ -442,6 +445,7 @@ fn atomic_fill_rollback_uses_prior_text_value() {
     assert_eq!(args["clear"], true);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn atomic_fill_rollback_rejects_editor_safe_surface_in_v1() {
     let mut element = Element {

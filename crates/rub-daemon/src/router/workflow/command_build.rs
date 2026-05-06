@@ -15,6 +15,7 @@ pub(super) struct FillValueTargetClassification {
     pub(super) recommended_safe_fallback: Option<&'static str>,
 }
 
+//noinspection DuplicatedCode
 pub(super) fn build_fill_step_locator_args(step: &FillStepSpec) -> serde_json::Value {
     locator_json(LocatorRequestArgs {
         index: step.index,

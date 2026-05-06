@@ -32,6 +32,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::io::BufReader;
 use tokio::net::UnixListener;
+use tokio::time::sleep;
 use uuid::Uuid;
 
 #[cfg(unix)]
@@ -1048,7 +1049,7 @@ async fn detect_or_connect_hardened_preserves_committed_registry_authority_when_
             .trim(),
         session_id
     );
-    let runtime_socket_matches = std::path::Path::new(&entry.socket_path) == runtime.socket_path();
+    let runtime_socket_matches = Path::new(&entry.socket_path) == runtime.socket_path();
     assert!(
         rub_core::process::is_process_alive(entry.pid)
             && runtime_socket_matches
@@ -1930,7 +1931,7 @@ async fn connect_ipc_with_retry_until_respects_shared_attach_budget_on_stale_soc
     let stale_listener = bind_std_unix_listener(&runtime.socket_path());
     drop(stale_listener);
 
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let failure = match connect_ipc_with_retry_until(
         runtime.socket_path().as_path(),
         super::AttachBudget {
@@ -2344,8 +2345,7 @@ async fn close_all_targets_ignore_pending_replacement_for_same_session() {
         StdBufReader::new(stream.try_clone().unwrap())
             .read_line(&mut request)
             .unwrap();
-        let decoded: rub_ipc::protocol::IpcRequest =
-            serde_json::from_str(request.trim_end()).unwrap();
+        let decoded: IpcRequest = serde_json::from_str(request.trim_end()).unwrap();
         assert_eq!(decoded.command, "_handshake");
         assert_eq!(
             decoded.command_id.as_deref(),
@@ -2919,7 +2919,7 @@ async fn startup_lock_upgrade_fails_closed_when_canonical_attachment_budget_exha
         tokio::time::sleep(Duration::from_secs(1)).await;
     });
 
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let error = upgrade_startup_lock_to_canonical_attachment_until(
         &mut guard,
         &home,
@@ -2974,7 +2974,7 @@ async fn acquire_startup_lock_times_out_under_contention() {
         "daemon_ctl.startup.lock_path"
     );
     assert!(
-        start.elapsed() >= std::time::Duration::from_millis(50),
+        start.elapsed() >= Duration::from_millis(50),
         "startup lock should wait rather than spin"
     );
 
@@ -3147,7 +3147,7 @@ async fn wait_for_ready_requires_ready_commit_marker_and_handshake() {
         let (stream, _) = listener.accept().await.expect("handshake accept");
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
-        let request: rub_ipc::protocol::IpcRequest = NdJsonCodec::read(&mut reader)
+        let request: IpcRequest = NdJsonCodec::read(&mut reader)
             .await
             .expect("read handshake")
             .expect("handshake request");
@@ -3187,7 +3187,7 @@ async fn wait_for_ready_requires_ready_commit_marker_and_handshake() {
         let (stream, _) = listener.accept().await.expect("bound client accept");
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
-        let request: rub_ipc::protocol::IpcRequest = NdJsonCodec::read(&mut reader)
+        let request: IpcRequest = NdJsonCodec::read(&mut reader)
             .await
             .expect("read bound request")
             .expect("bound request");
@@ -3211,7 +3211,7 @@ async fn wait_for_ready_requires_ready_commit_marker_and_handshake() {
     let ready_path = ready_file.clone();
     let committed_path = session_paths.startup_committed_path();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        sleep(Duration::from_millis(150)).await;
         std::fs::write(ready_path, b"ready").expect("ready marker");
         std::fs::create_dir_all(
             committed_path
@@ -3236,11 +3236,7 @@ async fn wait_for_ready_requires_ready_commit_marker_and_handshake() {
         .expect("startup readiness should require marker and handshake");
     assert_eq!(daemon_session_id, "sess-default");
     let response = client
-        .send(&rub_ipc::protocol::IpcRequest::new(
-            "doctor",
-            serde_json::json!({}),
-            1_000,
-        ))
+        .send(&IpcRequest::new("doctor", serde_json::json!({}), 1_000))
         .await
         .expect("bound client send");
     assert_eq!(response.status, ResponseStatus::Success);
@@ -3265,7 +3261,7 @@ async fn wait_for_ready_until_rejects_attachment_identity_mismatch() {
         let (stream, _) = listener.accept().await.expect("handshake accept");
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
-        let request: rub_ipc::protocol::IpcRequest = NdJsonCodec::read(&mut reader)
+        let request: IpcRequest = NdJsonCodec::read(&mut reader)
             .await
             .expect("read handshake")
             .expect("handshake request");
@@ -3307,7 +3303,7 @@ async fn wait_for_ready_until_rejects_attachment_identity_mismatch() {
     let ready_path = ready_file.clone();
     let committed_path = session_paths.startup_committed_path();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        sleep(Duration::from_millis(150)).await;
         std::fs::write(ready_path, b"ready").expect("ready marker");
         std::fs::create_dir_all(
             committed_path
@@ -3365,7 +3361,7 @@ async fn wait_for_ready_fails_fast_when_daemon_dies_before_commit() {
     let cleanup_file = session_paths.startup_cleanup_path("startup");
     std::fs::write(&ready_file, b"ready").unwrap();
 
-    let child = std::process::Command::new("sh")
+    let child = Command::new("sh")
         .arg("-c")
         .arg("exit 0")
         .spawn()
@@ -3416,7 +3412,7 @@ async fn wait_for_ready_uses_startup_stderr_excerpt_when_daemon_dies_before_comm
     )
     .unwrap();
 
-    let child = std::process::Command::new("sh")
+    let child = Command::new("sh")
         .arg("-c")
         .arg("exit 0")
         .spawn()

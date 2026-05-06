@@ -6,7 +6,6 @@ mod workflow;
 
 #[cfg(test)]
 pub(crate) use self::workflow::SOURCE_MATERIALIZATION_TIMEOUT_SENTINEL;
-#[cfg(test)]
 pub(crate) use self::workflow::orchestration_request_meta;
 #[cfg(test)]
 pub(crate) use self::workflow::resolve_source_session;
@@ -47,7 +46,7 @@ pub(super) async fn build_orchestration_action_request(
             })?;
             object.insert(
                 "_orchestration".to_string(),
-                self::workflow::orchestration_request_meta(
+                orchestration_request_meta(
                     context.rule,
                     context.command_identity_key,
                     context.execution_id,
@@ -111,7 +110,7 @@ pub(super) async fn build_orchestration_action_request(
             let args = serde_json::json!({
                 "spec": resolved_spec,
                 "spec_source": spec_source,
-                "_orchestration": self::workflow::orchestration_request_meta(
+                "_orchestration": orchestration_request_meta(
                     context.rule,
                     context.command_identity_key,
                     context.execution_id,

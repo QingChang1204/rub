@@ -180,6 +180,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn replace_projection_swaps_in_browser_authority_snapshot() {
         let mut state = DialogRuntimeState::default();

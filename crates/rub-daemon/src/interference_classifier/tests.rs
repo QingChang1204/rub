@@ -35,7 +35,7 @@ fn classifier_stays_inactive_for_clean_primary_context() {
 
     assert_eq!(
         classified.projection.status,
-        rub_core::model::InterferenceRuntimeStatus::Inactive
+        InterferenceRuntimeStatus::Inactive
     );
     assert!(classified.projection.current_interference.is_none());
     assert!(
@@ -195,6 +195,7 @@ fn classifier_does_not_treat_degraded_active_tab_url_as_navigation_truth() {
     assert!(classified.projection.current_interference.is_none());
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn classifier_detects_third_party_noise_from_repeated_failure_windows() {
     let observatory = RuntimeObservatoryInfo {
@@ -296,6 +297,7 @@ fn classifier_detects_third_party_noise_from_repeated_failure_windows() {
     );
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn classifier_ignores_single_failure_window_of_third_party_noise() {
     let observatory = RuntimeObservatoryInfo {
@@ -476,7 +478,7 @@ fn classifier_ignores_single_window_of_successful_third_party_assets() {
 
     assert_eq!(
         classified.projection.status,
-        rub_core::model::InterferenceRuntimeStatus::Inactive
+        InterferenceRuntimeStatus::Inactive
     );
     assert!(classified.projection.current_interference.is_none());
 }
@@ -526,7 +528,7 @@ fn classifier_ignores_non_web_internal_requests_for_noise() {
 
     assert_eq!(
         classified.projection.status,
-        rub_core::model::InterferenceRuntimeStatus::Inactive
+        InterferenceRuntimeStatus::Inactive
     );
     assert!(classified.projection.current_interference.is_none());
 }

@@ -218,6 +218,7 @@ mod tests {
         DialogKind, DialogResolutionInfo, DialogRuntimeInfo, DialogRuntimeStatus, PendingDialogInfo,
     };
 
+    //noinspection DuplicatedCode
     #[test]
     fn browser_handled_dialog_error_is_explainable() {
         let runtime = DialogRuntimeInfo {

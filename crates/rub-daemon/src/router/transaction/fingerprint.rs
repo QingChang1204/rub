@@ -20,7 +20,7 @@ pub(crate) struct ReplayFingerprintMetrics {
 }
 
 pub(super) fn replay_request_fingerprint(request: &IpcRequest) -> String {
-    REPLAY_FINGERPRINT_INVOCATIONS.with(|count| count.set(count.get().saturating_add(1)));
+    REPLAY_FINGERPRINT_INVOCATIONS.set(REPLAY_FINGERPRINT_INVOCATIONS.get().saturating_add(1));
     let semantic_args = semantic_replay_args(&request.command, &request.args);
     let mut fingerprint = String::with_capacity(request.command.len() + 64);
     fingerprint.push_str(&request.command);
@@ -177,10 +177,10 @@ pub(crate) fn replay_fingerprint_metrics_snapshot() -> ReplayFingerprintMetrics 
 
 #[cfg(test)]
 pub(crate) fn reset_replay_fingerprint_metrics() {
-    REPLAY_FINGERPRINT_INVOCATIONS.with(|count| count.set(0));
-    REPLAY_FINGERPRINT_OUTPUT_BYTES.with(|count| count.set(0));
-    REPLAY_FINGERPRINT_ARRAY_ENTRY_STEPS.with(|count| count.set(0));
-    REPLAY_FINGERPRINT_OBJECT_KEY_SORT_STEPS.with(|count| count.set(0));
+    REPLAY_FINGERPRINT_INVOCATIONS.set(0);
+    REPLAY_FINGERPRINT_OUTPUT_BYTES.set(0);
+    REPLAY_FINGERPRINT_ARRAY_ENTRY_STEPS.set(0);
+    REPLAY_FINGERPRINT_OBJECT_KEY_SORT_STEPS.set(0);
 }
 
 #[cfg(test)]

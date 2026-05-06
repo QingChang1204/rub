@@ -247,6 +247,7 @@ mod tests {
     use rub_core::model::{AXInfo, BoundingBox, ElementTag, ScrollPosition, SnapshotProjection};
     use std::collections::HashMap;
 
+    //noinspection DuplicatedCode
     fn sample_snapshot() -> Snapshot {
         let mut button_attrs = HashMap::new();
         button_attrs.insert("aria-label".to_string(), "Launch Rocket".to_string());

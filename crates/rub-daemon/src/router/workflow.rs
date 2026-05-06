@@ -80,9 +80,7 @@ pub(crate) fn semantic_replay_args(
             if let Some(submit) = submit_args(&parsed.submit) {
                 projected.insert("submit".to_string(), submit);
             }
-            if let Some(orchestration) =
-                super::frame_scope::semantic_replay_orchestration_metadata(args)
-            {
+            if let Some(orchestration) = frame_scope::semantic_replay_orchestration_metadata(args) {
                 projected.insert("_orchestration".to_string(), orchestration);
             }
             Some(serde_json::Value::Object(projected))
@@ -94,9 +92,7 @@ pub(crate) fn semantic_replay_args(
             if let Some(wait_after) = args.get("wait_after") {
                 projected.insert("wait_after".to_string(), wait_after.clone());
             }
-            if let Some(orchestration) =
-                super::frame_scope::semantic_replay_orchestration_metadata(args)
-            {
+            if let Some(orchestration) = frame_scope::semantic_replay_orchestration_metadata(args) {
                 projected.insert("_orchestration".to_string(), orchestration);
             }
             Some(serde_json::Value::Object(projected))

@@ -20,12 +20,14 @@ use rub_core::model::{
 };
 use rub_core::storage::{StorageArea, StorageMutationKind, StorageRuntimeStatus, StorageSnapshot};
 use rub_ipc::protocol::{IpcRequest, IpcResponse};
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::oneshot;
+use tokio::time::timeout;
 
 fn sample_orchestration_rule(id: u32) -> OrchestrationRuleInfo {
     OrchestrationRuleInfo {
@@ -63,7 +65,7 @@ fn sample_orchestration_rule(id: u32) -> OrchestrationRuleInfo {
         actions: vec![TriggerActionSpec {
             kind: TriggerActionKind::Workflow,
             command: None,
-            payload: Some(serde_json::json!({ "workflow_name": "reply_flow" })),
+            payload: Some(json!({ "workflow_name": "reply_flow" })),
         }],
         correlation_key: format!("corr-{id}"),
         idempotency_key: format!("idem-{id}"),
@@ -182,41 +184,35 @@ async fn automation_scheduler_metrics_track_queue_owned_worker_cycles() {
         metrics["authority_inventory"]["trigger_worker_pre_queue_gate"],
         "none"
     );
-    assert_eq!(
-        metrics["trigger_worker"]["rule_count"],
-        serde_json::json!(0)
-    );
-    assert_eq!(
-        metrics["trigger_worker"]["cycle_count"],
-        serde_json::json!(1)
-    );
+    assert_eq!(metrics["trigger_worker"]["rule_count"], json!(0));
+    assert_eq!(metrics["trigger_worker"]["cycle_count"], json!(1));
     assert_eq!(
         metrics["reservation_wait_policy"]["worker_cycle"]["mode"],
-        serde_json::json!("bounded_worker_cycle_budget")
+        json!("bounded_worker_cycle_budget")
     );
     assert_eq!(
         metrics["reservation_wait_policy"]["worker_cycle"]["wait_budget_ms"],
-        serde_json::json!(500)
+        json!(500)
     );
     assert_eq!(
         metrics["reservation_wait_policy"]["active_orchestration_step"]["mode"],
-        serde_json::json!("action_timeout_budget")
+        json!("action_timeout_budget")
     );
     assert_eq!(
         metrics["reservation_wait_policy"]["active_orchestration_step"]["timeout_authority"],
-        serde_json::json!("orchestration_action_request.timeout_ms")
+        json!("orchestration_action_request.timeout_ms")
     );
     assert_eq!(
         metrics["reservation_wait_policy"]["response_delivery"]["mode"],
-        serde_json::json!("transport_delivery_holds_fifo_until_write_or_fallback_commit")
+        json!("transport_delivery_holds_fifo_until_write_or_fallback_commit")
     );
     assert_eq!(
         metrics["reservation_wait_policy"]["response_delivery"]["transport_timeout_authority"],
-        serde_json::json!("daemon.IPC_WRITE_TIMEOUT")
+        json!("daemon.IPC_WRITE_TIMEOUT")
     );
     assert_eq!(
         metrics["reservation_wait_policy"]["response_delivery"]["fallback_commit_authority"],
-        serde_json::json!("router.transaction.commit_after_delivery_failure")
+        json!("router.transaction.commit_after_delivery_failure")
     );
     assert!(
         metrics["trigger_worker"]["last_cycle_uptime_ms"]
@@ -225,11 +221,11 @@ async fn automation_scheduler_metrics_track_queue_owned_worker_cycles() {
     );
     assert_eq!(
         metrics["orchestration_worker"]["metrics"]["rule_count"],
-        serde_json::json!(0)
+        json!(0)
     );
     assert_eq!(
         metrics["orchestration_worker"]["metrics"]["cycle_count"],
-        serde_json::json!(1)
+        json!(1)
     );
 }
 
@@ -245,42 +241,30 @@ async fn automation_scheduler_metrics_track_queue_pressure_and_shutdown_drain() 
 
     let metrics = state.automation_scheduler_metrics().await;
 
-    assert_eq!(
-        metrics["queue_pressure"]["max_in_flight_count"],
-        serde_json::json!(3)
-    );
-    assert_eq!(
-        metrics["queue_pressure"]["queue_timeout_count"],
-        serde_json::json!(1)
-    );
+    assert_eq!(metrics["queue_pressure"]["max_in_flight_count"], json!(3));
+    assert_eq!(metrics["queue_pressure"]["queue_timeout_count"], json!(1));
     assert!(
         metrics["queue_pressure"]["last_queue_timeout_uptime_ms"]
             .as_u64()
             .is_some()
     );
-    assert_eq!(
-        metrics["shutdown_drain"]["wait_loop_count"],
-        serde_json::json!(1)
-    );
-    assert_eq!(
-        metrics["shutdown_drain"]["soft_timeout_count"],
-        serde_json::json!(1)
-    );
+    assert_eq!(metrics["shutdown_drain"]["wait_loop_count"], json!(1));
+    assert_eq!(metrics["shutdown_drain"]["soft_timeout_count"], json!(1));
     assert_eq!(
         metrics["shutdown_drain"]["connected_only_soft_release_count"],
-        serde_json::json!(0)
+        json!(0)
     );
     assert_eq!(
         metrics["shutdown_drain"]["max_observed_in_flight_count"],
-        serde_json::json!(4)
+        json!(4)
     );
     assert_eq!(
         metrics["shutdown_drain"]["max_observed_connected_client_count"],
-        serde_json::json!(2)
+        json!(2)
     );
     assert_eq!(
         metrics["shutdown_drain"]["max_observed_pre_request_response_fence_count"],
-        serde_json::json!(5)
+        json!(5)
     );
 }
 
@@ -309,28 +293,22 @@ async fn browser_event_ingress_metrics_track_metered_critical_pressure() {
 
     assert_eq!(
         metrics["critical"]["mode"],
-        serde_json::json!("lossless_metered_unbounded")
+        json!("lossless_metered_unbounded")
     );
     assert_eq!(
         metrics["critical"]["soft_limit"],
-        serde_json::json!(BROWSER_EVENT_CRITICAL_SOFT_LIMIT)
+        json!(BROWSER_EVENT_CRITICAL_SOFT_LIMIT)
     );
     assert_eq!(
         metrics["critical"]["pending_count"],
-        serde_json::json!(BROWSER_EVENT_CRITICAL_SOFT_LIMIT + 1)
+        json!(BROWSER_EVENT_CRITICAL_SOFT_LIMIT + 1)
     );
     assert_eq!(
         metrics["critical"]["max_pending_count"],
-        serde_json::json!(BROWSER_EVENT_CRITICAL_SOFT_LIMIT + 1)
+        json!(BROWSER_EVENT_CRITICAL_SOFT_LIMIT + 1)
     );
-    assert_eq!(
-        metrics["critical"]["pressure_active"],
-        serde_json::json!(true)
-    );
-    assert_eq!(
-        metrics["critical"]["soft_limit_cross_count"],
-        serde_json::json!(1)
-    );
+    assert_eq!(metrics["critical"]["pressure_active"], json!(true));
+    assert_eq!(metrics["critical"]["soft_limit_cross_count"], json!(1));
     assert!(
         metrics["critical"]["last_soft_limit_cross_uptime_ms"]
             .as_u64()
@@ -338,10 +316,11 @@ async fn browser_event_ingress_metrics_track_metered_critical_pressure() {
     );
     assert_eq!(
         metrics["progress"]["mode"],
-        serde_json::json!("bounded_drop_with_degraded_marker")
+        json!("bounded_drop_with_degraded_marker")
     );
 }
 
+//noinspection DuplicatedCode
 #[tokio::test]
 async fn session_records_storage_snapshot_and_mutation_history() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
@@ -381,12 +360,13 @@ async fn session_records_storage_snapshot_and_mutation_history() {
     assert_eq!(storage.recent_mutations[0].area, Some(StorageArea::Local));
 }
 
+//noinspection DuplicatedCode
 #[tokio::test]
 async fn session_flushes_post_commit_projection_into_history_and_workflow_capture() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
     let request = IpcRequest::new(
         "pipe",
-        serde_json::json!({
+        json!({
             "spec": "[]",
             "spec_source": {
                 "kind": "file",
@@ -404,7 +384,7 @@ async fn session_flushes_post_commit_projection_into_history_and_workflow_captur
     )
     .with_command_id("cmd-1")
     .expect("static command_id must be valid");
-    let response = rub_ipc::protocol::IpcResponse::success("req-1", serde_json::json!({}))
+    let response = IpcResponse::success("req-1", json!({}))
         .with_command_id("cmd-1")
         .expect("static command_id must be valid");
 
@@ -426,11 +406,11 @@ async fn session_flushes_post_commit_projection_into_history_and_workflow_captur
     assert_eq!(capture.entries[0].command_id.as_deref(), Some("cmd-1"));
     assert_eq!(
         capture.entries[0].args["spec_source"]["path"],
-        serde_json::json!("/tmp/workflow.json")
+        json!("/tmp/workflow.json")
     );
     assert_eq!(
         capture.entries[0].args["spec_source"]["path_state"]["path_authority"],
-        serde_json::json!("cli.pipe.spec_source.path")
+        json!("cli.pipe.spec_source.path")
     );
 }
 
@@ -441,17 +421,13 @@ async fn session_background_projection_drain_applies_pending_entries() {
         PathBuf::from("/tmp/rub-test"),
         None,
     ));
-    let request = IpcRequest::new(
-        "open",
-        serde_json::json!({ "url": "https://example.com" }),
-        30_000,
-    );
-    let response = rub_ipc::protocol::IpcResponse::success("req-1", serde_json::json!({}));
+    let request = IpcRequest::new("open", json!({ "url": "https://example.com" }), 30_000);
+    let response = IpcResponse::success("req-1", json!({}));
 
     state.submit_post_commit_projection(&request, &response);
     state.spawn_post_commit_projection_drain();
 
-    tokio::time::timeout(std::time::Duration::from_millis(100), async {
+    timeout(Duration::from_millis(100), async {
         loop {
             if state.pending_post_commit_projection_count() == 0 {
                 break;
@@ -491,14 +467,14 @@ async fn session_records_redacted_post_commit_journal_entry() {
         let state = SessionState::new("default", home.clone(), None);
         let request = IpcRequest::new(
             "type",
-            serde_json::json!({ "selector": "#password", "text": "token-123", "clear": true }),
+            json!({ "selector": "#password", "text": "token-123", "clear": true }),
             1_000,
         )
         .with_command_id("cmd-1")
         .expect("static command_id must be valid");
-        let response = rub_ipc::protocol::IpcResponse::success(
+        let response = IpcResponse::success(
             "req-1",
-            serde_json::json!({
+            json!({
                 "echo": "token-123",
             }),
         )
@@ -520,46 +496,34 @@ async fn session_records_redacted_post_commit_journal_entry() {
         assert_eq!(journal.len(), 1);
         assert_eq!(
             journal[0]["journal_state"]["surface"],
-            serde_json::json!("post_commit_journal")
+            json!("post_commit_journal")
         );
         assert_eq!(
             journal[0]["journal_state"]["visibility"],
-            serde_json::json!("internal_only")
+            json!("internal_only")
         );
         assert_eq!(
             journal[0]["journal_state"]["recovery_role"],
-            serde_json::json!("daemon_recovery_writer")
+            json!("daemon_recovery_writer")
         );
         assert_eq!(
             journal[0]["journal_state"]["upstream_commit_truth"],
-            serde_json::json!("daemon_response_committed")
+            json!("daemon_response_committed")
         );
         assert_eq!(
             journal[0]["journal_state"]["delivery_state_contract"],
-            serde_json::json!("sibling_post_commit_delivery_state")
+            json!("sibling_post_commit_delivery_state")
         );
         assert_eq!(
             journal[0]["journal_state"]["retention_scope"],
-            serde_json::json!("session_runtime_cleanup")
+            json!("session_runtime_cleanup")
         );
-        assert_eq!(
-            journal[0]["request"]["args"]["text"],
-            serde_json::json!("$RUB_TOKEN")
-        );
-        assert_eq!(
-            journal[0]["response"]["data"]["echo"],
-            serde_json::json!("$RUB_TOKEN")
-        );
-        assert_eq!(journal[0]["command_id"], serde_json::json!("cmd-1"));
+        assert_eq!(journal[0]["request"]["args"]["text"], json!("$RUB_TOKEN"));
+        assert_eq!(journal[0]["response"]["data"]["echo"], json!("$RUB_TOKEN"));
+        assert_eq!(journal[0]["command_id"], json!("cmd-1"));
         assert!(journal[0]["delivery_state"].is_null());
-        assert_eq!(
-            journal[0]["request_redaction_lossy"],
-            serde_json::json!(false)
-        );
-        assert_eq!(
-            journal[0]["response_redaction_lossy"],
-            serde_json::json!(false)
-        );
+        assert_eq!(journal[0]["request_redaction_lossy"], json!(false));
+        assert_eq!(journal[0]["response_redaction_lossy"], json!(false));
 
         let _ = std::fs::remove_dir_all(home);
     }
@@ -583,14 +547,14 @@ async fn session_redacts_post_commit_journal_error_response_context() {
             .expect("set permissions");
 
         let state = SessionState::new("default", home.clone(), None);
-        let request = IpcRequest::new("open", serde_json::json!({}), 1_000);
-        let response = rub_ipc::protocol::IpcResponse::error(
+        let request = IpcRequest::new("open", json!({}), 1_000);
+        let response = IpcResponse::error(
             "req-err",
             rub_core::error::ErrorEnvelope::new(
                 rub_core::error::ErrorCode::InvalidInput,
                 "token-123 is not allowed",
             )
-            .with_context(serde_json::json!({
+            .with_context(json!({
                 "secret": "token-123",
             })),
         );
@@ -610,15 +574,15 @@ async fn session_redacts_post_commit_journal_error_response_context() {
         assert_eq!(journal.len(), 1);
         assert_eq!(
             journal[0]["journal_state"]["reader_contract"],
-            serde_json::json!("no_public_api")
+            json!("no_public_api")
         );
         assert_eq!(
             journal[0]["response"]["error"]["message"],
-            serde_json::json!("$RUB_TOKEN is not allowed")
+            json!("$RUB_TOKEN is not allowed")
         );
         assert_eq!(
             journal[0]["response"]["error"]["context"]["secret"],
-            serde_json::json!("$RUB_TOKEN")
+            json!("$RUB_TOKEN")
         );
 
         let _ = std::fs::remove_dir_all(home);
@@ -635,12 +599,8 @@ async fn session_tracks_post_commit_journal_append_failures() {
     std::fs::create_dir_all(&home).expect("create home");
 
     let state = SessionState::new("default", home.clone(), None);
-    let request = IpcRequest::new(
-        "open",
-        serde_json::json!({ "url": "https://example.com" }),
-        1_000,
-    );
-    let response = rub_ipc::protocol::IpcResponse::success("req-1", serde_json::json!({}));
+    let request = IpcRequest::new("open", json!({ "url": "https://example.com" }), 1_000);
+    let response = IpcResponse::success("req-1", json!({}));
 
     state.force_post_commit_journal_failure_once();
     let error = state
@@ -674,13 +634,8 @@ async fn session_reopens_same_session_id_and_appends_to_existing_journal() {
 
     let session_id = "sess-fixed";
     let first = SessionState::new_with_id("default", session_id, home.clone(), None);
-    let request_one = IpcRequest::new(
-        "open",
-        serde_json::json!({"url": "https://one.test"}),
-        1_000,
-    );
-    let response_one =
-        rub_ipc::protocol::IpcResponse::success("req-1", serde_json::json!({"ok": true}));
+    let request_one = IpcRequest::new("open", json!({"url": "https://one.test"}), 1_000);
+    let response_one = IpcResponse::success("req-1", json!({"ok": true}));
     first
         .record_post_commit_journal(
             &request_one,
@@ -691,13 +646,8 @@ async fn session_reopens_same_session_id_and_appends_to_existing_journal() {
         .expect("first append succeeds");
 
     let second = SessionState::new_with_id("default", session_id, home.clone(), None);
-    let request_two = IpcRequest::new(
-        "open",
-        serde_json::json!({"url": "https://two.test"}),
-        1_000,
-    );
-    let response_two =
-        rub_ipc::protocol::IpcResponse::success("req-2", serde_json::json!({"ok": true}));
+    let request_two = IpcRequest::new("open", json!({"url": "https://two.test"}), 1_000);
+    let response_two = IpcResponse::success("req-2", json!({"ok": true}));
     second
         .record_post_commit_journal(
             &request_two,
@@ -711,8 +661,8 @@ async fn session_reopens_same_session_id_and_appends_to_existing_journal() {
         .read_post_commit_journal_entries_for_tests()
         .expect("read journal");
     assert_eq!(journal.len(), 2);
-    assert_eq!(journal[0]["request_id"], serde_json::json!("req-1"));
-    assert_eq!(journal[1]["request_id"], serde_json::json!("req-2"));
+    assert_eq!(journal[0]["request_id"], json!("req-1"));
+    assert_eq!(journal[1]["request_id"], json!("req-2"));
 
     let _ = std::fs::remove_dir_all(home);
 }
@@ -727,13 +677,8 @@ async fn session_ignores_torn_post_commit_journal_tail() {
     std::fs::create_dir_all(&home).expect("create home");
 
     let state = SessionState::new("default", home.clone(), None);
-    let request = IpcRequest::new(
-        "open",
-        serde_json::json!({"url": "https://example.test"}),
-        1_000,
-    );
-    let response =
-        rub_ipc::protocol::IpcResponse::success("req-1", serde_json::json!({"ok": true}));
+    let request = IpcRequest::new("open", json!({"url": "https://example.test"}), 1_000);
+    let response = IpcResponse::success("req-1", json!({"ok": true}));
     state
         .record_post_commit_journal(&request, &response, WorkflowCaptureDeliveryState::Delivered)
         .await
@@ -755,7 +700,7 @@ async fn session_ignores_torn_post_commit_journal_tail() {
         .read_post_commit_journal_entries_for_tests()
         .expect("read journal");
     assert_eq!(journal.len(), 1);
-    assert_eq!(journal[0]["request_id"], serde_json::json!("req-1"));
+    assert_eq!(journal[0]["request_id"], json!("req-1"));
 
     let _ = std::fs::remove_dir_all(home);
 }
@@ -768,8 +713,8 @@ async fn repeated_projection_drain_spawns_coalesce_to_one_task() {
         None,
     ));
     let _drain_guard = state.post_commit_projection_drain.lock().await;
-    let request = IpcRequest::new("open", serde_json::json!({}), 30_000);
-    let response = rub_ipc::protocol::IpcResponse::success("req-1", serde_json::json!({}));
+    let request = IpcRequest::new("open", json!({}), 30_000);
+    let response = IpcResponse::success("req-1", json!({}));
 
     state.submit_post_commit_projection(&request, &response);
     state.spawn_post_commit_projection_drain();
@@ -797,13 +742,12 @@ async fn history_and_workflow_capture_surface_dropped_post_commit_records() {
     for index in 0..300u64 {
         let request = IpcRequest::new(
             "open",
-            serde_json::json!({
+            json!({
                 "url": format!("https://example.test/{index}")
             }),
             30_000,
         );
-        let response =
-            rub_ipc::protocol::IpcResponse::success(format!("req-{index}"), serde_json::json!({}));
+        let response = IpcResponse::success(format!("req-{index}"), json!({}));
         state.submit_post_commit_projection(&request, &response);
     }
 
@@ -832,10 +776,10 @@ async fn session_replay_claims_wait_until_owner_releases_and_can_be_reclaimed() 
         ReplayCommandClaim::Conflict => panic!("matching replay fingerprint should not conflict"),
     };
 
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
     let waited = tokio::spawn(async move {
         let _ = ready_tx.send(());
-        tokio::time::timeout(std::time::Duration::from_millis(100), async move {
+        timeout(Duration::from_millis(100), async move {
             if *waiter.borrow() == ReplayFenceState::Released {
                 return;
             }
@@ -872,7 +816,7 @@ async fn session_spent_replay_claim_survives_cached_response_eviction() {
         .cache_response(
             "cmd-1".to_string(),
             "fingerprint-1".to_string(),
-            IpcResponse::success("req-1", serde_json::json!({ "ok": true })),
+            IpcResponse::success("req-1", json!({ "ok": true })),
         )
         .await;
 
@@ -1414,8 +1358,8 @@ async fn bounded_download_window_recovers_authority_after_generation_rollover() 
     state
         .set_download_runtime(
             2,
-            rub_core::model::DownloadRuntimeStatus::Active,
-            rub_core::model::DownloadMode::Managed,
+            DownloadRuntimeStatus::Active,
+            DownloadMode::Managed,
             Some("/tmp/rub-downloads-next".to_string()),
         )
         .await;
@@ -1622,6 +1566,7 @@ async fn observatory_projection_tracks_recent_events_and_readiness() {
     );
 }
 
+//noinspection DuplicatedCode
 #[tokio::test]
 async fn state_inspector_projection_drives_integration_readiness() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
@@ -1663,6 +1608,7 @@ async fn state_inspector_projection_drives_integration_readiness() {
     );
 }
 
+//noinspection DuplicatedCode
 #[tokio::test]
 async fn readiness_projection_drives_integration_readiness() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
@@ -1827,6 +1773,7 @@ async fn network_request_ingress_overflow_fails_request_window_closed() {
     );
 }
 
+//noinspection DuplicatedCode
 #[tokio::test]
 async fn snapshot_cache_and_clear_use_consistent_lock_order() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
@@ -1874,13 +1821,14 @@ async fn snapshot_cache_and_clear_use_consistent_lock_order() {
     let read = async {
         let _ = state.get_snapshot("snap-1").await;
     };
-    tokio::time::timeout(std::time::Duration::from_millis(200), async {
+    timeout(Duration::from_millis(200), async {
         tokio::join!(cache, clear, read);
     })
     .await
     .expect("snapshot cache + clear + read should not deadlock");
 }
 
+//noinspection DuplicatedCode
 #[tokio::test]
 async fn runtime_state_probe_failure_marks_surfaces_degraded() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
@@ -1921,6 +1869,7 @@ async fn runtime_state_probe_failure_marks_surfaces_degraded() {
     );
 }
 
+//noinspection DuplicatedCode
 #[tokio::test]
 async fn stale_runtime_state_sequence_does_not_override_newer_snapshot() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
@@ -1964,6 +1913,7 @@ async fn stale_runtime_state_sequence_does_not_override_newer_snapshot() {
     assert_eq!(snapshot, newer);
 }
 
+//noinspection DuplicatedCode
 #[tokio::test]
 async fn runtime_state_publish_rechecks_callback_fence_after_waiting_for_write_authority() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
@@ -2004,6 +1954,7 @@ async fn runtime_state_publish_rechecks_callback_fence_after_waiting_for_write_a
     );
 }
 
+//noinspection DuplicatedCode
 #[tokio::test]
 async fn stale_orchestration_runtime_sequence_does_not_override_newer_projection() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);
@@ -2260,6 +2211,7 @@ fn external_dom_change_tracks_target_scoped_pending_authority() {
     assert!(!state.has_pending_external_dom_change());
 }
 
+//noinspection DuplicatedCode
 #[tokio::test]
 async fn snapshot_cache_evicts_oldest_entries() {
     let state = SessionState::new("default", PathBuf::from("/tmp/rub-test"), None);

@@ -143,6 +143,7 @@ async fn registry_entry_liveness_async_for_home(
     }
 }
 
+//noinspection DuplicatedCode
 #[cfg(unix)]
 fn registry_socket_probe(entry: &RegistryEntry) -> RegistrySocketProbe {
     #[cfg(test)]
@@ -206,6 +207,7 @@ fn registry_socket_probe(_entry: &RegistryEntry) -> RegistrySocketProbe {
     RegistrySocketProbe::Dead
 }
 
+//noinspection DuplicatedCode
 #[cfg(unix)]
 async fn registry_socket_probe_async(entry: &RegistryEntry) -> RegistrySocketProbe {
     #[cfg(test)]

@@ -12,13 +12,14 @@ use crate::router::request_args::{
     LocatorParseOptions, canonical_locator_json, parse_canonical_locator,
 };
 use rub_core::error::ErrorEnvelope;
+use serde_json::Value;
 
 pub(super) async fn cmd_fill_validate(
     router: &DaemonRouter,
-    args: &serde_json::Value,
+    args: &Value,
     deadline: TransactionDeadline,
     state: &Arc<SessionState>,
-) -> Result<serde_json::Value, RubError> {
+) -> Result<Value, RubError> {
     let parsed_args: FillArgs = parse_json_args(args, "fill")?;
     let parsed = parse_fill_steps(&parsed_args.spec, &state.rub_home)?;
     let steps = parsed.value;
@@ -34,18 +35,18 @@ pub(super) async fn cmd_fill_validate(
 
     for (index, step) in steps.iter().enumerate() {
         let projected = project_fill_step_validation(router, &snapshot, step, index).await;
-        overall_valid &= projected.get("status").and_then(serde_json::Value::as_str) == Some("ok");
+        overall_valid &= projected.get("status").and_then(Value::as_str) == Some("ok");
         snapshot_preflight_compatible &= projected
             .get("snapshot_preflight_compatible")
-            .and_then(serde_json::Value::as_bool)
+            .and_then(Value::as_bool)
             .unwrap_or(false);
         atomic_candidate &= projected
             .get("atomic_candidate")
-            .and_then(serde_json::Value::as_bool)
+            .and_then(Value::as_bool)
             .unwrap_or(false);
         live_confirmation_required |= projected
             .get("live_confirmation_needed")
-            .and_then(serde_json::Value::as_bool)
+            .and_then(Value::as_bool)
             .unwrap_or(false);
         projected_steps.push(projected);
     }
@@ -54,19 +55,19 @@ pub(super) async fn cmd_fill_validate(
         project_submit_validation(router, &snapshot, &parsed_args.submit).await?;
     overall_valid &= submit_projection
         .get("status")
-        .and_then(serde_json::Value::as_str)
+        .and_then(Value::as_str)
         .is_none_or(|status| status == "ok");
     snapshot_preflight_compatible &= submit_projection
         .get("snapshot_preflight_compatible")
-        .and_then(serde_json::Value::as_bool)
+        .and_then(Value::as_bool)
         .unwrap_or(true);
     atomic_candidate &= submit_projection
         .get("atomic_candidate")
-        .and_then(serde_json::Value::as_bool)
+        .and_then(Value::as_bool)
         .unwrap_or(true);
     live_confirmation_required |= submit_projection
         .get("live_confirmation_needed")
-        .and_then(serde_json::Value::as_bool)
+        .and_then(Value::as_bool)
         .unwrap_or(false);
 
     let result = serde_json::json!({
@@ -89,7 +90,7 @@ pub(super) async fn cmd_fill_validate(
             "submit": submit_projection,
             "global_wait_after": serde_json::json!({
                 "requested": parsed_args._wait_after.is_some(),
-                "probe": parsed_args._wait_after.clone().unwrap_or(serde_json::Value::Null),
+                "probe": parsed_args._wait_after.clone().unwrap_or(Value::Null),
                 "effect_on_atomic_candidate": parsed_args._wait_after.is_some(),
                 "effect_on_live_confirmation": parsed_args._wait_after.is_some(),
             }),
@@ -108,7 +109,7 @@ pub(super) async fn cmd_fill_validate(
     Ok(result)
 }
 
-fn plan_requires_a11y(steps: &[FillStepSpec], submit: &super::args::SubmitLocatorArgs) -> bool {
+fn plan_requires_a11y(steps: &[FillStepSpec], submit: &args::SubmitLocatorArgs) -> bool {
     steps.iter().any(step_requires_a11y) || submit_requires_a11y(submit)
 }
 
@@ -118,7 +119,8 @@ fn step_requires_a11y(step: &FillStepSpec) -> bool {
         .unwrap_or(false)
 }
 
-fn submit_requires_a11y(submit: &super::args::SubmitLocatorArgs) -> bool {
+//noinspection DuplicatedCode
+fn submit_requires_a11y(submit: &args::SubmitLocatorArgs) -> bool {
     submit_args(submit)
         .and_then(|value| {
             parse_canonical_locator(&value, LocatorParseOptions::OPTIONAL_ELEMENT_ADDRESS).ok()
@@ -133,7 +135,7 @@ async fn project_fill_step_validation(
     snapshot: &rub_core::model::Snapshot,
     step: &FillStepSpec,
     step_index: usize,
-) -> serde_json::Value {
+) -> Value {
     let locator_args = build_fill_step_locator_args(step);
     let canonical_locator =
         parse_canonical_locator(&locator_args, LocatorParseOptions::OPTIONAL_ELEMENT_ADDRESS)
@@ -159,7 +161,7 @@ async fn project_fill_step_validation(
             serde_json::json!({
                 "step_index": step_index,
                 "status": if classification.supported { "ok" } else { "invalid" },
-                "locator": canonical_locator.as_ref().map(canonical_locator_json).unwrap_or(serde_json::Value::Null),
+                "locator": canonical_locator.as_ref().map(canonical_locator_json).unwrap_or(Value::Null),
                 "target": project_fill_target_summary(&element),
                 "intent_class": intent,
                 "write_mode": classification.write_mode,
@@ -169,7 +171,7 @@ async fn project_fill_step_validation(
                 "live_confirmation_needed": classification.live_confirmation_needed || step.wait_after.is_some(),
                 "wait_after": serde_json::json!({
                     "requested": step.wait_after.is_some(),
-                    "probe": step.wait_after.as_ref().map(project_wait_after).unwrap_or(serde_json::Value::Null),
+                    "probe": step.wait_after.as_ref().map(project_wait_after).unwrap_or(Value::Null),
                 }),
                 "notes": notes,
                 "issues": classification.issues,
@@ -180,8 +182,8 @@ async fn project_fill_step_validation(
             serde_json::json!({
                 "step_index": step_index,
                 "status": "invalid",
-                "locator": canonical_locator.as_ref().map(canonical_locator_json).unwrap_or(serde_json::Value::Null),
-                "target": serde_json::Value::Null,
+                "locator": canonical_locator.as_ref().map(canonical_locator_json).unwrap_or(Value::Null),
+                "target": Value::Null,
                 "intent_class": intent,
                 "write_mode": "unresolved_target",
                 "rollback_class": "not_supported",
@@ -190,7 +192,7 @@ async fn project_fill_step_validation(
                 "live_confirmation_needed": false,
                 "wait_after": serde_json::json!({
                     "requested": step.wait_after.is_some(),
-                    "probe": step.wait_after.as_ref().map(project_wait_after).unwrap_or(serde_json::Value::Null),
+                    "probe": step.wait_after.as_ref().map(project_wait_after).unwrap_or(Value::Null),
                 }),
                 "notes": notes,
                 "issues": vec![project_issue(&envelope)],
@@ -202,16 +204,16 @@ async fn project_fill_step_validation(
 async fn project_submit_validation(
     router: &DaemonRouter,
     snapshot: &rub_core::model::Snapshot,
-    submit: &super::args::SubmitLocatorArgs,
-) -> Result<serde_json::Value, RubError> {
+    submit: &args::SubmitLocatorArgs,
+) -> Result<Value, RubError> {
     let Some(locator_args) = submit_args(submit) else {
         return Ok(serde_json::json!({
             "requested": false,
-            "status": serde_json::Value::Null,
-            "locator": serde_json::Value::Null,
-            "target": serde_json::Value::Null,
-            "write_mode": serde_json::Value::Null,
-            "rollback_class": serde_json::Value::Null,
+            "status": Value::Null,
+            "locator": Value::Null,
+            "target": Value::Null,
+            "write_mode": Value::Null,
+            "rollback_class": Value::Null,
             "snapshot_preflight_compatible": true,
             "atomic_candidate": true,
             "live_confirmation_needed": false,
@@ -222,7 +224,7 @@ async fn project_submit_validation(
     let canonical_locator =
         parse_canonical_locator(&locator_args, LocatorParseOptions::OPTIONAL_ELEMENT_ADDRESS)?
             .map(|locator| canonical_locator_json(&locator))
-            .unwrap_or(serde_json::Value::Null);
+            .unwrap_or(Value::Null);
 
     match resolve_elements_against_snapshot(
         router,
@@ -257,7 +259,7 @@ async fn project_submit_validation(
                 "requested": true,
                 "status": "invalid",
                 "locator": canonical_locator,
-                "target": serde_json::Value::Null,
+                "target": Value::Null,
                 "write_mode": "click_submit",
                 "rollback_class": "non_rollbackable",
                 "snapshot_preflight_compatible": false,
@@ -292,7 +294,7 @@ struct StepClassification {
     rollback_class: &'static str,
     atomic_candidate: bool,
     live_confirmation_needed: bool,
-    issues: Vec<serde_json::Value>,
+    issues: Vec<Value>,
 }
 
 fn classify_resolved_step(
@@ -341,7 +343,7 @@ fn classify_resolved_step(
     }
 }
 
-fn project_wait_after(wait_after: &super::args::StepWaitSpec) -> serde_json::Value {
+fn project_wait_after(wait_after: &args::StepWaitSpec) -> Value {
     serde_json::json!({
         "selector": wait_after.selector,
         "target_text": wait_after.target_text,
@@ -357,7 +359,7 @@ fn project_wait_after(wait_after: &super::args::StepWaitSpec) -> serde_json::Val
     })
 }
 
-fn project_issue(envelope: &ErrorEnvelope) -> serde_json::Value {
+fn project_issue(envelope: &ErrorEnvelope) -> Value {
     serde_json::json!({
         "code": envelope.code,
         "message": envelope.message,

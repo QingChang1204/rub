@@ -134,7 +134,7 @@ impl SessionState {
         id: u32,
         expected_generation: Option<u64>,
         evidence: Option<rub_core::model::TriggerEvidenceInfo>,
-    ) -> Option<rub_core::model::OrchestrationRuleInfo> {
+    ) -> Option<OrchestrationRuleInfo> {
         self.orchestration_runtime
             .write()
             .await
@@ -143,7 +143,7 @@ impl SessionState {
 
     pub async fn record_orchestration_outcome_with_fallback(
         &self,
-        rule_snapshot: &rub_core::model::OrchestrationRuleInfo,
+        rule_snapshot: &OrchestrationRuleInfo,
         expected_generation: Option<u64>,
         evidence: Option<rub_core::model::TriggerEvidenceInfo>,
         result: OrchestrationResultInfo,
@@ -331,7 +331,7 @@ impl SessionState {
 
     pub(crate) async fn trigger_network_request_baselines(
         &self,
-    ) -> std::collections::HashMap<u32, NetworkRequestBaseline> {
+    ) -> HashMap<u32, NetworkRequestBaseline> {
         self.trigger_runtime
             .read()
             .await
@@ -340,7 +340,7 @@ impl SessionState {
 
     pub(crate) async fn orchestration_network_request_baselines(
         &self,
-    ) -> std::collections::HashMap<u32, NetworkRequestBaseline> {
+    ) -> HashMap<u32, NetworkRequestBaseline> {
         self.orchestration_runtime
             .read()
             .await

@@ -17,6 +17,7 @@ pub(crate) struct OrchestrationFailureInput {
     pub(crate) error: ErrorEnvelope,
 }
 
+//noinspection DuplicatedCode
 pub(crate) fn orchestration_failure_result(
     input: OrchestrationFailureInput,
 ) -> OrchestrationResultInfo {

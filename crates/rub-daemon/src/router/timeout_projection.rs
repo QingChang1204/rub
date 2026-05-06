@@ -191,7 +191,7 @@ pub(crate) async fn scope_timeout_projection<F, T>(
     future: F,
 ) -> T
 where
-    F: std::future::Future<Output = T>,
+    F: Future<Output = T>,
 {
     let active_child_guard = current_timeout_projection_recorder()
         .filter(|parent| !Arc::ptr_eq(parent, &recorder))
@@ -448,6 +448,7 @@ fn request_has_effectful_timeout_surface(request: &IpcRequest) -> bool {
     )
 }
 
+//noinspection DuplicatedCode
 pub(crate) fn merge_timeout_projection_context(
     base: Option<serde_json::Value>,
     extra: Option<serde_json::Value>,

@@ -1177,7 +1177,7 @@ fn t390_392b_intercept_network_grouped_scenario() {
     );
     assert_eq!(waited["success"], true, "{waited}");
 
-    let mut doctor = serde_json::Value::Null;
+    let mut doctor = Value::Null;
     let mut doctor_matched = false;
     for _ in 0..60 {
         let out = parse_json(&session.cmd().arg("doctor").output().unwrap());
@@ -1268,7 +1268,7 @@ fn t390_392b_intercept_network_grouped_scenario() {
         "{inspected}"
     );
 
-    let mut doctor = serde_json::Value::Null;
+    let mut doctor = Value::Null;
     let mut doctor_matched = false;
     for _ in 0..60 {
         let out = parse_json(&session.cmd().arg("doctor").output().unwrap());
@@ -2436,7 +2436,7 @@ fn t421_423_selected_same_origin_frame_grouped_context_scenario() {
             .unwrap(),
     );
     assert_eq!(extracted["success"], true, "{extracted}");
-    let expected_filename = std::path::Path::new(&file_path)
+    let expected_filename = Path::new(&file_path)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap()
@@ -2955,7 +2955,7 @@ fn t400_402_interference_grouped_scenario() {
     );
     assert_eq!(
         secondary_interference["data"]["runtime"]["current_interference"],
-        serde_json::Value::Null,
+        Value::Null,
         "{secondary_interference}"
     );
 
@@ -3055,7 +3055,7 @@ fn t400_402_interference_grouped_scenario() {
     );
     assert_eq!(
         popup_interference["data"]["runtime"]["current_interference"],
-        serde_json::Value::Null,
+        Value::Null,
         "{popup_interference}"
     );
 

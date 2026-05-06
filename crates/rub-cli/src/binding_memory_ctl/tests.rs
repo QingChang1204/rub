@@ -60,6 +60,7 @@ fn remembered_alias_registry_defaults_to_v1_empty_registry() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn write_remembered_alias_registry_surfaces_rub_home_directory_durability_failure() {
     let root = std::env::temp_dir().join(format!(
@@ -104,6 +105,7 @@ fn write_remembered_alias_registry_surfaces_rub_home_directory_durability_failur
     let _ = std::fs::remove_dir_all(&root);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn write_remembered_alias_registry_rejects_published_only_file_commit() {
     let home = temp_home();

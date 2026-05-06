@@ -199,6 +199,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn external_sessions_project_active_takeover_runtime_when_handoff_is_active() {
         let mut state = TakeoverRuntimeState::default();

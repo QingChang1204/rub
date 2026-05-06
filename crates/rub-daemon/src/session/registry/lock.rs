@@ -15,6 +15,7 @@ pub(super) fn flock(file: &std::fs::File, exclusive: bool) -> std::io::Result<()
     }
 }
 
+//noinspection DuplicatedCode
 pub(super) fn unlock(file: &std::fs::File) -> std::io::Result<()> {
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
     if result == 0 {

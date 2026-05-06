@@ -7,6 +7,7 @@ use crate::runtime_refresh::{
     refresh_live_trigger_runtime, refresh_orchestration_runtime, refresh_takeover_runtime,
 };
 
+//noinspection DuplicatedCode
 pub(crate) async fn cmd_doctor(
     router: &DaemonRouter,
     state: &Arc<SessionState>,

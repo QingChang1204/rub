@@ -28,8 +28,8 @@ fn wait_for_distinct_tab_pair_by_title(
     panic!("distinct tabs titled {target_title} and {source_title} should exist");
 }
 
-fn close_tab_after_background_hook_fence(home: &str, index: Option<&str>) -> serde_json::Value {
-    let mut last = serde_json::Value::Null;
+fn close_tab_after_background_hook_fence(home: &str, index: Option<&str>) -> Value {
+    let mut last = Value::Null;
     for _ in 0..40 {
         let mut command = rub_cmd(home);
         command.arg("close-tab");
@@ -1283,7 +1283,7 @@ fn t437g_h_trigger_workflow_grouped_scenario() {
         ),
     ]);
 
-    let write_json_file = |name: &str, value: serde_json::Value| -> String {
+    let write_json_file = |name: &str, value: Value| -> String {
         let path = PathBuf::from(&home).join(name);
         std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
         path.to_string_lossy().into_owned()
@@ -1416,7 +1416,7 @@ fn t437g_h_trigger_workflow_grouped_scenario() {
     );
     assert_eq!(added["success"], true, "{added}");
     let trigger_id = added["data"]["result"]["trigger"]["id"].as_u64().unwrap();
-    let mut fired = serde_json::Value::Null;
+    let mut fired = Value::Null;
     for _ in 0..120 {
         let out = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
         assert_poll_success("trigger list", &out);
@@ -1433,7 +1433,7 @@ fn t437g_h_trigger_workflow_grouped_scenario() {
         fired = out;
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert_ne!(fired, serde_json::Value::Null);
+    assert_ne!(fired, Value::Null);
     let trigger = fired["data"]["result"]["items"]
         .as_array()
         .unwrap()
@@ -1534,7 +1534,7 @@ fn t437g_h_trigger_workflow_grouped_scenario() {
             .unwrap(),
     );
     assert_eq!(seeded["success"], true, "{seeded}");
-    let mut fired = serde_json::Value::Null;
+    let mut fired = Value::Null;
     for _ in 0..120 {
         let out = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
         assert_poll_success("trigger list", &out);
@@ -1654,7 +1654,7 @@ fn t437i_l_trigger_source_vars_storage_blocked_and_removed_grouped_scenario() {
         ),
     ]);
 
-    let write_json_file = |name: &str, value: serde_json::Value| -> String {
+    let write_json_file = |name: &str, value: Value| -> String {
         let path = PathBuf::from(&home).join(name);
         std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
         path.to_string_lossy().into_owned()
@@ -1900,7 +1900,7 @@ fn t437i_l_trigger_source_vars_storage_blocked_and_removed_grouped_scenario() {
             .unwrap(),
     );
     assert_eq!(seeded["success"], true, "{seeded}");
-    let mut fired = serde_json::Value::Null;
+    let mut fired = Value::Null;
     for _ in 0..120 {
         let out = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
         assert_poll_success("trigger list", &out);
@@ -2027,7 +2027,7 @@ fn t437i_l_trigger_source_vars_storage_blocked_and_removed_grouped_scenario() {
             .unwrap(),
     );
     assert_eq!(seeded["success"], true, "{seeded}");
-    let mut fired = serde_json::Value::Null;
+    let mut fired = Value::Null;
     for _ in 0..120 {
         let out = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
         assert_poll_success("trigger list", &out);
@@ -2152,7 +2152,7 @@ fn t437i_l_trigger_source_vars_storage_blocked_and_removed_grouped_scenario() {
             .unwrap(),
     );
     assert_eq!(seeded["success"], true, "{seeded}");
-    let mut blocked = serde_json::Value::Null;
+    let mut blocked = Value::Null;
     for _ in 0..120 {
         let out = parse_json(&session.cmd().args(["trigger", "list"]).output().unwrap());
         assert_poll_success("trigger list", &out);

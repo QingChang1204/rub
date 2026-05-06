@@ -94,6 +94,7 @@ fn selection_context_from_args(args: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Null
 }
 
+//noinspection DuplicatedCode
 fn ordering_policy_from_args(args: &serde_json::Value) -> &'static str {
     match (
         args.get("visible")

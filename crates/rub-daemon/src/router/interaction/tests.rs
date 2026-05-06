@@ -48,6 +48,7 @@ fn interaction_possible_commit_timeout_contract_redacts_raw_secret_bearing_args(
     );
 }
 
+//noinspection DuplicatedCode
 #[tokio::test]
 async fn post_interaction_projection_reads_refreshed_runtime_and_frame_state() {
     let state = Arc::new(SessionState::new(
@@ -154,6 +155,7 @@ async fn post_interaction_projection_reads_refreshed_runtime_and_frame_state() {
     assert_eq!(projection.interference_after, refreshed_interference);
 }
 
+//noinspection DuplicatedCode
 #[tokio::test]
 async fn stable_post_interaction_projection_waits_for_browser_quiescence_before_sampling() {
     let state = Arc::new(SessionState::new(

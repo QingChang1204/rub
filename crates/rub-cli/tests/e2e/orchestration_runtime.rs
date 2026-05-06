@@ -377,7 +377,7 @@ fn t437q_orchestration_add_replay_after_commit_grouped_scenario() {
     let target_session_id = session_id_by_name(&sessions, "target");
     let socket_path = registry_socket_path_by_session_id(home, &source_session_id);
 
-    let request = rub_ipc::protocol::IpcRequest::new(
+    let request = IpcRequest::new(
         "orchestration",
         json!({
             "sub": "add",
@@ -446,7 +446,7 @@ fn t437q_orchestration_add_replay_after_commit_grouped_scenario() {
         .expect("replayed orchestration add should preserve the committed rule id");
     assert_eq!(replayed_rule_id, first_rule_id, "{replayed:?}");
 
-    let conflicting_request = rub_ipc::protocol::IpcRequest::new(
+    let conflicting_request = IpcRequest::new(
         "orchestration",
         json!({
             "sub": "add",
@@ -1703,7 +1703,7 @@ fn t437aa_ab_orchestration_assets_and_embedded_watch_grouped_scenario() {
     let saved_to = exported["data"]["result"]["persisted_artifacts"][0]["path"]
         .as_str()
         .expect("named orchestration asset path");
-    let saved_spec: serde_json::Value =
+    let saved_spec: Value =
         serde_json::from_slice(&std::fs::read(saved_to).expect("exported asset should exist"))
             .expect("exported asset should be valid json");
     assert!(saved_spec.get("correlation_key").is_none(), "{saved_spec}");
@@ -2361,7 +2361,7 @@ fn t437s_y_orchestration_repeat_and_reactive_latch_grouped_scenario() {
             .data
             .as_ref()
             .and_then(|data| data.get("in_flight_count"))
-            .and_then(serde_json::Value::as_u64),
+            .and_then(Value::as_u64),
         Some(0),
         "{source_idle:?}"
     );

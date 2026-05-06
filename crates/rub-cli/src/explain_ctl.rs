@@ -265,6 +265,7 @@ fn locator_disambiguation_hints(candidates: &[Value]) -> Value {
     })
 }
 
+//noinspection DuplicatedCode
 fn ordering_policy_from_target(target: &ElementAddressArgs) -> &'static str {
     match (target.visible, target.prefer_enabled, target.topmost) {
         (true, true, true) => {

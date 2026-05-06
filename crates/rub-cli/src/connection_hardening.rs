@@ -88,8 +88,8 @@ where
     let mut attribution = RetryAttribution::default();
 
     loop {
-        match operation().await {
-            Ok(value) => return Ok((value, attribution)),
+        return match operation().await {
+            Ok(value) => Ok((value, attribution)),
             Err(attempt) => {
                 if let Some(reason) = attempt.transient_reason.clone()
                     && attribution.retry_count < policy.max_retries
@@ -100,7 +100,7 @@ where
                     continue;
                 }
 
-                return Err(RetryFailure {
+                Err(RetryFailure {
                     error: attempt.error,
                     attribution,
                     final_failure_class: if attempt.transient_reason.is_some() {
@@ -108,9 +108,9 @@ where
                     } else {
                         attempt.final_failure_class
                     },
-                });
+                })
             }
-        }
+        };
     }
 }
 

@@ -10,6 +10,7 @@ impl InterferenceRuntimeState {
         self.projection.clone()
     }
 
+    //noinspection DuplicatedCode
     pub(crate) fn prime_baseline_from_tabs(&mut self, tabs: &[TabInfo]) {
         if self.baseline.primary_target_id.is_some() || self.baseline.primary_url.is_some() {
             return;
@@ -26,6 +27,7 @@ impl InterferenceRuntimeState {
         };
     }
 
+    //noinspection DuplicatedCode
     pub(crate) fn adopt_primary_context_from_tabs(&mut self, tabs: &[TabInfo]) {
         let Some(active_tab) = tabs.iter().find(|tab| tab.active) else {
             return;

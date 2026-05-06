@@ -136,7 +136,7 @@ fn interactable_wait_state_parses_for_locator_waits() {
 
     match parsed.condition.kind {
         WaitKind::Locator { state, .. } => {
-            assert_eq!(state, rub_core::model::WaitState::Interactable)
+            assert_eq!(state, WaitState::Interactable)
         }
         other => panic!("expected locator wait kind, got {other:?}"),
     }

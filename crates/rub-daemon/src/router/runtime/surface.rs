@@ -13,7 +13,7 @@ use rub_core::error::{ErrorCode, RubError};
 use super::super::DaemonRouter;
 use super::super::downloads::annotate_download_runtime_path_states;
 use super::projection::{runtime_projection_state, runtime_subject, runtime_surface_payload};
-use crate::router::request_args::subcommand_arg;
+use crate::router::request_args::{reject_unknown_fields, subcommand_arg};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum RuntimeSurface {
@@ -107,6 +107,7 @@ impl RuntimeSurface {
         }
     }
 
+    //noinspection DuplicatedCode
     pub(super) async fn refresh(
         self,
         router: &DaemonRouter,
@@ -256,7 +257,7 @@ pub(super) async fn cmd_runtime(
     state: &Arc<SessionState>,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, RubError> {
-    super::super::request_args::reject_unknown_fields(args, &["sub"], "runtime")?;
+    reject_unknown_fields(args, &["sub"], "runtime")?;
     let surface = RuntimeSurface::parse(args)?;
     let refresh_outcomes = surface.refresh(router, state).await;
     let mut payload = runtime_surface_payload(

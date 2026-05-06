@@ -470,6 +470,7 @@ mod tests {
         ) -> Result<StorageSnapshot, RubError> {
             unexpected_browser_call!("storage_snapshot_for_tab")
         }
+        //noinspection DuplicatedCode
         async fn set_storage_item(
             &self,
             _frame_id: Option<&str>,

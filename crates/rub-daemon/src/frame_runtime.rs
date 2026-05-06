@@ -168,6 +168,7 @@ mod tests {
         FrameContextInfo, FrameContextStatus, FrameInventoryEntry, FrameRuntimeInfo,
     };
 
+    //noinspection DuplicatedCode
     #[test]
     fn frame_runtime_state_tracks_projection_and_degradation() {
         let mut state = FrameRuntimeState::default();
@@ -200,6 +201,7 @@ mod tests {
         assert!(projection.current_frame.is_none());
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn frame_runtime_state_projects_selected_child_frame_from_inventory() {
         let mut state = FrameRuntimeState::default();
@@ -251,6 +253,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn frame_runtime_state_marks_missing_selected_frame_as_stale() {
         let mut state = FrameRuntimeState::default();

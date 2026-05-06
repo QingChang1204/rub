@@ -7,6 +7,7 @@ use rub_core::model::{
 };
 use std::collections::HashMap;
 
+//noinspection DuplicatedCode
 #[test]
 fn interactability_assessment_flags_disabled_and_overlay_blockers() {
     let mut attributes = HashMap::new();
@@ -116,6 +117,7 @@ fn interactability_assessment_reports_ready_targets_as_likely_interactable() {
     );
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn interactability_probe_suggests_direct_click_for_overlay_recovery_target() {
     let element = Element {
@@ -162,6 +164,7 @@ fn interactability_probe_suggests_direct_click_for_overlay_recovery_target() {
     );
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn interactability_probe_avoids_direct_click_for_disabled_targets() {
     let mut attributes = HashMap::new();

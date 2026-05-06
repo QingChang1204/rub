@@ -343,6 +343,7 @@ mod tests {
         assert_eq!(trace.events[0].kind, OrchestrationEventKind::Registered);
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn orchestration_runtime_records_execution_outcome_and_trace() {
         let mut state = OrchestrationRuntimeState::default();
@@ -596,6 +597,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn orchestration_runtime_preserves_newer_lifecycle_when_outcome_generation_is_stale() {
         let mut state = OrchestrationRuntimeState::default();
@@ -915,6 +917,7 @@ mod tests {
         assert!(runtime.rules[0].last_condition_evidence.is_none());
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn orchestration_runtime_rejects_removed_rule_probe_failure_with_expected_generation() {
         let mut state = OrchestrationRuntimeState::default();

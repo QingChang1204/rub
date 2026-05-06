@@ -112,6 +112,7 @@ pub(super) fn reconcile_worker_state(
     }
 }
 
+//noinspection DuplicatedCode
 pub(super) async fn evaluate_trigger_condition(
     browser: &Arc<dyn rub_core::port::BrowserPort>,
     state: &Arc<SessionState>,
@@ -402,6 +403,7 @@ pub(super) fn trigger_evidence_consumption_key(evidence: &TriggerEvidenceInfo) -
         .unwrap_or_else(|| evidence.summary.clone())
 }
 
+//noinspection DuplicatedCode
 pub(super) fn readiness_matches(readiness: &ReadinessInfo, requested: &str) -> bool {
     let requested = requested.trim().to_ascii_lowercase();
     if requested.is_empty() {
@@ -458,6 +460,7 @@ pub(super) fn network_request_matches(
     true
 }
 
+//noinspection DuplicatedCode
 pub(super) fn storage_snapshot_matches(
     snapshot: &StorageSnapshot,
     trigger: &TriggerInfo,

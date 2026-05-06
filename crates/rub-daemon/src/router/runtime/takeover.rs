@@ -364,6 +364,7 @@ pub(super) fn takeover_runtime_refresh_unavailable_error(cause: impl Into<String
     )
 }
 
+//noinspection DuplicatedCode
 pub(super) fn takeover_degraded_authority_error(
     message: impl Into<String>,
     reason: &'static str,

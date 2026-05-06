@@ -167,6 +167,7 @@ mod tests {
         StateInspectorStatus,
     };
 
+    //noinspection DuplicatedCode
     #[test]
     fn runtime_state_delta_reports_changed_fields() {
         let before = RuntimeStateSnapshot {

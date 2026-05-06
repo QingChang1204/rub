@@ -81,6 +81,7 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
+    //noinspection DuplicatedCode
     #[test]
     fn storage_runtime_state_tracks_snapshot_and_mutations() {
         let mut state = StorageRuntimeState::default();

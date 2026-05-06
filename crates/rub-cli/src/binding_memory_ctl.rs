@@ -155,7 +155,7 @@ pub(crate) fn resolve_remembered_alias_target_from_binding_state(
     rub_home: &Path,
     normalized_alias: &str,
     registry: RememberedBindingAliasRegistryData,
-    binding_state: &crate::binding_ctl::BindingResolutionState,
+    binding_state: &BindingResolutionState,
 ) -> Result<
     (
         RememberedBindingAliasRecord,

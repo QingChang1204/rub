@@ -10,7 +10,8 @@ use crate::daemon::shutdown::{
 use crate::rub_paths::RubPaths;
 use crate::session::{RegistryEntry, SessionState, read_registry, write_registry};
 use rub_core::error::ErrorCode;
-use rub_ipc::protocol::{IPC_PROTOCOL_VERSION, IpcRequest};
+use rub_ipc::protocol::{IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse};
+use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -21,6 +22,7 @@ fn temp_home() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("rub-daemon-test-{}-{sequence}", std::process::id()))
 }
 
+//noinspection DuplicatedCode
 fn ensure_socket_path_parent(path: &std::path::Path) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();
@@ -128,7 +130,7 @@ fn protocol_read_failure_response_wraps_structured_error_envelope() {
 #[test]
 fn read_failure_envelope_preserves_request_schema_reason() {
     let envelope = read_failure_envelope(Box::new(rub_ipc::protocol::IpcProtocolDecodeError::new(
-        rub_ipc::protocol::IpcRequest::from_value_strict(serde_json::json!({
+        IpcRequest::from_value_strict(json!({
             "ipc_protocol_version": "1.0",
             "command": "doctor",
             "args": {},
@@ -287,6 +289,7 @@ fn startup_guard_skips_stale_previous_authority_restore() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn startup_guard_does_not_restore_previous_authority_without_public_commit_marker() {
     let home = temp_home();
@@ -357,6 +360,7 @@ fn startup_guard_does_not_restore_previous_authority_without_public_commit_marke
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn startup_guard_restores_previous_authority_after_replacement_startup_failure() {
     let home = temp_home();
@@ -451,6 +455,7 @@ fn startup_guard_restores_previous_authority_after_replacement_startup_failure()
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn startup_guard_does_not_restore_previous_authority_over_newer_pending_startup() {
     let home = temp_home();
@@ -570,6 +575,7 @@ fn startup_guard_does_not_restore_previous_authority_over_newer_pending_startup(
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn startup_guard_does_not_restore_previous_authority_when_non_latest_candidate_is_pending() {
     let home = temp_home();
@@ -704,6 +710,7 @@ fn startup_guard_does_not_restore_previous_authority_when_non_latest_candidate_i
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn startup_guard_does_not_restore_previous_authority_over_newer_committed_authority() {
     let home = temp_home();
@@ -820,6 +827,7 @@ fn startup_guard_does_not_restore_previous_authority_over_newer_committed_author
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn startup_guard_drops_previous_authority_that_dies_during_restore() {
     let home = temp_home();
@@ -901,7 +909,7 @@ async fn shutdown_drain_flushes_pending_post_commit_projections() {
     ));
     let request = IpcRequest::new(
         "pipe",
-        serde_json::json!({
+        json!({
             "spec": "[]",
             "spec_source": { "kind": "file", "path": "/tmp/workflow.json" }
         }),
@@ -909,7 +917,7 @@ async fn shutdown_drain_flushes_pending_post_commit_projections() {
     )
     .with_command_id("cmd-1")
     .expect("static command_id must be valid");
-    let response = rub_ipc::protocol::IpcResponse::success("req-1", serde_json::json!({}))
+    let response = IpcResponse::success("req-1", json!({}))
         .with_command_id("cmd-1")
         .expect("static command_id must be valid");
 
@@ -929,16 +937,12 @@ async fn shutdown_drain_waits_past_soft_timeout_until_transactions_finish() {
         temp_home(),
         None,
     ));
-    state
-        .in_flight_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    state.in_flight_count.store(1, Ordering::SeqCst);
 
     let drain_state = state.clone();
     let releaser = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        drain_state
-            .in_flight_count
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+        drain_state.in_flight_count.store(0, Ordering::SeqCst);
     });
 
     let start = tokio::time::Instant::now();
@@ -965,16 +969,14 @@ async fn shutdown_drain_waits_past_soft_timeout_until_connected_request_fence_cl
         temp_home(),
         None,
     ));
-    state
-        .connected_client_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    state.connected_client_count.store(1, Ordering::SeqCst);
 
     let drain_state = state.clone();
     let releaser = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         drain_state
             .connected_client_count
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+            .store(0, Ordering::SeqCst);
     });
 
     let start = tokio::time::Instant::now();
@@ -992,25 +994,22 @@ async fn shutdown_drain_waits_past_soft_timeout_until_connected_request_fence_cl
         elapsed >= std::time::Duration::from_millis(20),
         "drain returned before the connected request fence quiesced"
     );
-    assert_eq!(
-        metrics["shutdown_drain"]["soft_timeout_count"],
-        serde_json::json!(1)
-    );
+    assert_eq!(metrics["shutdown_drain"]["soft_timeout_count"], json!(1));
     assert_eq!(
         metrics["shutdown_drain"]["connected_only_soft_release_count"],
-        serde_json::json!(0)
+        json!(0)
     );
     assert_eq!(
         metrics["shutdown_drain"]["max_observed_in_flight_count"],
-        serde_json::json!(0)
+        json!(0)
     );
     assert_eq!(
         metrics["shutdown_drain"]["max_observed_connected_client_count"],
-        serde_json::json!(1)
+        json!(1)
     );
     assert_eq!(
         metrics["shutdown_drain"]["max_observed_pre_request_response_fence_count"],
-        serde_json::json!(0)
+        json!(0)
     );
 }
 
@@ -1024,14 +1023,14 @@ async fn shutdown_drain_waits_past_soft_timeout_until_pre_request_response_fence
     ));
     state
         .pre_request_response_fence_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+        .store(1, Ordering::SeqCst);
 
     let drain_state = state.clone();
     let releaser = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         drain_state
             .pre_request_response_fence_count
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+            .store(0, Ordering::SeqCst);
     });
 
     let start = tokio::time::Instant::now();
@@ -1049,21 +1048,18 @@ async fn shutdown_drain_waits_past_soft_timeout_until_pre_request_response_fence
         elapsed >= std::time::Duration::from_millis(20),
         "drain returned before the pre-request response fence quiesced"
     );
-    assert_eq!(
-        metrics["shutdown_drain"]["soft_timeout_count"],
-        serde_json::json!(1)
-    );
+    assert_eq!(metrics["shutdown_drain"]["soft_timeout_count"], json!(1));
     assert_eq!(
         metrics["shutdown_drain"]["max_observed_in_flight_count"],
-        serde_json::json!(0)
+        json!(0)
     );
     assert_eq!(
         metrics["shutdown_drain"]["max_observed_connected_client_count"],
-        serde_json::json!(0)
+        json!(0)
     );
     assert_eq!(
         metrics["shutdown_drain"]["max_observed_pre_request_response_fence_count"],
-        serde_json::json!(1)
+        json!(1)
     );
 }
 
@@ -1075,16 +1071,14 @@ async fn shutdown_drain_waits_for_post_commit_followups_after_live_fences_clear(
         temp_home(),
         None,
     ));
-    state
-        .post_commit_followup_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    state.post_commit_followup_count.store(1, Ordering::SeqCst);
 
     let drain_state = state.clone();
     let releaser = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         drain_state
             .post_commit_followup_count
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+            .store(0, Ordering::SeqCst);
     });
 
     let start = tokio::time::Instant::now();
@@ -1101,22 +1095,12 @@ async fn shutdown_drain_waits_for_post_commit_followups_after_live_fences_clear(
         elapsed >= std::time::Duration::from_millis(20),
         "drain returned before downstream post-commit followups quiesced"
     );
-    assert_eq!(
-        state
-            .in_flight_count
-            .load(std::sync::atomic::Ordering::SeqCst),
-        0
-    );
-    assert_eq!(
-        state
-            .connected_client_count
-            .load(std::sync::atomic::Ordering::SeqCst),
-        0
-    );
+    assert_eq!(state.in_flight_count.load(Ordering::SeqCst), 0);
+    assert_eq!(state.connected_client_count.load(Ordering::SeqCst), 0);
     assert_eq!(
         state
             .pre_request_response_fence_count
-            .load(std::sync::atomic::Ordering::SeqCst),
+            .load(Ordering::SeqCst),
         0
     );
 }
@@ -1127,7 +1111,7 @@ async fn worker_shutdown_waits_past_soft_timeout_without_abort() {
     let completed_worker = completed.clone();
     let handle = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        completed_worker.store(true, std::sync::atomic::Ordering::SeqCst);
+        completed_worker.store(true, Ordering::SeqCst);
     });
 
     let start = tokio::time::Instant::now();
@@ -1144,7 +1128,7 @@ async fn worker_shutdown_waits_past_soft_timeout_without_abort() {
         "worker shutdown returned before the worker naturally finished"
     );
     assert!(
-        completed.load(std::sync::atomic::Ordering::SeqCst),
+        completed.load(Ordering::SeqCst),
         "worker should complete instead of being aborted at the soft timeout"
     );
 }

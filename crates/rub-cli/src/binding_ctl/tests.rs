@@ -247,6 +247,7 @@ fn binding_projections_surface_live_registry_authority_failure_metadata() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn project_live_status_returns_typed_live_match_resolution() {
     let home = temp_home();
@@ -292,6 +293,7 @@ fn project_live_status_returns_typed_live_match_resolution() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn project_live_status_does_not_reuse_degraded_registry_authority() {
     let home = temp_home();
@@ -336,6 +338,7 @@ fn project_live_status_does_not_reuse_degraded_registry_authority() {
     }
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn project_live_status_does_not_fallback_to_user_data_dir_for_profile_bindings() {
     let home = temp_home();
@@ -379,6 +382,7 @@ fn project_live_status_uses_captured_attachment_identity_fallback_when_binding_f
     binding.user_data_dir_reference = Some("/Users/test/Chrome".to_string());
     binding.auth_provenance.captured_from_attachment_identity =
         Some("profile:/Users/test/Chrome/Profile 3".to_string());
+    //noinspection DuplicatedCode
     let snapshot = RegistryAuthoritySnapshot {
         sessions: vec![RegistrySessionSnapshot {
             session_name: "default".to_string(),
@@ -413,6 +417,7 @@ fn project_live_status_uses_captured_attachment_identity_fallback_when_binding_f
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn project_live_status_does_not_drift_to_user_data_dir_when_only_captured_attachment_identity_exists()
  {
@@ -464,10 +469,7 @@ fn rename_binding_alias_rejects_duplicate_target() {
 
     let error =
         rename_binding_alias(&home, "old-admin", "other").expect_err("duplicate alias should fail");
-    assert_eq!(
-        error.into_envelope().code,
-        rub_core::error::ErrorCode::InvalidInput
-    );
+    assert_eq!(error.into_envelope().code, ErrorCode::InvalidInput);
     let _ = std::fs::remove_dir_all(home);
 }
 
@@ -490,7 +492,7 @@ fn rename_binding_alias_rejects_referenced_binding_target() {
     let error = rename_binding_alias(&home, "old-admin", "new-admin")
         .expect_err("referenced binding rename should fail");
     let envelope = error.into_envelope();
-    assert_eq!(envelope.code, rub_core::error::ErrorCode::InvalidInput);
+    assert_eq!(envelope.code, ErrorCode::InvalidInput);
     let context = envelope
         .context
         .expect("rename guard should include context");
@@ -516,6 +518,7 @@ fn remove_binding_alias_updates_registry() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn remove_binding_alias_rejects_referenced_binding_target() {
     let home = temp_home();
@@ -535,7 +538,7 @@ fn remove_binding_alias_rejects_referenced_binding_target() {
     let error = remove_binding_alias(&home, "old-admin")
         .expect_err("referenced binding remove should fail");
     let envelope = error.into_envelope();
-    assert_eq!(envelope.code, rub_core::error::ErrorCode::InvalidInput);
+    assert_eq!(envelope.code, ErrorCode::InvalidInput);
     let context = envelope
         .context
         .expect("remove guard should include context");
@@ -546,6 +549,7 @@ fn remove_binding_alias_rejects_referenced_binding_target() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn build_binding_record_from_capture_candidate_preserves_capture_provenance() {
     let candidate = BindingCaptureCandidateInfo {
@@ -619,6 +623,7 @@ fn build_binding_record_from_capture_candidate_preserves_capture_provenance() {
     );
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn build_binding_record_from_bind_current_drops_capture_claim() {
     let candidate = BindingCaptureCandidateInfo {
@@ -689,6 +694,7 @@ fn build_binding_record_from_bind_current_drops_capture_claim() {
     );
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn build_binding_record_from_explicit_cli_capture_uses_operator_cli_fence() {
     let candidate = BindingCaptureCandidateInfo {
@@ -763,6 +769,7 @@ fn build_binding_record_from_explicit_cli_capture_uses_operator_cli_fence() {
     );
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn build_binding_record_from_explicit_mixed_capture_preserves_real_capture_fence() {
     let candidate = BindingCaptureCandidateInfo {

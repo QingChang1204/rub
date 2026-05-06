@@ -75,7 +75,7 @@ pub(super) async fn cmd_get_text_like(
         "Use --selector, --target-text, --role, --label, or --testid for a live read, or add --snapshot/--index/--ref to stay on snapshot authority",
     )?;
     let selected_frame_id =
-        super::super::frame_scope::effective_request_frame_id(router, raw_args, state).await?;
+        frame_scope::effective_request_frame_id(router, raw_args, state).await?;
 
     let value = match kind {
         GetReadKind::Text => serde_json::json!(
@@ -243,7 +243,7 @@ pub(super) async fn cmd_inspect_text_like(
         "Use --selector, --target-text, --role, --label, or --testid for a live multi-value read, or drop --many to inspect one selected element",
     )?;
     let selected_frame_id =
-        super::super::frame_scope::effective_request_frame_id(router, raw_args, state).await?;
+        frame_scope::effective_request_frame_id(router, raw_args, state).await?;
 
     let items = match kind {
         InspectReadKind::Text => serde_json::to_value(

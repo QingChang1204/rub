@@ -169,6 +169,7 @@ mod tests {
         assert_eq!(value["observation_projection"]["depth_count"], 3);
     }
 
+    //noinspection DuplicatedCode
     fn sample_snapshot() -> Snapshot {
         Snapshot {
             snapshot_id: "snap-1".to_string(),

@@ -603,9 +603,9 @@ fn t118_119_queue_and_busy_registry_grouped_scenario() {
     let _ = hold.wait();
 
     let registry_path = format!("{}/registry.json", session.home());
-    let mut registry: serde_json::Value =
+    let mut registry: Value =
         serde_json::from_str(&std::fs::read_to_string(&registry_path).unwrap()).unwrap();
-    registry["sessions"][0]["ipc_protocol_version"] = serde_json::json!("0.0");
+    registry["sessions"][0]["ipc_protocol_version"] = json!("0.0");
     std::fs::write(
         &registry_path,
         serde_json::to_string_pretty(&registry).unwrap(),
@@ -2093,7 +2093,7 @@ fn t232f5_f5c_inspect_harvest_grouped_scenario() {
     let source_path = format!("{}/detail-rows.json", session.home());
     std::fs::write(
         &source_path,
-        serde_json::json!({
+        json!({
             "data": {
                 "fields": {
                     "items": [
@@ -2109,7 +2109,7 @@ fn t232f5_f5c_inspect_harvest_grouped_scenario() {
     let extract_path = format!("{}/detail-spec.json", session.home());
     std::fs::write(
         &extract_path,
-        serde_json::json!({
+        json!({
             "title": { "selector": ".title", "kind": "text" },
             "author": { "selector": ".author", "kind": "text" }
         })
@@ -2150,7 +2150,7 @@ fn t232f5_f5c_inspect_harvest_grouped_scenario() {
     );
     assert_eq!(
         harvested["data"]["result"]["entries"][0]["result"]["fields"],
-        serde_json::json!({
+        json!({
             "author": "Alice",
             "title": "Alpha detail"
         }),
@@ -2158,7 +2158,7 @@ fn t232f5_f5c_inspect_harvest_grouped_scenario() {
     );
     assert_eq!(
         harvested["data"]["result"]["entries"][1]["result"]["fields"],
-        serde_json::json!({
+        json!({
             "author": "Bob",
             "title": "Beta detail"
         }),
@@ -2168,7 +2168,7 @@ fn t232f5_f5c_inspect_harvest_grouped_scenario() {
     let builder_path = format!("{}/detail-rows-builder.json", session.home());
     std::fs::write(
         &builder_path,
-        serde_json::json!({
+        json!({
             "data": {
                 "fields": {
                     "items": [
@@ -2215,7 +2215,7 @@ fn t232f5_f5c_inspect_harvest_grouped_scenario() {
     );
     assert_eq!(
         builder["data"]["result"]["entries"][0]["result"]["fields"],
-        serde_json::json!({
+        json!({
             "author": "Alice",
             "hero": "/img/a.webp",
             "title": "Alpha detail"
@@ -2224,7 +2224,7 @@ fn t232f5_f5c_inspect_harvest_grouped_scenario() {
     );
     assert_eq!(
         builder["data"]["result"]["entries"][1]["result"]["fields"],
-        serde_json::json!({
+        json!({
             "author": "Bob",
             "hero": "/img/b.webp",
             "title": "Beta detail"
@@ -2235,7 +2235,7 @@ fn t232f5_f5c_inspect_harvest_grouped_scenario() {
     let autodetect_path = format!("{}/detail-rows-autodetect.json", session.home());
     std::fs::write(
         &autodetect_path,
-        serde_json::json!({
+        json!({
             "data": {
                 "result": {
                     "items": [
@@ -2272,7 +2272,7 @@ fn t232f5_f5c_inspect_harvest_grouped_scenario() {
     );
     assert_eq!(
         autodetect["data"]["result"]["entries"][0]["result"]["fields"],
-        serde_json::json!({
+        json!({
             "title": "Alpha detail"
         }),
         "{autodetect}"

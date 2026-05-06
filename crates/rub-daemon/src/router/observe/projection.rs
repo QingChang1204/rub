@@ -1,5 +1,7 @@
 use super::super::element_semantics::semantic_role;
-use super::super::navigation::write_screenshot_artifact;
+use super::super::navigation::{
+    inline_screenshot_payload_exceeds_limit, write_screenshot_artifact,
+};
 use super::super::state_format::summarize_element_label;
 use super::super::{DaemonRouter, RubError, TransactionDeadline};
 
@@ -58,7 +60,7 @@ pub(super) async fn capture_screenshot_payload(
         );
     }
 
-    if super::super::navigation::inline_screenshot_payload_exceeds_limit(png_bytes.len()) {
+    if inline_screenshot_payload_exceeds_limit(png_bytes.len()) {
         return Ok(serde_json::json!({
             "kind": "screenshot",
             "format": "png",

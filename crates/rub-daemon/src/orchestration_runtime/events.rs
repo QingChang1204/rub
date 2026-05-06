@@ -11,7 +11,7 @@ enum RuleSessionState {
 fn rule_session_state(session: Option<&OrchestrationSessionInfo>) -> RuleSessionState {
     match session {
         None => RuleSessionState::Missing,
-        Some(session) if super::orchestration_session_addressability_reason(session).is_some() => {
+        Some(session) if orchestration_session_addressability_reason(session).is_some() => {
             RuleSessionState::NotAddressable
         }
         Some(_) => RuleSessionState::Addressable,

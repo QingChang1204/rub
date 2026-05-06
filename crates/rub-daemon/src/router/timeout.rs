@@ -73,6 +73,7 @@ pub(super) fn timeout_context(
     serde_json::Value::Object(context)
 }
 
+//noinspection DuplicatedCode
 fn merge_object_context(
     base: Option<serde_json::Value>,
     extra: serde_json::Value,

@@ -312,7 +312,7 @@ mod tests {
     use reqwest::header::HeaderValue;
     use rub_core::error::ErrorCode;
     use rub_core::fs::commit_temporary_file;
-    use serde_json::json;
+    use serde_json::{from_value, json};
     use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn download_save_args_accept_request_path_metadata() {
-        let parsed: DownloadSaveArgs = serde_json::from_value(serde_json::json!({
+        let parsed: DownloadSaveArgs = from_value(json!({
             "sub": "save",
             "file": "/tmp/assets.json",
             "file_state": {

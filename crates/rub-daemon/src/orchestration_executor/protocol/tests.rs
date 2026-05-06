@@ -656,6 +656,7 @@ async fn remote_error_response_namespaces_reason_and_adds_session_path_context()
     server.await.expect("server join");
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn project_remote_request_onto_deadline_shrinks_nested_wrapper_timeout_authority() {
     let inner = IpcRequest::new("wait", serde_json::json!({ "timeout_ms": 5_000 }), 5_000)
@@ -746,6 +747,7 @@ fn align_orchestration_timeout_authority_shrinks_inspect_list_wait_budget() {
     );
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn project_remote_request_onto_deadline_shrinks_nested_inspect_list_wait_budget() {
     let inner = IpcRequest::new(

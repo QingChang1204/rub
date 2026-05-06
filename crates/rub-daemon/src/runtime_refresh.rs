@@ -202,6 +202,7 @@ mod tests {
         )
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn policy_driven_handoff_activates_when_available() {
         let state = Arc::new(SessionState::new("default", temp_home(), None));
@@ -240,6 +241,7 @@ mod tests {
         assert!(takeover.automation_paused);
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn policy_driven_handoff_does_not_activate_when_unavailable() {
         let state = Arc::new(SessionState::new("default", temp_home(), None));
@@ -306,6 +308,7 @@ mod tests {
         assert!(!handoff.automation_paused);
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn read_only_interference_refresh_does_not_activate_policy_handoff() {
         let state = Arc::new(SessionState::new("default", temp_home(), None));
@@ -344,6 +347,7 @@ mod tests {
         assert!(!takeover.automation_paused);
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn orchestration_refresh_projects_registry_backed_session_identity() {
         let home = temp_home();
@@ -471,6 +475,7 @@ mod tests {
         fixture.join();
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn orchestration_refresh_prioritizes_missing_current_session_over_non_addressable_remote_sessions()
      {
@@ -544,6 +549,7 @@ mod tests {
         remote_fixture.join();
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn orchestration_refresh_keeps_current_session_when_live_authority_is_committed() {
         let home = temp_home();
@@ -657,6 +663,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn orchestration_refresh_keeps_protocol_incompatible_sessions_visible_and_non_addressable()
      {
@@ -731,6 +738,7 @@ mod tests {
         remote_fixture.join();
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn orchestration_refresh_keeps_busy_sessions_visible_and_non_addressable() {
         let home = temp_home();
@@ -803,6 +811,7 @@ mod tests {
         remote_fixture.join();
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn orchestration_refresh_keeps_large_busy_registries_within_one_probe_budget_window() {
         let home = temp_home();
@@ -865,6 +874,7 @@ mod tests {
         }
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn orchestration_refresh_keeps_late_live_entries_addressable_beyond_old_probe_cap() {
         let home = temp_home();
@@ -952,6 +962,7 @@ mod tests {
         remote_fixture.join();
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn orchestration_refresh_keeps_probe_contract_failure_sessions_visible_and_non_addressable()
      {
@@ -1025,6 +1036,7 @@ mod tests {
         remote_fixture.join();
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn orchestration_refresh_keeps_pending_startup_sessions_visible_and_non_addressable() {
         let home = temp_home();

@@ -258,6 +258,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn history_projection_reports_retention_truncation() {
         let mut history = CommandHistoryState::default();
@@ -335,6 +336,7 @@ mod tests {
         assert!(projection.entries[0].success);
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn history_projection_range_filters_entries_by_sequence() {
         let mut history = CommandHistoryState::default();
@@ -359,6 +361,7 @@ mod tests {
         assert!(!projection.selection_truncated_by_retention);
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn history_projection_last_selection_can_be_complete_despite_global_retention_loss() {
         let mut history = CommandHistoryState::default();
@@ -379,6 +382,7 @@ mod tests {
         assert!(!projection.selection_truncated_by_retention);
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn history_projection_last_selection_ignores_global_projection_loss_when_window_is_complete() {
         let mut history = CommandHistoryState::default();
@@ -399,6 +403,7 @@ mod tests {
         assert!(!projection.selection_truncated_by_retention);
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn history_projection_last_selection_marks_projection_loss_when_requested_window_is_short() {
         let mut history = CommandHistoryState::default();
@@ -418,6 +423,7 @@ mod tests {
         assert!(projection.selection_dropped_before_projection);
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn history_projection_range_selection_ignores_global_projection_loss() {
         let mut history = CommandHistoryState::default();

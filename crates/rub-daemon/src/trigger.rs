@@ -418,7 +418,7 @@ mod tests {
                     result: None,
                     error_code: Some(rub_core::error::ErrorCode::SessionBusy),
                     reason: Some("continuity_frame_unavailable".to_string()),
-                    error_context: Some(serde_json::json!({
+                    error_context: Some(json!({
                         "reason": "continuity_frame_unavailable",
                         "target_tab_target_id": "target",
                         "phase": "action",
@@ -505,7 +505,7 @@ mod tests {
                 summary: "trigger action executed".to_string(),
                 command_id: Some("cmd-1".to_string()),
                 action: None,
-                result: Some(serde_json::json!({"ok": true})),
+                result: Some(json!({"ok": true})),
                 error_code: None,
                 reason: None,
                 error_context: None,
@@ -556,7 +556,7 @@ mod tests {
                 summary: "trigger action executed".to_string(),
                 command_id: Some("cmd-2".to_string()),
                 action: None,
-                result: Some(serde_json::json!({"ok": true})),
+                result: Some(json!({"ok": true})),
                 error_code: None,
                 reason: None,
                 error_context: None,

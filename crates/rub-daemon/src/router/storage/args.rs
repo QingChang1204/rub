@@ -45,6 +45,7 @@ pub(super) struct InspectStorageArgs {
     pub(super) _orchestration: Option<serde_json::Value>,
 }
 
+//noinspection DuplicatedCode
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct StorageGetArgs {
@@ -69,6 +70,7 @@ pub(super) struct StorageSetArgs {
     pub(super) _orchestration: Option<serde_json::Value>,
 }
 
+//noinspection DuplicatedCode
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct StorageRemoveArgs {

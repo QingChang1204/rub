@@ -48,7 +48,7 @@ pub(super) async fn run_with_orchestration_retry<T, F, Fut>(
 ) -> Result<(T, u32), OrchestrationRetryFailure>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, ErrorEnvelope>>,
+    Fut: Future<Output = Result<T, ErrorEnvelope>>,
 {
     run_with_orchestration_retry_with_timeout_error(
         policy,
@@ -67,7 +67,7 @@ pub(super) async fn run_with_orchestration_retry_with_timeout_error<T, F, Fut, G
 ) -> Result<(T, u32), OrchestrationRetryFailure>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, ErrorEnvelope>>,
+    Fut: Future<Output = Result<T, ErrorEnvelope>>,
     G: Fn() -> ErrorEnvelope,
 {
     let mut attempts = 0;
@@ -81,8 +81,8 @@ where
             operation(),
         )
         .await;
-        match result {
-            Ok(value) => return Ok((value, attempts)),
+        return match result {
+            Ok(value) => Ok((value, attempts)),
             Err(error) => {
                 if let Some(retry_reason) = classify_retryable_orchestration_error(&error)
                     && attempts <= policy.max_retries.saturating_add(1)
@@ -108,16 +108,16 @@ where
                     });
                 }
 
-                return Err(OrchestrationRetryFailure {
+                Err(OrchestrationRetryFailure {
                     error: attach_orchestration_retry_diagnostics(
                         error,
                         attempts.saturating_sub(1),
                         last_retry_reason.as_deref(),
                     ),
                     attempts,
-                });
+                })
             }
-        }
+        };
     }
 }
 

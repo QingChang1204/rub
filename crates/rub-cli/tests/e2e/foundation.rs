@@ -1,4 +1,5 @@
 use super::*;
+use std::thread::sleep;
 
 // ============================================================
 // Phase 3: Session lifecycle tests (T039-T042)
@@ -19,7 +20,7 @@ fn t038b_close_noops_without_bootstrap() {
         "{json}"
     );
     assert!(
-        !std::path::Path::new(home).exists(),
+        !Path::new(home).exists(),
         "close must not create RUB_HOME when no daemon authority exists"
     );
 }
@@ -58,7 +59,7 @@ fn t039_daemon_auto_start_lifecycle() {
             closeable = true;
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        sleep(Duration::from_millis(100));
     }
     assert!(
         closeable,
@@ -93,7 +94,7 @@ fn t040_stale_pid_recovery() {
         libc::kill(pid, libc::SIGKILL);
     }
     assert!(
-        wait_for_home_processes_to_exit(home, std::time::Duration::from_secs(5)),
+        wait_for_home_processes_to_exit(home, Duration::from_secs(5)),
         "daemon process tree must fully exit before stale recovery is asserted"
     );
 
@@ -1270,7 +1271,7 @@ fn t100_101_screenshot_grouped_scenario() {
             .unwrap()
             > 0
     );
-    assert!(std::path::Path::new(&screenshot_path).exists());
+    assert!(Path::new(&screenshot_path).exists());
     let out = session.cmd().arg("screenshot").output().unwrap();
     let json = parse_json(&out);
     assert_eq!(json["success"], true);
@@ -1358,7 +1359,7 @@ fn t107_doctor_health() {
     assert_eq!(runtime["interference_runtime"]["status"], "inactive");
     assert_eq!(
         runtime["interference_runtime"]["current_interference"],
-        serde_json::Value::Null
+        Value::Null
     );
     assert_eq!(
         runtime["interference_runtime"]["active_policies"],

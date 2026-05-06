@@ -370,7 +370,7 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(10),
             DownloadRuntimeInfo {
-                status: rub_core::model::DownloadRuntimeStatus::Active,
+                status: DownloadRuntimeStatus::Active,
                 mode: DownloadMode::Managed,
                 download_dir: Some("/tmp/downloads".to_string()),
                 active_downloads: vec![download(DownloadState::InProgress)],

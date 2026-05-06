@@ -249,6 +249,7 @@ async fn dropping_unstarted_replay_owner_releases_in_flight_claim() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[tokio::test]
 async fn dropping_started_replay_owner_marks_spent_without_cached_response() {
     let home = unique_home("drop-started-replay-owner");
@@ -297,6 +298,7 @@ async fn dropping_started_replay_owner_marks_spent_without_cached_response() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[tokio::test]
 async fn transport_frame_overflow_does_not_replace_committed_response_truth() {
     let home = unique_home("transport-overflow-truth");
@@ -490,6 +492,7 @@ async fn cached_committed_internal_transport_overflow_is_not_rerunnable() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn response_for_transport_applies_frame_limit_after_daemon_session_id_injection() {
     let daemon_session_id =
@@ -674,6 +677,7 @@ fn replay_timeout_response_reports_inherited_transaction_budget() {
     assert_ne!(context["transaction_timeout_ms"], serde_json::json!(5_000));
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn external_preflight_rejects_in_process_only_internal_commands() {
     let state = Arc::new(SessionState::new(
@@ -756,6 +760,7 @@ fn external_preflight_rejects_protocol_mismatch_for_semantic_internal_commands()
     let _ = std::fs::remove_dir_all(home);
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn external_preflight_rejects_daemon_authority_mismatch_for_internal_commands() {
     let home = unique_home("internal-daemon-authority");

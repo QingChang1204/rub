@@ -15,6 +15,7 @@ pub(super) enum TriggerEvidenceDisposition {
     ConsumeOnPermanentActionFailure,
 }
 
+//noinspection DuplicatedCode
 pub(super) async fn record_trigger_failure(
     state: &Arc<SessionState>,
     trigger: &TriggerInfo,

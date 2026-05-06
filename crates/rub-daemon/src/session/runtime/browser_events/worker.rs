@@ -7,9 +7,9 @@ pub(super) async fn run_browser_event_worker(
     mut critical_rx: tokio::sync::mpsc::UnboundedReceiver<BrowserSessionEvent>,
     mut progress_rx: tokio::sync::mpsc::Receiver<BrowserSessionEvent>,
     progress_overflow_coordination: Arc<std::sync::Mutex<()>>,
-    progress_overflow_latched: Arc<std::sync::atomic::AtomicBool>,
-    progress_overflow_latched_generation: Arc<std::sync::atomic::AtomicU64>,
-    progress_overflow_latched_sequence: Arc<std::sync::atomic::AtomicU64>,
+    progress_overflow_latched: Arc<AtomicBool>,
+    progress_overflow_latched_generation: Arc<AtomicU64>,
+    progress_overflow_latched_sequence: Arc<AtomicU64>,
 ) {
     let mut pending = BTreeMap::<u64, BrowserSessionEvent>::new();
     let mut next_sequence = state.committed_browser_event_cursor().saturating_add(1);
@@ -76,9 +76,9 @@ pub(super) async fn drain_ready_browser_events(
     pending: &mut BTreeMap<u64, BrowserSessionEvent>,
     next_sequence: &mut u64,
     progress_overflow_coordination: &Arc<std::sync::Mutex<()>>,
-    progress_overflow_latched: &Arc<std::sync::atomic::AtomicBool>,
-    progress_overflow_latched_generation: &Arc<std::sync::atomic::AtomicU64>,
-    progress_overflow_latched_sequence: &Arc<std::sync::atomic::AtomicU64>,
+    progress_overflow_latched: &Arc<AtomicBool>,
+    progress_overflow_latched_generation: &Arc<AtomicU64>,
+    progress_overflow_latched_sequence: &Arc<AtomicU64>,
 ) {
     loop {
         let committed = state.committed_browser_event_cursor();

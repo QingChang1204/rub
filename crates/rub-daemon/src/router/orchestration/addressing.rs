@@ -101,6 +101,7 @@ fn ensure_orchestration_session_addressable(
     ))
 }
 
+//noinspection DuplicatedCode
 fn local_orchestration_inventory_unavailable_error(
     session: &OrchestrationSessionInfo,
     reason: String,

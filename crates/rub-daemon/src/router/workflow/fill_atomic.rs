@@ -593,6 +593,7 @@ fn atomic_fill_failure_from_source(
     RubError::domain_with_context(envelope.code, message, serde_json::Value::Object(context))
 }
 
+//noinspection DuplicatedCode
 fn atomic_plan_requires_a11y(steps: &[FillStepSpec], submit: &SubmitLocatorArgs) -> bool {
     steps.iter().any(|step| {
         parse_canonical_locator(

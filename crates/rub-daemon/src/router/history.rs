@@ -248,6 +248,7 @@ mod tests {
         assert_eq!(items[1]["sequence"], serde_json::json!(3));
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn command_history_projection_state_ignores_global_projection_loss_when_last_window_is_complete()
      {
@@ -294,6 +295,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn command_history_projection_state_ignores_global_projection_loss_when_range_window_is_complete()
      {
@@ -548,6 +550,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn export_history_marks_projection_loss_as_incomplete() {
         let home = std::env::temp_dir().join(format!(

@@ -177,7 +177,7 @@ fn find_element_by_ref(
     element_ref_index: &HashMap<&str, &Element>,
     element_ref: &str,
 ) -> Option<Element> {
-    MEMO_ELEMENT_REF_LOOKUPS.with(|count| count.set(count.get().saturating_add(1)));
+    MEMO_ELEMENT_REF_LOOKUPS.set(MEMO_ELEMENT_REF_LOOKUPS.get().saturating_add(1));
     element_ref_index.get(element_ref).cloned().cloned()
 }
 
@@ -191,8 +191,8 @@ fn memo_rehydrate_metrics_snapshot() -> MemoRehydrateMetrics {
 
 #[cfg(test)]
 fn reset_memo_rehydrate_metrics() {
-    MEMO_ELEMENT_REF_LOOKUPS.with(|count| count.set(0));
-    MEMO_ELEMENT_REF_INDEX_BUILD_STEPS.with(|count| count.set(0));
+    MEMO_ELEMENT_REF_LOOKUPS.set(0);
+    MEMO_ELEMENT_REF_INDEX_BUILD_STEPS.set(0);
 }
 
 fn memo_targets(elements: &[Element]) -> Vec<LocatorMemoTarget> {

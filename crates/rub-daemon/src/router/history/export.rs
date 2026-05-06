@@ -42,7 +42,7 @@ pub(super) async fn export_pipe_history(
     from: Option<u64>,
     to: Option<u64>,
     include_observation: bool,
-) -> Result<serde_json::Value, RubError> {
+) -> Result<Value, RubError> {
     let projection = build_export_projection(state, last, from, to, include_observation).await?;
     Ok(serde_json::json!({
         "subject": history_subject(last, from, to),
@@ -75,7 +75,7 @@ pub(super) async fn export_script_history(
     from: Option<u64>,
     to: Option<u64>,
     include_observation: bool,
-) -> Result<serde_json::Value, RubError> {
+) -> Result<Value, RubError> {
     let projection = build_export_projection(state, last, from, to, include_observation).await?;
     let script = render_export_script(&projection)?;
     Ok(serde_json::json!({
@@ -231,7 +231,7 @@ fn export_step(entry: WorkflowCaptureEntry) -> WorkflowExportStep {
     }
 }
 
-fn export_step_json(step: &WorkflowExportStep) -> serde_json::Value {
+fn export_step_json(step: &WorkflowExportStep) -> Value {
     serde_json::json!({
         "command": step.command,
         "args": step.args,
@@ -239,7 +239,7 @@ fn export_step_json(step: &WorkflowExportStep) -> serde_json::Value {
     })
 }
 
-fn replayable_export_step_json(step: &WorkflowExportStep) -> serde_json::Value {
+fn replayable_export_step_json(step: &WorkflowExportStep) -> Value {
     serde_json::json!({
         "command": step.command,
         "args": step.args,

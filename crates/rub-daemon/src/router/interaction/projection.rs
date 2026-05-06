@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::time::Duration;
 
 use super::super::*;
+use crate::router::projection::ProjectionSignals;
 use crate::runtime_refresh::{
     InterferenceRefreshIntent, refresh_live_frame_runtime, refresh_live_interference_state,
     refresh_live_runtime_state,
@@ -145,6 +146,7 @@ pub(super) async fn capture_interaction_trace_windows(
     }
 }
 
+//noinspection DuplicatedCode
 pub(super) async fn finalize_interaction_projection(
     router: &DaemonRouter,
     state: &Arc<SessionState>,
@@ -172,7 +174,7 @@ pub(super) async fn finalize_interaction_projection(
     attach_interaction_projection(
         data,
         outcome,
-        crate::router::projection::ProjectionSignals {
+        ProjectionSignals {
             frame_runtime: &stable_projection.projection_state.frame_runtime,
             runtime_before: baseline.runtime_before.as_ref(),
             runtime_after: Some(&stable_projection.projection_state.runtime_after),
@@ -219,6 +221,7 @@ fn should_promote_primary_context(
     )
 }
 
+//noinspection DuplicatedCode
 pub(super) async fn finalize_select_projection(
     router: &DaemonRouter,
     state: &Arc<SessionState>,
@@ -240,7 +243,7 @@ pub(super) async fn finalize_select_projection(
     attach_select_projection(
         data,
         outcome,
-        crate::router::projection::ProjectionSignals {
+        ProjectionSignals {
             frame_runtime: &stable_projection.projection_state.frame_runtime,
             runtime_before: baseline.runtime_before.as_ref(),
             runtime_after: Some(&stable_projection.projection_state.runtime_after),

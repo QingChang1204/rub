@@ -41,7 +41,7 @@ fn rub_cmd_env(rub_home: &str, envs: &[(&str, &str)]) -> Command {
     cmd
 }
 
-fn parse_json(output: &std::process::Output) -> serde_json::Value {
+fn parse_json(output: &std::process::Output) -> Value {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!(
@@ -76,11 +76,11 @@ fn assert_poll_success(surface: &str, parsed: &Value) {
     );
 }
 
-fn doctor_result(json: &serde_json::Value) -> &serde_json::Value {
+fn doctor_result(json: &Value) -> &Value {
     &json["data"]["result"]
 }
 
-fn doctor_runtime(json: &serde_json::Value) -> &serde_json::Value {
+fn doctor_runtime(json: &Value) -> &Value {
     &json["data"]["runtime"]
 }
 
@@ -93,13 +93,13 @@ fn prepare_rub_home_secrets(home: &str, contents: &str) {
     write_secure_secrets_env(&PathBuf::from(home).join("secrets.env"), contents);
 }
 
-fn open_and_assert_success(mut cmd: Command, url: &str) -> serde_json::Value {
+fn open_and_assert_success(mut cmd: Command, url: &str) -> Value {
     let opened = parse_json(&cmd.args(["open", url]).output().unwrap());
     assert_eq!(opened["success"], true, "{opened}");
     opened
 }
 
-fn assert_input_secret_references(json: &serde_json::Value, expected: &[(&str, &str)]) {
+fn assert_input_secret_references(json: &Value, expected: &[(&str, &str)]) {
     let references = &json["data"]["input_secret_references"];
     assert_eq!(references["count"], expected.len(), "{json}");
     let items = references["items"]
@@ -115,11 +115,11 @@ fn assert_input_secret_references(json: &serde_json::Value, expected: &[(&str, &
     }
 }
 
-fn wait_for_no_live_sessions(home: &str) -> serde_json::Value {
+fn wait_for_no_live_sessions(home: &str) -> Value {
     wait_for_no_live_sessions_with_timeout(home, Duration::from_secs(5))
 }
 
-fn wait_for_no_live_sessions_with_timeout(home: &str, timeout: Duration) -> serde_json::Value {
+fn wait_for_no_live_sessions_with_timeout(home: &str, timeout: Duration) -> Value {
     let mut last_sessions = None;
     let mut last_observed = None;
     let deadline = std::time::Instant::now() + timeout;
@@ -212,7 +212,7 @@ fn bind_current_and_remember_alias(
 }
 
 fn assert_binding_result_auth(
-    json: &serde_json::Value,
+    json: &Value,
     mode: &str,
     alias: &str,
     created_via: &str,
@@ -243,7 +243,7 @@ fn assert_binding_result_auth(
 }
 
 fn assert_binding_capture_candidate(
-    json: &serde_json::Value,
+    json: &Value,
     status: &str,
     capture_fence: Option<&str>,
     persistence_policy: Option<&str>,
@@ -286,7 +286,7 @@ fn assert_binding_capture_candidate(
     }
 }
 
-fn wait_for_pending_dialog(home: &str) -> serde_json::Value {
+fn wait_for_pending_dialog(home: &str) -> Value {
     for _ in 0..40 {
         let out = rub_cmd(home).arg("dialog").output().unwrap();
         let json = parse_json(&out);
@@ -299,7 +299,7 @@ fn wait_for_pending_dialog(home: &str) -> serde_json::Value {
     panic!("Timed out waiting for pending dialog");
 }
 
-fn wait_for_tabs_count(home: &str, count: u64) -> serde_json::Value {
+fn wait_for_tabs_count(home: &str, count: u64) -> Value {
     for _ in 0..50 {
         let out = parse_json(&rub_cmd(home).arg("tabs").output().unwrap());
         assert_poll_success("tabs", &out);
@@ -316,7 +316,7 @@ fn wait_for_tabs_count(home: &str, count: u64) -> serde_json::Value {
     panic!("Timed out waiting for at least {count} tabs");
 }
 
-fn wait_for_trigger_status(home: &str, id: u64, expected: &str) -> serde_json::Value {
+fn wait_for_trigger_status(home: &str, id: u64, expected: &str) -> Value {
     for _ in 0..80 {
         let out = parse_json(&rub_cmd(home).args(["trigger", "list"]).output().unwrap());
         assert_poll_success("trigger list", &out);
@@ -336,7 +336,7 @@ fn wait_for_trigger_status(home: &str, id: u64, expected: &str) -> serde_json::V
     panic!("Timed out waiting for trigger {id} to reach status '{expected}'");
 }
 
-fn wait_for_trigger_last_action_status(home: &str, id: u64, expected: &str) -> serde_json::Value {
+fn wait_for_trigger_last_action_status(home: &str, id: u64, expected: &str) -> Value {
     for _ in 0..80 {
         let out = parse_json(&rub_cmd(home).args(["trigger", "list"]).output().unwrap());
         assert_poll_success("trigger list", &out);
@@ -356,8 +356,8 @@ fn wait_for_trigger_last_action_status(home: &str, id: u64, expected: &str) -> s
     panic!("Timed out waiting for trigger {id} to publish last_action_result.status '{expected}'");
 }
 
-fn wait_for_trigger_unavailable_reason(home: &str, id: u64, expected: &str) -> serde_json::Value {
-    let mut last = serde_json::Value::Null;
+fn wait_for_trigger_unavailable_reason(home: &str, id: u64, expected: &str) -> Value {
+    let mut last = Value::Null;
     for _ in 0..80 {
         let out = parse_json(&rub_cmd(home).args(["trigger", "list"]).output().unwrap());
         assert_poll_success("trigger list", &out);
@@ -386,12 +386,7 @@ fn trigger_unavailable_reason_matches(actual: Option<&str>, expected: &str) -> b
             && actual == Some("source_tab_projection_degraded_and_target_missing"))
 }
 
-fn assert_trigger_status_remains(
-    home: &str,
-    id: u64,
-    expected: &str,
-    duration: Duration,
-) -> serde_json::Value {
+fn assert_trigger_status_remains(home: &str, id: u64, expected: &str, duration: Duration) -> Value {
     let deadline = std::time::Instant::now() + duration;
     loop {
         let out = parse_json(&rub_cmd(home).args(["trigger", "list"]).output().unwrap());
@@ -419,7 +414,7 @@ fn assert_trigger_remains_unavailable_without_action(
     id: u64,
     expected_reason: &str,
     duration: Duration,
-) -> serde_json::Value {
+) -> Value {
     let deadline = std::time::Instant::now() + duration;
     loop {
         let out = parse_json(&rub_cmd(home).args(["trigger", "list"]).output().unwrap());
@@ -451,7 +446,7 @@ fn wait_for_runtime_frame_degraded_reason(
     expected_status: &str,
     expected_reason: &str,
     timeout: Duration,
-) -> serde_json::Value {
+) -> Value {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let out = parse_json(&rub_cmd(home).args(["runtime", "frame"]).output().unwrap());
@@ -481,13 +476,8 @@ fn wait_for_pid_exit(pid: i32, timeout: Duration) {
     });
 }
 
-fn wait_for_orchestration_status(
-    home: &str,
-    session: &str,
-    id: u64,
-    expected: &str,
-) -> serde_json::Value {
-    let mut last = serde_json::Value::Null;
+fn wait_for_orchestration_status(home: &str, session: &str, id: u64, expected: &str) -> Value {
+    let mut last = Value::Null;
     for _ in 0..80 {
         let out = parse_json(
             &rub_cmd(home)
@@ -517,7 +507,7 @@ fn wait_for_orchestration_rule_result(
     id: u64,
     expected_status: &str,
     expected_result_status: &str,
-) -> serde_json::Value {
+) -> Value {
     for _ in 0..80 {
         let out = parse_json(
             &rub_cmd(home)
@@ -547,8 +537,8 @@ fn wait_for_orchestration_condition_evidence_summary(
     id: u64,
     expected_status: &str,
     expected_summary: Option<&str>,
-) -> serde_json::Value {
-    let mut last = serde_json::Value::Null;
+) -> Value {
+    let mut last = Value::Null;
     for _ in 0..80 {
         let out = parse_json(
             &rub_cmd(home)
@@ -579,12 +569,8 @@ fn wait_for_orchestration_condition_evidence_summary(
     );
 }
 
-fn wait_for_orchestration_cooldown_to_expire(
-    home: &str,
-    session: &str,
-    id: u64,
-) -> serde_json::Value {
-    let mut last = serde_json::Value::Null;
+fn wait_for_orchestration_cooldown_to_expire(home: &str, session: &str, id: u64) -> Value {
+    let mut last = Value::Null;
     for _ in 0..80 {
         let out = parse_json(
             &rub_cmd(home)
@@ -623,8 +609,8 @@ fn wait_for_orchestration_cooldown_to_renew(
     session: &str,
     id: u64,
     previous_deadline_ms: u64,
-) -> serde_json::Value {
-    let mut last = serde_json::Value::Null;
+) -> Value {
+    let mut last = Value::Null;
     for _ in 0..80 {
         let out = parse_json(
             &rub_cmd(home)
@@ -661,7 +647,7 @@ fn wait_for_session_in_flight_count(
     let socket_path = registry_socket_path_by_session_id(home, session_id);
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let request = IpcRequest::new("_handshake", serde_json::json!({}), 1_000)
+        let request = IpcRequest::new("_handshake", json!({}), 1_000)
             .with_command_id(HANDSHAKE_PROBE_COMMAND_ID)
             .expect("fixed handshake probe command_id should stay valid");
         let response = send_bound_ipc_request(runtime, &socket_path, session_id, &request);
@@ -670,7 +656,7 @@ fn wait_for_session_in_flight_count(
                 .data
                 .as_ref()
                 .and_then(|data| data.get("in_flight_count"))
-                .and_then(serde_json::Value::as_u64)
+                .and_then(Value::as_u64)
                 == Some(expected)
         {
             return response;
@@ -691,7 +677,7 @@ fn wait_for_orchestration_probe_match(
     session_id: &str,
     tab_target_id: &str,
     frame_id: Option<&str>,
-    condition: serde_json::Value,
+    condition: Value,
     expected_matched: bool,
     timeout: Duration,
 ) -> IpcResponse {
@@ -715,7 +701,7 @@ fn wait_for_orchestration_probe_match(
                 .data
                 .as_ref()
                 .and_then(|data| data.get("matched"))
-                .and_then(serde_json::Value::as_bool)
+                .and_then(Value::as_bool)
                 == Some(expected_matched)
         {
             return response;
@@ -766,7 +752,7 @@ fn wait_for_text_in_session(
     }
 }
 
-fn session_id_by_name(sessions_json: &serde_json::Value, name: &str) -> String {
+fn session_id_by_name(sessions_json: &Value, name: &str) -> String {
     sessions_json["data"]["result"]["items"]
         .as_array()
         .and_then(|sessions| {
@@ -851,7 +837,7 @@ fn send_bound_ipc_request(
     })
 }
 
-fn frame_id_by_name(frames_json: &serde_json::Value, name: &str) -> String {
+fn frame_id_by_name(frames_json: &Value, name: &str) -> String {
     frames_json["data"]["result"]["items"]
         .as_array()
         .and_then(|frames| {

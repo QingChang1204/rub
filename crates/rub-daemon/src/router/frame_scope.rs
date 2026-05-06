@@ -214,6 +214,7 @@ mod tests {
         list_frames_for_tab_error: Option<String>,
     }
 
+    //noinspection DuplicatedCode
     fn frame_inventory(frame_id: &str) -> FrameInventoryEntry {
         FrameInventoryEntry {
             index: 0,
@@ -656,6 +657,7 @@ mod tests {
             unexpected_browser_call!("storage_snapshot_for_tab")
         }
 
+        //noinspection DuplicatedCode
         async fn set_storage_item(
             &self,
             _frame_id: Option<&str>,

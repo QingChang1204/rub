@@ -463,6 +463,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn binding_capture_candidate_marks_external_sessions_for_reattachment() {
         let home = PathBuf::from("/tmp/rub-binding-candidate-external");

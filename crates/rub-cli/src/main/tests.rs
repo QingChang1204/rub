@@ -2,10 +2,16 @@ use super::*;
 use crate::binding_ctl::write_binding_registry;
 use crate::binding_execution_ctl::resolve_command_execution_binding;
 use crate::binding_memory_ctl::remember_binding_alias;
+use crate::cleanup_ctl::CleanupResult;
 use crate::commands::EffectiveCli;
 use crate::commands::RememberedBindingAliasKindArg;
+use crate::daemon_ctl::{
+    BatchCloseResult, BatchCloseSessionError, CompatibilityDegradedOwnedReason,
+    CompatibilityDegradedOwnedSession,
+};
 use crate::main_dispatch::{
     cleanup_compatibility_degraded_owned_error, close_all_partial_failure_error,
+    resolve_close_selector_attachment_identity_until,
 };
 use crate::main_support::project_sessions_result;
 use crate::session_policy::ConnectionRequest;
@@ -785,7 +791,7 @@ fn close_all_selector_error_is_invalid_input() {
     assert_eq!(envelope.code, ErrorCode::InvalidInput);
     assert_eq!(
         envelope.context.expect("context")["reason"],
-        serde_json::json!("close_all_selector_not_supported")
+        json!("close_all_selector_not_supported")
     );
 }
 
@@ -793,23 +799,20 @@ fn close_all_selector_error_is_invalid_input() {
 fn close_all_partial_failure_error_reports_failed_sessions_as_non_success() {
     let envelope = close_all_partial_failure_error(
         std::path::Path::new("/tmp/rub-home"),
-        &crate::daemon_ctl::BatchCloseResult {
+        &BatchCloseResult {
             closed: vec!["default".to_string()],
             cleaned_stale: vec!["work".to_string()],
             compatibility_degraded_owned_sessions: vec![],
             failed: vec!["broken".to_string()],
-            session_error_details: vec![crate::daemon_ctl::BatchCloseSessionError {
+            session_error_details: vec![BatchCloseSessionError {
                 session: "broken".to_string(),
-                error: rub_core::error::ErrorEnvelope::new(
-                    ErrorCode::IpcProtocolError,
-                    "replay recovery failed",
-                )
-                .with_context(serde_json::json!({
-                    "reason": "ipc_replay_retry_failed",
-                    "recovery_contract": {
-                        "kind": "session_post_commit_journal",
-                    },
-                })),
+                error: ErrorEnvelope::new(ErrorCode::IpcProtocolError, "replay recovery failed")
+                    .with_context(json!({
+                        "reason": "ipc_replay_retry_failed",
+                        "recovery_contract": {
+                            "kind": "session_post_commit_journal",
+                        },
+                    })),
             }],
         },
     )
@@ -817,14 +820,14 @@ fn close_all_partial_failure_error_reports_failed_sessions_as_non_success() {
     assert_eq!(envelope.code, ErrorCode::IpcProtocolError);
     assert_eq!(
         envelope.context.as_ref().and_then(|ctx| ctx.get("reason")),
-        Some(&serde_json::json!("close_all_partial_failure"))
+        Some(&json!("close_all_partial_failure"))
     );
     assert_eq!(
         envelope
             .context
             .as_ref()
             .and_then(|ctx| ctx.get("failed_sessions")),
-        Some(&serde_json::json!(["broken"]))
+        Some(&json!(["broken"]))
     );
     assert_eq!(
         envelope
@@ -836,25 +839,23 @@ fn close_all_partial_failure_error_reports_failed_sessions_as_non_success() {
             .and_then(|value| value.get("context"))
             .and_then(|value| value.get("recovery_contract"))
             .and_then(|value| value.get("kind")),
-        Some(&serde_json::json!("session_post_commit_journal"))
+        Some(&json!("session_post_commit_journal"))
     );
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn close_all_partial_failure_error_treats_compatibility_degraded_owned_sessions_as_non_success() {
     let envelope = close_all_partial_failure_error(
         std::path::Path::new("/tmp/rub-home"),
-        &crate::daemon_ctl::BatchCloseResult {
+        &BatchCloseResult {
             closed: vec!["default".to_string()],
             cleaned_stale: vec![],
-            compatibility_degraded_owned_sessions: vec![
-                crate::daemon_ctl::CompatibilityDegradedOwnedSession {
-                    session: "legacy".to_string(),
-                    daemon_session_id: "sess-legacy".to_string(),
-                    reason:
-                        crate::daemon_ctl::CompatibilityDegradedOwnedReason::ProtocolIncompatible,
-                },
-            ],
+            compatibility_degraded_owned_sessions: vec![CompatibilityDegradedOwnedSession {
+                session: "legacy".to_string(),
+                daemon_session_id: "sess-legacy".to_string(),
+                reason: CompatibilityDegradedOwnedReason::ProtocolIncompatible,
+            }],
             failed: vec![],
             session_error_details: vec![],
         },
@@ -869,16 +870,14 @@ fn close_all_partial_failure_error_treats_compatibility_degraded_owned_sessions_
     );
     assert_eq!(
         envelope.context.as_ref().and_then(|ctx| ctx.get("reason")),
-        Some(&serde_json::json!(
-            "close_all_compatibility_degraded_owned_sessions"
-        ))
+        Some(&json!("close_all_compatibility_degraded_owned_sessions"))
     );
     assert_eq!(
         envelope
             .context
             .as_ref()
             .and_then(|ctx| ctx.get("compatibility_degraded_owned_sessions")),
-        Some(&serde_json::json!([{
+        Some(&json!([{
             "session": "legacy",
             "daemon_session_id": "sess-legacy",
             "reason": "protocol_incompatible"
@@ -886,19 +885,17 @@ fn close_all_partial_failure_error_treats_compatibility_degraded_owned_sessions_
     );
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn cleanup_compatibility_degraded_owned_error_uses_shared_family_projection() {
     let envelope = cleanup_compatibility_degraded_owned_error(
         std::path::Path::new("/tmp/rub-home"),
-        &crate::cleanup_ctl::CleanupResult {
-            compatibility_degraded_owned_sessions: vec![
-                crate::daemon_ctl::CompatibilityDegradedOwnedSession {
-                    session: "legacy".to_string(),
-                    daemon_session_id: "sess-legacy".to_string(),
-                    reason:
-                        crate::daemon_ctl::CompatibilityDegradedOwnedReason::ProtocolIncompatible,
-                },
-            ],
+        &CleanupResult {
+            compatibility_degraded_owned_sessions: vec![CompatibilityDegradedOwnedSession {
+                session: "legacy".to_string(),
+                daemon_session_id: "sess-legacy".to_string(),
+                reason: CompatibilityDegradedOwnedReason::ProtocolIncompatible,
+            }],
             ..Default::default()
         },
     )
@@ -906,16 +903,14 @@ fn cleanup_compatibility_degraded_owned_error_uses_shared_family_projection() {
     assert_eq!(envelope.code, ErrorCode::SessionBusy);
     assert_eq!(
         envelope.context.as_ref().and_then(|ctx| ctx.get("reason")),
-        Some(&serde_json::json!(
-            "cleanup_compatibility_degraded_owned_sessions"
-        ))
+        Some(&json!("cleanup_compatibility_degraded_owned_sessions"))
     );
     assert_eq!(
         envelope
             .context
             .as_ref()
             .and_then(|ctx| ctx.get("compatibility_degraded_owned_sessions")),
-        Some(&serde_json::json!([{
+        Some(&json!([{
             "session": "legacy",
             "daemon_session_id": "sess-legacy",
             "reason": "protocol_incompatible"
@@ -954,7 +949,7 @@ async fn close_selector_attachment_identity_resolves_to_canonical_cdp_authority(
     let request = ConnectionRequest::CdpUrl {
         url: format!("http://{address}/json/version"),
     };
-    let resolved = crate::main_dispatch::resolve_close_selector_attachment_identity_until(
+    let resolved = resolve_close_selector_attachment_identity_until(
         &cli,
         &request,
         Instant::now() + Duration::from_secs(1),
@@ -980,10 +975,7 @@ fn handle_sessions_reports_registry_read_failure_instead_of_empty_success() {
     let context = error
         .context
         .expect("sessions failure should publish context");
-    assert_eq!(
-        context["reason"],
-        serde_json::json!("session_registry_read_failed")
-    );
+    assert_eq!(context["reason"], json!("session_registry_read_failed"));
     assert_eq!(
         context["rub_home_state"]["path_authority"],
         "cli.sessions.subject.rub_home"
@@ -1091,7 +1083,7 @@ fn use_alias_local_surface_error_rejects_local_only_surfaces() {
     assert_eq!(binding_error.code, ErrorCode::InvalidInput);
     assert_eq!(
         binding_error.context.expect("context")["surface"],
-        serde_json::json!("binding")
+        json!("binding")
     );
 
     let secret_cli = local_surface_use_alias_cli(Commands::Secret {
@@ -1100,28 +1092,28 @@ fn use_alias_local_surface_error_rejects_local_only_surfaces() {
     let secret_error = use_alias_local_surface_error(&secret_cli).expect("secret must fail");
     assert_eq!(
         secret_error.context.expect("context")["surface"],
-        serde_json::json!("secret")
+        json!("secret")
     );
 
     let sessions_cli = local_surface_use_alias_cli(Commands::Sessions);
     let sessions_error = use_alias_local_surface_error(&sessions_cli).expect("sessions must fail");
     assert_eq!(
         sessions_error.context.expect("context")["surface"],
-        serde_json::json!("sessions")
+        json!("sessions")
     );
 
     let cleanup_cli = local_surface_use_alias_cli(Commands::Cleanup);
     let cleanup_error = use_alias_local_surface_error(&cleanup_cli).expect("cleanup must fail");
     assert_eq!(
         cleanup_error.context.expect("context")["surface"],
-        serde_json::json!("cleanup")
+        json!("cleanup")
     );
 
     let teardown_cli = local_surface_use_alias_cli(Commands::Teardown);
     let teardown_error = use_alias_local_surface_error(&teardown_cli).expect("teardown must fail");
     assert_eq!(
         teardown_error.context.expect("context")["surface"],
-        serde_json::json!("teardown")
+        json!("teardown")
     );
 
     let pipe_list_cli = local_surface_use_alias_cli(Commands::Pipe {
@@ -1136,7 +1128,7 @@ fn use_alias_local_surface_error_rejects_local_only_surfaces() {
         use_alias_local_surface_error(&pipe_list_cli).expect("pipe list-workflows must fail");
     assert_eq!(
         pipe_list_error.context.expect("context")["surface"],
-        serde_json::json!("pipe list-workflows")
+        json!("pipe list-workflows")
     );
 
     let orchestration_assets_cli = local_surface_use_alias_cli(Commands::Orchestration {
@@ -1146,7 +1138,7 @@ fn use_alias_local_surface_error_rejects_local_only_surfaces() {
         .expect("orchestration list-assets must fail");
     assert_eq!(
         orchestration_assets_error.context.expect("context")["surface"],
-        serde_json::json!("orchestration list-assets")
+        json!("orchestration list-assets")
     );
 
     let inspect_harvest_cli =
@@ -1165,7 +1157,7 @@ fn use_alias_local_surface_error_rejects_local_only_surfaces() {
         use_alias_local_surface_error(&inspect_harvest_cli).expect("inspect harvest must fail");
     assert_eq!(
         inspect_harvest_error.context.expect("context")["surface"],
-        serde_json::json!("inspect harvest")
+        json!("inspect harvest")
     );
 }
 

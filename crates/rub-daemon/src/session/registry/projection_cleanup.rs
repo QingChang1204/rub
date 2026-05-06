@@ -144,6 +144,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn cleanup_projections_removes_legacy_runtime_socket_path() {
         let home = std::env::temp_dir().join(format!(
@@ -181,6 +182,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&legacy_socket_dir);
     }
 
+    //noinspection DuplicatedCode
     #[test]
     fn cleanup_projections_does_not_remove_lookalike_non_legacy_socket_path() {
         let home = std::env::temp_dir().join(format!(

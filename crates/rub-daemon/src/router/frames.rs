@@ -38,7 +38,7 @@ pub(super) async fn cmd_frame(
     args: &serde_json::Value,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
-    let parsed: FrameSelectionArgs = super::request_args::parse_json_args(args, "frame")?;
+    let parsed: FrameSelectionArgs = request_args::parse_json_args(args, "frame")?;
     refresh_live_frame_runtime(&router.browser, state).await;
     let frames = router.browser.list_frames().await?;
     let selected_frame_id = resolve_selected_frame_id(&parsed, &frames)?;

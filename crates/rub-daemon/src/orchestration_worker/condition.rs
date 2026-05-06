@@ -294,6 +294,7 @@ pub(super) async fn record_orchestration_probe_failure(
     record_orchestration_failure_with_fallback(state, rule, envelope, None).await;
 }
 
+//noinspection DuplicatedCode
 pub(super) async fn record_orchestration_failure_with_fallback(
     state: &Arc<SessionState>,
     rule: &OrchestrationRuleInfo,

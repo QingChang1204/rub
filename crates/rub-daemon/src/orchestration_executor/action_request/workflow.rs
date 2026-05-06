@@ -12,13 +12,13 @@ use crate::workflow_params::{
     parse_workflow_json_parameter_bindings, resolve_workflow_binding_map,
 };
 use rub_core::json_spec::NormalizedJsonSpec;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::path::Path;
 
 pub(crate) const SOURCE_MATERIALIZATION_TIMEOUT_SENTINEL: &str =
     "__rub_source_materialization_timeout_sentinel__";
 
-pub(crate) fn orchestration_action_timeout_ms(command: &str, args: &serde_json::Value) -> u64 {
+pub(crate) fn orchestration_action_timeout_ms(command: &str, args: &Value) -> u64 {
     ORCHESTRATION_ACTION_BASE_TIMEOUT_MS.saturating_add(
         rub_core::automation_timeout::command_additional_timeout_ms(command, args),
     )
@@ -246,7 +246,7 @@ pub(crate) async fn resolve_orchestration_workflow_parameterization(
     state: &Arc<SessionState>,
     runtime: &OrchestrationRuntimeInfo,
     rule: &OrchestrationRuleInfo,
-    payload: &serde_json::Map<String, serde_json::Value>,
+    payload: &Map<String, Value>,
     raw_spec: &str,
     outer_deadline: Option<TransactionDeadline>,
 ) -> Result<
@@ -298,7 +298,7 @@ pub(crate) async fn resolve_orchestration_workflow_source_bindings(
     state: &Arc<SessionState>,
     runtime: &OrchestrationRuntimeInfo,
     rule: &OrchestrationRuleInfo,
-    payload: &serde_json::Map<String, serde_json::Value>,
+    payload: &Map<String, Value>,
     outer_deadline: Option<TransactionDeadline>,
 ) -> Result<std::collections::BTreeMap<String, String>, ErrorEnvelope> {
     if payload.get("source_vars").is_none() {
@@ -396,7 +396,7 @@ pub(crate) async fn dispatch_to_source_session_for_workflow_bindings(
     session: &OrchestrationSessionInfo,
     source_target_id: &str,
     source_frame_id: Option<&str>,
-    payload: &serde_json::Map<String, serde_json::Value>,
+    payload: &Map<String, Value>,
     outer_deadline: Option<TransactionDeadline>,
 ) -> Result<std::collections::BTreeMap<String, String>, ErrorEnvelope> {
     let timeout_ms =
@@ -407,7 +407,7 @@ pub(crate) async fn dispatch_to_source_session_for_workflow_bindings(
                     &session.session_name,
                 )
             })?;
-    let request = crate::orchestration_executor::bind_live_orchestration_phase_command_id(
+    let request = bind_live_orchestration_phase_command_id(
         IpcRequest::new(
             "_orchestration_workflow_source_vars",
             serde_json::json!({
@@ -460,9 +460,9 @@ fn source_var_timeout_budget_exhausted_error(
 }
 
 pub(crate) fn resolve_orchestration_workflow_spec(
-    payload: &serde_json::Map<String, serde_json::Value>,
+    payload: &Map<String, Value>,
     rub_home: &Path,
-) -> Result<(String, serde_json::Value), ErrorEnvelope> {
+) -> Result<(String, Value), ErrorEnvelope> {
     match (
         payload.get("workflow_name").and_then(|value| value.as_str()),
         payload.get("steps"),
@@ -549,7 +549,7 @@ pub(crate) fn orchestration_request_meta(
     execution_id: &str,
     step_index: u32,
     phase: &str,
-) -> serde_json::Value {
+) -> Value {
     let command_id =
         orchestration_step_command_id(rule, command_identity_key, execution_id, step_index);
     serde_json::json!({

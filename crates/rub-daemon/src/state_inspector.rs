@@ -36,6 +36,7 @@ mod tests {
     use super::StateInspectorState;
     use rub_core::model::{AuthState, StateInspectorInfo, StateInspectorStatus};
 
+    //noinspection DuplicatedCode
     #[test]
     fn state_inspector_state_tracks_projection_and_readiness() {
         let mut state = StateInspectorState::default();

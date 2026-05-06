@@ -127,6 +127,7 @@ mod tests {
         assert!(runtime.degraded_reason.is_none());
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn download_runtime_event_can_restore_active_download_projection_truth() {
         let state = Arc::new(SessionState::new(
@@ -295,6 +296,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn same_generation_overflow_reopens_after_later_clear_is_enqueued() {
         let state = Arc::new(SessionState::new(
@@ -364,6 +366,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn older_clear_does_not_reset_newer_same_generation_overflow_latch() {
         let state = Arc::new(SessionState::new(
@@ -572,6 +575,7 @@ mod tests {
         );
     }
 
+    //noinspection DuplicatedCode
     #[tokio::test]
     async fn dialog_runtime_event_replaces_projection_with_failed_rebuild_fallback_truth() {
         let state = Arc::new(SessionState::new(

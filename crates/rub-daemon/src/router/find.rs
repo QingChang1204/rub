@@ -122,8 +122,7 @@ async fn cmd_find_content(
         "Provide --selector, --target-text, --role, --label, or --testid to search content anchors",
     )?;
 
-    let selected_frame_id =
-        super::frame_scope::effective_request_frame_id(router, args, state).await?;
+    let selected_frame_id = frame_scope::effective_request_frame_id(router, args, state).await?;
     let content_matches = router
         .browser
         .find_content_matches(selected_frame_id.as_deref(), &locator)

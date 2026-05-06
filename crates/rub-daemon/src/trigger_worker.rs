@@ -616,7 +616,7 @@ fn reconcile_pending_trigger_reservations(
                 ),
             )
         })
-        .collect::<std::collections::HashMap<_, _>>();
+        .collect::<HashMap<_, _>>();
     pending_reservations.retain(|trigger_id, pending| {
         let keep =
             live_fingerprints

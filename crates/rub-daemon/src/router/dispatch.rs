@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use super::*;
 use rub_core::command::CommandMetadata;
+use serde_json::Value;
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn command_metadata(command: &str) -> CommandMetadata {
@@ -27,7 +28,7 @@ pub(super) fn command_supports_post_wait(command: &str) -> bool {
 pub(super) async fn dispatch_named_command(
     router: &DaemonRouter,
     command: &str,
-    args: &serde_json::Value,
+    args: &Value,
     deadline: TransactionDeadline,
     state: &Arc<SessionState>,
 ) -> Result<CommandDispatchOutcome, RubError> {
@@ -37,12 +38,10 @@ pub(super) async fn dispatch_named_command(
 pub(super) fn execute_named_command_with_fence<'a>(
     router: &'a DaemonRouter,
     command: &'a str,
-    args: &'a serde_json::Value,
+    args: &'a Value,
     deadline: TransactionDeadline,
     state: &'a Arc<SessionState>,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<serde_json::Value, RubError>> + Send + 'a>,
-> {
+) -> std::pin::Pin<Box<dyn Future<Output = Result<Value, RubError>> + Send + 'a>> {
     execute::execute_named_command_with_fence(router, command, args, deadline, state)
 }
 

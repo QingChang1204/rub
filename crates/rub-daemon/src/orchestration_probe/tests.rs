@@ -35,6 +35,7 @@ struct ReadinessProbeBrowser {
     degraded_readiness: bool,
 }
 
+//noinspection DuplicatedCode
 fn ready_snapshot() -> RuntimeStateSnapshot {
     RuntimeStateSnapshot {
         state_inspector: StateInspectorInfo::default(),
@@ -483,6 +484,7 @@ impl BrowserPort for ReadinessProbeBrowser {
         unexpected_browser_call!("storage_snapshot_for_tab")
     }
 
+    //noinspection DuplicatedCode
     async fn set_storage_item(
         &self,
         _frame_id: Option<&str>,
@@ -701,6 +703,7 @@ fn orchestration_network_request_matches_allow_tab_scoped_rules_without_frame() 
     ));
 }
 
+//noinspection DuplicatedCode
 #[tokio::test]
 async fn orchestration_readiness_probe_fails_closed_for_explicit_frame_errors() {
     let browser: Arc<dyn BrowserPort> = Arc::new(ReadinessProbeBrowser::default());
@@ -737,6 +740,7 @@ async fn orchestration_readiness_probe_fails_closed_for_explicit_frame_errors() 
     assert!(error.to_string().contains("missing-frame"), "{error}");
 }
 
+//noinspection DuplicatedCode
 #[tokio::test]
 async fn orchestration_readiness_probe_fails_closed_when_readiness_is_degraded() {
     let browser: Arc<dyn BrowserPort> = Arc::new(ReadinessProbeBrowser {

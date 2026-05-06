@@ -143,7 +143,7 @@ pub(super) async fn cmd_cookies(
             let json = serde_json::to_string_pretty(&cookies)
                 .map_err(|e| RubError::Internal(format!("Serialize cookies failed: {e}")))?;
             let commit_outcome =
-                atomic_write_bytes(std::path::Path::new(&parsed.path), json.as_bytes(), 0o600)
+                atomic_write_bytes(Path::new(&parsed.path), json.as_bytes(), 0o600)
                     .map_err(|e| RubError::Internal(format!("Cannot write file: {e}")))?;
 
             Ok(cookie_payload(

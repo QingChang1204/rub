@@ -412,6 +412,7 @@ fn committed_cli_error_preserves_daemon_request_correlation_and_projection() {
     );
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn format_exec_raw_response_returns_explicit_raw_surface() {
     let response = IpcResponse {
@@ -483,6 +484,7 @@ fn format_exec_raw_response_requires_success_with_result_payload() {
     assert!(format_exec_raw_response(&missing_result, false).is_none());
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn format_response_keeps_exec_success_in_json_envelope_by_default() {
     let response = IpcResponse {
@@ -616,7 +618,7 @@ fn format_response_trace_mode_picks_up_new_interaction_fields_without_hardcoded_
             }
         })),
         error: None,
-        timing: rub_core::model::Timing::default(),
+        timing: Timing::default(),
     };
 
     let output = format_response(
@@ -732,6 +734,7 @@ fn format_cli_error_attaches_trigger_continuity_guidance_for_session_busy() {
     );
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn format_response_verbose_uses_request_id_when_command_id_missing() {
     let response = IpcResponse {
@@ -762,6 +765,7 @@ fn format_response_verbose_uses_request_id_when_command_id_missing() {
     assert_eq!(json["data"]["interaction_trace"]["trace_id"], "019-request");
 }
 
+//noinspection DuplicatedCode
 #[test]
 fn format_response_rejects_missing_command_id_for_non_compat_command_and_preserves_stdout_contract()
 {

@@ -11,7 +11,7 @@ struct ObservatoryDropCounts {
 impl SessionState {
     fn observatory_drop_counts(
         &self,
-        observatory: &crate::observatory::RuntimeObservatoryState,
+        observatory: &RuntimeObservatoryState,
     ) -> ObservatoryDropCounts {
         let timeline = self
             .observatory_ingress_drop_count()
@@ -27,14 +27,14 @@ impl SessionState {
 
     pub(super) fn projected_observatory(
         &self,
-        observatory: &crate::observatory::RuntimeObservatoryState,
+        observatory: &RuntimeObservatoryState,
     ) -> RuntimeObservatoryInfo {
         observatory.projection_with_drop_count(self.observatory_drop_counts(observatory).total)
     }
 
     fn observatory_event_window_between_from_state(
         &self,
-        observatory: &crate::observatory::RuntimeObservatoryState,
+        observatory: &RuntimeObservatoryState,
         cursor: u64,
         end_cursor: u64,
         last_observed_ingress_drop_count: u64,
@@ -50,7 +50,7 @@ impl SessionState {
 
     fn observatory_request_window_from_state(
         &self,
-        observatory: &crate::observatory::RuntimeObservatoryState,
+        observatory: &RuntimeObservatoryState,
         cursor: u64,
         last_observed_ingress_drop_count: u64,
     ) -> crate::observatory::NetworkRequestWindow {
@@ -63,7 +63,7 @@ impl SessionState {
 
     fn observatory_request_window_between_from_state(
         &self,
-        observatory: &crate::observatory::RuntimeObservatoryState,
+        observatory: &RuntimeObservatoryState,
         cursor: u64,
         end_cursor: u64,
         last_observed_ingress_drop_count: u64,
@@ -93,10 +93,8 @@ impl SessionState {
         self.observatory.read().await.request_cursor()
     }
 
-    pub(crate) async fn current_network_request_baseline(
-        &self,
-    ) -> crate::session::NetworkRequestBaseline {
-        crate::session::NetworkRequestBaseline {
+    pub(crate) async fn current_network_request_baseline(&self) -> NetworkRequestBaseline {
+        NetworkRequestBaseline {
             cursor: self.network_request_cursor().await,
             observed_ingress_drop_count: self.network_request_ingress_drop_count(),
             primed: true,
@@ -235,7 +233,7 @@ impl SessionState {
     }
 
     /// Shared notification channel for new network-request record commits.
-    pub fn network_request_notifier(&self) -> Arc<tokio::sync::Notify> {
+    pub fn network_request_notifier(&self) -> Arc<Notify> {
         self.network_request_notify.clone()
     }
 }

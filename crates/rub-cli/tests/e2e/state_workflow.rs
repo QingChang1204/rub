@@ -6,6 +6,9 @@ use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use rub_daemon::session::{read_registry, write_registry};
+use serde_json::{from_str, to_vec_pretty};
+
 fn external_cdp_http_request(cdp_origin: &str, method: &str, path: &str) -> Option<String> {
     use std::io::{ErrorKind, Read};
 
@@ -41,7 +44,7 @@ fn external_cdp_http_request(cdp_origin: &str, method: &str, path: &str) -> Opti
 
 fn external_cdp_page_target_id(cdp_origin: &str, title: &str) -> Option<String> {
     let body = external_cdp_http_request(cdp_origin, "GET", "/json/list")?;
-    let targets: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let targets: Value = from_str(&body).ok()?;
     targets.as_array()?.iter().find_map(|target| {
         (target["type"].as_str() == Some("page") && target["title"].as_str() == Some(title))
             .then(|| target["id"].as_str().map(str::to_string))
@@ -55,7 +58,7 @@ fn open_external_cdp_page(cdp_origin: &str, url: &str) -> Option<String> {
         "PUT",
         &format!("/json/new?{}", percent_encode_url_component(url)),
     )?;
-    let target: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let target: Value = from_str(&body).ok()?;
     target["id"].as_str().map(str::to_string)
 }
 
@@ -100,7 +103,7 @@ fn inject_replay_failing_batch_close_session(
     session_name: &str,
 ) -> (String, PathBuf, JoinHandle<()>) {
     let session_id = format!("sess-{session_name}");
-    let runtime = rub_daemon::rub_paths::RubPaths::new(home).session_runtime(session_name, &session_id);
+    let runtime = RubPaths::new(home).session_runtime(session_name, &session_id);
     let socket_path = runtime.actual_socket_path();
     let _ = std::fs::remove_file(&socket_path);
     std::fs::create_dir_all(
@@ -122,15 +125,15 @@ fn inject_replay_failing_batch_close_session(
                     .try_clone()
                     .expect("clone fake daemon stream for read"),
             );
-            let request: rub_ipc::protocol::IpcRequest =
+            let request: IpcRequest =
                 rub_ipc::codec::NdJsonCodec::read_blocking(&mut reader)
                     .expect("read fake daemon request")
                     .expect("fake daemon request frame");
             match request.command.as_str() {
                 "_handshake" => {
-                    let response = rub_ipc::protocol::IpcResponse::success(
+                    let response = IpcResponse::success(
                         "handshake",
-                        serde_json::json!({
+                        json!({
                             "daemon_session_id": session_id_for_server,
                             "launch_policy": {
                                 "headless": true,
@@ -182,7 +185,7 @@ fn inject_replay_failing_batch_close_session(
     std::fs::write(runtime.startup_committed_path(), &session_id)
         .expect("write replay-failing startup committed marker");
 
-    let mut registry = rub_daemon::session::read_registry(std::path::Path::new(home))
+    let mut registry = read_registry(Path::new(home))
         .expect("read live registry for replay-failing batch close injection");
     registry.sessions.push(rub_daemon::session::RegistryEntry {
         session_id: session_id.clone(),
@@ -195,18 +198,18 @@ fn inject_replay_failing_batch_close_session(
         attachment_identity: None,
         connection_target: None,
     });
-    rub_daemon::session::write_registry(std::path::Path::new(home), &registry)
+    write_registry(Path::new(home), &registry)
         .expect("write registry with replay-failing batch close session");
 
     (session_id, socket_path, server)
 }
 
 fn assert_session_post_commit_recovery_contract(
-    recovery_contract: &serde_json::Value,
+    recovery_contract: &Value,
     home: &str,
     session_name: &str,
     session_id: &str,
-    debug: &serde_json::Value,
+    debug: &Value,
 ) {
     assert_eq!(
         recovery_contract["kind"],
@@ -245,7 +248,7 @@ fn assert_session_post_commit_recovery_contract(
     );
     assert_eq!(
         recovery_contract["journal_path"],
-        rub_daemon::rub_paths::RubPaths::new(home)
+        RubPaths::new(home)
             .session_runtime(session_name, session_id)
             .post_commit_journal_path()
             .display()
@@ -511,7 +514,7 @@ fn t215_concurrent_first_command_serializes_startup() {
     assert_eq!(json_a["error"], Value::Null);
     assert_eq!(json_b["error"], Value::Null);
 
-    let registry = rub_daemon::session::read_registry(std::path::Path::new(&home))
+    let registry = read_registry(Path::new(&home))
         .expect("registry should be readable after concurrent startup");
     assert_eq!(
         registry.sessions.len(),
@@ -939,7 +942,7 @@ fn t233e_i_history_export_grouped_scenario() {
     );
     assert_eq!(opened["success"], true, "{opened}");
     let opened_registry_entry =
-        rub_daemon::session::read_registry(std::path::Path::new(session.home()))
+        read_registry(Path::new(session.home()))
             .unwrap_or_else(|error| {
                 panic!(
                     "registry should be readable for {}: {error}",
@@ -960,7 +963,7 @@ fn t233e_i_history_export_grouped_scenario() {
     assert_eq!(executed["success"], true, "{executed}");
     assert_eq!(executed["data"]["result"], "History Fixture", "{executed}");
     let executed_registry_entry =
-        rub_daemon::session::read_registry(std::path::Path::new(session.home()))
+        read_registry(Path::new(session.home()))
             .unwrap_or_else(|error| {
                 panic!(
                     "registry should stay readable for {}: {error}",
@@ -1008,7 +1011,7 @@ fn t233e_i_history_export_grouped_scenario() {
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(|line| {
-            serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+            from_str::<Value>(line).unwrap_or_else(|error| {
                 panic!("journal line should decode as json: {error}: {line}")
             })
         })
@@ -1182,7 +1185,7 @@ fn t233e_i_history_export_grouped_scenario() {
         .output()
         .unwrap();
     let observe_registry_entry =
-        rub_daemon::session::read_registry(std::path::Path::new(session.home()))
+        read_registry(Path::new(session.home()))
             .unwrap_or_else(|error| {
                 panic!(
                     "registry should be readable for {}: {error}",
@@ -1203,7 +1206,7 @@ fn t233e_i_history_export_grouped_scenario() {
     assert_eq!(observed["success"], true, "{observed}");
     assert_eq!(observed["data"]["result"]["value"], "ok", "{observed}");
     let observed_registry_entry =
-        rub_daemon::session::read_registry(std::path::Path::new(session.home()))
+        read_registry(Path::new(session.home()))
             .unwrap_or_else(|error| {
                 panic!(
                     "registry should stay readable for {}: {error}",
@@ -1242,7 +1245,7 @@ fn t233e_i_history_export_grouped_scenario() {
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(|line| {
-            serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+            from_str::<Value>(line).unwrap_or_else(|error| {
                 panic!("journal line should decode as json: {error}: {line}")
             })
         })
@@ -1328,7 +1331,7 @@ fn t233e_i_history_export_grouped_scenario() {
         .output()
         .unwrap();
     let script_registry_entry =
-        rub_daemon::session::read_registry(std::path::Path::new(session.home()))
+        read_registry(Path::new(session.home()))
             .unwrap_or_else(|error| {
                 panic!(
                     "registry should be readable for {}: {error}",
@@ -1350,7 +1353,7 @@ fn t233e_i_history_export_grouped_scenario() {
         .output()
         .unwrap();
     let clicked_registry_entry =
-        rub_daemon::session::read_registry(std::path::Path::new(session.home()))
+        read_registry(Path::new(session.home()))
             .unwrap_or_else(|error| {
                 panic!(
                     "registry should stay readable for {}: {error}",
@@ -1395,7 +1398,7 @@ fn t233e_i_history_export_grouped_scenario() {
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(|line| {
-            serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+            from_str::<Value>(line).unwrap_or_else(|error| {
                 panic!("journal line should decode as json: {error}: {line}")
             })
         })
@@ -1622,14 +1625,14 @@ fn t233e_i_history_export_grouped_scenario() {
     std::fs::create_dir_all(saved_path.parent().unwrap()).unwrap();
     std::fs::write(
         &saved_path,
-        serde_json::to_vec_pretty(&serde_json::json!({
+        to_vec_pretty(&json!({
             "steps": saved_export["error"]["context"]["committed_response_projection"]["result"]["steps"].clone(),
         }))
         .unwrap(),
     )
     .unwrap();
     assert!(saved_path.exists(), "{saved_export}");
-    let saved_value: Value = serde_json::from_str(&std::fs::read_to_string(&saved_path).unwrap())
+    let saved_value: Value = from_str(&std::fs::read_to_string(&saved_path).unwrap())
         .expect("saved workflow json");
     assert!(saved_value["steps"].is_array(), "{saved_value}");
     assert_eq!(
@@ -2957,12 +2960,12 @@ fn t330_333_close_and_cleanup_grouped_scenario() {
         .expect("close --all replay-failing fake daemon thread should join");
     let _ = std::fs::remove_file(&broken_close_socket);
     rub_daemon::session::deregister_session(
-        std::path::Path::new(&home),
+        Path::new(&home),
         &broken_close_session_id,
     )
     .expect("remove injected replay-failing close --all session");
     let _ = std::fs::remove_dir_all(
-        rub_daemon::rub_paths::RubPaths::new(&home)
+        RubPaths::new(&home)
             .session_runtime("broken-close", &broken_close_session_id)
             .session_dir(),
     );
@@ -3002,12 +3005,12 @@ fn t330_333_close_and_cleanup_grouped_scenario() {
         .expect("teardown replay-failing fake daemon thread should join");
     let _ = std::fs::remove_file(&broken_teardown_socket);
     rub_daemon::session::deregister_session(
-        std::path::Path::new(&home),
+        Path::new(&home),
         &broken_teardown_session_id,
     )
     .expect("remove injected replay-failing teardown session");
     let _ = std::fs::remove_dir_all(
-        rub_daemon::rub_paths::RubPaths::new(&home)
+        RubPaths::new(&home)
             .session_runtime("broken-teardown", &broken_teardown_session_id)
             .session_dir(),
     );
@@ -3015,7 +3018,7 @@ fn t330_333_close_and_cleanup_grouped_scenario() {
     let cleanup_observation = observe_home_cleanup(&home);
     teardown_and_cleanup(&home);
     drop(session);
-    wait_until(Duration::from_secs(5), || !std::path::Path::new(&home).exists());
+    wait_until(Duration::from_secs(5), || !Path::new(&home).exists());
     assert_eq!(
         verify_home_cleanup_complete(&home, &cleanup_observation),
         Ok(CleanupVerification::Verified)
