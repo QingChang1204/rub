@@ -366,7 +366,7 @@ mod tests {
     fn locator_present_condition() -> TriggerConditionSpec {
         serde_json::from_value(serde_json::json!({
             "kind": "locator_present",
-            "locator": { "selector": "#ready" }
+            "locator": { "kind": "selector", "css": "#ready" }
         }))
         .expect("locator_present condition fixture should parse")
     }

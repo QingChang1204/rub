@@ -269,13 +269,15 @@ mod tests {
 
         let request = parse_connection_request(&cli)
             .expect("internal resolved profile authority should parse");
+        let expected_profile = normalize_identity_path("/tmp/bindings/Profile 3");
+        let expected_root = normalize_identity_path("/tmp/bindings");
         assert_eq!(
             request,
             ConnectionRequest::Profile {
                 name: "Work".to_string(),
                 dir_name: "Profile 3".to_string(),
-                resolved_path: "/tmp/bindings/Profile 3".to_string(),
-                user_data_root: "/tmp/bindings".to_string(),
+                resolved_path: expected_profile,
+                user_data_root: expected_root,
             }
         );
     }

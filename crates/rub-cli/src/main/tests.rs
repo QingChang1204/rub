@@ -15,6 +15,7 @@ use crate::main_dispatch::{
 };
 use crate::main_support::project_sessions_result;
 use crate::session_policy::ConnectionRequest;
+use crate::session_policy::normalize_identity_path;
 use rub_core::error::ErrorCode;
 use rub_core::model::{
     BindingAuthInputMode, BindingAuthProvenance, BindingCreatedVia, BindingPersistencePolicy,
@@ -1176,8 +1177,8 @@ fn use_alias_profile_binding_routes_to_daemon_profile_flag() {
         Some(ConnectionRequest::Profile {
             name: "Profile 3".to_string(),
             dir_name: "Profile 3".to_string(),
-            resolved_path: "/tmp/work/Profile 3".to_string(),
-            user_data_root: "/tmp/work".to_string(),
+            resolved_path: normalize_identity_path("/tmp/work/Profile 3"),
+            user_data_root: normalize_identity_path("/tmp/work"),
         })
     );
 
@@ -1191,7 +1192,7 @@ fn use_alias_profile_binding_routes_to_daemon_profile_flag() {
     assert!(args.contains(&"--profile".to_string()));
     assert!(args.contains(&"Profile 3".to_string()));
     assert!(args.contains(&"--profile-resolved-path".to_string()));
-    assert!(args.contains(&"/tmp/work/Profile 3".to_string()));
+    assert!(args.contains(&normalize_identity_path("/tmp/work/Profile 3")));
     assert!(!args.contains(&"--user-data-dir".to_string()));
 
     let _ = std::fs::remove_dir_all(home);

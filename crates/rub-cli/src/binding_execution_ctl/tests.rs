@@ -4,7 +4,7 @@ use crate::binding_memory_ctl::remember_binding_alias;
 use crate::commands::{
     Commands, EffectiveCli, RememberedBindingAliasKindArg, RequestedLaunchPolicy,
 };
-use crate::session_policy::ConnectionRequest;
+use crate::session_policy::{ConnectionRequest, normalize_identity_path};
 use rub_core::error::ErrorCode;
 use rub_core::model::{
     BindingAuthInputMode, BindingAuthProvenance, BindingCreatedVia, BindingExecutionMode,
@@ -133,6 +133,15 @@ fn write_profile_binding(home: &Path, persistence_policy: BindingPersistencePoli
         RememberedBindingAliasKindArg::Workspace,
     )
     .unwrap();
+}
+
+fn expected_profile_3_request() -> ConnectionRequest {
+    ConnectionRequest::Profile {
+        name: "Profile 3".to_string(),
+        dir_name: "Profile 3".to_string(),
+        resolved_path: normalize_identity_path("/tmp/work/Profile 3"),
+        user_data_root: normalize_identity_path("/tmp/work"),
+    }
 }
 
 fn spawn_live_registry_handshake_server(
@@ -356,12 +365,7 @@ fn remembered_alias_no_live_match_launches_bound_profile_without_collapsing_to_r
     assert!(resolved.cli.requested_launch_policy.user_data_dir.is_none());
     assert_eq!(
         resolved.connection_request_override,
-        Some(ConnectionRequest::Profile {
-            name: "Profile 3".to_string(),
-            dir_name: "Profile 3".to_string(),
-            resolved_path: "/tmp/work/Profile 3".to_string(),
-            user_data_root: "/tmp/work".to_string(),
-        })
+        Some(expected_profile_3_request())
     );
     let projection = resolved.projection.expect("projection");
     assert_eq!(projection.mode, BindingExecutionMode::LaunchBoundProfile);
@@ -388,12 +392,7 @@ fn remembered_alias_profile_binding_reuses_attachment_identity_without_profile_p
         .expect("profile binding should reuse attachment identity without projection fallback");
     assert_eq!(
         resolved.connection_request_override,
-        Some(ConnectionRequest::Profile {
-            name: "Profile 3".to_string(),
-            dir_name: "Profile 3".to_string(),
-            resolved_path: "/tmp/work/Profile 3".to_string(),
-            user_data_root: "/tmp/work".to_string(),
-        })
+        Some(expected_profile_3_request())
     );
 
     let _ = std::fs::remove_dir_all(home);
@@ -414,12 +413,7 @@ fn remembered_alias_profile_binding_reuses_captured_attachment_authority_when_cu
         .expect("profile binding should reuse capture-time profile authority");
     assert_eq!(
         resolved.connection_request_override,
-        Some(ConnectionRequest::Profile {
-            name: "Profile 3".to_string(),
-            dir_name: "Profile 3".to_string(),
-            resolved_path: "/tmp/work/Profile 3".to_string(),
-            user_data_root: "/tmp/work".to_string(),
-        })
+        Some(expected_profile_3_request())
     );
 
     let _ = std::fs::remove_dir_all(home);

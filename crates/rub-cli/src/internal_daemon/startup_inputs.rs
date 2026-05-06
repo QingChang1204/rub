@@ -173,18 +173,18 @@ mod tests {
         let inputs = resolve_startup_inputs(&cli, "sess-123")
             .await
             .expect("explicit user-data-dir startup inputs should resolve");
+        let expected_root =
+            crate::session_policy::normalize_identity_path("/tmp/explicit-profile-root");
 
         assert!(
             inputs
                 .effective_user_data_dir
                 .as_deref()
-                .is_some_and(|path| path == "/tmp/explicit-profile-root")
+                .is_some_and(|path| path == expected_root)
         );
-        assert!(
-            inputs
-                .attachment_identity
-                .as_deref()
-                .is_some_and(|identity| identity == "user_data_dir:/tmp/explicit-profile-root")
+        assert_eq!(
+            inputs.attachment_identity.as_deref(),
+            Some(format!("user_data_dir:{expected_root}").as_str())
         );
     }
 
@@ -199,23 +199,26 @@ mod tests {
         let inputs = resolve_startup_inputs(&cli, "sess-123")
             .await
             .expect("internal resolved profile authority should survive startup input parsing");
+        let expected_profile =
+            crate::session_policy::normalize_identity_path("/tmp/bindings/Profile 3");
+        let expected_root = crate::session_policy::normalize_identity_path("/tmp/bindings");
 
         assert_eq!(
             inputs.connection_request,
             ConnectionRequest::Profile {
                 name: "Work".to_string(),
                 dir_name: "Profile 3".to_string(),
-                resolved_path: "/tmp/bindings/Profile 3".to_string(),
-                user_data_root: "/tmp/bindings".to_string(),
+                resolved_path: expected_profile.clone(),
+                user_data_root: expected_root.clone(),
             }
         );
         assert_eq!(
             inputs.effective_user_data_dir.as_deref(),
-            Some("/tmp/bindings")
+            Some(expected_root.as_str())
         );
         assert_eq!(
             inputs.attachment_identity.as_deref(),
-            Some("profile:/tmp/bindings/Profile 3")
+            Some(format!("profile:{expected_profile}").as_str())
         );
     }
 
