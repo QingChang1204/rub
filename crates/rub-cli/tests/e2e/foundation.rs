@@ -654,7 +654,7 @@ fn t075_081d_interaction_grouped_scenario() {
         .output()
         .unwrap();
     let json = parse_json(&out);
-    assert_eq!(json["success"], true);
+    assert_eq!(json["success"], true, "{json}");
     assert_eq!(json["data"]["interaction"]["semantic_class"], "set_value");
     assert!(json["data"]["dom_epoch"].is_number());
     let out = session

@@ -514,9 +514,19 @@ async fn ensure_text_target_focus_committed(
     object_id: &RemoteObjectId,
     editable_projection: EditableProjectionKind,
 ) -> Result<(), RubError> {
-    let focused_target = crate::interaction::observe_element(page, object_id).await?;
-    if focused_target.active && focused_target.editable_projection == Some(editable_projection) {
-        return Ok(());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    loop {
+        let focused_target = crate::interaction::observe_element(page, object_id).await?;
+        if focused_target.active && focused_target.editable_projection == Some(editable_projection)
+        {
+            return Ok(());
+        }
+        if focused_target.editable_projection != Some(editable_projection)
+            || std::time::Instant::now() >= deadline
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 
     Err(RubError::domain(
