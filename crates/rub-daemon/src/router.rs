@@ -46,6 +46,7 @@ mod workflow;
 use std::path::Path;
 use std::sync::Arc;
 
+use rub_core::command::{CommandEffectClass, command_metadata_for_args};
 use rub_core::error::{ErrorCode, RubError};
 use rub_core::model::{NetworkRule, NetworkRuleSpec, NetworkRuleStatus};
 use rub_core::port::BrowserPort;
@@ -62,22 +63,23 @@ pub(crate) use transaction::handoff_blocked_error_for_command;
 #[cfg(test)]
 pub(crate) use transaction::replay_request_fingerprint;
 pub(crate) use transaction_context::{
-    CommandDispatchOutcome, OwnedRouterTransactionGuard, PendingExternalDomCommit,
-    RouterFenceDisposition, RouterTransactionGuard, TransactionDeadline,
+    CommandDispatchOutcome, OwnedRouterTransactionGuard, OwnedRouterTransactionPermit,
+    PendingExternalDomCommit, RouterFenceDisposition, RouterTransactionGuard,
+    RouterTransactionPermit, TransactionDeadline,
 };
 use wait_after::apply_post_wait_if_requested;
 /// The central command router. Owns the FIFO dispatch queue.
 pub struct DaemonRouter {
     browser: Arc<dyn BrowserPort>,
-    /// Serializes command execution (FIFO).
-    exec_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Session transaction gate. Writes are exclusive; vetted pure projections may share reads.
+    exec_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl DaemonRouter {
     pub fn new(browser: Arc<dyn BrowserPort>) -> Self {
         Self {
             browser,
-            exec_semaphore: Arc::new(tokio::sync::Semaphore::new(1)), // FIFO: one at a time
+            exec_gate: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -89,6 +91,13 @@ impl DaemonRouter {
     pub async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.browser.close().await.map_err(|e| Box::new(e) as _)
     }
+}
+
+fn command_allows_shared_read_transaction(command: &str, args: &serde_json::Value) -> bool {
+    if command_metadata_for_args(command, args).effect_class != CommandEffectClass::ReadOnly {
+        return false;
+    }
+    matches!(command, "history" | "downloads")
 }
 
 pub(crate) fn explain_extract_spec_contract(

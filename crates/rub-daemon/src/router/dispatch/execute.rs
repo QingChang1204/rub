@@ -212,7 +212,10 @@ pub(super) fn execute_named_command_with_fence<'a>(
         let outcome = match dispatch_named_command(router, command, args, deadline, state).await {
             Ok(outcome) => outcome,
             Err(error) if same_epoch_viewport_error_requires_cache_fence(command, args, &error) => {
-                apply_same_epoch_snapshot_cache_fence(command, args, state).await;
+                let target_id =
+                    target_scoped_same_epoch_snapshot_invalidation(router, command, args).await;
+                apply_same_epoch_snapshot_cache_fence(command, args, state, target_id.as_deref())
+                    .await;
                 return Err(same_epoch_viewport_side_effect_error(error, command));
             }
             Err(error) => return Err(error),
@@ -224,7 +227,8 @@ pub(super) fn execute_named_command_with_fence<'a>(
         } else {
             data.clone()
         };
-        apply_same_epoch_snapshot_cache_fence(command, args, state).await;
+        let target_id = target_scoped_same_epoch_snapshot_invalidation(router, command, args).await;
+        apply_same_epoch_snapshot_cache_fence(command, args, state, target_id.as_deref()).await;
         if args.get("wait_after").is_some() {
             record_post_wait_partial_commit_timeout_projection(
                 command,
@@ -263,10 +267,37 @@ pub(super) async fn apply_same_epoch_snapshot_cache_fence(
     command: &str,
     args: &serde_json::Value,
     state: &Arc<SessionState>,
+    target_id: Option<&str>,
 ) {
     if command_invalidates_cached_snapshots_without_epoch_bump(command, args) {
-        state.clear_all_snapshots().await;
+        if let Some(target_id) = target_id {
+            state.clear_snapshots_for_target(target_id).await;
+        } else {
+            state.clear_all_snapshots().await;
+        }
     }
+}
+
+async fn target_scoped_same_epoch_snapshot_invalidation(
+    router: &DaemonRouter,
+    command: &str,
+    args: &serde_json::Value,
+) -> Option<String> {
+    let current_tab_viewport_mutation = command == "scroll"
+        || (command == "find"
+            && args.get("topmost").and_then(|value| value.as_bool()) == Some(true))
+        || (command == "extract" && args.get("scan").is_some_and(|scan| !scan.is_null()));
+    if !current_tab_viewport_mutation {
+        return None;
+    }
+    router
+        .browser
+        .list_tabs()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|tab| tab.active)
+        .map(|tab| tab.target_id)
 }
 
 fn same_epoch_viewport_error_requires_cache_fence(
@@ -314,7 +345,7 @@ async fn apply_post_dispatch_same_epoch_fence_before_post_wait<F>(
 where
     F: Future<Output = Result<serde_json::Value, RubError>>,
 {
-    apply_same_epoch_snapshot_cache_fence(command, args, state).await;
+    apply_same_epoch_snapshot_cache_fence(command, args, state, None).await;
     post_wait.await
 }
 
@@ -451,7 +482,8 @@ mod tests {
                 "precondition: snapshot must be cached for {command}"
             );
 
-            apply_same_epoch_snapshot_cache_fence(command, &serde_json::json!({}), &state).await;
+            apply_same_epoch_snapshot_cache_fence(command, &serde_json::json!({}), &state, None)
+                .await;
 
             assert!(
                 state.get_snapshot(&cached.snapshot_id).await.is_none(),
@@ -465,7 +497,7 @@ mod tests {
         let state = test_state("state-keeps");
         let cached = state.cache_snapshot(test_snapshot("snap-state")).await;
 
-        apply_same_epoch_snapshot_cache_fence("state", &serde_json::json!({}), &state).await;
+        apply_same_epoch_snapshot_cache_fence("state", &serde_json::json!({}), &state, None).await;
 
         assert!(
             state.get_snapshot(&cached.snapshot_id).await.is_some(),
@@ -484,6 +516,7 @@ mod tests {
             "extract",
             &serde_json::json!({"spec": {"title": "h1"}}),
             &ordinary_state,
+            None,
         )
         .await;
 
@@ -504,6 +537,7 @@ mod tests {
             "extract",
             &serde_json::json!({"scan": {"limit": 3}}),
             &scan_state,
+            None,
         )
         .await;
 
@@ -514,6 +548,26 @@ mod tests {
                 .is_none(),
             "extract scan scrolls and must clear cached snapshot authority"
         );
+    }
+
+    #[tokio::test]
+    async fn same_epoch_target_fence_preserves_other_tab_snapshots() {
+        let state = test_state("target-scoped-same-epoch-fence");
+        let current_tab = state.cache_snapshot(test_snapshot("snap-current")).await;
+        let mut other_snapshot = test_snapshot("snap-other");
+        other_snapshot.frame_context.target_id = Some("target-2".to_string());
+        let other_tab = state.cache_snapshot(other_snapshot).await;
+
+        apply_same_epoch_snapshot_cache_fence(
+            "scroll",
+            &serde_json::json!({}),
+            &state,
+            Some("target-1"),
+        )
+        .await;
+
+        assert!(state.get_snapshot(&current_tab.snapshot_id).await.is_none());
+        assert!(state.get_snapshot(&other_tab.snapshot_id).await.is_some());
     }
 
     #[tokio::test]

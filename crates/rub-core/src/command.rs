@@ -416,8 +416,8 @@ impl CommandName {
                     transport_protocol_compat_exempt: false,
                     effect_class: CommandEffectClass::RuntimeMutation,
                     dom_epoch_policy: DomEpochPolicy::None,
-                    timeout_recovery_surface: TimeoutRecoverySurface::None,
-                    replay_safety: ReplaySafety::NotReplayable,
+                    timeout_recovery_surface: TimeoutRecoverySurface::PossibleCommit,
+                    replay_safety: ReplaySafety::RequiresSameCommandId,
                 }
             }
             Self::Secret => CommandMetadata {
@@ -671,6 +671,14 @@ mod tests {
         assert_eq!(state.dom_epoch_policy, DomEpochPolicy::None);
         assert_eq!(state.timeout_recovery_surface, TimeoutRecoverySurface::None);
         assert_eq!(state.replay_safety, ReplaySafety::SafeWithFreshCommandId);
+
+        let close = CommandName::Close.metadata();
+        assert_eq!(close.effect_class, CommandEffectClass::RuntimeMutation);
+        assert_eq!(
+            close.timeout_recovery_surface,
+            TimeoutRecoverySurface::PossibleCommit
+        );
+        assert_eq!(close.replay_safety, ReplaySafety::RequiresSameCommandId);
     }
 
     #[test]

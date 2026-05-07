@@ -486,6 +486,24 @@ impl SessionState {
         sc.map.clear();
         sc.order.clear();
     }
+
+    /// Drop cached snapshots for one tab target while preserving other tab authorities.
+    pub async fn clear_snapshots_for_target(&self, target_id: &str) {
+        let mut sc = self.snapshot_cache.write().await;
+        let stale_snapshot_ids = sc
+            .map
+            .iter()
+            .filter(|(_, snapshot)| snapshot.frame_context.target_id.as_deref() == Some(target_id))
+            .map(|(snapshot_id, _)| snapshot_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        if stale_snapshot_ids.is_empty() {
+            return;
+        }
+        sc.map
+            .retain(|snapshot_id, _| !stale_snapshot_ids.contains(snapshot_id));
+        sc.order
+            .retain(|snapshot_id| !stale_snapshot_ids.contains(snapshot_id));
+    }
 }
 
 #[cfg(test)]

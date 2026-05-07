@@ -41,7 +41,7 @@ use std::sync::atomic::Ordering;
 use std::{
     io::{BufRead as _, BufReader as StdBufReader, Write as _},
     os::unix::fs::{PermissionsExt, symlink},
-    os::unix::net::UnixListener as StdUnixListener,
+    os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream},
     process::Command,
 };
 
@@ -60,6 +60,17 @@ fn ensure_unix_socket_parent(path: &Path) {
 fn bind_std_unix_listener(path: &Path) -> StdUnixListener {
     ensure_unix_socket_parent(path);
     StdUnixListener::bind(path).expect("bind unix listener")
+}
+
+#[cfg(unix)]
+fn wait_until_unix_socket_refuses_connections(path: &Path) {
+    for _ in 0..20 {
+        if StdUnixStream::connect(path).is_err() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("unix socket still accepts connections after stale listener drop");
 }
 
 #[cfg(unix)]
@@ -1930,6 +1941,7 @@ async fn connect_ipc_with_retry_until_respects_shared_attach_budget_on_stale_soc
     std::fs::create_dir_all(runtime.socket_path().parent().unwrap()).unwrap();
     let stale_listener = bind_std_unix_listener(&runtime.socket_path());
     drop(stale_listener);
+    wait_until_unix_socket_refuses_connections(&runtime.socket_path());
 
     let started = Instant::now();
     let failure = match connect_ipc_with_retry_until(

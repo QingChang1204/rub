@@ -382,11 +382,46 @@ fn serialize_checked_command_result(result: CommandResult, pretty: bool) -> Stri
 }
 
 fn serialize_command_result_json(result: &CommandResult, pretty: bool) -> String {
-    if pretty {
-        serde_json::to_string_pretty(result).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+    let serialized = if pretty {
+        serde_json::to_string_pretty(result)
     } else {
-        serde_json::to_string(result).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+        serde_json::to_string(result)
+    };
+    match serialized {
+        Ok(output) => output,
+        Err(error) => serialize_stdout_json_fallback(result, &error.to_string(), pretty),
     }
+}
+
+fn serialize_stdout_json_fallback(result: &CommandResult, error: &str, pretty: bool) -> String {
+    let fallback = CommandResult {
+        success: false,
+        command: result.command.clone(),
+        stdout_schema_version: CommandResult::STDOUT_SCHEMA_VERSION.to_string(),
+        request_id: stdout_request_id(&result.request_id),
+        command_id: stdout_command_id(result.command_id.as_deref()),
+        session: result.session.clone(),
+        timing: Default::default(),
+        data: None,
+        error: Some(stdout_contract_fallback_error(
+            ErrorEnvelope::new(
+                ErrorCode::InternalError,
+                "Failed to serialize stdout CommandResult",
+            )
+            .with_context(json!({
+                "reason": "stdout_json_serialization_failed",
+                "serialization_error": error,
+            })),
+        )),
+    };
+    let serialized = if pretty {
+        serde_json::to_string_pretty(&fallback)
+    } else {
+        serde_json::to_string(&fallback)
+    };
+    serialized.unwrap_or_else(|_| {
+        "{\"success\":false,\"command\":\"rub\",\"stdout_schema_version\":\"3.0\",\"request_id\":\"stdout-serialization-failed\",\"session\":\"unknown\",\"timing\":{},\"error\":{\"code\":\"INTERNAL_ERROR\",\"message\":\"Failed to serialize stdout CommandResult\"}}".to_string()
+    })
 }
 
 fn attach_interaction_trace(result: &mut CommandResult, trace_mode: InteractionTraceMode) {

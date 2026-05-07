@@ -22,11 +22,14 @@ pub(crate) fn command_timeout_ms(cli: &EffectiveCli) -> u64 {
 }
 
 pub(crate) fn deadline_from_start(started_at: Instant, timeout_ms: u64) -> Instant {
-    deadline_from_start_checked(started_at, timeout_ms).unwrap_or(started_at)
+    deadline_from_start_checked(started_at, timeout_ms)
+        .unwrap_or_else(|| started_at + Duration::from_millis(MAX_IPC_TIMEOUT_MS))
 }
 
 pub(crate) fn deadline_from_start_checked(started_at: Instant, timeout_ms: u64) -> Option<Instant> {
-    started_at.checked_add(Duration::from_millis(timeout_ms.max(1)))
+    started_at.checked_add(Duration::from_millis(
+        timeout_ms.clamp(1, MAX_IPC_TIMEOUT_MS),
+    ))
 }
 
 pub(crate) fn validate_timeout_budget(timeout_ms: u64) -> Result<(), RubError> {

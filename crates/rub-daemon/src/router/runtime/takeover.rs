@@ -260,6 +260,8 @@ pub(super) async fn cmd_handoff(
     args: &serde_json::Value,
     state: &Arc<SessionState>,
 ) -> Result<serde_json::Value, RubError> {
+    refresh_takeover_runtime(&router.browser, state).await;
+
     let action = HandoffAction::parse(args)?;
     action.execute(router, state).await?;
 

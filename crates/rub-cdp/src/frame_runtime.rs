@@ -229,9 +229,26 @@ pub(crate) fn ensure_same_frame_document(
     ))
 }
 
+fn ensure_same_main_frame(before: &str, after: &str, phase: &str) -> Result<(), RubError> {
+    if before == after {
+        return Ok(());
+    }
+    Err(RubError::domain_with_context(
+        ErrorCode::InvalidInput,
+        format!("Main frame changed while {phase} was reading frame inventory"),
+        serde_json::json!({
+            "reason": "frame_main_frame_changed_during_projection",
+            "phase": phase,
+            "before_main_frame_id": before,
+            "after_main_frame_id": after,
+        }),
+    ))
+}
+
 async fn collect_frame_inventory(page: &Arc<Page>) -> Result<Vec<FrameInventoryEntry>, RubError> {
     FRAME_INVENTORY_COLLECTIONS.set(FRAME_INVENTORY_COLLECTIONS.get().saturating_add(1));
     let main_frame = read_main_frame(page).await?;
+    let before_document_fence = probe_frame_document_fence(page, None).await?;
     let frames = page
         .frames()
         .await
@@ -312,6 +329,16 @@ async fn collect_frame_inventory(page: &Arc<Page>) -> Result<Vec<FrameInventoryE
             frame.frame_id.clone(),
         )
     });
+    let after_main_frame = read_main_frame(page).await?;
+    let after_main_frame_key = after_main_frame.as_ref().to_string();
+    ensure_same_main_frame(&main_frame_key, &after_main_frame_key, "frame_inventory")?;
+    let after_document_fence = probe_frame_document_fence(page, None).await?;
+    ensure_same_frame_document(
+        &before_document_fence,
+        &after_document_fence,
+        &main_frame_key,
+        "frame_inventory",
+    )?;
 
     Ok(frames
         .into_iter()
@@ -489,6 +516,7 @@ mod tests {
     };
     use crate::snapshot_lookup::sample_frame_context;
     use chromiumoxide::cdp::browser_protocol::page::FrameId;
+    use rub_core::error::{ErrorCode, RubError};
     use rub_core::model::{FrameContextInfo, FrameInventoryEntry};
     use std::collections::HashMap;
 
@@ -641,5 +669,54 @@ mod tests {
         assert!(!super::same_origin_probe_context_churn(
             "Protocol error: permission denied"
         ));
+    }
+
+    #[test]
+    fn frame_inventory_document_fence_reports_navigation_drift() {
+        let before = super::FrameDocumentFence {
+            href: "https://example.test/a".to_string(),
+            time_origin: Some(1.0),
+        };
+        let after = super::FrameDocumentFence {
+            href: "https://example.test/b".to_string(),
+            time_origin: Some(2.0),
+        };
+
+        let error = super::ensure_same_frame_document(&before, &after, "main", "frame_inventory")
+            .expect_err("frame inventory must fail closed when document drifts");
+        match error {
+            RubError::Domain(envelope) => {
+                assert_eq!(envelope.code, ErrorCode::InvalidInput);
+                assert_eq!(
+                    envelope
+                        .context
+                        .as_ref()
+                        .and_then(|context| context.get("reason"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("frame_document_changed_during_projection")
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_inventory_main_frame_fence_reports_frame_drift() {
+        let error = super::ensure_same_main_frame("frame-a", "frame-b", "frame_inventory")
+            .expect_err("frame inventory must fail closed when main frame drifts");
+        match error {
+            RubError::Domain(envelope) => {
+                assert_eq!(envelope.code, ErrorCode::InvalidInput);
+                assert_eq!(
+                    envelope
+                        .context
+                        .as_ref()
+                        .and_then(|context| context.get("reason"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("frame_main_frame_changed_during_projection")
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

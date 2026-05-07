@@ -2259,3 +2259,52 @@ async fn snapshot_cache_evicts_oldest_entries() {
     assert!(state.get_snapshot("snap-2").await.is_some());
     assert!(state.get_snapshot("snap-129").await.is_some());
 }
+
+//noinspection DuplicatedCode
+#[tokio::test]
+async fn snapshot_cache_can_clear_one_target_without_dropping_other_tabs() {
+    let state = SessionState::new("default", PathBuf::from("/tmp/rub-test-target-clear"), None);
+    for (snapshot_id, target_id) in [("snap-target-1", "target-1"), ("snap-target-2", "target-2")] {
+        state
+            .cache_snapshot(Snapshot {
+                snapshot_id: snapshot_id.to_string(),
+                dom_epoch: 1,
+                frame_context: rub_core::model::FrameContextInfo {
+                    frame_id: "main".to_string(),
+                    name: Some("main".to_string()),
+                    parent_frame_id: None,
+                    target_id: Some(target_id.to_string()),
+                    url: Some("https://example.com".to_string()),
+                    depth: 0,
+                    same_origin_accessible: Some(true),
+                },
+                frame_lineage: vec!["main".to_string()],
+                url: "https://example.com".to_string(),
+                title: "Example".to_string(),
+                elements: Vec::new(),
+                total_count: 0,
+                truncated: false,
+                scroll: rub_core::model::ScrollPosition {
+                    x: 0.0,
+                    y: 0.0,
+                    at_bottom: false,
+                },
+                timestamp: "2026-03-29T00:00:00Z".to_string(),
+                projection: rub_core::model::SnapshotProjection {
+                    verified: true,
+                    js_traversal_count: 0,
+                    backend_traversal_count: 0,
+                    resolved_ref_count: 0,
+                    warning: None,
+                },
+                viewport_filtered: None,
+                viewport_count: None,
+            })
+            .await;
+    }
+
+    state.clear_snapshots_for_target("target-1").await;
+
+    assert!(state.get_snapshot("snap-target-1").await.is_none());
+    assert!(state.get_snapshot("snap-target-2").await.is_some());
+}

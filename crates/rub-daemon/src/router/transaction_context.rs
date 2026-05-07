@@ -91,7 +91,7 @@ impl From<serde_json::Value> for CommandDispatchOutcome {
 }
 
 pub(crate) struct RouterTransactionGuard<'a> {
-    pub(crate) _permit: tokio::sync::SemaphorePermit<'a>,
+    pub(crate) _permit: RouterTransactionPermit<'a>,
     pub(crate) state: Arc<SessionState>,
 }
 
@@ -104,7 +104,7 @@ impl Drop for RouterTransactionGuard<'_> {
 }
 
 pub(crate) struct OwnedRouterTransactionGuard {
-    pub(crate) _permit: tokio::sync::OwnedSemaphorePermit,
+    pub(crate) _permit: OwnedRouterTransactionPermit,
     pub(crate) state: Arc<SessionState>,
 }
 
@@ -114,4 +114,16 @@ impl Drop for OwnedRouterTransactionGuard {
             .in_flight_count
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+#[allow(dead_code)]
+pub(crate) enum RouterTransactionPermit<'a> {
+    Shared(tokio::sync::RwLockReadGuard<'a, ()>),
+    Exclusive(tokio::sync::RwLockWriteGuard<'a, ()>),
+}
+
+#[allow(dead_code)]
+pub(crate) enum OwnedRouterTransactionPermit {
+    Shared(tokio::sync::OwnedRwLockReadGuard<()>),
+    Exclusive(tokio::sync::OwnedRwLockWriteGuard<()>),
 }

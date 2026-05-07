@@ -400,7 +400,7 @@ async fn handshake_and_upgrade_check_expose_automation_scheduler_inventory() {
     );
     assert_eq!(
         handshake["automation_scheduler"]["authority_inventory"]["queue_owner"],
-        "router.exec_semaphore"
+        "router.exec_gate"
     );
     assert_eq!(
         handshake["automation_scheduler"]["reservation_wait_policy"]["worker_cycle"]["mode"],

@@ -503,6 +503,24 @@ impl IpcResponse {
                     "expected_daemon_session_id": request.daemon_session_id,
                 })),
             ),
+            (_, _, None, Some(_))
+                if !allows_unsolicited_response_daemon_session_id(&request.command) =>
+            {
+                Some(
+                    ErrorEnvelope::new(
+                        rub_core::error::ErrorCode::IpcProtocolError,
+                        format!(
+                            "IPC response for command '{}' carried an unsolicited daemon_session_id",
+                            request.command
+                        ),
+                    )
+                    .with_context(serde_json::json!({
+                        "reason": "ipc_response_unsolicited_daemon_session_id",
+                        "command": request.command,
+                        "actual_daemon_session_id": self.daemon_session_id,
+                    })),
+                )
+            }
             _ => None,
         }
     }
@@ -731,6 +749,10 @@ fn default_request_command_id(command: &str) -> Option<String> {
     } else {
         Some(Uuid::now_v7().to_string())
     }
+}
+
+fn allows_unsolicited_response_daemon_session_id(command: &str) -> bool {
+    command == "_handshake"
 }
 
 fn validate_request_id(request_id: String) -> Result<String, String> {
@@ -1127,6 +1149,67 @@ mod tests {
                 .and_then(|context| context.get("reason"))
                 .and_then(serde_json::Value::as_str),
             Some("ipc_response_missing_daemon_session_id")
+        );
+    }
+
+    #[test]
+    fn correlated_response_rejects_unsolicited_daemon_session_id_when_request_was_untargeted() {
+        let request = IpcRequest::new("doctor", serde_json::json!({}), 1_000);
+        let response = IpcResponse::success("req-1", serde_json::json!({"ok": true}))
+            .with_command_id(
+                request
+                    .command_id
+                    .clone()
+                    .expect("doctor request should carry command_id"),
+            )
+            .expect("command_id must remain valid")
+            .with_daemon_session_id("sess-other")
+            .expect("daemon_session_id must be valid");
+
+        let error = response
+            .validate_correlated_contract(&request)
+            .expect_err("unsolicited daemon_session_id must fail closed");
+        assert_eq!(error.code, rub_core::error::ErrorCode::IpcProtocolError);
+        assert_eq!(
+            error
+                .context
+                .as_ref()
+                .and_then(|context| context.get("reason"))
+                .and_then(serde_json::Value::as_str),
+            Some("ipc_response_unsolicited_daemon_session_id")
+        );
+    }
+
+    #[test]
+    fn correlated_response_allows_daemon_session_id_discovery_for_handshake() {
+        let request = IpcRequest::new("_handshake", serde_json::json!({}), 1_000);
+        let response = IpcResponse::success("req-1", serde_json::json!({"ok": true}))
+            .with_daemon_session_id("sess-live")
+            .expect("daemon_session_id must be valid");
+
+        response
+            .validate_correlated_contract(&request)
+            .expect("handshake response may discover daemon_session_id");
+    }
+
+    #[test]
+    fn correlated_response_rejects_unsolicited_daemon_session_id_for_upgrade_check() {
+        let request = IpcRequest::new("_upgrade_check", serde_json::json!({}), 1_000);
+        let response = IpcResponse::success("req-1", serde_json::json!({"idle": true}))
+            .with_daemon_session_id("sess-live")
+            .expect("daemon_session_id must be valid");
+
+        let error = response
+            .validate_correlated_contract(&request)
+            .expect_err("upgrade-check must target daemon authority before echoing it");
+        assert_eq!(error.code, rub_core::error::ErrorCode::IpcProtocolError);
+        assert_eq!(
+            error
+                .context
+                .as_ref()
+                .and_then(|context| context.get("reason"))
+                .and_then(serde_json::Value::as_str),
+            Some("ipc_response_unsolicited_daemon_session_id")
         );
     }
 

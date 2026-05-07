@@ -410,14 +410,14 @@ async fn input_text_with_resolved_target(
 ) -> Result<InteractionOutcome, RubError> {
     let editable_projection = ensure_text_control_editable(page, object_id).await?;
     let expected_text_after_input = if clear {
-        text.to_string()
+        expected_text_after_input_from_observed(clear, text, None)?
     } else {
-        crate::interaction::observe_element(page, object_id)
-            .await
-            .ok()
-            .and_then(|observed| crate::interaction::observed_editable_content(&observed))
-            .map(|before| format!("{before}{text}"))
-            .unwrap_or_else(|| text.to_string())
+        let observed = crate::interaction::observe_element(page, object_id).await?;
+        expected_text_after_input_from_observed(
+            clear,
+            text,
+            crate::interaction::observed_editable_content(&observed),
+        )?
     };
     let before_page = crate::interaction::capture_related_page_baseline(page, object_id).await;
     let expected_target_id = page.target_id().as_ref().to_string();
@@ -509,6 +509,24 @@ async fn input_text_with_resolved_target(
     })
 }
 
+fn expected_text_after_input_from_observed(
+    clear: bool,
+    text: &str,
+    observed_before: Option<String>,
+) -> Result<String, RubError> {
+    if clear {
+        return Ok(text.to_string());
+    }
+    observed_before
+        .map(|before| format!("{before}{text}"))
+        .ok_or_else(|| {
+            RubError::domain(
+                ErrorCode::ElementNotInteractable,
+                "Element text projection is unavailable before typing",
+            )
+        })
+}
+
 async fn ensure_text_target_focus_committed(
     page: &Arc<Page>,
     object_id: &RemoteObjectId,
@@ -537,7 +555,7 @@ async fn ensure_text_target_focus_committed(
 
 #[cfg(test)]
 mod tests {
-    use super::{js_string_literal, parse_select_result};
+    use super::{expected_text_after_input_from_observed, js_string_literal, parse_select_result};
     use rub_core::error::ErrorCode;
 
     #[test]
@@ -560,6 +578,32 @@ mod tests {
     fn parse_select_result_keeps_non_select_as_interactability_error() {
         let error =
             parse_select_result("NOT_SELECT", "Two").expect_err("not select should fail closed");
+        match error {
+            rub_core::error::RubError::Domain(envelope) => {
+                assert_eq!(envelope.code, ErrorCode::ElementNotInteractable);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expected_text_after_input_appends_to_observed_content() {
+        assert_eq!(
+            expected_text_after_input_from_observed(false, "bar", Some("foo".to_string()))
+                .expect("observed content should be usable"),
+            "foobar"
+        );
+        assert_eq!(
+            expected_text_after_input_from_observed(true, "bar", None)
+                .expect("clear does not need prior text projection"),
+            "bar"
+        );
+    }
+
+    #[test]
+    fn expected_text_after_input_fails_closed_without_prior_projection() {
+        let error = expected_text_after_input_from_observed(false, "bar", None)
+            .expect_err("append typing needs authoritative prior content");
         match error {
             rub_core::error::RubError::Domain(envelope) => {
                 assert_eq!(envelope.code, ErrorCode::ElementNotInteractable);

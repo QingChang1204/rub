@@ -35,8 +35,9 @@ use super::transaction::{
     prepare_request_preflight_with_inherited_deadline, queue_timeout_response,
 };
 use super::{
-    DaemonRouter, OwnedRouterTransactionGuard, RouterFenceDisposition, RouterTransactionGuard,
-    TransactionDeadline,
+    DaemonRouter, OwnedRouterTransactionGuard, OwnedRouterTransactionPermit,
+    RouterFenceDisposition, RouterTransactionGuard, RouterTransactionPermit, TransactionDeadline,
+    command_allows_shared_read_transaction,
 };
 
 impl DaemonRouter {
@@ -65,23 +66,19 @@ impl DaemonRouter {
     }
 
     #[cfg(test)]
-    async fn acquire_fifo_permit<'a>(
+    async fn acquire_exclusive_permit<'a>(
         &'a self,
         command: &str,
         request_id: &str,
         deadline: TransactionDeadline,
         state: &Arc<SessionState>,
-    ) -> Result<tokio::sync::SemaphorePermit<'a>, IpcResponse> {
+    ) -> Result<RouterTransactionPermit<'a>, IpcResponse> {
         let Some(timeout) = deadline.remaining_duration() else {
             state.record_queue_pressure_timeout();
             return Err(queue_timeout_response(command, request_id, deadline));
         };
-        match tokio::time::timeout(timeout, self.exec_semaphore.acquire()).await {
-            Ok(Ok(permit)) => Ok(permit),
-            Ok(Err(_)) => Err(IpcResponse::error(
-                request_id,
-                ErrorEnvelope::new(ErrorCode::IpcTimeout, "Command queue closed"),
-            )),
+        match tokio::time::timeout(timeout, self.exec_gate.write()).await {
+            Ok(permit) => Ok(RouterTransactionPermit::Exclusive(permit)),
             Err(_) => {
                 state.record_queue_pressure_timeout();
                 Err(queue_timeout_response(command, request_id, deadline))
@@ -98,7 +95,7 @@ impl DaemonRouter {
         state: &Arc<SessionState>,
     ) -> Result<RouterTransactionGuard<'a>, IpcResponse> {
         let permit = self
-            .acquire_fifo_permit(command, request_id, deadline, state)
+            .acquire_exclusive_permit(command, request_id, deadline, state)
             .await?;
         if let Some(response) = reject_after_queue_wait_if_shutdown(command, request_id, state) {
             return Err(response);
@@ -122,31 +119,32 @@ impl DaemonRouter {
 
     async fn begin_request_transaction_owned(
         &self,
-        command: &str,
+        request: &IpcRequest,
         request_id: &str,
         deadline: TransactionDeadline,
         state: &Arc<SessionState>,
     ) -> Result<OwnedRouterTransactionGuard, IpcResponse> {
+        let command = request.command.as_str();
         let Some(timeout) = deadline.remaining_duration() else {
             state.record_queue_pressure_timeout();
             return Err(queue_timeout_response(command, request_id, deadline));
         };
-        let permit = match tokio::time::timeout(
-            timeout,
-            self.exec_semaphore.clone().acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => {
-                return Err(IpcResponse::error(
-                    request_id,
-                    ErrorEnvelope::new(ErrorCode::IpcTimeout, "Command queue closed"),
-                ));
+        let shared_read = command_allows_shared_read_transaction(command, &request.args);
+        let permit = if shared_read {
+            match tokio::time::timeout(timeout, self.exec_gate.clone().read_owned()).await {
+                Ok(permit) => OwnedRouterTransactionPermit::Shared(permit),
+                Err(_) => {
+                    state.record_queue_pressure_timeout();
+                    return Err(queue_timeout_response(command, request_id, deadline));
+                }
             }
-            Err(_) => {
-                state.record_queue_pressure_timeout();
-                return Err(queue_timeout_response(command, request_id, deadline));
+        } else {
+            match tokio::time::timeout(timeout, self.exec_gate.clone().write_owned()).await {
+                Ok(permit) => OwnedRouterTransactionPermit::Exclusive(permit),
+                Err(_) => {
+                    state.record_queue_pressure_timeout();
+                    return Err(queue_timeout_response(command, request_id, deadline));
+                }
             }
         };
         if let Some(response) = reject_after_queue_wait_if_shutdown(command, request_id, state) {
@@ -176,7 +174,7 @@ impl DaemonRouter {
         queue_wait_budget: Duration,
         shutdown_poll_interval: Duration,
     ) -> Result<RouterTransactionGuard<'a>, ErrorEnvelope> {
-        let acquire = self.exec_semaphore.acquire();
+        let acquire = self.exec_gate.write();
         tokio::pin!(acquire);
         let queue_deadline = tokio::time::Instant::now() + queue_wait_budget;
         loop {
@@ -191,12 +189,6 @@ impl DaemonRouter {
             let remaining = queue_deadline.saturating_duration_since(now);
             tokio::select! {
                 permit = &mut acquire => {
-                    let permit = permit.map_err(|_| {
-                        ErrorEnvelope::new(
-                            ErrorCode::IpcTimeout,
-                            format!("Automation transaction '{command}' failed because the command queue closed"),
-                        )
-                    })?;
                     if state.is_shutdown_requested() {
                         drop(permit);
                         return Err(automation_shutdown_rejection(state, command));
@@ -211,7 +203,7 @@ impl DaemonRouter {
                         .saturating_add(1);
                     state.record_in_flight_count_observation(in_flight_count);
                     return Ok(RouterTransactionGuard {
-                        _permit: permit,
+                        _permit: RouterTransactionPermit::Exclusive(permit),
                         state: state.clone(),
                     });
                 }
@@ -256,7 +248,7 @@ impl DaemonRouter {
         queue_wait_budget: Duration,
         shutdown_poll_interval: Duration,
     ) -> Result<OwnedRouterTransactionGuard, ErrorEnvelope> {
-        let acquire = self.exec_semaphore.clone().acquire_owned();
+        let acquire = self.exec_gate.clone().write_owned();
         tokio::pin!(acquire);
         let queue_deadline = tokio::time::Instant::now() + queue_wait_budget;
         loop {
@@ -271,12 +263,6 @@ impl DaemonRouter {
             let remaining = queue_deadline.saturating_duration_since(now);
             tokio::select! {
                 permit = &mut acquire => {
-                    let permit = permit.map_err(|_| {
-                        ErrorEnvelope::new(
-                            ErrorCode::IpcTimeout,
-                            format!("Automation transaction '{command}' failed because the command queue closed"),
-                        )
-                    })?;
                     if state.is_shutdown_requested() {
                         drop(permit);
                         return Err(automation_shutdown_rejection(state, command));
@@ -291,7 +277,7 @@ impl DaemonRouter {
                         .saturating_add(1);
                     state.record_in_flight_count_observation(in_flight_count);
                     return Ok(OwnedRouterTransactionGuard {
-                        _permit: permit,
+                        _permit: OwnedRouterTransactionPermit::Exclusive(permit),
                         state: state.clone(),
                     });
                 }
@@ -458,7 +444,7 @@ impl DaemonRouter {
     ) -> PendingResponseCommit {
         let transaction = match self
             .begin_request_transaction_owned(
-                request.command.as_str(),
+                request,
                 prepared.request_id(),
                 prepared.deadline(),
                 state,

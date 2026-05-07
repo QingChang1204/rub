@@ -297,13 +297,13 @@ pub async fn ensure_page_dialog_runtime(
     listener_generation_rx: ListenerGenerationRx,
     authority_release_in_progress: Arc<AtomicBool>,
 ) -> Result<(), RubError> {
-    let mut degraded_reason = None;
+    let mut degraded_reasons = Vec::new();
     let tab_target_id = page.target_id().as_ref().to_string();
 
     let opening_listener = match page.event_listener::<EventJavascriptDialogOpening>().await {
         Ok(listener) => Some(listener),
         Err(error) => {
-            degraded_reason = Some(format!("dialog_open_listener_failed:{error}"));
+            degraded_reasons.push(format!("dialog_open_listener_failed:{error}"));
             None
         }
     };
@@ -311,11 +311,12 @@ pub async fn ensure_page_dialog_runtime(
     let closed_listener = match page.event_listener::<EventJavascriptDialogClosed>().await {
         Ok(listener) => Some(listener),
         Err(error) => {
-            degraded_reason.get_or_insert_with(|| format!("dialog_closed_listener_failed:{error}"));
+            degraded_reasons.push(format!("dialog_closed_listener_failed:{error}"));
             None
         }
     };
 
+    let degraded_reason = joined_dialog_degraded_reasons(degraded_reasons);
     let projection = commit_dialog_hook_install_projection(&runtime, degraded_reason.clone()).await;
     if let Some(callback) = callbacks.on_runtime.as_ref() {
         callback(DialogRuntimeUpdate {
@@ -428,6 +429,10 @@ pub async fn ensure_page_dialog_runtime(
     }
 
     Ok(())
+}
+
+fn joined_dialog_degraded_reasons(reasons: Vec<String>) -> Option<String> {
+    (!reasons.is_empty()).then(|| reasons.join(","))
 }
 
 fn apply_dialog_runtime_status(state: &mut DialogRuntimeInfo, desired: DialogRuntimeStatus) {
@@ -587,6 +592,18 @@ mod tests {
         runtime.degraded_reason = None;
         apply_dialog_runtime_status(&mut runtime, DialogRuntimeStatus::Inactive);
         assert_eq!(runtime.status, DialogRuntimeStatus::Inactive);
+    }
+
+    #[test]
+    fn hook_install_degraded_reason_preserves_both_listener_failures() {
+        let joined = super::joined_dialog_degraded_reasons(vec![
+            "dialog_open_listener_failed:open".to_string(),
+            "dialog_closed_listener_failed:closed".to_string(),
+        ])
+        .expect("two listener failures should be published together");
+
+        assert!(joined.contains("dialog_open_listener_failed:open"));
+        assert!(joined.contains("dialog_closed_listener_failed:closed"));
     }
 
     #[tokio::test]

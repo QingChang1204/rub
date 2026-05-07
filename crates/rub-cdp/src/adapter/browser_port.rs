@@ -770,7 +770,8 @@ impl BrowserPort for ChromiumAdapter {
 
     async fn hover(&self, element: &Element) -> Result<InteractionOutcome, RubError> {
         let page = page_for_element_authority(self, element).await?;
-        crate::gestures::hover(&page, element, &self.humanize).await
+        let dialog_runtime = self.manager.dialog_runtime();
+        crate::gestures::hover(&page, element, &self.humanize, &dialog_runtime).await
     }
 
     async fn dblclick_xy(&self, x: f64, y: f64) -> Result<InteractionOutcome, RubError> {

@@ -15,6 +15,7 @@ use rub_core::error::ErrorCode;
 use rub_ipc::protocol::MAX_IPC_TIMEOUT_MS;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 fn cli_with(command: Commands) -> EffectiveCli {
     effective_cli_with_default_home(command)
@@ -47,6 +48,16 @@ fn build_request_rejects_timeout_outside_ipc_protocol_budget_before_dispatch() {
     assert_eq!(
         envelope.context.as_ref().unwrap()["field"],
         serde_json::json!("timeout_ms")
+    );
+}
+
+#[test]
+fn deadline_from_start_overflow_falls_back_to_protocol_max_budget() {
+    let started_at = Instant::now();
+
+    assert_eq!(
+        super::deadline_from_start(started_at, u64::MAX),
+        started_at + Duration::from_millis(MAX_IPC_TIMEOUT_MS)
     );
 }
 

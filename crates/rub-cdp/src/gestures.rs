@@ -325,6 +325,7 @@ pub(crate) async fn hover(
     page: &Arc<Page>,
     element: &Element,
     humanize: &HumanizeConfig,
+    dialog_runtime: &SharedDialogRuntime,
 ) -> Result<InteractionOutcome, RubError> {
     let resolved = crate::targeting::resolve_element(page, element).await?;
     let target = crate::targeting::resolve_activation_target(page, &resolved, element.tag).await?;
@@ -336,8 +337,32 @@ pub(crate) async fn hover(
     let point = crate::targeting::resolve_pointer_point(page, &target).await?;
     let baseline =
         crate::interaction::capture_interaction_baseline(page, &resolved.remote_object_id).await;
+    let expected_target_id = page.target_id().as_ref().to_string();
 
-    crate::pointer::move_to(page, point.x, point.y, humanize).await?;
+    let page_for_hover = page.clone();
+    let humanize_for_hover = humanize.clone();
+    let fence = await_actuation_or_dialog(
+        async move {
+            crate::pointer::move_to(&page_for_hover, point.x, point.y, &humanize_for_hover).await
+        },
+        dialog_runtime.clone(),
+        "pointer_hover",
+        &expected_target_id,
+    )
+    .await?;
+    if let Some(outcome) = dialog_fallback_outcome(
+        dialog_runtime,
+        &expected_target_id,
+        &fence,
+        InteractionSemanticClass::Hover,
+        resolved.verified,
+        InteractionActuation::Pointer,
+        "pointer_hover",
+    )
+    .await
+    {
+        return Ok(outcome);
+    }
     let confirmation =
         crate::interaction::confirm_hover(page, &resolved.remote_object_id, baseline).await;
 

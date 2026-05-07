@@ -102,7 +102,7 @@ impl SessionState {
         serde_json::json!({
             "slice": "shared_fifo_scheduler_policy",
             "authority_inventory": {
-                "queue_owner": "router.exec_semaphore",
+                "queue_owner": "router.exec_gate",
                 "transaction_admission_fence": "router.begin_request_transaction",
                 "in_flight_authority": "session.in_flight_count",
                 "accepted_connection_fence_authority": "session.connected_client_count",

@@ -103,6 +103,85 @@ fn test_snapshot(snapshot_id: &str) -> rub_core::model::Snapshot {
 }
 
 #[tokio::test]
+async fn pure_projection_reads_share_router_transaction_gate() {
+    let router = test_router();
+    let state = Arc::new(SessionState::new(
+        "default",
+        temp_home("shared-read-gate"),
+        None,
+    ));
+    let first = IpcRequest::new("history", serde_json::json!({}), 1_000);
+    let second = IpcRequest::new("downloads", serde_json::json!({}), 1_000);
+
+    let first_guard = router
+        .begin_request_transaction_owned(
+            &first,
+            "req-first-read",
+            TransactionDeadline::new(1_000),
+            &state,
+        )
+        .await
+        .expect("first read transaction should acquire");
+    let second_guard = tokio::time::timeout(
+        Duration::from_millis(20),
+        router.begin_request_transaction_owned(
+            &second,
+            "req-second-read",
+            TransactionDeadline::new(1_000),
+            &state,
+        ),
+    )
+    .await
+    .expect("second pure projection read should not wait behind first read")
+    .expect("second read transaction should acquire");
+
+    drop(second_guard);
+    drop(first_guard);
+}
+
+#[tokio::test]
+async fn mutating_transaction_waits_behind_shared_read_gate() {
+    let router = test_router();
+    let state = Arc::new(SessionState::new(
+        "default",
+        temp_home("shared-read-blocks-write"),
+        None,
+    ));
+    let read = IpcRequest::new("history", serde_json::json!({}), 1_000);
+    let write = IpcRequest::new("click", serde_json::json!({}), 1_000);
+
+    let read_guard = router
+        .begin_request_transaction_owned(&read, "req-read", TransactionDeadline::new(1_000), &state)
+        .await
+        .expect("read transaction should acquire");
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            router.begin_request_transaction_owned(
+                &write,
+                "req-write-blocked",
+                TransactionDeadline::new(1_000),
+                &state,
+            ),
+        )
+        .await
+        .is_err(),
+        "mutating transaction must wait until shared readers release"
+    );
+
+    drop(read_guard);
+    router
+        .begin_request_transaction_owned(
+            &write,
+            "req-write-after-read",
+            TransactionDeadline::new(1_000),
+            &state,
+        )
+        .await
+        .expect("write transaction should acquire after reader releases");
+}
+
+#[tokio::test]
 async fn execution_timeout_fence_marks_possible_dom_commit_and_drops_snapshots() {
     let state = Arc::new(SessionState::new(
         "default",

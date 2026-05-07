@@ -1332,11 +1332,7 @@ async fn handshake_bypasses_fifo_when_router_is_busy() {
         None,
     ));
     let router = test_router();
-    let _permit: tokio::sync::SemaphorePermit<'_> = router
-        .exec_semaphore
-        .acquire()
-        .await
-        .expect("test should hold fifo permit");
+    let _permit = router.exec_gate.write().await;
 
     let response = router
         .dispatch(
