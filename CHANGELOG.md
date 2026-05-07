@@ -3,6 +3,18 @@
 
 Nothing yet.
 
+## v0.1.10 — 2026-05-07
+
+### 🚀 Features
+
+- Allow vetted pure projection reads to share the router transaction gate while keeping browser-affecting reads and mutations exclusive.
+
+- Scope same-epoch snapshot cache invalidation to the active tab target for viewport-only mutations when target authority is available.
+
+### 🐛 Bug Fixes
+
+- Harden dialog, frame, IPC, timeout, and stdout projection fences so degraded or ambiguous authority is surfaced instead of silently publishing stronger truth.
+
 ## v0.1.9 — 2026-05-02
 
 ### 🐛 Bug Fixes
