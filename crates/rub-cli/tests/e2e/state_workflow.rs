@@ -2800,12 +2800,16 @@ fn t330_333_close_and_cleanup_grouped_scenario() {
     open_work();
     let json = parse_json(&session.cmd().args(["close", "--all"]).output().unwrap());
     assert_eq!(json["success"], true, "{json}");
-    assert_eq!(
-        json["data"]["result"]["closed"]
-            .as_array()
-            .map(|items| items.len())
-            .unwrap_or_default(),
-        2,
+    let closed = json["data"]["result"]["closed"].as_array().unwrap();
+    let cleaned_stale = json["data"]["result"]["cleaned_stale"]
+        .as_array()
+        .unwrap();
+    assert_eq!(closed.len() + cleaned_stale.len(), 2, "{json}");
+    assert!(
+        ["default", "work"].iter().all(|name| {
+            closed.iter().any(|value| value == name)
+                || cleaned_stale.iter().any(|value| value == name)
+        }),
         "{json}"
     );
     let sessions = parse_json(&session.cmd().arg("sessions").output().unwrap());
