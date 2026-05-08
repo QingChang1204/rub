@@ -3,6 +3,20 @@
 
 Nothing yet.
 
+## v0.1.11 — 2026-05-08
+
+### 🚀 Features
+
+- Add a compact agent-oriented stdout projection while retaining the legacy command-result envelope through `RUB_STDOUT_FORMAT=command-result`.
+
+- Add one-shot JavaScript dialog intercept and cancel-intercept commands with a dismiss-by-default policy.
+
+### 🐛 Bug Fixes
+
+- Confirm intercept-resolved dialogs without blocking synchronous alert actions.
+
+- Stabilize browser-backed E2E lifecycle assertions for close-all and manual orchestration execution.
+
 ## v0.1.10 — 2026-05-07
 
 ### 🚀 Features
