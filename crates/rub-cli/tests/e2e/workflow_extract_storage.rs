@@ -992,9 +992,7 @@ fn t411_411f_fill_grouped_scenario() {
     let failed = parse_json(&session.cmd().args(["fill", &bad_spec]).output().unwrap());
     assert_eq!(failed["success"], false, "{failed}");
     assert_eq!(failed["error"]["code"], "ELEMENT_NOT_FOUND", "{failed}");
-    let suggestion = failed["error"]["suggestion"].as_str().unwrap_or_default();
-    assert!(suggestion.contains("--role"), "{failed}");
-    assert!(suggestion.contains("rub observe"), "{failed}");
+    assert!(failed["error"].get("suggestion").is_none());
 }
 
 /// T412/T412b/T412c/T412d/T412g: extract workflow variants should reuse one browser-backed scenario.
@@ -1867,19 +1865,7 @@ fn t414b_l_find_grouped_scenario() {
         content["data"]["result"]["matches"][0]["text"], "External links",
         "{content}"
     );
-    assert_eq!(
-        content["data"]["workflow_continuity"]["source_signal"], "find_content_anchor",
-        "{content}"
-    );
-    assert_eq!(
-        content["data"]["workflow_continuity"]["next_command_hints"][0]["command"],
-        "rub get text ...",
-        "{content}"
-    );
-    assert_eq!(
-        content["data"]["workflow_continuity"]["authority_observation"]["surface"], "content",
-        "{content}"
-    );
+    assert!(content["data"].get("workflow_continuity").is_none());
 
     let heading = parse_json(
         &session
@@ -2360,10 +2346,7 @@ fn t414j_extract_dense_page_failures_publish_resolution_hints() {
     let failed = parse_json(&rub_cmd(home).args(["extract", &spec]).output().unwrap());
     assert_eq!(failed["success"], false, "{failed}");
     assert_eq!(failed["error"]["code"], "INVALID_INPUT", "{failed}");
-    let suggestion = failed["error"]["suggestion"].as_str().unwrap_or_default();
-    assert!(suggestion.contains("many: true"), "{failed}");
-    assert!(suggestion.contains("first"), "{failed}");
-    assert!(suggestion.contains("nth"), "{failed}");
+    assert!(failed["error"].get("suggestion").is_none());
     assert_eq!(failed["error"]["context"]["field"], "headline", "{failed}");
     assert_eq!(
         failed["error"]["context"]["surface"], "interactive",
@@ -2659,10 +2642,7 @@ fn t414k_extract_collection_row_failures_publish_row_scoped_hints() {
     let failed = parse_json(&rub_cmd(home).args(["extract", &spec]).output().unwrap());
     assert_eq!(failed["success"], false, "{failed}");
     assert_eq!(failed["error"]["code"], "INVALID_INPUT", "{failed}");
-    let suggestion = failed["error"]["suggestion"].as_str().unwrap_or_default();
-    assert!(suggestion.contains("row-scoped"), "{failed}");
-    assert!(suggestion.contains("many: true"), "{failed}");
-    assert!(suggestion.contains("first"), "{failed}");
+    assert!(failed["error"].get("suggestion").is_none());
     assert_eq!(
         failed["error"]["context"]["collection"], "items",
         "{failed}"
@@ -2829,13 +2809,7 @@ fn t430_433_download_runtime_grouped_scenario() {
             .contains("current state is 'in_progress'"),
         "{waited}"
     );
-    assert!(
-        waited["error"]["suggestion"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("rub downloads"),
-        "{waited}"
-    );
+    assert!(waited["error"].get("suggestion").is_none());
     assert_eq!(waited["error"]["context"]["kind"], "download", "{waited}");
     assert_eq!(
         waited["error"]["context"]["download_runtime"]["mode"], "managed",

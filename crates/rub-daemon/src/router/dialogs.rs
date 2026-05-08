@@ -42,7 +42,7 @@ pub(super) async fn cmd_dialog(
             let action = args
                 .get("action")
                 .and_then(|v| v.as_str())
-                .unwrap_or("accept");
+                .unwrap_or("dismiss");
             let accept = !matches!(action, "dismiss");
             let prompt_text = args
                 .get("prompt_text")

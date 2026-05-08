@@ -386,7 +386,8 @@ pub fn load_file_config(rub_home: &Path) -> Result<FileConfig, RubError> {
 mod tests {
     use super::{Cli, load_file_config, normalize_rub_home_path};
     use crate::commands::{
-        Commands, OrchestrationSubcommand, RuntimeSubcommand, TriggerSubcommand,
+        Commands, DialogInterceptActionArg, DialogSubcommand, OrchestrationSubcommand,
+        RuntimeSubcommand, TriggerSubcommand,
     };
     use clap::Parser;
     use rub_core::error::ErrorCode;
@@ -490,6 +491,24 @@ mod tests {
                 subcommand: Some(RuntimeSubcommand::Orchestration),
             } => {}
             other => panic!("expected runtime orchestration command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dialog_intercept_defaults_to_dismiss() {
+        let cli = Cli::try_parse_from(["rub", "dialog", "intercept"]).expect("cli should parse");
+        match cli.command {
+            Commands::Dialog {
+                subcommand:
+                    Some(DialogSubcommand::Intercept {
+                        action,
+                        prompt_text,
+                    }),
+            } => {
+                assert_eq!(action, DialogInterceptActionArg::Dismiss);
+                assert!(prompt_text.is_none());
+            }
+            other => panic!("expected dialog intercept command, got {other:?}"),
         }
     }
 

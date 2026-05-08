@@ -5,13 +5,15 @@ use chromiumoxide::Page;
 use chromiumoxide::cdp::js_protocol::runtime::{ExecutionContextId, RemoteObjectId};
 use rub_core::error::RubError;
 use rub_core::model::{
-    ElementTag, InteractionConfirmation, InteractionConfirmationKind,
+    DialogResolutionInfo, ElementTag, InteractionConfirmation, InteractionConfirmationKind,
     InteractionConfirmationStatus, PendingDialogInfo,
 };
 use serde::Serialize;
 use serde_json::json;
 use std::future::Future;
 use std::sync::Arc;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::time::{Duration, Instant};
 use tracing::info;
 
@@ -41,7 +43,8 @@ pub(crate) enum ActuationFence {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DialogFenceBaseline {
-    previous_opened_at: Option<String>,
+    previous_pending_opened_at: Option<String>,
+    previous_last_opened_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,18 +64,47 @@ pub(crate) async fn capture_dialog_fence_baseline(
     dialog_runtime: &SharedDialogRuntime,
     expected_target_id: &str,
 ) -> DialogFenceBaseline {
+    let state = dialog_runtime.read().await;
     DialogFenceBaseline {
-        previous_opened_at: pending_dialog_for_target(dialog_runtime, expected_target_id)
-            .await
-            .map(|dialog| dialog.opened_at),
+        previous_pending_opened_at: state
+            .pending_dialog
+            .as_ref()
+            .filter(|dialog| {
+                crate::dialogs::pending_dialog_matches_target(dialog, expected_target_id)
+            })
+            .map(|dialog| dialog.opened_at.clone()),
+        previous_last_opened_at: state
+            .last_dialog
+            .as_ref()
+            .filter(|dialog| {
+                crate::dialogs::pending_dialog_matches_target(dialog, expected_target_id)
+            })
+            .map(|dialog| dialog.opened_at.clone()),
     }
 }
 
-fn dialog_is_new_since_baseline(
+fn pending_dialog_is_new_since_baseline(
     dialog: &PendingDialogInfo,
     baseline: &DialogFenceBaseline,
 ) -> bool {
-    baseline.previous_opened_at.as_deref() != Some(dialog.opened_at.as_str())
+    baseline.previous_pending_opened_at.as_deref() != Some(dialog.opened_at.as_str())
+}
+
+fn last_dialog_is_new_since_baseline(
+    dialog: &PendingDialogInfo,
+    baseline: &DialogFenceBaseline,
+) -> bool {
+    baseline.previous_last_opened_at.as_deref() != Some(dialog.opened_at.as_str())
+}
+
+fn dialog_resolution_matches(dialog: &PendingDialogInfo, result: &DialogResolutionInfo) -> bool {
+    let Ok(opened_at) = OffsetDateTime::parse(&dialog.opened_at, &Rfc3339) else {
+        return false;
+    };
+    let Ok(closed_at) = OffsetDateTime::parse(&result.closed_at, &Rfc3339) else {
+        return false;
+    };
+    closed_at >= opened_at
 }
 
 async fn pending_dialog_for_target_since(
@@ -81,7 +113,33 @@ async fn pending_dialog_for_target_since(
     baseline: &DialogFenceBaseline,
 ) -> Option<PendingDialogInfo> {
     let dialog = pending_dialog_for_target(dialog_runtime, expected_target_id).await?;
-    dialog_is_new_since_baseline(&dialog, baseline).then_some(dialog)
+    pending_dialog_is_new_since_baseline(&dialog, baseline).then_some(dialog)
+}
+
+async fn handled_dialog_for_target_since(
+    dialog_runtime: &SharedDialogRuntime,
+    expected_target_id: &str,
+    baseline: &DialogFenceBaseline,
+) -> Option<(PendingDialogInfo, DialogResolutionInfo)> {
+    let state = dialog_runtime.read().await;
+    let dialog = state.last_dialog.as_ref()?;
+    if !crate::dialogs::pending_dialog_matches_target(dialog, expected_target_id)
+        || !last_dialog_is_new_since_baseline(dialog, baseline)
+    {
+        return None;
+    }
+    if state
+        .pending_dialog
+        .as_ref()
+        .is_some_and(|pending| pending.opened_at == dialog.opened_at)
+    {
+        return None;
+    }
+    let result = state.last_result.as_ref()?;
+    if !dialog_resolution_matches(dialog, result) {
+        return None;
+    }
+    Some((dialog.clone(), result.clone()))
 }
 
 fn dialog_confirmation_details(dialog: PendingDialogInfo) -> serde_json::Value {
@@ -92,6 +150,23 @@ fn dialog_confirmation_details(dialog: PendingDialogInfo) -> serde_json::Value {
         "frame_id": dialog.frame_id,
         "default_prompt": dialog.default_prompt,
         "opened_at": dialog.opened_at,
+    })
+}
+
+fn handled_dialog_confirmation_details(
+    dialog: PendingDialogInfo,
+    result: DialogResolutionInfo,
+) -> serde_json::Value {
+    json!({
+        "kind": dialog.kind,
+        "message": dialog.message,
+        "url": dialog.url,
+        "frame_id": dialog.frame_id,
+        "default_prompt": dialog.default_prompt,
+        "opened_at": dialog.opened_at,
+        "accepted": result.accepted,
+        "user_input": result.user_input,
+        "closed_at": result.closed_at,
     })
 }
 
@@ -154,25 +229,44 @@ where
     T: Send + 'static,
 {
     let dialog_baseline = capture_dialog_fence_baseline(&dialog_runtime, expected_target_id).await;
-    let mut handle = tokio::spawn(actuation);
-    match tokio::time::timeout(DIALOG_ACTUATION_TIMEOUT, &mut handle).await {
-        Ok(joined) => {
-            let result = joined
+    let handle = tokio::spawn(actuation);
+    let deadline = Instant::now() + DIALOG_ACTUATION_TIMEOUT;
+    loop {
+        if pending_dialog_for_target_since(&dialog_runtime, expected_target_id, &dialog_baseline)
+            .await
+            .is_some()
+        {
+            info!(
+                actuation = label,
+                "Dialog fallback became active while actuation was still in flight"
+            );
+            handle.abort();
+            return Ok(ActuationResultFenceOutcome {
+                result: None,
+                fence: ActuationFence::DialogOpened,
+                dialog_baseline,
+            });
+        }
+
+        if handle.is_finished() {
+            let result = handle
+                .await
                 .map_err(|error| RubError::Internal(format!("{label} task failed: {error}")))??;
-            Ok(ActuationResultFenceOutcome {
+            return Ok(ActuationResultFenceOutcome {
                 result: Some(result),
                 fence: ActuationFence::Completed,
                 dialog_baseline,
-            })
+            });
         }
-        Err(_) => {
+
+        let now = Instant::now();
+        if now >= deadline {
             info!(
                 actuation = label,
                 "Interaction actuation timed out; aborting the local actuation task and waiting for a truthful post-timeout dialog fence"
             );
             handle.abort();
-            let _ = handle.await;
-            let deadline = Instant::now() + DIALOG_ACTUATION_GRACE_PERIOD;
+            let grace_deadline = Instant::now() + DIALOG_ACTUATION_GRACE_PERIOD;
             loop {
                 if pending_dialog_for_target_since(
                     &dialog_runtime,
@@ -192,7 +286,7 @@ where
                         dialog_baseline,
                     });
                 }
-                if Instant::now() >= deadline {
+                if Instant::now() >= grace_deadline {
                     return Ok(ActuationResultFenceOutcome {
                         result: None,
                         fence: ActuationFence::Indeterminate,
@@ -202,6 +296,8 @@ where
                 tokio::time::sleep(DIALOG_ACTUATION_POLL_INTERVAL).await;
             }
         }
+
+        tokio::time::sleep(DIALOG_ACTUATION_POLL_INTERVAL.min(deadline - now)).await;
     }
 }
 
@@ -210,13 +306,23 @@ pub(crate) async fn dialog_confirmation(
     expected_target_id: &str,
     dialog_baseline: &DialogFenceBaseline,
 ) -> Option<InteractionConfirmation> {
-    let dialog =
-        pending_dialog_for_target_since(dialog_runtime, expected_target_id, dialog_baseline)
+    if let Some(dialog) =
+        pending_dialog_for_target_since(dialog_runtime, expected_target_id, dialog_baseline).await
+    {
+        return Some(InteractionConfirmation {
+            status: InteractionConfirmationStatus::Confirmed,
+            kind: Some(InteractionConfirmationKind::DialogOpened),
+            details: Some(dialog_confirmation_details(dialog)),
+        });
+    }
+
+    let (dialog, result) =
+        handled_dialog_for_target_since(dialog_runtime, expected_target_id, dialog_baseline)
             .await?;
     Some(InteractionConfirmation {
         status: InteractionConfirmationStatus::Confirmed,
         kind: Some(InteractionConfirmationKind::DialogOpened),
-        details: Some(dialog_confirmation_details(dialog)),
+        details: Some(handled_dialog_confirmation_details(dialog, result)),
     })
 }
 

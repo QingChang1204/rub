@@ -590,14 +590,7 @@ fn t118_119_queue_and_busy_registry_grouped_scenario() {
         (1..=100).contains(&queue_ms),
         "queue time should remain within the requested budget: {queue_timeout}"
     );
-    let suggestion = queue_timeout["error"]["suggestion"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        suggestion.contains("one command at a time"),
-        "{queue_timeout}"
-    );
-    assert!(suggestion.contains("separate RUB_HOME"), "{queue_timeout}");
+    assert!(queue_timeout["error"].get("suggestion").is_none());
 
     let mut hold = hold;
     let _ = hold.wait();
@@ -1765,9 +1758,7 @@ fn t230_232e_get_read_query_grouped_scenario() {
             .contains("not a valid selector"),
         "{invalid}"
     );
-    let suggestion = invalid["error"]["suggestion"].as_str().unwrap_or_default();
-    assert!(suggestion.contains("--role"), "{invalid}");
-    assert!(suggestion.contains("rub observe"), "{invalid}");
+    assert!(invalid["error"].get("suggestion").is_none());
 }
 
 /// T232d: `get` should read non-interactive content through live read-query authority.
@@ -2672,9 +2663,7 @@ fn t232g_n_inspect_page_text_html_grouped_scenario() {
     );
     assert_eq!(scalar["success"], false, "{scalar}");
     assert_eq!(scalar["error"]["code"], "INVALID_INPUT", "{scalar}");
-    let scalar_suggestion = scalar["error"]["suggestion"].as_str().unwrap_or_default();
-    assert!(scalar_suggestion.contains("--first"), "{scalar}");
-    assert!(scalar_suggestion.contains("--nth"), "{scalar}");
+    assert!(scalar["error"].get("suggestion").is_none());
 
     let many = parse_json(
         &session
@@ -2871,40 +2860,7 @@ fn t232i_j_network_detail_and_wait_grouped_scenario() {
         network["data"]["subject"]["kind"], "network_request_registry",
         "{network}"
     );
-    assert_eq!(
-        network["data"]["workflow_continuity"]["source_signal"], "network_request_registry",
-        "{network}"
-    );
-    assert_eq!(
-        network["data"]["workflow_continuity"]["runtime_roles"]["current_runtime"]["role"],
-        "observation_runtime",
-        "{network}"
-    );
-    assert_eq!(
-        network["data"]["workflow_continuity"]["next_command_hints"][1]["command"],
-        "rub find --content ...",
-        "{network}"
-    );
-    assert_eq!(
-        network["data"]["workflow_continuity"]["next_command_hints"][2]["command"],
-        "rub extract ...",
-        "{network}"
-    );
-    assert_eq!(
-        network["data"]["workflow_continuity"]["next_command_hints"][3]["command"],
-        "rub inspect list ... --wait-field ... --wait-contains ...",
-        "{network}"
-    );
-    assert_eq!(
-        network["data"]["workflow_continuity"]["next_command_hints"][4]["command"],
-        "rub explain blockers",
-        "{network}"
-    );
-    assert_eq!(
-        network["data"]["workflow_continuity"]["authority_observation"]["evidence_kind"],
-        "mixed_network_registry",
-        "{network}"
-    );
+    assert!(network["data"].get("workflow_continuity").is_none());
     let requests = network["data"]["result"]["items"].as_array().unwrap();
     assert!(
         requests.iter().any(|request| {
@@ -3017,30 +2973,7 @@ fn t232i_j_network_detail_and_wait_grouped_scenario() {
             .unwrap(),
     );
     assert_eq!(read_detail["success"], true, "{read_detail}");
-    assert_eq!(
-        read_detail["data"]["workflow_continuity"]["source_signal"], "network_request_record",
-        "{read_detail}"
-    );
-    assert_eq!(
-        read_detail["data"]["workflow_continuity"]["runtime_roles"]["current_runtime"]["role"],
-        "content_runtime",
-        "{read_detail}"
-    );
-    assert_eq!(
-        read_detail["data"]["workflow_continuity"]["next_command_hints"][1]["command"],
-        "rub find --content ...",
-        "{read_detail}"
-    );
-    assert_eq!(
-        read_detail["data"]["workflow_continuity"]["next_command_hints"][2]["command"],
-        "rub extract ...",
-        "{read_detail}"
-    );
-    assert_eq!(
-        read_detail["data"]["workflow_continuity"]["authority_observation"]["evidence_kind"],
-        "read_like_network_request",
-        "{read_detail}"
-    );
+    assert!(read_detail["data"].get("workflow_continuity").is_none());
 
     let curl = parse_json(
         &session

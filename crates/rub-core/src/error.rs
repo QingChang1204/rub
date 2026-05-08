@@ -198,12 +198,12 @@ impl fmt::Display for ErrorCode {
     }
 }
 
-/// Structured error envelope for JSON output.
-/// Every error carries code, message, suggestion, and optional context.
+/// Structured error envelope for command and IPC failures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorEnvelope {
     pub code: ErrorCode,
     pub message: String,
+    #[serde(default)]
     pub suggestion: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<serde_json::Value>,

@@ -691,8 +691,8 @@ fn t437o_p_orchestration_execute_grouped_scenario() {
             },
             "mode": "once",
             "condition": {
-                "kind": "text_present",
-                "text": "Ready"
+                "kind": "network_request",
+                "url_pattern": "/manual-execute-never-fired"
             },
             "actions": [
                 {
@@ -837,8 +837,8 @@ fn t437o_p_orchestration_execute_grouped_scenario() {
             },
             "mode": "once",
             "condition": {
-                "kind": "text_present",
-                "text": "Ready"
+                "kind": "network_request",
+                "url_pattern": "/manual-blocked-never-fired"
             },
             "actions": [
                 {

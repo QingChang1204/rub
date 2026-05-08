@@ -1807,16 +1807,8 @@ fn t416_417_424_425_frame_runtime_inventory_and_stale_grouped_scenario() {
         get_text["error"]["context"]["authority_state"], "selected_frame_context_drifted",
         "{get_text}"
     );
-    assert_eq!(
-        get_text["error"]["context"]["authority_guidance"]["source_signal"],
-        "selected_frame_context_drifted",
-        "{get_text}"
-    );
-    assert_eq!(
-        get_text["error"]["context"]["authority_guidance"]["next_command_hints"][0]["command"],
-        "rub frames",
-        "{get_text}"
-    );
+    assert!(get_text["error"].get("suggestion").is_none());
+    assert!(get_text["error"]["context"].get("authority_guidance").is_none());
 
     let navigated = parse_json(
         &session
@@ -1932,20 +1924,7 @@ fn t416_417_424_425_frame_runtime_inventory_and_stale_grouped_scenario() {
         stale_runtime["data"]["runtime"]["degraded_reason"], "selected_frame_not_found",
         "{stale_runtime}"
     );
-    assert_eq!(
-        stale_runtime["data"]["workflow_continuity"]["source_signal"], "frame_runtime_stale",
-        "{stale_runtime}"
-    );
-    assert_eq!(
-        stale_runtime["data"]["workflow_continuity"]["next_command_hints"][0]["command"],
-        "rub frames",
-        "{stale_runtime}"
-    );
-    assert_eq!(
-        stale_runtime["data"]["workflow_continuity"]["authority_observation"]["frame_status"],
-        "stale",
-        "{stale_runtime}"
-    );
+    assert!(stale_runtime["data"].get("workflow_continuity").is_none());
 
     let stale_state = parse_json(&session.cmd().arg("state").output().unwrap());
     assert_eq!(stale_state["success"], false, "{stale_state}");
@@ -2876,21 +2855,7 @@ fn t400_402_interference_grouped_scenario() {
         interstitial_url,
         "{active_interference}"
     );
-    assert_eq!(
-        active_interference["data"]["workflow_continuity"]["source_signal"],
-        "interstitial_navigation",
-        "{active_interference}"
-    );
-    assert_eq!(
-        active_interference["data"]["workflow_continuity"]["next_command_hints"][0]["command"],
-        "rub interference recover",
-        "{active_interference}"
-    );
-    assert_eq!(
-        active_interference["data"]["workflow_continuity"]["authority_observation"]["interference_kind"],
-        "interstitial_navigation",
-        "{active_interference}"
-    );
+    assert!(active_interference["data"].get("workflow_continuity").is_none());
 
     let recovered = parse_json(
         &session

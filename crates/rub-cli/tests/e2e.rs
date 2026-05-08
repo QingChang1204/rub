@@ -30,6 +30,7 @@ fn rub_binary() -> String {
 fn rub_cmd(rub_home: &str) -> Command {
     let mut cmd = Command::new(rub_binary());
     cmd.arg("--rub-home").arg(rub_home);
+    cmd.env("RUB_STDOUT_FORMAT", "command-result");
     cmd
 }
 

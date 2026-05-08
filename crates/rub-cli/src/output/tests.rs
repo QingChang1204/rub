@@ -228,13 +228,14 @@ fn format_response_with_success_fails_closed_on_non_confirmed_interaction() {
     let json: Value = serde_json::from_str(&formatted.output).unwrap();
 
     assert!(!formatted.success);
-    assert_eq!(json["success"], false, "{json}");
-    assert_eq!(json["request_id"], "019-request", "{json}");
-    assert_eq!(json["command_id"], "019-click", "{json}");
+    assert_eq!(json["ok"], false, "{json}");
+    assert_eq!(json["ctx"]["request_id"], "019-request", "{json}");
+    assert_eq!(json["ctx"]["id"], "019-click", "{json}");
     assert_eq!(json["error"]["code"], "INTERACTION_NOT_CONFIRMED", "{json}");
-    assert_eq!(
-        json["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_status"],
-        "unconfirmed",
+    assert_eq!(json["error"]["committed"], true, "{json}");
+    assert_eq!(json["error"]["status"], "unconfirmed", "{json}");
+    assert!(
+        !formatted.output.contains("committed_response_projection"),
         "{json}"
     );
 }
@@ -273,8 +274,258 @@ fn format_response_treats_matched_wait_after_as_interaction_commit_fallback() {
     let json: Value = serde_json::from_str(&formatted.output).unwrap();
 
     assert!(formatted.success);
-    assert_eq!(json["success"], true, "{json}");
-    assert_eq!(json["data"]["wait_after"]["matched"], true, "{json}");
+    assert_eq!(json["ok"], true, "{json}");
+    assert_eq!(json["result"]["kind"], "interaction", "{json}");
+    assert_eq!(json["evidence"][0]["kind"], "wait_after", "{json}");
+    assert_eq!(json["evidence"][0]["matched"], true, "{json}");
+}
+
+#[test]
+fn agent_brief_projects_navigation_result() {
+    let response = IpcResponse {
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        command_id: Some("019-open".to_string()),
+        daemon_session_id: None,
+        request_id: "019-request".to_string(),
+        status: ResponseStatus::Success,
+        data: Some(serde_json::json!({
+            "result": {
+                "active_tab": {
+                    "active": true,
+                    "active_authority": "browser_truth",
+                    "index": 0,
+                    "target_id": "target-1",
+                    "title": "Form Page",
+                    "url": "https://example.com/form"
+                },
+                "page": {
+                    "final_url": "https://example.com/form",
+                    "http_status": 200,
+                    "title": "Form Page",
+                    "url": "https://example.com/form"
+                }
+            },
+            "subject": {
+                "kind": "tab_navigation",
+                "requested_url": "https://example.com/form"
+            }
+        })),
+        error: None,
+        timing: Timing::default(),
+    };
+
+    let formatted = format_response_with_success(
+        &response,
+        "open",
+        "default",
+        rub_home(),
+        false,
+        InteractionTraceMode::Compact,
+    );
+    let json: Value = serde_json::from_str(&formatted.output).unwrap();
+
+    assert_eq!(json["result"]["kind"], "tab_navigation", "{json}");
+    assert_eq!(json["result"]["url"], "https://example.com/form", "{json}");
+    assert_eq!(json["result"]["http_status"], 200, "{json}");
+    assert_eq!(
+        json["result"]["active_tab"]["authority"], "browser_truth",
+        "{json}"
+    );
+}
+
+#[test]
+fn agent_brief_projects_extract_fields_before_snapshot() {
+    let response = IpcResponse {
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        command_id: Some("019-extract".to_string()),
+        daemon_session_id: None,
+        request_id: "019-request".to_string(),
+        status: ResponseStatus::Success,
+        data: Some(serde_json::json!({
+            "result": {
+                "field_count": 1,
+                "fields": {
+                    "title": "Contact Form"
+                },
+                "snapshot": {
+                    "snapshot_id": "snap-1",
+                    "title": "Form Page",
+                    "url": "https://example.com/form"
+                }
+            },
+            "subject": {
+                "kind": "extract_query",
+                "source": "live_page"
+            }
+        })),
+        error: None,
+        timing: Timing::default(),
+    };
+
+    let formatted = format_response_with_success(
+        &response,
+        "extract",
+        "default",
+        rub_home(),
+        false,
+        InteractionTraceMode::Compact,
+    );
+    let json: Value = serde_json::from_str(&formatted.output).unwrap();
+
+    assert_eq!(json["ok"], true, "{json}");
+    assert_eq!(json["result"]["kind"], "structured_extract", "{json}");
+    assert_eq!(json["result"]["field_count"], 1, "{json}");
+    assert_eq!(json["fields"]["title"], "Contact Form", "{json}");
+    assert!(json.get("items").is_none(), "{json}");
+}
+
+#[test]
+fn agent_brief_projects_storage_matches_and_mutation() {
+    let response = IpcResponse {
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        command_id: Some("019-storage".to_string()),
+        daemon_session_id: None,
+        request_id: "019-request".to_string(),
+        status: ResponseStatus::Success,
+        data: Some(serde_json::json!({
+            "result": {
+                "matches": [
+                    {
+                        "area": "local",
+                        "value": "ok"
+                    }
+                ],
+                "snapshot": {
+                    "local_storage": {
+                        "rub_test": "ok"
+                    },
+                    "session_storage": {}
+                }
+            },
+            "runtime": {
+                "local_storage_keys": ["rub_test"],
+                "session_storage_keys": [],
+                "recent_mutations": [
+                    {
+                        "kind": "set",
+                        "area": "local",
+                        "key": "rub_test",
+                        "commit_status": "snapshot_committed"
+                    }
+                ]
+            },
+            "subject": {
+                "kind": "storage",
+                "key": "rub_test",
+                "origin": "https://example.com"
+            }
+        })),
+        error: None,
+        timing: Timing::default(),
+    };
+
+    let formatted = format_response_with_success(
+        &response,
+        "storage",
+        "default",
+        rub_home(),
+        false,
+        InteractionTraceMode::Compact,
+    );
+    let json: Value = serde_json::from_str(&formatted.output).unwrap();
+
+    assert_eq!(json["result"]["kind"], "storage", "{json}");
+    assert_eq!(json["result"]["key"], "rub_test", "{json}");
+    assert_eq!(json["result"]["match_count"], 1, "{json}");
+    assert_eq!(
+        json["result"]["last_mutation"]["commit_status"], "snapshot_committed",
+        "{json}"
+    );
+    assert_eq!(json["items"][0]["value"], "ok", "{json}");
+}
+
+#[test]
+fn agent_brief_projects_cookies_as_items() {
+    let response = IpcResponse {
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        command_id: Some("019-cookies".to_string()),
+        daemon_session_id: None,
+        request_id: "019-request".to_string(),
+        status: ResponseStatus::Success,
+        data: Some(serde_json::json!({
+            "result": {
+                "cookies": [
+                    {
+                        "name": "rubtest",
+                        "value": "cookie-value",
+                        "domain": "127.0.0.1",
+                        "path": "/",
+                        "secure": false,
+                        "http_only": false,
+                        "same_site": "Lax"
+                    }
+                ]
+            },
+            "subject": {
+                "kind": "cookies"
+            }
+        })),
+        error: None,
+        timing: Timing::default(),
+    };
+
+    let formatted = format_response_with_success(
+        &response,
+        "cookies",
+        "default",
+        rub_home(),
+        false,
+        InteractionTraceMode::Compact,
+    );
+    let json: Value = serde_json::from_str(&formatted.output).unwrap();
+
+    assert_eq!(json["result"]["kind"], "cookies", "{json}");
+    assert_eq!(json["result"]["cookie_count"], 1, "{json}");
+    assert_eq!(json["items"][0]["name"], "rubtest", "{json}");
+    assert_eq!(json["items"][0]["domain"], "127.0.0.1", "{json}");
+}
+
+#[test]
+fn agent_brief_projects_dialog_intercept_and_runtime() {
+    let response = IpcResponse {
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        command_id: Some("019-dialog".to_string()),
+        daemon_session_id: None,
+        request_id: "019-request".to_string(),
+        status: ResponseStatus::Success,
+        data: Some(serde_json::json!({
+            "subject": {
+                "kind": "dialog_intercept",
+                "action": "armed"
+            },
+            "intercept": {
+                "action": "dismiss",
+                "target_tab_id": "tab-1"
+            }
+        })),
+        error: None,
+        timing: Timing::default(),
+    };
+
+    let formatted = format_response_with_success(
+        &response,
+        "dialog",
+        "default",
+        rub_home(),
+        false,
+        InteractionTraceMode::Compact,
+    );
+    let json: Value = serde_json::from_str(&formatted.output).unwrap();
+
+    assert_eq!(json["result"]["kind"], "dialog_intercept", "{json}");
+    assert_eq!(json["result"]["action"], "armed", "{json}");
+    assert_eq!(json["result"]["intercept"]["action"], "dismiss", "{json}");
+    assert!(json.get("data").is_none(), "{json}");
 }
 
 #[test]
@@ -301,22 +552,12 @@ fn legacy_success_shaped_post_commit_cli_error_fails_stdout_contract() {
         false,
     );
     let value: Value = serde_json::from_str(&formatted).expect("valid output JSON");
-    assert_eq!(value["request_id"], "req-42");
-    assert_eq!(value["command_id"], "cmd-42");
-    assert_eq!(value["success"], false);
-    assert_eq!(
-        value["error"]["context"]["projection_kind"],
-        "cli_stdout_contract_fallback"
-    );
-    assert_eq!(
-        value["error"]["context"]["field"],
-        "data.post_commit_followup_*"
-    );
-    assert_eq!(
-        value["error"]["context"]["expected_surface"],
-        "top_level_error"
-    );
-    assert!(value.get("data").is_none() || value["data"].is_null());
+    assert_eq!(value["ctx"]["request_id"], "req-42");
+    assert_eq!(value["ctx"]["id"], "cmd-42");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "IPC_PROTOCOL_ERROR");
+    assert_eq!(value["error"]["reason"], "invalid_stdout_result_contract");
+    assert!(value.get("data").is_none());
 }
 
 #[test]
@@ -344,15 +585,9 @@ fn legacy_success_shaped_post_commit_cli_error_wraps_non_object_payload_but_fail
     );
     let value: Value = serde_json::from_str(&formatted).expect("valid output JSON");
 
-    assert_eq!(value["success"], false);
-    assert_eq!(
-        value["error"]["context"]["projection_kind"],
-        "cli_stdout_contract_fallback"
-    );
-    assert_eq!(
-        value["error"]["context"]["expected_surface"],
-        "top_level_error"
-    );
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "IPC_PROTOCOL_ERROR");
+    assert_eq!(value["error"]["reason"], "invalid_stdout_result_contract");
 }
 
 #[test]
@@ -394,22 +629,16 @@ fn committed_cli_error_preserves_daemon_request_correlation_and_projection() {
         false,
     );
     let value: Value = serde_json::from_str(&formatted).expect("valid output JSON");
-    assert_eq!(value["request_id"], "req-77");
-    assert_eq!(value["command_id"], "cmd-77");
-    assert_eq!(value["success"], false);
-    assert!(
-        value.get("data").is_none() || value["data"].is_null(),
-        "{value}"
-    );
+    assert_eq!(value["ctx"]["request_id"], "req-77");
+    assert_eq!(value["ctx"]["id"], "cmd-77");
+    assert_eq!(value["ok"], false);
+    assert!(value.get("data").is_none(), "{value}");
     assert_eq!(
-        value["error"]["context"]["reason"],
+        value["error"]["reason"],
         "post_commit_history_export_failed"
     );
-    assert_eq!(value["error"]["context"]["daemon_request_committed"], true);
-    assert_eq!(
-        value["error"]["context"]["committed_response_projection"]["result"]["format"],
-        "pipe"
-    );
+    assert_eq!(value["error"]["committed"], true);
+    assert!(!formatted.contains("committed_response_projection"));
 }
 
 //noinspection DuplicatedCode
@@ -641,7 +870,7 @@ fn format_response_trace_mode_picks_up_new_interaction_fields_without_hardcoded_
 }
 
 #[test]
-fn format_response_attaches_frame_drift_authority_guidance_to_errors() {
+fn format_response_keeps_frame_drift_error_factual() {
     let response = IpcResponse {
         ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
         command_id: Some("019-frame-drift".to_string()),
@@ -673,17 +902,59 @@ fn format_response_attaches_frame_drift_authority_guidance_to_errors() {
     let json: Value = serde_json::from_str(&output).unwrap();
     assert_eq!(json["success"], false);
     assert_eq!(
-        json["error"]["context"]["authority_guidance"]["source_signal"],
+        json["error"]["context"]["authority_state"],
         "selected_frame_context_drifted"
     );
-    assert_eq!(
-        json["error"]["context"]["authority_guidance"]["next_command_hints"][0]["command"],
-        "rub frames"
-    );
+    assert!(json["error"].get("suggestion").is_none());
+    assert!(json["error"]["context"].get("authority_guidance").is_none());
+    assert!(json["error"]["context"].get("next_command_hints").is_none());
 }
 
 #[test]
-fn format_cli_error_attaches_takeover_continuity_guidance() {
+fn format_response_strips_guidance_keys_from_success_data() {
+    let response = IpcResponse {
+        ipc_protocol_version: rub_ipc::protocol::IPC_PROTOCOL_VERSION.to_string(),
+        command_id: Some("019-guidance".to_string()),
+        daemon_session_id: None,
+        request_id: "019-request".to_string(),
+        status: ResponseStatus::Success,
+        data: Some(serde_json::json!({
+            "result": {
+                "value": 1,
+                "suggestion": "use a different command",
+                "nested": {
+                    "next_safe_actions": ["do this"],
+                    "workflow_guidance": { "kind": "advice" },
+                    "workflow_continuity": { "source_signal": "old" },
+                    "authority_guidance": { "source_signal": "old" }
+                }
+            }
+        })),
+        error: None,
+        timing: Timing::default(),
+    };
+
+    let output = format_response(
+        &response,
+        "inspect",
+        "default",
+        rub_home(),
+        false,
+        InteractionTraceMode::Compact,
+    );
+    let json: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(json["success"], true);
+    let result = &json["data"]["result"];
+    assert_eq!(result["value"], 1);
+    assert!(result.get("suggestion").is_none());
+    assert!(result["nested"].get("next_safe_actions").is_none());
+    assert!(result["nested"].get("workflow_guidance").is_none());
+    assert!(result["nested"].get("workflow_continuity").is_none());
+    assert!(result["nested"].get("authority_guidance").is_none());
+}
+
+#[test]
+fn format_cli_error_keeps_agent_brief_factual_for_takeover_continuity() {
     let output = format_cli_error(
         "takeover",
         "default",
@@ -697,19 +968,13 @@ fn format_cli_error_attaches_takeover_continuity_guidance() {
         false,
     );
     let json: Value = serde_json::from_str(&output).unwrap();
-    assert_eq!(json["success"], false);
-    assert_eq!(
-        json["error"]["context"]["authority_guidance"]["source_signal"],
-        "continuity_no_active_tab"
-    );
-    assert_eq!(
-        json["error"]["context"]["authority_guidance"]["next_command_hints"][0]["command"],
-        "rub tabs"
-    );
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["reason"], "continuity_no_active_tab");
+    assert!(json.get("next").is_none(), "{json}");
 }
 
 #[test]
-fn format_cli_error_attaches_trigger_continuity_guidance_for_session_busy() {
+fn format_cli_error_keeps_agent_brief_factual_for_trigger_continuity() {
     let output = format_cli_error(
         "trigger",
         "default",
@@ -723,15 +988,9 @@ fn format_cli_error_attaches_trigger_continuity_guidance_for_session_busy() {
         false,
     );
     let json: Value = serde_json::from_str(&output).unwrap();
-    assert_eq!(json["success"], false);
-    assert_eq!(
-        json["error"]["context"]["authority_guidance"]["source_signal"],
-        "continuity_frame_unavailable"
-    );
-    assert_eq!(
-        json["error"]["context"]["authority_guidance"]["next_command_hints"][0]["command"],
-        "rub frames"
-    );
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["reason"], "continuity_frame_unavailable");
+    assert!(json.get("next").is_none(), "{json}");
 }
 
 //noinspection DuplicatedCode

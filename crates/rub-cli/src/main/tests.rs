@@ -299,23 +299,16 @@ fn explain_locator_projection_failure_fails_closed_after_daemon_commit() {
         serde_json::from_str(&output.output).expect("formatted output should be valid json");
 
     assert!(!output.success);
-    assert_eq!(value["success"], false, "{value}");
-    assert!(value["data"].is_null(), "{value}");
-    assert_eq!(value["request_id"], "req-explain", "{value}");
-    assert_eq!(value["command_id"], "cmd-explain", "{value}");
+    assert_eq!(value["ok"], false, "{value}");
+    assert!(value.get("data").is_none(), "{value}");
+    assert_eq!(value["ctx"]["request_id"], "req-explain", "{value}");
+    assert_eq!(value["ctx"]["id"], "cmd-explain", "{value}");
     assert_eq!(
-        value["error"]["context"]["reason"], "post_commit_locator_explain_failed",
+        value["error"]["reason"], "post_commit_locator_explain_failed",
         "{value}"
     );
-    assert_eq!(
-        value["error"]["context"]["daemon_request_committed"], true,
-        "{value}"
-    );
-    assert_eq!(
-        value["error"]["context"]["committed_response_projection"]["result"]["matches"],
-        json!([]),
-        "{value}"
-    );
+    assert_eq!(value["error"]["committed"], true, "{value}");
+    assert!(!output.output.contains("committed_response_projection"));
 }
 
 #[test]
@@ -345,23 +338,16 @@ fn find_explain_projection_failure_fails_closed_after_daemon_commit() {
         serde_json::from_str(&output.output).expect("formatted output should be valid json");
 
     assert!(!output.success);
-    assert_eq!(value["success"], false, "{value}");
-    assert!(value["data"].is_null(), "{value}");
-    assert_eq!(value["request_id"], "req-find", "{value}");
-    assert_eq!(value["command_id"], "cmd-find", "{value}");
+    assert_eq!(value["ok"], false, "{value}");
+    assert!(value.get("data").is_none(), "{value}");
+    assert_eq!(value["ctx"]["request_id"], "req-find", "{value}");
+    assert_eq!(value["ctx"]["id"], "cmd-find", "{value}");
     assert_eq!(
-        value["error"]["context"]["reason"], "post_commit_find_locator_explain_failed",
+        value["error"]["reason"], "post_commit_find_locator_explain_failed",
         "{value}"
     );
-    assert_eq!(
-        value["error"]["context"]["daemon_request_committed"], true,
-        "{value}"
-    );
-    assert_eq!(
-        value["error"]["context"]["committed_response_projection"]["result"]["matches"],
-        json!([]),
-        "{value}"
-    );
+    assert_eq!(value["error"]["committed"], true, "{value}");
+    assert!(!output.output.contains("committed_response_projection"));
 }
 
 #[test]
@@ -391,17 +377,14 @@ fn exec_raw_missing_result_fails_closed_after_daemon_commit() {
         serde_json::from_str(&output.output).expect("raw failure should use JSON error envelope");
 
     assert!(!output.success);
-    assert_eq!(value["success"], false, "{value}");
-    assert_eq!(value["request_id"], "req-raw", "{value}");
-    assert_eq!(value["command_id"], "cmd-raw", "{value}");
+    assert_eq!(value["ok"], false, "{value}");
+    assert_eq!(value["ctx"]["request_id"], "req-raw", "{value}");
+    assert_eq!(value["ctx"]["id"], "cmd-raw", "{value}");
     assert_eq!(
-        value["error"]["context"]["reason"], "post_commit_exec_raw_projection_failed",
+        value["error"]["reason"], "post_commit_exec_raw_projection_failed",
         "{value}"
     );
-    assert_eq!(
-        value["error"]["context"]["daemon_request_committed"], true,
-        "{value}"
-    );
+    assert_eq!(value["error"]["committed"], true, "{value}");
 }
 
 #[test]
@@ -468,16 +451,16 @@ fn finalize_response_output_uses_effect_truth_for_interaction_exit_surface() {
         serde_json::from_str(&output.output).expect("formatted output should be valid json");
 
     assert!(!output.success);
-    assert_eq!(value["success"], false, "{value}");
+    assert_eq!(value["ok"], false, "{value}");
+    assert_eq!(value["ctx"]["request_id"], "req-click", "{value}");
+    assert_eq!(value["ctx"]["id"], "cmd-click", "{value}");
     assert_eq!(
         value["error"]["code"], "INTERACTION_NOT_CONFIRMED",
         "{value}"
     );
-    assert_eq!(
-        value["error"]["context"]["committed_response_projection"]["interaction"]["confirmation_status"],
-        "degraded",
-        "{value}"
-    );
+    assert_eq!(value["error"]["committed"], true, "{value}");
+    assert_eq!(value["error"]["status"], "degraded", "{value}");
+    assert!(!output.output.contains("committed_response_projection"));
 }
 
 #[test]
@@ -532,23 +515,16 @@ fn finalize_response_output_history_export_failure_uses_committed_top_level_erro
         serde_json::from_str(&output.output).expect("formatted output should be valid json");
 
     assert!(!output.success);
-    assert_eq!(value["success"], false, "{value}");
+    assert_eq!(value["ok"], false, "{value}");
+    assert_eq!(value["ctx"]["request_id"], "req-history-export", "{value}");
+    assert_eq!(value["ctx"]["id"], "cmd-history-export", "{value}");
     assert_eq!(
-        value["error"]["context"]["reason"],
+        value["error"]["reason"],
         "post_commit_history_export_failed"
     );
-    assert_eq!(
-        value["error"]["context"]["daemon_request_committed"], true,
-        "{value}"
-    );
-    assert_eq!(
-        value["error"]["context"]["committed_response_projection"]["result"]["format"], "pipe",
-        "{value}"
-    );
-    assert!(
-        value.get("data").is_none() || value["data"].is_null(),
-        "{value}"
-    );
+    assert_eq!(value["error"]["committed"], true, "{value}");
+    assert!(value.get("data").is_none(), "{value}");
+    assert!(!output.output.contains("committed_response_projection"));
 }
 
 #[test]
@@ -591,24 +567,19 @@ fn finalize_response_output_orchestration_export_failure_uses_committed_top_leve
         serde_json::from_str(&output.output).expect("formatted output should be valid json");
 
     assert!(!output.success);
-    assert_eq!(value["success"], false, "{value}");
+    assert_eq!(value["ok"], false, "{value}");
     assert_eq!(
-        value["error"]["context"]["reason"], "post_commit_orchestration_export_failed",
+        value["ctx"]["request_id"], "req-orchestration-export",
         "{value}"
     );
+    assert_eq!(value["ctx"]["id"], "cmd-orchestration-export", "{value}");
     assert_eq!(
-        value["error"]["context"]["daemon_request_committed"], true,
+        value["error"]["reason"], "post_commit_orchestration_export_failed",
         "{value}"
     );
-    assert_eq!(
-        value["error"]["context"]["committed_response_projection"]["result"]["format"],
-        "orchestration",
-        "{value}"
-    );
-    assert!(
-        value.get("data").is_none() || value["data"].is_null(),
-        "{value}"
-    );
+    assert_eq!(value["error"]["committed"], true, "{value}");
+    assert!(value.get("data").is_none(), "{value}");
+    assert!(!output.output.contains("committed_response_projection"));
 }
 
 #[test]

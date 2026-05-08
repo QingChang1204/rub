@@ -120,12 +120,6 @@ macro_rules! assert_json_error {
                 .is_some_and(|value| value.is_string()),
             "Missing error message"
         );
-        assert!(
-            json["error"]
-                .get("suggestion")
-                .is_some_and(|value| value.is_string()),
-            "Missing error suggestion"
-        );
         if let Some(context) = json["error"].get("context") {
             assert!(
                 context.is_object() || context.is_null(),
@@ -213,12 +207,6 @@ macro_rules! assert_post_commit_local_failure {
                 .get("message")
                 .is_some_and(|value| value.is_string()),
             "Missing post-commit error message"
-        );
-        assert!(
-            json["error"]
-                .get("suggestion")
-                .is_some_and(|value| value.is_string()),
-            "Missing post-commit error suggestion"
         );
         assert_eq!(
             json["error"]["context"]["daemon_request_committed"],
@@ -372,7 +360,6 @@ mod tests {
             "error": {
                 "code": "INVALID_INPUT",
                 "message": "bad input",
-                "suggestion": "fix it"
             }
         })
     }
@@ -443,7 +430,6 @@ mod tests {
             "error": {
                 "code": "INVALID_INPUT",
                 "message": "bad input",
-                "suggestion": "fix it"
             }
         });
         crate::assert_json_error!(json, "INVALID_INPUT");
@@ -475,7 +461,6 @@ mod tests {
             "error": {
                 "code": "INVALID_INPUT",
                 "message": "bad input",
-                "suggestion": "fix it"
             }
         });
         crate::assert_json_error!(json, "INVALID_INPUT");
@@ -519,7 +504,6 @@ mod tests {
             "error": {
                 "code": "INVALID_INPUT",
                 "message": "bad input",
-                "suggestion": "fix it"
             }
         });
         crate::assert_json_error!(json, "INVALID_INPUT");
@@ -556,7 +540,6 @@ mod tests {
             "error": {
                 "code": "INVALID_INPUT",
                 "message": "bad input",
-                "suggestion": "fix it"
             }
         });
         crate::assert_json_error!(json, "INVALID_INPUT");
@@ -583,7 +566,6 @@ mod tests {
             "error": {
                 "code": "INVALID_INPUT",
                 "message": "local export failed after daemon success",
-                "suggestion": "fix it",
                 "context": {
                     "reason": "post_commit_history_export_failed",
                     "daemon_request_committed": true,
@@ -631,7 +613,6 @@ mod tests {
             "error": {
                 "code": "IPC_PROTOCOL_ERROR",
                 "message": "IPC response contract error: bad",
-                "suggestion": "fix it",
                 "context": {
                     "reason": "invalid_ipc_response_contract"
                 }
@@ -704,7 +685,6 @@ mod tests {
             "error": {
                 "code": "IPC_PROTOCOL_ERROR",
                 "message": "IPC response contract error: bad",
-                "suggestion": "fix it",
                 "context": {
                     "reason": "invalid_stdout_result_contract",
                     "stdout_contract_fallback": true,
@@ -758,7 +738,6 @@ mod tests {
                 "error": {
                     "code": "IPC_PROTOCOL_ERROR",
                     "message": "compat control-plane failure",
-                    "suggestion": "fix it"
                 }
             });
             crate::assert_json_error!(json_missing, "IPC_PROTOCOL_ERROR");
@@ -774,7 +753,6 @@ mod tests {
                 "error": {
                     "code": "IPC_PROTOCOL_ERROR",
                     "message": "compat control-plane failure",
-                    "suggestion": "fix it"
                 }
             });
             crate::assert_json_error!(json_null, "IPC_PROTOCOL_ERROR");

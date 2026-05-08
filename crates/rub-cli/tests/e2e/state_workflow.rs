@@ -1475,6 +1475,7 @@ fn t233e_i_history_export_grouped_scenario() {
         .env("RUB", rub_binary())
         .env("RUB_HOME", &replay_home)
         .env("RUB_SESSION", "replay")
+        .env("RUB_STDOUT_FORMAT", "command-result")
         .output()
         .unwrap();
     let replayed = parse_json(&replay);

@@ -1,8 +1,8 @@
 //! JSON output formatter for CLI → stdout.
 
-mod continuity;
+mod agent;
 
-use self::continuity::attach_workflow_continuity;
+use self::agent::project_agent_result;
 use rub_core::error::{ErrorCode, ErrorEnvelope};
 use rub_core::model::{
     CommandResult, InteractionConfirmationStatus, projected_interaction_confirmation_status,
@@ -17,6 +17,8 @@ use std::path::Path;
 const POST_COMMIT_LOCAL_FAILURE_STATE: &str = "daemon_committed_local_followup_failed";
 const STDOUT_CONTRACT_FALLBACK_SURFACE: &str = "cli_stdout_contract_fallback";
 const INTERACTION_EFFECT_FAILURE_SURFACE: &str = "cli_interaction_effect_failure";
+const STDOUT_FORMAT_ENV: &str = "RUB_STDOUT_FORMAT";
+const STDOUT_FORMAT_COMMAND_RESULT: &str = "command-result";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionTraceMode {
@@ -41,7 +43,10 @@ pub fn format_response(
     pretty: bool,
     trace_mode: InteractionTraceMode,
 ) -> String {
-    format_response_with_success(response, command, session, rub_home, pretty, trace_mode).output
+    let result = checked_command_result(command_result_from_response(
+        response, command, session, rub_home, trace_mode,
+    ));
+    serialize_command_result_json(&result, pretty)
 }
 
 pub fn format_response_with_success(
@@ -56,7 +61,7 @@ pub fn format_response_with_success(
         response, command, session, rub_home, trace_mode,
     ));
     let success = result.success;
-    let output = serialize_command_result_json(&result, pretty);
+    let output = serialize_stdout_result_json(&result, rub_home, pretty);
     FormattedCommandResult { output, success }
 }
 
@@ -64,7 +69,7 @@ fn command_result_from_response(
     response: &IpcResponse,
     command: &str,
     session: &str,
-    rub_home: &Path,
+    _rub_home: &Path,
     trace_mode: InteractionTraceMode,
 ) -> CommandResult {
     if let Some(envelope) = response.contract_error_envelope() {
@@ -77,7 +82,7 @@ fn command_result_from_response(
             session: session.to_string(),
             timing: response.timing,
             data: None,
-            error: Some(attach_authority_error_guidance(envelope)),
+            error: Some(envelope),
         };
     }
 
@@ -90,10 +95,9 @@ fn command_result_from_response(
         session: session.to_string(),
         timing: response.timing,
         data: response.data.clone(),
-        error: response.error.clone().map(attach_authority_error_guidance),
+        error: response.error.clone(),
     };
     attach_interaction_trace(&mut result, trace_mode);
-    attach_workflow_continuity(&mut result, rub_home);
     if let Some(effect_failure) = interaction_effect_failure_result(&result) {
         return effect_failure;
     }
@@ -130,13 +134,8 @@ pub fn format_cli_error(
     envelope: ErrorEnvelope,
     pretty: bool,
 ) -> String {
-    let result = CommandResult::error(
-        command,
-        session,
-        uuid::Uuid::now_v7().to_string(),
-        attach_authority_error_guidance(envelope),
-    );
-    serialize_checked_command_result(result, pretty)
+    let result = CommandResult::error(command, session, uuid::Uuid::now_v7().to_string(), envelope);
+    serialize_checked_stdout_result(result, Path::new(""), pretty)
 }
 
 /// Format a CLI-side error that happened after the daemon had already committed a response.
@@ -148,7 +147,7 @@ pub fn format_post_commit_cli_error(
     envelope: ErrorEnvelope,
     pretty: bool,
 ) -> String {
-    let followup_error = attach_authority_error_guidance(envelope);
+    let followup_error = envelope;
     let data = Some(annotate_post_commit_local_failure_data(
         response.data.as_ref().unwrap_or(&Value::Null),
         &followup_error,
@@ -164,7 +163,7 @@ pub fn format_post_commit_cli_error(
         data,
         error: None,
     };
-    serialize_checked_command_result(result, pretty)
+    serialize_checked_stdout_result(result, Path::new(""), pretty)
 }
 
 /// Format a CLI-side failure that happened after the daemon had already
@@ -186,9 +185,9 @@ pub fn format_committed_cli_error(
         session: session.to_string(),
         timing: response.timing,
         data: None,
-        error: Some(attach_authority_error_guidance(envelope)),
+        error: Some(envelope),
     };
-    serialize_checked_command_result(result, pretty)
+    serialize_checked_stdout_result(result, Path::new(""), pretty)
 }
 
 #[cfg(test)]
@@ -249,8 +248,7 @@ pub fn format_cli_success(
     let mut result =
         CommandResult::success(command, session, uuid::Uuid::now_v7().to_string(), data);
     attach_interaction_trace(&mut result, trace_mode);
-    attach_workflow_continuity(&mut result, rub_home);
-    serialize_checked_command_result(result, pretty)
+    serialize_checked_stdout_result(result, rub_home, pretty)
 }
 
 fn stdout_request_id(request_id: &str) -> String {
@@ -284,7 +282,7 @@ fn interaction_effect_failure_result(result: &CommandResult) -> Option<CommandRe
         session: result.session.clone(),
         timing: result.timing,
         data: None,
-        error: Some(attach_authority_error_guidance(envelope)),
+        error: Some(envelope),
     })
 }
 
@@ -369,27 +367,84 @@ fn checked_command_result(result: CommandResult) -> CommandResult {
             session: result.session,
             timing: result.timing,
             data: None,
-            error: Some(stdout_contract_fallback_error(
-                attach_authority_error_guidance(envelope),
-            )),
+            error: Some(stdout_contract_fallback_error(envelope)),
         };
     }
     result
 }
 
-fn serialize_checked_command_result(result: CommandResult, pretty: bool) -> String {
-    serialize_command_result_json(&checked_command_result(result), pretty)
+fn serialize_checked_stdout_result(result: CommandResult, rub_home: &Path, pretty: bool) -> String {
+    serialize_stdout_result_json(&checked_command_result(result), rub_home, pretty)
 }
 
-fn serialize_command_result_json(result: &CommandResult, pretty: bool) -> String {
+fn serialize_stdout_result_json(result: &CommandResult, rub_home: &Path, pretty: bool) -> String {
+    if stdout_format_is_command_result() {
+        return serialize_command_result_json(result, pretty);
+    }
+    serialize_agent_result_json(result, rub_home, pretty)
+}
+
+fn stdout_format_is_command_result() -> bool {
+    std::env::var(STDOUT_FORMAT_ENV).ok().is_some_and(|value| {
+        value
+            .trim()
+            .eq_ignore_ascii_case(STDOUT_FORMAT_COMMAND_RESULT)
+    })
+}
+
+fn serialize_agent_result_json(result: &CommandResult, rub_home: &Path, pretty: bool) -> String {
+    let projected = project_agent_result(result, rub_home);
     let serialized = if pretty {
-        serde_json::to_string_pretty(result)
+        serde_json::to_string_pretty(&projected)
     } else {
-        serde_json::to_string(result)
+        serde_json::to_string(&projected)
     };
     match serialized {
         Ok(output) => output,
         Err(error) => serialize_stdout_json_fallback(result, &error.to_string(), pretty),
+    }
+}
+
+fn serialize_command_result_json(result: &CommandResult, pretty: bool) -> String {
+    let mut value = match serde_json::to_value(result) {
+        Ok(value) => value,
+        Err(error) => return serialize_stdout_json_fallback(result, &error.to_string(), pretty),
+    };
+    strip_stdout_guidance(&mut value);
+    let serialized = if pretty {
+        serde_json::to_string_pretty(&value)
+    } else {
+        serde_json::to_string(&value)
+    };
+    match serialized {
+        Ok(output) => output,
+        Err(error) => serialize_stdout_json_fallback(result, &error.to_string(), pretty),
+    }
+}
+
+fn strip_stdout_guidance(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for key in [
+                "suggestion",
+                "next_command_hints",
+                "next_safe_actions",
+                "workflow_guidance",
+                "workflow_continuity",
+                "authority_guidance",
+            ] {
+                object.remove(key);
+            }
+            for value in object.values_mut() {
+                strip_stdout_guidance(value);
+            }
+        }
+        Value::Array(items) => {
+            for value in items {
+                strip_stdout_guidance(value);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -467,19 +522,6 @@ fn attach_interaction_trace(result: &mut CommandResult, trace_mode: InteractionT
     object.insert("interaction_trace".to_string(), Value::Object(trace));
 }
 
-fn attach_authority_error_guidance(mut envelope: ErrorEnvelope) -> ErrorEnvelope {
-    let Some(context) = envelope.context.as_mut() else {
-        return envelope;
-    };
-    let Some(guidance) = authority_error_guidance(envelope.code, context) else {
-        return envelope;
-    };
-    if let Some(object) = context.as_object_mut() {
-        object.insert("authority_guidance".to_string(), guidance);
-    }
-    envelope
-}
-
 fn stdout_contract_fallback_error(mut envelope: ErrorEnvelope) -> ErrorEnvelope {
     let mut context = envelope
         .context
@@ -505,146 +547,6 @@ fn stdout_contract_fallback_error(mut envelope: ErrorEnvelope) -> ErrorEnvelope 
     );
     envelope.context = Some(Value::Object(context));
     envelope
-}
-
-fn authority_error_guidance(code: ErrorCode, context: &Value) -> Option<Value> {
-    let object = context.as_object()?;
-    let authority_state = object.get("authority_state").and_then(Value::as_str);
-    let reason = object.get("reason").and_then(Value::as_str);
-
-    match (code, authority_state, reason) {
-        (ErrorCode::StaleSnapshot, Some("selected_frame_context_drifted"), _) => {
-            Some(authority_guidance(
-                "selected_frame_context_drifted",
-                "The selected frame changed after the snapshot was captured. Re-select the current frame and refresh snapshot authority before continuing.",
-                vec![
-                    guidance_command_hint(
-                        "rub frames",
-                        "inspect the live frame inventory before choosing the current frame again",
-                    ),
-                    guidance_command_hint(
-                        "rub frame --top or rub frame --name <frame-name>",
-                        "restore the intended frame selection before taking a fresh snapshot",
-                    ),
-                    guidance_command_hint(
-                        "rub state",
-                        "capture a fresh snapshot after frame authority has been restored",
-                    ),
-                ],
-            ))
-        }
-        (ErrorCode::StaleSnapshot, Some("selected_frame_context_stale"), _) => {
-            Some(authority_guidance(
-                "selected_frame_context_stale",
-                "The selected frame context is no longer live. Re-establish frame authority and capture a fresh snapshot before continuing.",
-                vec![
-                    guidance_command_hint(
-                        "rub frames",
-                        "inspect the live frame inventory to confirm which frames still exist",
-                    ),
-                    guidance_command_hint(
-                        "rub frame --top or rub frame --name <frame-name>",
-                        "select the intended live frame again before retrying",
-                    ),
-                    guidance_command_hint(
-                        "rub state",
-                        "capture a fresh snapshot from the restored frame context",
-                    ),
-                ],
-            ))
-        }
-        (ErrorCode::StaleSnapshot, Some("explicit_frame_scope_mismatch"), _) => {
-            Some(authority_guidance(
-                "explicit_frame_scope_mismatch",
-                "The cached snapshot does not match the explicitly requested frame scope. Re-select the intended frame and capture a fresh snapshot before continuing.",
-                vec![
-                    guidance_command_hint(
-                        "rub frames",
-                        "inspect the live frame inventory and confirm the intended frame name or id",
-                    ),
-                    guidance_command_hint(
-                        "rub frame --name <frame-name> or rub frame --top",
-                        "restore the explicit frame scope before retrying the command",
-                    ),
-                    guidance_command_hint(
-                        "rub state",
-                        "capture a fresh snapshot after restoring the intended frame scope",
-                    ),
-                ],
-            ))
-        }
-        (ErrorCode::BrowserCrashed, _, Some("continuity_no_active_tab"))
-        | (ErrorCode::SessionBusy, _, Some("continuity_no_active_tab"))
-        | (ErrorCode::SessionBusy, _, Some("continuity_target_tab_missing"))
-        | (ErrorCode::SessionBusy, _, Some("continuity_tab_refresh_failed")) => {
-            Some(authority_guidance(
-                match reason {
-                    Some("continuity_target_tab_missing") => "continuity_target_tab_missing",
-                    Some("continuity_tab_refresh_failed") => "continuity_tab_refresh_failed",
-                    _ => "continuity_no_active_tab",
-                },
-                "Tab authority became unavailable during continuity recovery. Re-establish the intended tab before continuing automation.",
-                vec![
-                    guidance_command_hint(
-                        "rub tabs",
-                        "inspect the current tab registry and confirm which tab, if any, still owns the workflow",
-                    ),
-                    guidance_command_hint(
-                        "rub switch <index>",
-                        "restore the intended active tab before attempting to resume",
-                    ),
-                    guidance_command_hint(
-                        "rub runtime takeover",
-                        "re-check the takeover runtime surface after tab authority is restored",
-                    ),
-                ],
-            ))
-        }
-        (ErrorCode::BrowserCrashed, _, Some("continuity_frame_unavailable"))
-        | (ErrorCode::SessionBusy, _, Some("continuity_frame_unavailable")) => {
-            Some(authority_guidance(
-                "continuity_frame_unavailable",
-                "Frame authority became unavailable during continuity recovery. Re-select the intended frame and refresh page authority before continuing.",
-                vec![
-                    guidance_command_hint(
-                        "rub frames",
-                        "inspect the live frame inventory before choosing the current frame again",
-                    ),
-                    guidance_command_hint(
-                        "rub frame --top or rub frame --name <frame-name>",
-                        "restore the intended frame selection before retrying",
-                    ),
-                    guidance_command_hint(
-                        "rub runtime takeover",
-                        "re-check the takeover runtime surface after frame authority is restored",
-                    ),
-                ],
-            ))
-        }
-        _ => None,
-    }
-}
-
-fn authority_guidance(source_signal: &str, summary: &str, next_command_hints: Vec<Value>) -> Value {
-    json!({
-        "surface": "cli_authority_guidance",
-        "truth_level": "operator_projection",
-        "projection_kind": "authority_guidance",
-        "projection_authority": "cli.output.error_guidance",
-        "upstream_commit_truth": "error_context",
-        "control_role": "guidance_only",
-        "durability": "ephemeral",
-        "source_signal": source_signal,
-        "summary": summary,
-        "next_command_hints": next_command_hints,
-    })
-}
-
-fn guidance_command_hint(command: &str, reason: &str) -> Value {
-    json!({
-        "command": command,
-        "reason": reason,
-    })
 }
 
 fn copy_field(source: &Map<String, Value>, dest: &mut Map<String, Value>, key: &str) {

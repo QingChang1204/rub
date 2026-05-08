@@ -980,6 +980,17 @@ fn t093_095g_navigation_reload_and_dialog_grouped_scenario() {
 </html>"#,
         ),
         (
+            "/dialog-sync-alert",
+            "text/html",
+            r#"<!DOCTYPE html>
+<html>
+<head><title>Sync Dialog Fixture</title></head>
+<body>
+  <button id="trigger" onclick="alert('Sync hello!')">Show Sync Alert</button>
+</body>
+</html>"#,
+        ),
+        (
             "/dialog-prompt",
             "text/html",
             r#"<!DOCTYPE html>
@@ -1179,6 +1190,56 @@ fn t093_095g_navigation_reload_and_dialog_grouped_scenario() {
     assert!(dismissed["data"]["result"]["pending_dialog"].is_null());
     assert_eq!(
         dismissed["data"]["result"]["last_result"]["accepted"],
+        false
+    );
+
+    let sync_alert_open = parse_json(
+        &session
+            .cmd()
+            .args(["open", &server.url_for("/dialog-sync-alert")])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        sync_alert_open["success"], true,
+        "Step 5b: open sync alert"
+    );
+    let sync_intercept = parse_json(
+        &session
+            .cmd()
+            .args(["dialog", "intercept", "--action", "dismiss"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(sync_intercept["success"], true, "{sync_intercept}");
+    assert_eq!(
+        sync_intercept["data"]["subject"]["kind"],
+        "dialog_intercept"
+    );
+    let sync_alert_click = parse_json(
+        &session
+            .cmd()
+            .args(["click", "--selector", "#trigger"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        sync_alert_click["success"], true,
+        "armed synchronous alert click must return instead of blocking the queue: {sync_alert_click}"
+    );
+    let pending_sync_alert = parse_json(&session.cmd().args(["dialog", "status"]).output().unwrap());
+    assert_eq!(pending_sync_alert["success"], true, "{pending_sync_alert}");
+    assert_eq!(
+        pending_sync_alert["data"]["runtime"]["status"],
+        "inactive",
+        "{pending_sync_alert}"
+    );
+    assert_eq!(
+        pending_sync_alert["data"]["runtime"]["last_dialog"]["message"],
+        "Sync hello!"
+    );
+    assert_eq!(
+        pending_sync_alert["data"]["runtime"]["last_result"]["accepted"],
         false
     );
 

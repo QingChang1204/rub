@@ -1,6 +1,6 @@
 use crate::commands::{
-    Commands, DialogSubcommand, DownloadSubcommand, HandoffSubcommand, RuntimeSubcommand,
-    StorageAreaArg, StorageSubcommand, TakeoverSubcommand,
+    Commands, DialogInterceptActionArg, DialogSubcommand, DownloadSubcommand, HandoffSubcommand,
+    RuntimeSubcommand, StorageAreaArg, StorageSubcommand, TakeoverSubcommand,
 };
 use crate::timeout_budget::helpers::input_path_reference_state;
 use rub_core::error::{ErrorCode, RubError};
@@ -310,6 +310,26 @@ pub(crate) fn build_dialog_request(
         DialogSubcommand::Dismiss => Ok(mutating_request(
             "dialog",
             serde_json::json!({ "sub": "dismiss" }),
+            timeout,
+        )),
+        DialogSubcommand::Intercept {
+            action,
+            prompt_text,
+        } => Ok(mutating_request(
+            "dialog",
+            serde_json::json!({
+                "sub": "intercept",
+                "action": match action {
+                    DialogInterceptActionArg::Accept => "accept",
+                    DialogInterceptActionArg::Dismiss => "dismiss",
+                },
+                "prompt_text": prompt_text,
+            }),
+            timeout,
+        )),
+        DialogSubcommand::CancelIntercept => Ok(mutating_request(
+            "dialog",
+            serde_json::json!({ "sub": "cancel_intercept" }),
             timeout,
         )),
     }

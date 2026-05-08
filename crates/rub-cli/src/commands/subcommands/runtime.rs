@@ -195,6 +195,12 @@ pub enum TakeoverSubcommand {
     Resume,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum DialogInterceptActionArg {
+    Accept,
+    Dismiss,
+}
+
 /// Subcommands for `rub dialog`.
 #[derive(Debug, Clone, Subcommand)]
 pub enum DialogSubcommand {
@@ -208,6 +214,17 @@ pub enum DialogSubcommand {
     },
     /// Dismiss the pending dialog
     Dismiss,
+    /// Arm a one-shot handler for the next JavaScript dialog on the active tab
+    Intercept {
+        /// How to resolve the next dialog
+        #[arg(long, value_enum, default_value = "dismiss")]
+        action: DialogInterceptActionArg,
+        /// Prompt text to supply when accepting a prompt dialog
+        #[arg(long = "prompt-text")]
+        prompt_text: Option<String>,
+    },
+    /// Cancel a previously armed one-shot dialog intercept
+    CancelIntercept,
 }
 
 /// Subcommands for `rub intercept`.

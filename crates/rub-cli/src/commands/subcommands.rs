@@ -17,10 +17,10 @@ pub(crate) use self::meta::render_nested_subcommand_long_help;
 pub use explain::ExplainSubcommand;
 pub use query::{GetSubcommand, InspectSubcommand};
 pub use runtime::{
-    BindingCaptureAuthInputArg, BindingSubcommand, CookiesSubcommand, DialogSubcommand,
-    DownloadSubcommand, HandoffSubcommand, InterceptSubcommand, InterferenceSubcommand,
-    OrchestrationSubcommand, RememberedBindingAliasKindArg, RuntimeSubcommand, SecretSubcommand,
-    StorageSubcommand, TakeoverSubcommand, TriggerSubcommand,
+    BindingCaptureAuthInputArg, BindingSubcommand, CookiesSubcommand, DialogInterceptActionArg,
+    DialogSubcommand, DownloadSubcommand, HandoffSubcommand, InterceptSubcommand,
+    InterferenceSubcommand, OrchestrationSubcommand, RememberedBindingAliasKindArg,
+    RuntimeSubcommand, SecretSubcommand, StorageSubcommand, TakeoverSubcommand, TriggerSubcommand,
 };
 
 #[derive(Debug, Clone, Subcommand)]
